@@ -1,3 +1,5 @@
+# test_retrieval.py
+# Tests for the HybridRetriever covering the BM25/dense/graph gate, RRF fusion, cache hits, and identifier-pattern matching.
 """Tests for Module 4: retrieval/.
 
 Section 8 invariants tested here:

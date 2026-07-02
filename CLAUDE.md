@@ -3,6 +3,12 @@
 This file instructs Claude Code on what to build, how to structure it, and what the
 invariants are. Read it fully before writing any code.
 
+> **Reference architecture:** `APEX-Nexus-Unified-Architecture-Detailed.md` (project
+> root) is the detailed engineering spec that this file distils. Read both before
+> making structural changes. CLAUDE.md governs implementation decisions;
+> the architecture doc provides the full design rationale, data schemas, scaling
+> model, and evaluation plan.
+
 ---
 
 ## 0. What this project is (and is not)
@@ -551,6 +557,14 @@ These are stricter than, and additive to, the memfabric invariants:
   itself is never copied into `apex_host` source.
 - **All memory writes go through `MemoryAPI`.** No `apex_host` component
   touches a memfabric store directly (memfabric Invariant 1 applies here too).
+- **No machine-specific profile files.** Do not create files named after
+  individual HTB machines or targets (e.g. `meow.py`, `lame.py`, `blue.py`,
+  or any `<machine-name>.py`). Target details (IP, credentials, payload repo)
+  are always supplied through CLI flags at runtime. Machine-specific solver
+  logic, expected credential paths, default usernames, and expected service
+  configurations must never be committed to the repository. Every authorized
+  HTB Easy/Medium machine reachable over the VPN is a valid target and is
+  treated identically by the architecture.
 
 ### 11.3 The APEX LangGraph (`graph.py`)
 
@@ -616,3 +630,828 @@ bypass the staging gate.
 - No raw `subprocess`/`asyncio.create_subprocess_*` calls anywhere in
   `apex_host` outside `apex_host/tools/runner.py`.
 - All memory writes go through `MemoryAPI`.
+
+---
+
+## 12. Working Prototype Roadmap
+
+### 12.1 Goal
+
+Turn the current `apex_host` skeleton into a working prototype that can run
+safely against **authorized HackTheBox Easy/Medium machines** from a local
+macOS workstation over the HTB VPN. This is a local-first, single-operator
+prototype — not a production tool, not a Kali replacement, not a cloud
+service.
+
+### 12.2 Meow is the first smoke test only
+
+"Meow" (HTB Starting Point machine) is used as the **first end-to-end
+smoke test** for the dry-run → real-execution pipeline. It is not
+hardcoded anywhere in the codebase. The architecture is fully
+target-agnostic: any HTB Easy/Medium machine reachable over the VPN can be
+the engagement target. The only thing that changes between targets is the
+`--target` IP/hostname passed on the CLI and the phase progression driven
+by whatever the live tool output produces.
+
+### 12.3 Authorization requirement (non-negotiable)
+
+Every real-execution run (`--no-dry-run`) **must** target an authorized
+lab machine:
+
+- Hack The Box (HTB) machines accessed through the official HTB VPN.
+- Other explicitly authorized lab environments (TryHackMe, PWNX, personal
+  lab VMs, etc.).
+
+**Never** run `--no-dry-run` against any host you do not own or have
+explicit written permission to test. `dry_run=True` is the default and
+remains so. Removing the default requires a deliberate flag on every
+invocation.
+
+### 12.4 No Kali integration yet
+
+All tools (`nmap`, `ffuf`, `gobuster`, `curl`, `searchsploit`) run from the
+local macOS environment. Homebrew or direct binary installs suffice for the
+prototype phase. Kali integration (via SSH, Docker, or a shared toolchain
+container) is a future milestone and does not affect the current
+architecture — the `ToolRegistry` / `runner.py` boundary is the abstraction
+point where that wiring would plug in.
+
+### 12.5 Prototype milestones
+
+| Milestone | What it proves |
+|---|---|
+| M1 — dry-run end-to-end | CLI runs without errors; all safety gates hold |
+| M2 — first real recon | `nmap` output parsed into EKG host/service nodes |
+| M3 — phase progression | GlobalPlanner advances through recon → web → credential |
+| M4 — Meow smoke test | Full engagement against Meow over HTB VPN, findings logged |
+| M5 — second target | Prototype generalizes: different IP, different phase path |
+
+### 12.6 File-header convention (enforced)
+
+Every Python file in this repo must start with:
+
+```python
+# filename.py
+# One-line explanation of what this file does.
+```
+
+This must be the literal first two lines — before docstrings, before
+`from __future__ import annotations`, before imports. If you create a new
+file, add this header. The CI header scan (`find ... | while read f; do head
+-1 "$f" | grep -v "^#" && echo "MISSING: $f"; done`) enforces this.
+
+### 12.7 Local Mac Tool Profile
+
+The default `ApexConfig.allowed_tools` is tuned for a vanilla macOS workstation:
+
+| Tool | Source | Status |
+|---|---|---|
+| `nmap` | Homebrew (`brew install nmap`) | Default |
+| `curl` | macOS built-in | Default |
+| `python3` | macOS built-in | Default |
+| `nc` | macOS built-in (`/usr/bin/nc`) | Default |
+| `netcat` | Alternate binary name | Optional |
+| `ffuf` | Homebrew (`brew install ffuf`) | Optional |
+| `gobuster` | Homebrew / manual build | Optional |
+| `searchsploit` | `exploitdb` Homebrew tap | Optional |
+
+**Optional tools** are registered in `ToolRegistry._KNOWN_TOOLS` but **not** in
+the default `allowed_tools`. Add them explicitly:
+
+```python
+config = ApexConfig(target="10.10.10.x", allowed_tools=["nmap", "curl", "python3", "nc", "ffuf"])
+```
+
+**Missing tools degrade gracefully.** `runner.py` calls `shutil.which()` before
+any live execution. If the binary is not in `PATH`, it returns a
+`ToolResult(error="tool '...' not found in PATH")` and the engagement continues
+— it does not crash. Dry-run mode is unaffected (no PATH check needed; the
+dry-run result is synthetic).
+
+**Preflight check.** Before a real-execution run, verify your tool stack:
+
+```bash
+python -m apex_host.main --target 10.10.10.x --preflight
+```
+
+This calls `check_local_tools(config)` from `apex_host/tools/preflight.py`,
+prints a per-tool OK/MISSING table, and exits with code 1 if any tool is
+missing, 0 if all are available.
+
+### 12.8 Parser Expansion for Common HTB Services
+
+`apex_host/parsers/` produces EKG node/edge deltas from tool output. All
+parsers are **stateless** — they receive raw text and return a
+`ParsedObservation` with no stored state. All writes go through `MemoryAPI`
+(memfabric Invariant 1). Unknown non-empty output is **never silently dropped**:
+it becomes a staged `KnowledgeEntry` at confidence 0.25–0.3.
+
+#### Node and edge type conventions
+
+| Node type | Meaning | Key props |
+|---|---|---|
+| `host` | A reachable IP/hostname | `ip`, `target` |
+| `service` | An open port / protocol binding | `port`, `proto`, `service`, `version` |
+| `tech` | An identified product or library | `name`, `version` |
+| `endpoint` | An HTTP path/URL | `url`, `status`, `server` |
+| `auth_flow` | A login mechanism or credential boundary | `url`, `hint` |
+| `credential` | A captured credential or token | `username`, `secret_hint` |
+| `access_state` | Current privilege level reached | `level`, `evidence` |
+
+| Edge type | Meaning |
+|---|---|
+| `exposes` | host → service, host → endpoint |
+| `runs` | service → tech, endpoint → tech |
+| `requires` | endpoint → auth_flow |
+| `contains` | endpoint → form, endpoint → token |
+
+#### Parser routing (in `apex_host/graph.py` `parse_observation`)
+
+| Tool name / `parser` field | Parser class | What it produces |
+|---|---|---|
+| `nmap` | `NmapParser` | host, service, tech nodes; exposes + runs edges |
+| `curl` (HTTP/ output) | `CommandParser` | endpoint + tech nodes; exposes + runs edges |
+| `nc` / `netcat` | `BannerParser` | service + tech nodes; runs edges |
+| `ffuf` | `FfufParser` | endpoint nodes; exposes edges |
+| `gobuster` | `GobusterParser` | endpoint nodes; exposes edges |
+| anything else | `CommandParser` fallback | staged `KnowledgeEntry` (confidence 0.3) |
+
+#### Tech extraction rules
+
+- **nmap**: version string → first non-digit token(s) = product name (max 3
+  words), first digit-starting token = version. Empty version → no tech node.
+- **curl -I**: `Server:` header → `product[/version]` pattern. No `Server:`
+  header → endpoint node only, no tech node.
+- **nc/netcat**: SSH banner `SSH-proto-software` → OpenSSH/etc. FTP `220`
+  banner → vsftpd or ProFTPD if detectable. Telnet `login:` prompt → telnet
+  service node. Unrecognised → `KnowledgeEntry`.
+
+### 12.9 Generic Recon Prototype
+
+`ReconPlanner` drives the recon phase in two deterministic stages, reading only
+the `SubgraphView` passed in — no direct `MemoryAPI` calls (blackboard model,
+Invariant 7).
+
+#### Flow: target → host → service → tech / banner observations
+
+```
+turn 1 (no services known)
+  ReconPlanner  →  nmap -sV -T4 <target>
+  NmapParser    →  host node + service nodes + tech nodes (from version banner)
+  MemoryAPI     ←  upsert_node / upsert_edge  (via parse_observation in graph.py)
+
+turn 2+ (services exist in subgraph)
+  ReconPlanner  →  nc -nv <target> <port>  (up to 3 safe banner probes)
+  BannerParser  →  service node + tech node (SSH/FTP/Telnet/…)
+  MemoryAPI     ←  upsert_node / upsert_edge
+```
+
+#### Safe banner probe set
+
+`ReconPlanner` only emits `nc` banner probes for services in the
+`_BANNER_PROBE_SERVICES` set (ssh, ftp, telnet, smtp, mysql, redis,
+postgresql) or whose port is in `_BANNER_PROBE_PORTS` (21, 22, 23, 25,
+3306, 5432, 6379). UDP services, closed/filtered ports, and services
+outside these sets are skipped. At most `_MAX_BANNER_TASKS = 3` nc tasks
+are emitted per turn.
+
+#### Args convention
+
+All args emitted by planners are **complete** — the target (and port for nc)
+are already included in `params["args"]`. Graph.py's `_run_one_task` passes
+args directly to `ToolCommand` without appending target. This is consistent
+across all tools (nmap: `["-sV", "-T4", target]`; nc: `["-nv", target, port]`;
+curl: `["-s", "-I", url]`).
+
+#### Dry-run vs live
+
+- `dry_run=True` (default): runner returns synthetic stdout; parsers receive it
+  but produce no real nodes (nmap dry-run output is not valid nmap format);
+  no real network traffic is generated. Use for routing / safety verification.
+- `dry_run=False` (`--no-dry-run`): `nmap -sV -T4 <target>` is executed against
+  an **authorized** HTB/VPN target. All safety gates in `tools/safety.py`
+  still apply. `nc` banner probes are similarly gated.
+
+### 12.10 Payload RAG Prototype
+
+#### Source of truth
+
+Payload knowledge lives **only** in an external directory supplied via
+`--payload-repo <path>` at startup (e.g., `./payloads`). No payload text
+is embedded in source files. `apex_host/knowledge/payload_repo_loader.py`
+reads that directory at runtime and stages chunks via
+`MemoryAPI.propose_knowledge()`.
+
+#### Chunking
+
+Markdown files are split on `## ` headings (section-level chunks). All
+other file types (`.txt`, `.py`, `.rb`, `.sh`, `.json`, `.yaml`, `.yml`)
+are size-chunked at 1 500 characters. Each chunk carries metadata:
+
+| Field | Value |
+|---|---|
+| `source_path` | Absolute path to the source file |
+| `payload_family` | Parent directory name (e.g., `sqli`, `xss`) |
+| `file_ext` | Extension (e.g., `.md`) |
+| `tier` | `"semantic"` |
+| `source` | `"payload_repo"` |
+| `chunk_index` | 0-based position within the file's chunk list |
+
+#### Promotion path
+
+`seed_payload_repo(path, api, config)` in `knowledge/seed_loader.py`:
+
+1. Calls `PayloadRepoLoader.load()` — proposes all chunks to the staging
+   area (NOT yet retrievable, per memfabric Invariant 4).
+2. Runs one `ReflectorWorker.run_once()` pass — the real Reflector
+   promotion path, not a shortcut. Promotes every staged knowledge entry
+   whose `confidence >= config.min_confidence` (default 0.5; the loader
+   sets confidence to 0.7, so all entries clear the gate).
+
+After this call, promoted chunks are in the BM25 lexical index and are
+returned by `MemoryAPI.query()` with their text populated in
+`ScoredEntry.text`.
+
+#### Retrieval text fix
+
+Prior to Phase 4, `ScoredEntry.text` was always `""` after RRF fusion
+because the BM25 search interface returned `(id, score, metadata)` tuples
+without the raw text. The fix:
+
+- `memfabric/api.py`: all `lexical.add()` calls now include `"_text"` in
+  the metadata dict, set to the same text string passed as the second arg.
+- `memfabric/retrieval/engine.py`: `ScoredEntry` is built with
+  `text=str(meta.get("_text", ""))` so the text travels through RRF back
+  to callers.
+
+#### Tests
+
+`tests/apex_host/test_payload_repo_loader.py` verifies:
+- Chunks are proposed and staged correctly.
+- All required metadata fields are present (`tier`, `source`,
+  `payload_family`, `file_ext`, `chunk_index`).
+- Markdown files split into ≥ 2 chunks when `## ` headings are present.
+- Missing repo path returns 0 (graceful degradation).
+- Staged entries are NOT returned by `api.query()` until promoted
+  (staging isolation invariant).
+- `seed_payload_repo` promotes all entries via the Reflector path.
+- `api.query()` returns non-empty `ScoredEntry.text` after promotion.
+- Retrieved text contains words from the original chunk content.
+
+### 12.11 Generic Service Capability Model
+
+`apex_host/planners/capabilities.py` is the single place where observed EKG
+nodes are translated into named, safe planner actions.  No individual planner
+may contain service-name strings or port-number sets — those live exclusively
+in this module.
+
+#### Why this prevents Meow-specific hardcoding
+
+Without a capability layer every planner hardcodes its own idea of what
+constitutes SSH, HTTP, or a banner-probeable port.  Two planners that both
+care about SSH would each carry their own `{"ssh", "22"}` constants, and
+adding a new planner for a different HTB machine would require hunting through
+all of them.  `capabilities_from_subgraph()` centralises that knowledge: any
+target whose EKG has an SSH service node will produce
+`access_validate_ssh` regardless of which machine it came from.
+
+#### API
+
+```python
+from apex_host.planners.capabilities import Capability, capabilities_from_subgraph
+
+caps: list[Capability] = capabilities_from_subgraph(subgraph)
+```
+
+`Capability` fields: `name`, `target`, `port`, `service`, `confidence`,
+`source_node_id`.
+
+#### Capability names
+
+| Name | Trigger | Planner consumer |
+|---|---|---|
+| `web_probe` | HTTP/HTTPS service or endpoint node | `WebPlanner`, `ReconPlanner` |
+| `browser_observe` | HTTP/HTTPS service or endpoint node | browser agent |
+| `access_validate_telnet` | Telnet service/port 23 | `ReconPlanner` banner probe |
+| `access_validate_ssh` | SSH service/port 22 | `ReconPlanner` banner probe |
+| `access_validate_ftp` | FTP service/port 21 | `ReconPlanner` banner probe |
+| `service_probe` | Open TCP on a probeworthy port, no specific match | `ReconPlanner` banner probe |
+| `exploit_research` | Service node with non-empty version string | `PrivEscPlanner` |
+
+`service_probe` is only emitted for ports in `_PROBEWORTHY_PORTS` (21, 22,
+23, 25, 3306, 5432, 6379).  Arbitrary high ports produce no capability and
+are silently skipped — this prevents nc-probing every open port.
+
+`exploit_research` coexists with protocol-specific capabilities (a versioned
+SSH service produces both `access_validate_ssh` **and** `exploit_research`).
+
+#### Planner update rule
+
+If a planner needs to classify services or ports, it calls
+`capabilities_from_subgraph(subgraph)` and filters by `Capability.name`.
+It must **not** inspect `node.props["service"]` or hardcode port strings.
+
+#### Tests
+
+`tests/apex_host/test_capabilities.py` verifies:
+- Telnet service/port 23 → `access_validate_telnet`.
+- SSH service/port 22 → `access_validate_ssh`.
+- FTP service/port 21 → `access_validate_ftp`.
+- HTTP/HTTPS service → `web_probe` + `browser_observe`.
+- Versioned service → `exploit_research` (coexists with protocol cap).
+- Port 6379 (no service name) → `service_probe`.
+- SMB port 445 → no capability.
+- UDP service → no capability.
+- Closed/filtered service → no capability.
+- Endpoint node → `web_probe` + `browser_observe`.
+- All `Capability` fields (`target`, `port`, `service`, `confidence`,
+  `source_node_id`) carry the correct values.
+
+---
+
+### 12.12 Generic Bounded Access Validation
+
+Provides a one-attempt, explicit-credential login validation workflow for
+authorized HTB Easy/Medium machines. No brute force. No credential stuffing.
+No autonomous credential guessing. Telnet is implemented first; SSH/FTP are
+capability placeholders for future iterations.
+
+#### Safety invariants (non-negotiable)
+
+- **No brute force, no credential stuffing.** `CredentialPlanner` emits
+  exactly ONE task per turn, using the first configured credential pair.
+  There is no loop over `username_candidates × password_candidates`.
+- **No autonomous credential guessing.** Credentials must be supplied
+  explicitly by the operator via `--username` / `--password` CLI flags.
+  If neither is supplied and a telnet capability is found, the planner
+  returns `AbandonSignal` with a helpful message.
+- **Dry-run enforced in `TelnetExecutor`.** With `config.dry_run=True`
+  (the default), `TelnetExecutor.run()` returns a synthetic result
+  immediately — `asyncio.open_connection` is never called.
+- **`TelnetExecutor` uses `asyncio.open_connection`, never subprocess.**
+  This upholds the "no raw subprocess outside runner.py" invariant while
+  still being safe — TCP is not a subprocess.
+- **Secret material never stored in EKG.** `AccessParser` always sets
+  `secret_hint="[redacted]"` on the `credential` node. The plaintext
+  password never appears in graph state, episodic log, or proposals.
+
+#### Flow
+
+```
+CredentialPlanner.plan()
+  ├── capabilities_from_subgraph() finds access_validate_telnet
+  │     ├── credentials configured? → emit ONE TaskSpec(tool="telnet_access", parser="access")
+  │     └── no credentials         → AbandonSignal (operator must supply --username/--password)
+  └── no telnet capability → fallback curl HEAD probe or AbandonSignal
+```
+
+`execute_agent` in `graph.py` routes `tool="telnet_access"` tasks to
+`TelnetExecutor.run()` (asyncio TCP), then builds a `tool_result` dict
+compatible with the existing `parse_observation` / `write_memory` nodes.
+
+`parse_observation` routes `parser="access"` to `AccessParser.parse_text()`:
+- Always emits a `credential` node (`username` + `secret_hint="[redacted]"`).
+- On success (shell prompt detected, no failure indicator): also emits an
+  `access_state` node and a `grants` edge `credential → access_state`.
+- On failure (`login incorrect` / `authentication failed` / etc.): only the
+  `credential` node is emitted — no `access_state`.
+
+#### New config fields (`ApexConfig`)
+
+| Field | Type | Default | Purpose |
+|---|---|---|---|
+| `username_candidates` | `list[str]` | `[]` | Usernames from `--username` |
+| `password_candidates` | `list[str]` | `[]` | Passwords from `--password` |
+| `max_access_attempts` | `int` | `1` | Upper bound on attempts (never > 1 in this iteration) |
+
+#### New CLI flags (`main.py`)
+
+```bash
+python -m apex_host.main \
+  --target 10.10.10.14 \
+  --username root \
+  --password "" \
+  --dry-run
+```
+
+Both `--username` and `--password` are `append`-action flags (can be
+repeated). Only the first pair is used. `dry_run=True` is the default.
+
+#### New files
+
+| File | Purpose |
+|---|---|
+| `apex_host/agents/telnet_executor.py` | Stateless bounded telnet login executor |
+| `apex_host/parsers/access_parser.py` | Session-text → EKG credential/access_state deltas |
+| `tests/apex_host/test_access_validation.py` | 20+ tests for all four acceptance criteria |
+
+#### Tests (`tests/apex_host/test_access_validation.py`)
+
+- `CredentialPlanner` abandons without credentials when telnet cap present.
+- `CredentialPlanner` emits exactly one task with explicit credentials.
+- Multiple credential pairs → still exactly one task (first pair only).
+- `AccessParser` creates credential + access_state + grants on shell prompt.
+- `AccessParser` creates credential node only on login-incorrect output.
+- `AccessParser` returns empty on blank input.
+- `TelnetExecutor` dry-run returns synthetic success, `dry_run=True` in data.
+- `TelnetExecutor` dry-run monkeypatch verifies `asyncio.open_connection`
+  is never called.
+
+---
+
+### 12.14 Browser Executor Prototype
+
+`apex_host/agents/browser_executor.py` drives Playwright in live mode and
+returns a synthetic `BrowserObservation` in dry-run mode (the safe default).
+Each `run()` call creates a fresh browser instance and tears it down before
+returning — no browser state, no session, no page handle is held on `self`
+across calls (memfabric Invariant 6: executors are stateless).
+
+#### What the executor collects (live mode)
+
+| Data | How | EKG result |
+|---|---|---|
+| Page title | `page.title()` | stored in `episode.data` |
+| Forms with input field names | JS eval — `document.forms` | `form` node per form |
+| Password-field auth hint | JS eval — `input[type="password"]` | `auth_flow` node |
+| Hidden-input / meta token names (`csrf`, `token`, `nonce`) | JS eval | `token` node per name |
+| Same-origin anchor links (≤ 50) | JS eval — `a[href]` | stored in obs for future probing |
+
+Playwright is **only imported** (lazy) and **only executed** when
+`config.dry_run is False`.  In dry-run mode a synthetic observation is
+returned immediately — no import, no subprocess, no network.
+
+#### Observation data flow
+
+The executor stores collected data in `episode.data["obs"]` as a plain
+JSON-serialisable dict.  `browser_agent` in `apex_host/graph.py` passes
+this through to `tool_result["obs"]`.  `parse_observation` reconstructs a
+`BrowserObservation` from that dict and calls `BrowserParser.parse_observation`
+to produce EKG node/edge deltas — consistent with every other
+executor/parser pair: all writes go through `MemoryAPI` in `parse_observation`,
+never inside the executor itself (memfabric Invariant 1).
+
+#### BrowserParser node types
+
+| Input | Output nodes | Output edges |
+|---|---|---|
+| Any URL observed | `endpoint` | — |
+| A form element | `form` | `endpoint → form` (`contains`) |
+| A form with a password field | `auth_flow` | `endpoint → auth_flow` (`requires`) |
+| `auth_hints` list entries | `auth_flow` | `endpoint → auth_flow` (`requires`) |
+| Token names (csrf, nonce, …) | `token` | `endpoint → token` (`contains`) |
+
+#### How this feeds planning
+
+`BrowserParser` produces `auth_flow` nodes.  `GlobalPlanner.decide_phase`
+advances from `web` to `credential` as soon as `"auth_flow" in node_types_seen`.
+So a successful browser observation of a login page causes the very next turn
+to enter the credential phase and attempt bounded access validation — the
+browser and credential phases are automatically chained through the EKG.
+
+#### Web-phase routing
+
+```
+web phase, turn N (no prior web finding) → web_agent → ffuf / curl → endpoint discovery
+web phase, turn N+1 (prior web finding)  → browser_agent → BrowserExecutor → form/token/auth_flow discovery
+```
+
+`WebPlanner` uses `capabilities_from_subgraph(subgraph)` to derive the
+correct base URL from the highest-confidence `web_probe` capability in the
+EKG.  If nmap found port 8080 the ffuf/curl tasks probe `http://target:8080`,
+not the hardcoded port 80.  Falls back to `http://target` before recon runs.
+
+#### Tests
+
+`tests/apex_host/test_browser_executor.py` verifies:
+- Dry-run returns `Outcome.success`; `dry_run=True` flag present in episode data.
+- `episode.data["obs"]` dict contains url, title, forms, tokens, links.
+- Synthetic forms include a password field (triggers `auth_flow` node).
+- Synthetic tokens include a csrf-pattern name (triggers `token` node).
+- Two consecutive dry-run calls are independent (stateless executor).
+- `BrowserParser` creates `endpoint`, `auth_flow`, `token` nodes from the
+  synthetic obs produced by `BrowserExecutor` in dry-run mode.
+- `WebPlanner` derives correct http/https URL from port-80/443/8080 capability.
+- Highest-confidence capability wins when multiple web services are present.
+- Web phase routes to `browser_agent` after a prior web finding.
+
+---
+
+### 12.13 Local HTB Runner
+
+`apex_host/eval/run_htb_local.py` is the **general-purpose local runner**
+for authorized HTB Easy/Medium machines from a macOS workstation. It wraps
+`runtime.py` and prints a phase-by-phase summary, findings table, EKG
+node/edge breakdown, and episode count after each engagement.
+
+All target details are supplied through CLI flags. No machine-specific
+profiles, expected credential paths, default usernames, or target-specific
+phase progressions are stored in the codebase (see §11.2 safety invariants).
+
+#### New files
+
+| File | Purpose |
+|---|---|
+| `apex_host/eval/run_htb_local.py` | General local HTB runner with rich output |
+| `apex_host/eval/export_graph.py` | Serialises EKG nodes + edges to JSON |
+
+#### Usage
+
+Generic dry-run (safe, no real commands):
+```bash
+python -m apex_host.eval.run_htb_local \
+  --target <HTB_TARGET_IP> \
+  --payload-repo ./payloads \
+  --dry-run
+```
+
+Generic live authorized run (HTB VPN required):
+```bash
+python -m apex_host.eval.run_htb_local \
+  --target <HTB_TARGET_IP> \
+  --payload-repo ./payloads \
+  --no-dry-run \
+  --username <USER> \
+  --password <PASS>
+```
+
+Export EKG to JSON after the run:
+```bash
+python -m apex_host.eval.run_htb_local \
+  --target <HTB_TARGET_IP> --dry-run \
+  --export-graph ./ekg_snapshot.json
+```
+
+#### Report output
+
+After each run the runner prints:
+- **Phase Summary** — finding count per phase
+- **Findings** — id, type, confidence, source per finding
+- **EKG Summary** — node and edge counts by type (from a depth-10 subgraph
+  traversal rooted at `host:<target>`)
+- **Episodes** — turns completed and last error
+
+#### Tests
+
+`tests/apex_host/test_htb_local_runner.py` verifies:
+- `export_ekg` returns the correct structure for known EKG state.
+- `NmapParser` produces host + telnet service nodes from synthetic nmap text.
+- `AccessParser` produces credential + access_state nodes from a synthetic
+  success session string.
+- **Synthetic E2E**: combining both parsers populates all four required node
+  types (host, service, credential, access_state) in one MemoryAPI.
+- The `grants` edge is present between credential and access_state.
+- `credential.secret_hint` is always `"[redacted]"`.
+- `format_report` contains the expected sections.
+- `run_engagement` completes without error in dry-run mode.
+- `ApexConfig.dry_run` defaults to `True` (live mode cannot be triggered
+  accidentally).
+
+---
+
+## 13. Development commands
+
+### Run the test suite
+
+```bash
+.venv/bin/python -m pytest tests/ -q
+```
+
+### Dry-run engagement (default — safe, no real commands)
+
+```bash
+python -m apex_host.main \
+  --target <HTB-machine-IP> \
+  --payload-repo ./payloads \
+  --dry-run
+```
+
+No network traffic is generated. Tool invocations are simulated and logged.
+Use this to verify routing logic, phase progression, and EKG writes without
+touching a live target.
+
+### Real engagement (authorized HTB/VPN targets only)
+
+```bash
+python -m apex_host.main \
+  --target <HTB-machine-IP> \
+  --payload-repo ./payloads \
+  --no-dry-run
+```
+
+**Only run this against an authorized HTB machine over the official HTB
+OpenVPN connection (or another explicitly authorized lab environment).** All
+commands are still safety-gated by `apex_host/tools/safety.py` — the
+allowlist and destructive-command block apply even in real-execution mode.
+
+---
+
+### 12.15 Safe Web Probing
+
+`WebPlanner` produces bounded, non-exploitative HTTP probes for the web
+phase. No fuzzing wordlists are assumed; directory discovery is strictly
+opt-in.
+
+#### Design rules (non-negotiable)
+
+- **No autonomous exploitation.** Web probing is discovery and fingerprinting
+  only. No SQLi payloads, XSS injections, or directory traversal attempts.
+- **No high-risk fuzzing by default.** `ffuf` and `gobuster` are never
+  emitted unless `ApexConfig.web_wordlist_path` is explicitly set. The
+  default is `None`, which guarantees no wordlist-based fuzzing runs.
+- **Safe by default.** `curl -s -I <url>` (HEAD) and `curl -s <url>` (body)
+  are always safe; they generate a single HTTP request each. They remain the
+  only probes when no wordlist is configured.
+
+#### Probe emission order
+
+| # | Task | Condition | Parser |
+|---|------|-----------|--------|
+| 1 | `curl -s -I <url>` | curl in `allowed_tools` | `command` (existing `CommandParser.parse`) |
+| 2 | `curl -s <url>` | curl in `allowed_tools` | `curl_body` (`CommandParser.parse_curl_body`) |
+| 3 | `ffuf -u <url>/FUZZ -w <wordlist> -mc 200,301,302,403 -maxtime 60` | curl in `allowed_tools` **AND** `web_wordlist_path` set | `ffuf` |
+| 4 | `gobuster dir -u <url> -w <wordlist> -q --no-progress` | gobuster in `allowed_tools` **AND** `web_wordlist_path` set | `gobuster` |
+
+#### `CommandParser.parse_curl_body` — HTML body parsing
+
+`parse_curl_body(raw)` extracts page structure from an HTML body response:
+
+- Detects HTML by presence of `<html`, `<!doctype`, or `<title` (case-insensitive).
+- Extracts the `<title>` content → stored as `props["title"]` on the base
+  `endpoint` node. Surrounding whitespace is collapsed.
+- Extracts relative `href` values (paths starting with `/`; external
+  `http://`/`https://` URLs are excluded) → up to **20** additional
+  `endpoint` nodes with `props["url"]` (full URL) and `props["path"]` (path only).
+- Creates `contains` edges from the base endpoint to each link endpoint.
+- Creates one `exposes` edge from `host:<ip>` to the base endpoint.
+- Non-HTML content → fallback `KnowledgeEntry` at confidence 0.3.
+- Empty content → returns empty `ParsedObservation`.
+
+The 20-link cap keeps the EKG bounded on pages with large nav menus.
+
+#### New config fields
+
+| Field | Type | Default | Purpose |
+|---|---|---|---|
+| `web_wordlist_path` | `str \| None` | `None` | Path to wordlist for ffuf/gobuster; `None` disables both |
+| `max_web_paths` | `int` | `50` | Passed as `-maxtime` hint to ffuf |
+
+#### New CLI flags
+
+```bash
+python -m apex_host.main --target 10.10.10.80 \
+  --web-wordlist /path/to/wordlist.txt \
+  --max-web-paths 50 \
+  --dry-run
+```
+
+Both flags are also available on `apex_host/eval/run_htb_local.py`.
+
+#### Tests (`tests/apex_host/test_web_planner.py`)
+
+- `WebPlanner` without wordlist → only curl HEAD + body, no ffuf/gobuster.
+- `WebPlanner` with wordlist → ffuf and gobuster included.
+- HEAD task is first, body task is second.
+- HEAD task uses parser `"command"`; body task uses parser `"curl_body"`.
+- Both curl tasks target the same base URL.
+- ffuf args include `-mc` (status filter) and `-maxtime` flags.
+- wordlist path appears verbatim in ffuf and gobuster args.
+- `AbandonSignal` returned when no allowed tools are available.
+- `CommandParser.parse_curl_body` extracts title, whitespace-collapses it.
+- `parse_curl_body` creates `exposes` edge from `host:<ip>`.
+- `parse_curl_body` extracts relative links as endpoint nodes with `contains` edges.
+- `parse_curl_body` excludes external URLs.
+- `parse_curl_body` caps link endpoint nodes at 20.
+- `parse_curl_body` falls back to `KnowledgeEntry` for non-HTML content.
+- `parse_curl_body` returns empty observation for blank input.
+- `parse_curl_body` preserves explicit port in the base URL (e.g., `:8080`).
+
+---
+
+## 13. Future Modification Rules for Claude Code
+
+When a future session of Claude Code continues work on this codebase, the
+following rules apply. They reinforce the design invariants in Section 1,
+the safety invariants in Section 11.2, and the conventions established
+throughout Sections 2–12. Treat them as binding constraints, not
+suggestions.
+
+### 13.1 Read CLAUDE.md before writing any code
+
+Read this file **in full** before writing, editing, or deleting any file.
+Changes that violate the rules in Section 1, Section 11.2, or this section
+will need to be reverted. If CLAUDE.md and the architecture doc conflict,
+CLAUDE.md governs implementation; the architecture doc provides rationale.
+
+### 13.2 Preserve file-header convention
+
+Every Python file must start with exactly two comment lines before any
+`from __future__ import annotations`, docstring, or import:
+
+```python
+# filename.py
+# One-line explanation of what this file does.
+```
+
+When creating a new file, add this header first. When editing an existing
+file, never remove or shift its header lines.
+
+### 13.3 Never put host-specific code in `memfabric`
+
+`memfabric/` is domain-agnostic. It must not contain:
+- Cybersecurity terminology (CVE, exploit, shell, credential, …)
+- References to `apex_host` modules, types, or classes
+- Any concrete `Executor`, `Planner`, or `Parser` that drives real tooling
+
+If you need to add a behavior that belongs in the host application, place
+it under `apex_host/` and wire it through the Protocol seams Section 9
+defines. If you find yourself adding an import of `apex_host` inside
+`memfabric`, stop — you are in the wrong module.
+
+### 13.4 Add tests for every behavior change
+
+Each new module or modified behavior needs a matching test in `tests/`.
+Tests live in `tests/` (for `memfabric`) or `tests/apex_host/` (for the
+host application). The file structure mirrors the package; the naming
+convention is `test_<module>.py`.
+
+- Write the test **before** or **alongside** the implementation, not after.
+- Tests must run under `pytest` with no network access and no real tool
+  execution (`dry_run=True` for all `ApexConfig` instances in tests).
+- If you touch an existing module, run the existing tests before and after
+  your change to confirm no regression. Run with:
+  ```bash
+  .venv/bin/python -m pytest tests/ -q
+  ```
+
+### 13.5 The dry-run default must never change
+
+`ApexConfig.dry_run` defaults to `True`. This is a safety invariant, not
+a convenience setting. Never change this default, never add code that
+implicitly sets `dry_run=False`, and never bypass it in tests. Real
+execution (`dry_run=False`) must always require an explicit CLI flag
+(`--no-dry-run`) on every invocation. If you are writing a test, pass
+`dry_run=True` explicitly so the intent is visible in the test.
+
+### 13.6 No raw subprocess outside `apex_host/tools/runner.py`
+
+Every command execution path goes through `apex_host/tools/runner.py`,
+which calls `safety.py` first. Do not use `subprocess`, `os.system`,
+`asyncio.create_subprocess_exec`, or `asyncio.create_subprocess_shell`
+anywhere else in the codebase. If you need to run a new tool, add it to
+`ToolRegistry._KNOWN_TOOLS` and emit a `TaskSpec` from a planner; the
+graph's `execute_agent` node will route it through `runner.py`.
+
+### 13.7 All memory writes go through `MemoryAPI`
+
+No `apex_host` component, parser, or executor may write to a `memfabric`
+store directly. Every state change goes through `MemoryAPI.upsert_node`,
+`upsert_edge`, `append_episode`, `propose_knowledge`, or `propose_skill`.
+This is Invariant 1 from Section 1 — do not violate it even in test
+helpers. Test helpers that need pre-seeded EKG state must call the
+`MemoryAPI` methods, not the store directly.
+
+### 13.8 Meow is a smoke test, not hardcoded behavior
+
+"Meow" (HTB Starting Point machine) is used as the first end-to-end
+smoke test only. No machine-specific code, expected credentials, default
+usernames, service-specific flows, or expected port sets may be committed
+to the repository. All target details (IP, phase path, credential pairs)
+are supplied through CLI flags at runtime. The architecture must remain
+fully target-agnostic: any authorized HTB Easy/Medium machine produces the
+same code path.
+
+### 13.9 No machine-specific profile files
+
+Do not create files named after individual machines or targets (e.g.
+`meow.py`, `lame.py`, `blue.py`, `<machine-name>.py`). If you feel the
+urge to create such a file, ask yourself: "can this behavior be expressed
+as generic config or CLI flags?" The answer is always yes.
+
+### 13.10 Staging gate is non-negotiable
+
+A `propose_knowledge` or `propose_skill` call stages an entry. The entry
+is **not** retrievable until the Reflector promotes it. Never call
+internal staging-store methods directly to bypass this gate, and never
+promote entries from outside `reflector/worker.py` except through the
+test-only `ReflectorWorker.run_once()` path (which itself uses the
+standard promotion logic). Bypassing the gate is a security-relevant
+violation — see the test in Section 8 ("Staging isolation").
+
+### 13.11 How to extend the system safely
+
+**Add a new tool**: Register in `ToolRegistry._KNOWN_TOOLS`. Emit
+`TaskSpec` from a planner. Route in `graph.py`'s `execute_agent`. Add
+parser. Add tests.
+
+**Add a new phase**: Add a value to `ApexPhase`. Update `GlobalPlanner`'s
+decision logic. Add the corresponding agent/planner. Wire the conditional
+edge in `graph.py`. Add tests.
+
+**Change a retrieval threshold**: Edit `memfabric/config.py` (the
+`Config` dataclass). Never hard-code a threshold in a component; it must
+be config-driven so tests can override it.
+
+**Add new EKG node/edge types**: Document them in CLAUDE.md Section 12.8
+(the node/edge type convention table). Add parsers that produce them. Add
+tests that verify the correct node type and props are created.

@@ -1,3 +1,5 @@
+# graph_networkx.py
+# In-memory EKG reference implementation backed by networkx.DiGraph with asyncio locking for concurrent-safe node/edge upserts and BFS subgraph extraction.
 """In-memory EKG reference implementation backed by networkx.DiGraph.
 
 This is the reference GraphStore.  Every mutation is protected by an

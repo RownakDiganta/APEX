@@ -1,3 +1,5 @@
+# consolidate.py
+# Episodic-to-skill generalisation logic that turns concrete success episode chains into templated Skills by replacing domain-specific identifiers with typed slot references.
 """Episodic→skill generalization (Section 7 — consolidate).
 
 ``generalize(chain)`` turns a concrete episode chain into a templated Skill

@@ -1,3 +1,5 @@
+# repair_executor.py
+# Repair executor that synthesises a low-confidence repair suggestion from a failed task's clue without re-running any tool.
 """Repair executor. Implements memfabric.coordination.protocols.Executor.
 
 Handles tasks routed to the "repair" domain after a script_error/fixable

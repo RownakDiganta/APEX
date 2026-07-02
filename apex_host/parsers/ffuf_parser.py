@@ -1,3 +1,5 @@
+# ffuf_parser.py
+# Stateless parser that extracts discovered HTTP paths and status codes from ffuf stdout into Endpoint nodes and host-exposes edges.
 """Parses ffuf default-text output into Endpoint nodes + exposes edges."""
 from __future__ import annotations
 

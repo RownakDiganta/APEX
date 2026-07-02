@@ -1,3 +1,5 @@
+# metrics.py
+# Simple, dependency-free metrics summariser that computes engagement coverage counts from a completed ApexGraphState.
 """Simple, dependency-free metrics over an ApexGraphState's findings/turns."""
 from __future__ import annotations
 

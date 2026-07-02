@@ -1,3 +1,5 @@
+# protocols.py
+# Store Protocol definitions (GraphStore, EpisodicStore, LexicalIndex, VectorIndex, KVStore) as structural Protocols so any conforming object can be injected without subclassing.
 """Store Protocol definitions.
 
 Every boundary here is a structural Protocol so that any conforming object

@@ -1,3 +1,5 @@
+# engine.py
+# HybridRetriever that fuses BM25, regex identifier lookup, dense vector, and graph-match channels via RRF with a low-confidence gate controlling the expensive channels.
 """HybridRetriever — the unified retrieval engine.
 
 Pipeline per query:
@@ -158,7 +160,7 @@ class HybridRetriever:
             ScoredEntry(
                 id=doc_id,
                 score=score,
-                text="",
+                text=str(meta.get("_text", "")),
                 source=str(meta.get("source", "")),
                 tier=str(meta.get("tier", "")),
                 metadata=dict(meta),

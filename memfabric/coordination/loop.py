@@ -1,3 +1,5 @@
+# loop.py
+# Orchestrator control loop that builds and invokes the LangGraph state machine per turn, manages a shared MemorySaver checkpointer, and enforces budget pre-checks.
 """Orchestrator control loop — delegates to the LangGraph state machine.
 
 Public API is unchanged:

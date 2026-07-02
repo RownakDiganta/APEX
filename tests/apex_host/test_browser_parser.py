@@ -1,3 +1,5 @@
+# test_browser_parser.py
+# Tests for BrowserParser verifying Endpoint, Form, AuthFlow, and Token node creation from BrowserObservation inputs.
 from __future__ import annotations
 
 from apex_host.parsers.browser_parser import BrowserParser

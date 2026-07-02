@@ -1,3 +1,5 @@
+# types.py
+# Core APEX-specific data shapes — ApexPhase, ApexFinding, ToolCommand, ToolResult, BrowserObservation, and ApexRunConfig — that feed into memfabric types via parsers.
 """Core data shapes for the APEX cybersecurity host application.
 
 These types are APEX-specific (unlike memfabric/types.py, which is

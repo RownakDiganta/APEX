@@ -1,3 +1,5 @@
+# api.py
+# The unified Memory API — the only surface through which any component reads or writes state.
 """MemoryAPI — the ONLY surface through which any component touches state.
 
 Design invariants enforced here:
@@ -209,11 +211,12 @@ class MemoryAPI:
                 }
             node._provenance = prov
             await self._graph.put_node(node)
-            # Index for retrieval
+            # Index for retrieval — _text stored in metadata so search can return it
+            _t = _node_text(node)
             await self._lexical.add(
                 node.id,
-                _node_text(node),
-                {"tier": Tier.working.value, "type": node.type},
+                _t,
+                {"tier": Tier.working.value, "type": node.type, "_text": _t},
             )
             logger.debug("upsert_node (new) id=%s", node.id)
             return node.id
@@ -291,10 +294,11 @@ class MemoryAPI:
         merged._provenance = merged_prov
 
         await self._graph.put_node(merged)
+        _mt = _node_text(merged)
         await self._lexical.add(
             merged.id,
-            _node_text(merged),
-            {"tier": Tier.working.value, "type": merged.type},
+            _mt,
+            {"tier": Tier.working.value, "type": merged.type, "_text": _mt},
         )
         logger.debug("upsert_node (merge) id=%s", node.id)
         return node.id
@@ -318,10 +322,11 @@ class MemoryAPI:
         """
         eid = await self._episodic.append(episode)
         # Index episode for lexical search
+        _et = _episode_text(episode)
         await self._lexical.add(
             episode.id,
-            _episode_text(episode),
-            {"tier": Tier.episodic.value, "outcome": episode.outcome.value},
+            _et,
+            {"tier": Tier.episodic.value, "outcome": episode.outcome.value, "_text": _et},
         )
         logger.debug("append_episode id=%s outcome=%s", eid, episode.outcome.value)
         return eid
@@ -364,10 +369,11 @@ class MemoryAPI:
                 return False
             entry.promoted = True
 
+        _kt = _knowledge_text(entry)
         await self._lexical.add(
             entry.id,
-            _knowledge_text(entry),
-            {"tier": Tier.semantic.value, "source": entry.source},
+            _kt,
+            {"tier": Tier.semantic.value, "source": entry.source, "_text": _kt},
         )
         if entry.embedding:
             await self._vector.add(
@@ -386,10 +392,11 @@ class MemoryAPI:
                 return False
             skill.promoted = True
 
+        _st = _skill_text(skill)
         await self._lexical.add(
             skill.id,
-            _skill_text(skill),
-            {"tier": Tier.procedural.value, "name": skill.name},
+            _st,
+            {"tier": Tier.procedural.value, "name": skill.name, "_text": _st},
         )
         if skill.embedding:
             await self._vector.add(

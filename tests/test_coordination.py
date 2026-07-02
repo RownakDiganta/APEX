@@ -1,3 +1,5 @@
+# test_coordination.py
+# Tests for the coordination layer covering Scheduler concurrency cap, BudgetLedger ceiling enforcement, conflict creation, and protocol fake behaviour.
 """Tests for Module 5: coordination/.
 
 Section 8 invariants tested here:

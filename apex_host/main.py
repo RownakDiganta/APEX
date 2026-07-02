@@ -1,3 +1,5 @@
+# main.py
+# CLI entry point for the APEX host application, wiring config and runtime then running the engagement graph to completion.
 """CLI entry point.
 
     python -m apex_host.main --target 127.0.0.1 --payload-repo ./payloads --dry-run
@@ -33,17 +35,65 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-dry-run", dest="dry_run", action="store_false",
         help="Allow real, safety-gated command execution",
     )
+    parser.add_argument(
+        "--username", dest="username", action="append", default=[],
+        metavar="USER",
+        help="Username candidate for bounded access validation (may be specified multiple times)",
+    )
+    parser.add_argument(
+        "--password", dest="password", action="append", default=[],
+        metavar="PASS",
+        help="Password candidate for bounded access validation (may be specified multiple times)",
+    )
+    parser.add_argument(
+        "--web-wordlist", dest="web_wordlist", default=None, metavar="PATH",
+        help="Wordlist file for ffuf/gobuster directory discovery (omit to skip wordlist-based fuzzing)",
+    )
+    parser.add_argument(
+        "--max-web-paths", type=int, default=50,
+        help="Maximum number of web paths to discover per turn (default: 50)",
+    )
+    parser.add_argument(
+        "--max-access-attempts", type=int, default=1,
+        help="Maximum access validation attempts per run (default: 1; never brute-forces)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--preflight", action="store_true",
+        help="Check which allowed tools are available in PATH then exit",
+    )
     return parser.parse_args(argv)
 
 
 async def run(args: argparse.Namespace) -> None:
+    import sys
+
     config = ApexConfig(
         target=args.target,
         payload_repo_path=args.payload_repo,
         max_turns=args.max_turns,
         dry_run=args.dry_run,
+        web_wordlist_path=args.web_wordlist,
+        max_web_paths=args.max_web_paths,
+        username_candidates=list(args.username),
+        password_candidates=list(args.password),
+        max_access_attempts=args.max_access_attempts,
     )
+
+    if args.preflight:
+        from apex_host.tools.preflight import check_local_tools
+        availability = check_local_tools(config)
+        print(f"Preflight tool check for target={config.target!r}:")
+        for tool, present in availability.items():
+            status = "OK     " if present else "MISSING"
+            print(f"  [{status}] {tool}")
+        missing = [t for t, ok in availability.items() if not ok]
+        if missing:
+            print(f"\n{len(missing)} tool(s) missing — install or remove from allowed_tools.")
+            sys.exit(1)
+        print("\nAll allowed tools found.")
+        sys.exit(0)
+
     runtime = build_runtime(config)
 
     seeded = await runtime.seed()

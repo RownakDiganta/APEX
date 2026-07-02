@@ -1,3 +1,5 @@
+# runtime.py
+# Wires MemoryAPI, reference stores, HybridRetriever, payload-repo seeding, and the APEX LangGraph into a single runnable ApexRuntime engagement object.
 """Wires MemoryAPI + reference stores + HybridRetriever + the payload-repo
 seed loader + the APEX LangGraph into one runnable engagement.
 

@@ -1,3 +1,5 @@
+# test_graph_loop.py
+# Tests for the LangGraph coordination loop covering turn round-trip parity, conditional abandon edge, outcome-based retry routing, checkpoint round-trip, state genericity, and budget integration.
 """Tests for the LangGraph coordination loop (graph_state + graph_loop + loop).
 
 Section 8 invariants tested here:

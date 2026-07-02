@@ -1,3 +1,5 @@
+# kv_memory.py
+# In-memory KVStore reference implementation backed by a plain dict with optional per-entry TTL and asyncio locking.
 """In-memory KVStore reference implementation with TTL support."""
 from __future__ import annotations
 

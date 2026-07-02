@@ -1,3 +1,5 @@
+# gates.py
+# Pure policy functions for the Reflector promotion gate, confidence decay, and win-rate quarantine — all state mutations go through MemoryAPI, not here.
 """Promotion, decay, and quarantine policy (Section 7 — gates).
 
 These are PURE POLICY FUNCTIONS.  They take a Skill or KnowledgeEntry and

@@ -1,3 +1,5 @@
+# test_graph.py
+# Tests for the APEX LangGraph and ApexGraphState covering state-field type safety, dry-run subprocess prevention, and phase progression from seeded EKG data.
 """Tests for apex_host/graph.py and graph_state.py.
 
 Covers:

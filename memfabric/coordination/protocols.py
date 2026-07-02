@@ -1,3 +1,5 @@
+# protocols.py
+# Executor, Parser, and Planner Protocol definitions and their deterministic test fakes (EchoExecutor, PassthroughParser, StaticPlanner) — the host-app extension seams.
 """Executor, Parser, Planner Protocols — the host-app extension seams.
 
 The substrate defines these interfaces and ships ONLY deterministic test fakes.

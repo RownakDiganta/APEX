@@ -1,3 +1,5 @@
+# payload_repo_loader.py
+# RAG seed source that recursively chunks an external payload repository and stages each chunk via MemoryAPI.propose_knowledge() without bypassing the promotion gate.
 """RAG seed source: ingest an external payload repository into memfabric's
 staged knowledge tier.
 
@@ -48,7 +50,7 @@ class PayloadRepoLoader:
         for path in sorted(self._root.rglob("*")):
             if not path.is_file() or path.suffix.lower() not in _INGESTIBLE_SUFFIXES:
                 continue
-            for chunk_text in self._chunk_file(path):
+            for chunk_index, chunk_text in enumerate(self._chunk_file(path)):
                 if not chunk_text.strip():
                     continue
                 entry = KnowledgeEntry(
@@ -61,6 +63,7 @@ class PayloadRepoLoader:
                         "file_ext": path.suffix.lower(),
                         "tier": "semantic",
                         "source": "payload_repo",
+                        "chunk_index": chunk_index,
                     },
                 )
                 await self._api.propose_knowledge(entry)

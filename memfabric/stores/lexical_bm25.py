@@ -1,3 +1,5 @@
+# lexical_bm25.py
+# BM25-based lexical index reference implementation with lazy rebuild, 2-char minimum tokenisation, zero-score filtering, dedup guard, and graceful empty-index degradation.
 """BM25-based lexical index reference implementation.
 
 Design adapted from the predecessor pattern:

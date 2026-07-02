@@ -1,3 +1,5 @@
+# test_synthetic_run.py
+# Tests for the synthetic-machine evaluation harness verifying EKG seeding, correct phase progression, and max-turns bounding in dry-run mode.
 """Tests for apex_host/eval/run_synthetic_machine.py — the domain-neutral
 synthetic-machine evaluation harness (no real network/target involved)."""
 from __future__ import annotations

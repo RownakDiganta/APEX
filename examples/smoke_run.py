@@ -1,3 +1,5 @@
+# smoke_run.py
+# End-to-end smoke run that wires all reference store implementations with the LangGraph orchestrator and verifies retrieval, upsert provenance, episodic log, open-task view, checkpoint round-trip, and Reflector skill promotion on synthetic data.
 """Smoke run — wires all reference implementations together and runs ~5 turns
 through the LangGraph orchestrator.
 

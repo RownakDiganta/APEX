@@ -1,3 +1,5 @@
+# fusion.py
+# Reciprocal-Rank Fusion (RRF) implementation that merges multiple ranked channel results into a single scored list using per-channel weights.
 """Reciprocal-Rank Fusion (RRF).
 
 Standard RRF with per-channel weights:

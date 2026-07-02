@@ -1,3 +1,5 @@
+# episodic_jsonl.py
+# Append-only JSONL episodic store reference implementation that enforces immutability, uses an asyncio lock for concurrent safety, and supports in-memory mode for tests.
 """Append-only JSONL episodic store reference implementation.
 
 Invariants enforced here:

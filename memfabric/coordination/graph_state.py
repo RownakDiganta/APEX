@@ -1,3 +1,5 @@
+# graph_state.py
+# TurnState TypedDict and operator.add/merge reducers for the LangGraph coordination loop; holds only generic substrate types, never infrastructure objects.
 """TurnState TypedDict and its field reducers for the LangGraph coordination loop.
 
 State holds ONLY generic substrate types.  MemoryAPI, Scheduler, Executors,

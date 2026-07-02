@@ -1,3 +1,5 @@
+# registry.py
+# Catalogue of recognised tools filtered to the ApexConfig allowlist, exposing only tools that planners are permitted to emit.
 """Catalogue of recognised tools, filtered down to ApexConfig.allowed_tools."""
 from __future__ import annotations
 
@@ -16,11 +18,15 @@ class ToolSpec:
 
 
 _KNOWN_TOOLS: dict[str, ToolSpec] = {
+    # Mac-native (available without extra installs or via Homebrew nmap)
     "nmap": ToolSpec("nmap", "Network mapper for host/service discovery", ["-T4"]),
-    "ffuf": ToolSpec("ffuf", "Web fuzzer for endpoint/directory discovery", ["-c"]),
-    "gobuster": ToolSpec("gobuster", "Directory and DNS busting tool", ["dir"]),
     "curl": ToolSpec("curl", "HTTP client for web interaction", ["-s"]),
     "python3": ToolSpec("python3", "Python interpreter for bounded scripting", []),
+    "nc": ToolSpec("nc", "Netcat — TCP/UDP banner grabbing and connectivity checks", ["-z", "-v"]),
+    "netcat": ToolSpec("netcat", "Netcat (alternate binary name on some systems)", ["-z", "-v"]),
+    # Optional — must be Homebrew/manually installed; not in default allowed_tools
+    "ffuf": ToolSpec("ffuf", "Web fuzzer for endpoint/directory discovery", ["-c"]),
+    "gobuster": ToolSpec("gobuster", "Directory and DNS busting tool", ["dir"]),
     "searchsploit": ToolSpec("searchsploit", "Local exploit-database search", ["--json"]),
 }
 

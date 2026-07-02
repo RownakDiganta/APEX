@@ -1,3 +1,5 @@
+# worker.py
+# Async Reflector worker that reads new episodes, generalises success chains into staged skills, and applies promotion, decay, and quarantine gates — the only component allowed to promote proposals.
 """Async Reflector worker — driven off the episodic stream (Section 7).
 
 The worker:
