@@ -1,3 +1,5 @@
+# test_foundation.py
+# Tests for the memfabric foundation modules — ids.py, types.py, and config.py — verifying ID uniqueness, UTC timestamp format, dataclass slot correctness, and default thresholds.
 """Tests for Module 1: ids.py, types.py, config.py."""
 from __future__ import annotations
 

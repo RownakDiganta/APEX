@@ -1,3 +1,5 @@
+# vector_faiss.py
+# Dense vector index reference implementation backed by faiss.IndexIDMap wrapping IndexFlatIP for cosine similarity over pre-normalised vectors.
 """Dense vector index reference implementation backed by faiss.
 
 Uses IndexFlatIP (inner-product / cosine via pre-normalised vectors).

@@ -1,3 +1,5 @@
+# run_synthetic_machine.py
+# Synthetic-machine evaluation harness that seeds a deterministic EKG and runs the APEX graph in dry-run mode to verify phase coverage without real execution.
 """Synthetic-machine evaluation harness — no real network/target involved.
 
 Seeds a MemoryAPI with a deterministic synthetic EKG (host -> service ->

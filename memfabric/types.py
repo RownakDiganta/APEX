@@ -1,3 +1,5 @@
+# types.py
+# Core domain-agnostic data shapes for the memory fabric — Node, Edge, Episode, KnowledgeEntry, Skill, EvidenceBundle, Conflict, TaskSpec, ExecutorResult, Goal, and related enums.
 """Core data shapes for the memory fabric.
 
 All records are @dataclass(slots=True) for memory efficiency and

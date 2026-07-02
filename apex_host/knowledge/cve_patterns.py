@@ -1,3 +1,5 @@
+# cve_patterns.py
+# Configurable identifier regex patterns (CVE, CWE, service/version) supplied by the APEX host to the memfabric regex retrieval channel.
 """Configurable identifier regex patterns, fed into HybridRetriever's regex
 channel (memfabric/retrieval/engine.py's ``identifier_patterns`` parameter).
 

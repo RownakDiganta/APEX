@@ -1,3 +1,5 @@
+# nmap_parser.py
+# Stateless parser that converts nmap text-mode stdout into Host, Service, and Tech EKG nodes plus host-exposes and service-runs edges.
 """Parses nmap text-mode output (``nmap -oN`` / default stdout format) into
 memfabric Node/Edge deltas. No payload or exploit content — purely structural
 parsing of host/port/service/version text.
@@ -15,6 +17,33 @@ _PORT_RE = re.compile(
 )
 
 
+def _extract_tech(version_str: str) -> tuple[str, str] | None:
+    """Return (display_name, version_string) from an nmap version field, or None.
+
+    Strategy: find the first whitespace-token that begins with a digit — that is
+    the version string.  Everything before it (up to 3 tokens) is the product
+    name.  Examples:
+      "OpenSSH 8.4p1 Ubuntu …"  → ("OpenSSH", "8.4p1")
+      "Apache httpd 2.4.41 …"   → ("Apache httpd", "2.4.41")
+      "vsftpd 3.0.3"            → ("vsftpd", "3.0.3")
+      "Linux telnetd"            → ("Linux telnetd", "")
+    """
+    v = version_str.strip()
+    if not v:
+        return None
+    tokens = v.split()
+    ver_idx = next((i for i, t in enumerate(tokens) if t and t[0].isdigit()), len(tokens))
+    name_tokens = tokens[: max(ver_idx, 1)][:3]
+    ver = tokens[ver_idx] if ver_idx < len(tokens) else ""
+    name = " ".join(name_tokens).rstrip("/(")
+    return (name, ver) if name else None
+
+
+def _tech_id(host_addr: str, tech_name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", tech_name.lower()).strip("_")
+    return f"tech:{host_addr}:{slug}"
+
+
 class NmapParser:
     """Stateless parser: nmap stdout text -> ParsedObservation."""
 
@@ -25,9 +54,9 @@ class NmapParser:
 
         host_addr = target
         for line in output.splitlines():
-            match = _HOST_RE.match(line.strip())
-            if match:
-                host_addr = match.group("addr")
+            m = _HOST_RE.match(line.strip())
+            if m:
+                host_addr = m.group("addr")
                 break
 
         host_id = f"host:{host_addr}"
@@ -44,14 +73,14 @@ class NmapParser:
         )
 
         for line in output.splitlines():
-            match = _PORT_RE.match(line.strip())
-            if not match:
+            pm = _PORT_RE.match(line.strip())
+            if not pm:
                 continue
-            port = match.group("port")
-            proto = match.group("proto")
-            state = match.group("state")
-            service = match.group("service")
-            version = (match.group("version") or "").strip()
+            port = pm.group("port")
+            proto = pm.group("proto")
+            state = pm.group("state")
+            service = pm.group("service")
+            version = (pm.group("version") or "").strip()
 
             service_id = f"service:{host_addr}:{port}/{proto}"
             nodes.append(
@@ -84,5 +113,35 @@ class NmapParser:
                     last_seen=timestamp,
                 )
             )
+
+            # Tech node: only when version banner is non-empty and parseable
+            tech = _extract_tech(version)
+            if tech:
+                tech_name, tech_ver = tech
+                tid = _tech_id(host_addr, tech_name)
+                nodes.append(
+                    Node(
+                        id=tid,
+                        type="tech",
+                        props={"name": tech_name, "version": tech_ver, "service": service},
+                        confidence=0.8,
+                        source=source,
+                        first_seen=timestamp,
+                        last_seen=timestamp,
+                    )
+                )
+                edges.append(
+                    Edge(
+                        id=new_id(),
+                        from_id=service_id,
+                        to_id=tid,
+                        type="runs",
+                        props={},
+                        confidence=0.8,
+                        source=source,
+                        first_seen=timestamp,
+                        last_seen=timestamp,
+                    )
+                )
 
         return ParsedObservation(node_deltas=nodes, edge_deltas=edges)

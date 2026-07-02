@@ -1,3 +1,5 @@
+# protocols.py
+# Retrieval-layer Protocol definitions (Embedder, Reranker, GraphMatcher) plus built-in stub implementations shipped with the substrate.
 """Retrieval-layer Protocols.
 
 These are the pluggable boundaries for expensive, model-dependent components.

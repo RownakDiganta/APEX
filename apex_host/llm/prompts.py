@@ -1,3 +1,5 @@
+# prompts.py
+# Prompt templates for the future LLM-backed planner, executor, and parser seam; not yet called by the current deterministic planners.
 """Prompt templates for the (future) LLM-backed planner/executor/parser seam.
 
 Today's planners (apex_host/planners/) are deterministic and do not call an

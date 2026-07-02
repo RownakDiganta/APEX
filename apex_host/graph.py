@@ -1,3 +1,5 @@
+# graph.py
+# The APEX multi-phase engagement LangGraph that orchestrates recon, web, browser, credential, and priv-esc agent nodes through a safety-gated multi-turn loop.
 """The APEX multi-phase engagement LangGraph.
 
 This is a **separate** StateGraph from memfabric.coordination.graph_loop —
@@ -36,7 +38,10 @@ from memfabric.types import (
 )
 
 from apex_host.agents.browser_executor import BrowserExecutor
+from apex_host.agents.telnet_executor import TelnetExecutor
 from apex_host.graph_state import ApexGraphState, CompiledApexGraph
+from apex_host.parsers.access_parser import AccessParser
+from apex_host.parsers.banner_parser import BannerParser
 from apex_host.parsers.browser_parser import BrowserParser
 from apex_host.parsers.command_parser import CommandParser
 from apex_host.parsers.ffuf_parser import FfufParser
@@ -62,7 +67,9 @@ _NMAP = NmapParser()
 _FFUF = FfufParser()
 _GOBUSTER = GobusterParser()
 _COMMAND = CommandParser()
+_BANNER = BannerParser()
 _BROWSER_PARSER = BrowserParser()
+_ACCESS = AccessParser()
 
 # phase -> name of the LangGraph node reached from route_phase
 _PHASE_NODE: dict[str, str] = {
@@ -86,6 +93,12 @@ def _outcome_for(returncode: int, error: str | None) -> Outcome:
     if returncode != 0:
         return Outcome.script_error
     return Outcome.success
+
+
+def _port_from_nc_args(args: list[str]) -> str:
+    """Return the port from nc/netcat argv (last positional — non-flag — token)."""
+    positional = [a for a in args if not a.startswith("-")]
+    return positional[-1] if len(positional) >= 2 else ""
 
 
 def _findings_from_parsed(
@@ -124,11 +137,23 @@ def build_apex_graph(
     global_planner = GlobalPlanner(max_turns=config.max_turns)
     phase_planners: dict[str, "Planner"] = {
         ApexPhase.recon.value: ReconPlanner(config.target, registry),
-        ApexPhase.web.value: WebPlanner(config.target, registry),
-        ApexPhase.credential.value: CredentialPlanner(config.target, registry),
+        ApexPhase.web.value: WebPlanner(
+            config.target,
+            registry,
+            web_wordlist_path=config.web_wordlist_path,
+            max_web_paths=config.max_web_paths,
+        ),
+        ApexPhase.credential.value: CredentialPlanner(
+            config.target,
+            registry,
+            username_candidates=config.username_candidates,
+            password_candidates=config.password_candidates,
+            max_access_attempts=config.max_access_attempts,
+        ),
         ApexPhase.priv_esc.value: PrivEscPlanner(config.target, registry),
     }
     browser_executor = BrowserExecutor(config)
+    telnet_executor = TelnetExecutor(config)
 
     def _anchor() -> str:
         return f"host:{config.target}"
@@ -235,7 +260,96 @@ def build_apex_graph(
         return await _run_one_task(state, phase_planners[ApexPhase.web.value])
 
     async def execute_agent(state: ApexGraphState) -> dict[str, Any]:
-        return await _run_one_task(state, phase_planners[ApexPhase.credential.value])
+        """Credential-phase agent: routes to TelnetExecutor or run_command."""
+        anchor = _anchor()
+        goal = Goal(
+            id=state["run_id"], description=state["goal"],
+            phase=state["phase"], anchor_node=anchor,
+        )
+        subgraph = await api.get_subgraph(anchor, depth=2)
+        evidence = await api.query(text=goal.description, subgraph_anchor=anchor)
+
+        plan_result = await phase_planners[ApexPhase.credential.value].plan(
+            goal, subgraph, evidence
+        )
+        if isinstance(plan_result, AbandonSignal):
+            logger.info("credential phase abandoned: %s", plan_result.reason)
+            return {"current_task": None, "last_tool_result": None, "last_error": plan_result.reason}
+
+        tasks: list[TaskSpec] = list(plan_result) if plan_result else []
+        if not tasks:
+            return {"current_task": None, "last_tool_result": None, "last_error": "planner returned no tasks"}
+
+        task = tasks[0]
+        tool = str(task.params.get("tool", ""))
+        parser_name = str(task.params.get("parser", "command"))
+        target = str(task.params.get("target", config.target))
+        current_task_info: dict[str, Any] = {
+            "id": task.id,
+            "executor_domain": task.executor_domain,
+            "params": task.params,
+        }
+
+        if tool == "telnet_access":
+            # Bounded authorized login validation — uses asyncio TCP, not runner.py.
+            # Dry-run is enforced inside TelnetExecutor (no network in dry_run mode).
+            result = await telnet_executor.run(task, evidence)
+            ep_data = result.episode.data
+            outcome_is_success = result.episode.outcome == Outcome.success
+            stdout = str(ep_data.get("stdout", ""))
+            raw_error: object = ep_data.get("error")
+            if not outcome_is_success and raw_error is None:
+                raw_error = "login failed"
+            error_str: str | None = str(raw_error) if raw_error is not None else None
+            tool_result: dict[str, Any] = {
+                "task_id": task.id,
+                "tool": tool,
+                "args": [],
+                "target": target,
+                "parser": parser_name,
+                "stdout": stdout,
+                "stderr": "",
+                "returncode": 0 if outcome_is_success else 1,
+                "dry_run": bool(ep_data.get("dry_run", False)),
+                "error": error_str,
+                "phase": state["phase"],
+                "username": str(task.params.get("username", "")),
+            }
+            return {
+                "current_task": current_task_info,
+                "last_tool_result": tool_result,
+                "last_error": error_str,
+            }
+
+        # Fallback: shell-based tools via safety-gated runner.py
+        args = [str(a) for a in task.params.get("args", [])]
+        cmd = ToolCommand(tool=tool, args=args, timeout_seconds=config.max_command_seconds)
+        try:
+            run_result = await run_command(cmd, config)
+        except ValueError as exc:
+            return {
+                "current_task": current_task_info,
+                "last_tool_result": None,
+                "last_error": str(exc),
+            }
+        cmd_tool_result: dict[str, Any] = {
+            "task_id": task.id,
+            "tool": tool,
+            "args": args,
+            "target": target,
+            "parser": parser_name,
+            "stdout": run_result.stdout,
+            "stderr": run_result.stderr,
+            "returncode": run_result.returncode,
+            "dry_run": run_result.dry_run,
+            "error": run_result.error,
+            "phase": state["phase"],
+        }
+        return {
+            "current_task": current_task_info,
+            "last_tool_result": cmd_tool_result,
+            "last_error": run_result.error,
+        }
 
     async def priv_esc_agent(state: ApexGraphState) -> dict[str, Any]:
         return await _run_one_task(state, phase_planners[ApexPhase.priv_esc.value])
@@ -262,6 +376,8 @@ def build_apex_graph(
         evidence = await api.query(text=state["goal"], subgraph_anchor=anchor)
         result = await browser_executor.run(task, evidence)
 
+        ep_data = result.episode.data
+        last_error = ep_data.get("error") if result.episode.outcome != Outcome.success else None
         tool_result = {
             "kind": "browser",
             "task_id": task.id,
@@ -269,8 +385,9 @@ def build_apex_graph(
             "dry_run": config.dry_run,
             "outcome": result.episode.outcome.value,
             "phase": state["phase"],
+            # obs dict carries forms/tokens/auth_hints/links for parse_observation
+            "obs": ep_data.get("obs", {}),
         }
-        last_error = result.episode.data.get("error") if result.episode.outcome != Outcome.success else None
         return {
             "current_task": {"id": task.id, "executor_domain": "browser", "params": task.params},
             "last_tool_result": tool_result,
@@ -292,24 +409,48 @@ def build_apex_graph(
         timestamp = tool_result.get("timestamp", "")
 
         if tool_result.get("kind") == "browser":
+            # Reconstruct the full BrowserObservation from the serialised obs dict
+            # that browser_agent stored in tool_result.  An empty dict (e.g. on
+            # executor failure) produces a minimal obs that generates only the
+            # endpoint node — safe, no crash.
+            obs_dict = tool_result.get("obs") or {}
+            fallback_url = tool_result["url"]
+            fallback_title = "(dry-run)" if tool_result.get("dry_run") else ""
             obs = BrowserObservation(
-                url=tool_result["url"],
+                url=str(obs_dict.get("url", fallback_url)),
                 html_snippet="",
-                title="(dry-run)" if tool_result.get("dry_run") else "",
+                title=str(obs_dict.get("title", fallback_title)),
+                forms=list(obs_dict.get("forms", [])),
+                tokens=list(obs_dict.get("tokens", [])),
+                auth_hints=list(obs_dict.get("auth_hints", [])),
+                links=list(obs_dict.get("links", [])),
             )
-            parsed = _BROWSER_PARSER.parse_observation(obs, target=tool_result["url"], source="browser")
+            obs_target = str(obs_dict.get("url", fallback_url))
+            parsed = _BROWSER_PARSER.parse_observation(obs, target=obs_target, source="browser")
             source = "browser"
         else:
             target = tool_result.get("target", state["target"])
             stdout = tool_result.get("stdout", "")
             parser_name = tool_result.get("parser", "command")
             tool_name = tool_result.get("tool", "")
-            if parser_name == "nmap":
+            if parser_name == "nmap" or tool_name == "nmap":
                 parsed = _NMAP.parse_text(stdout, target=target)
             elif parser_name == "ffuf":
                 parsed = _FFUF.parse_text(stdout, target=target)
             elif parser_name == "gobuster":
                 parsed = _GOBUSTER.parse_text(stdout, target=target)
+            elif tool_name in ("nc", "netcat") or parser_name == "banner":
+                port = _port_from_nc_args(tool_result.get("args", []))
+                parsed = _BANNER.parse_text(stdout, target=target, source=tool_name, port=port)
+            elif parser_name == "access":
+                username = str(tool_result.get("username", ""))
+                parsed = _ACCESS.parse_text(
+                    stdout, target=target, username=username,
+                    source=str(tool_result.get("tool", "telnet_access")),
+                )
+            elif parser_name == "curl_body":
+                raw = RawObservation(raw=stdout, metadata={"source": "curl_body", "target": target})
+                parsed = _COMMAND.parse_curl_body(raw)
             else:
                 raw = RawObservation(raw=stdout, metadata={"source": tool_name, "target": target})
                 parsed = _COMMAND.parse(raw)

@@ -1,3 +1,5 @@
+# priv_esc_planner.py
+# Deterministic privilege-escalation-phase planner that emits read-only searchsploit enumeration tasks against known service/version strings without any exploit execution.
 """Deterministic privilege-escalation-phase planner.
 
 Implements memfabric.coordination.protocols.Planner. Emits only safe,
@@ -11,6 +13,7 @@ from __future__ import annotations
 from memfabric.ids import new_id
 from memfabric.types import AbandonSignal, EvidenceBundle, Goal, SubgraphView, TaskSpec
 
+from apex_host.planners.capabilities import capabilities_from_subgraph
 from apex_host.tools.registry import ToolRegistry
 
 
@@ -25,13 +28,21 @@ class PrivEscPlanner:
         if self._registry.get("searchsploit") is None:
             return AbandonSignal(reason="searchsploit not available in allowed_tools")
 
-        services = [n for n in subgraph.nodes if n.type == "service"]
-        if not services:
-            return AbandonSignal(reason="no known services to enumerate against")
+        # Use the capability layer to find services with known version strings.
+        # Service classification lives in capabilities.py — not here.
+        caps = capabilities_from_subgraph(subgraph)
+        research = [c for c in caps if c.name == "exploit_research"]
+        if not research:
+            return AbandonSignal(reason="no enumerable service/version strings")
 
+        node_by_id = {n.id: n for n in subgraph.nodes}
         tasks: list[TaskSpec] = []
-        for service in services[:3]:
-            query = f"{service.props.get('service', '')} {service.props.get('version', '')}".strip()
+        for cap in research[:3]:
+            node = node_by_id.get(cap.source_node_id)
+            if node is None:
+                continue
+            version = str(node.props.get("version", "")).strip()
+            query = f"{cap.service} {version}".strip()
             if not query:
                 continue
             tasks.append(

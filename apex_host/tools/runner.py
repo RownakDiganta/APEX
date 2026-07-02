@@ -1,3 +1,5 @@
+# runner.py
+# The only place in apex_host that spawns a subprocess, always via asyncio.create_subprocess_exec after a safety check and with dry-run short-circuit support.
 """The ONLY place in apex_host that may spawn a subprocess.
 
 ``run_command`` always checks ``tools/safety.py`` first, always uses
@@ -9,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import time
 from typing import TYPE_CHECKING
 
@@ -34,6 +37,17 @@ async def run_command(cmd: ToolCommand, config: "ApexConfig") -> ToolResult:
             returncode=0,
             duration_seconds=0.0,
             dry_run=True,
+        )
+
+    if shutil.which(cmd.tool) is None:
+        return ToolResult(
+            command=cmd,
+            stdout="",
+            stderr="",
+            returncode=-1,
+            duration_seconds=0.0,
+            dry_run=False,
+            error=f"tool '{cmd.tool}' not found in PATH",
         )
 
     timeout = min(cmd.timeout_seconds, config.max_command_seconds)

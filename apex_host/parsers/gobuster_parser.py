@@ -1,3 +1,5 @@
+# gobuster_parser.py
+# Stateless parser that extracts discovered HTTP paths and status codes from gobuster dir-mode stdout into Endpoint nodes and host-exposes edges.
 """Parses gobuster dir-mode output into Endpoint nodes + exposes edges."""
 from __future__ import annotations
 

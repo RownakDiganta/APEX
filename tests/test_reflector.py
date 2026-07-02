@@ -1,3 +1,5 @@
+# test_reflector.py
+# Tests for the Reflector covering promotion gates, skill decay, quarantine, and episodic-to-skill consolidation.
 """Tests for Module 6: reflector/.
 
 Section 8 invariants tested here:

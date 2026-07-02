@@ -1,3 +1,5 @@
+# test_api.py
+# Tests for MemoryAPI covering per-field LWW upsert, episodic immutability, staging isolation, open-task derivation, conflict detection, and Reflector promotion paths.
 """Tests for Module 3: api.py (MemoryAPI).
 
 Section 8 invariants tested here:

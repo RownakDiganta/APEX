@@ -1,3 +1,5 @@
+# router.py
+# Model routing seam that provides a ModelRouter Protocol plus a FakeModelRouter for tests and an OpenAI-backed real implementation for production.
 """Model routing seam for future LLM-backed planning/parsing.
 
 Today's planners and parsers are deterministic and rule-based (per

@@ -1,28 +1,269 @@
-"""Generic fallback parser for tool output that has no dedicated parser.
+# command_parser.py
+# Stateless parser for curl HTTP headers and generic command fallback — never silently drops non-empty tool output.
+"""Parser for curl -I HTTP header output and generic command fallback.
 
-Implements memfabric.coordination.protocols.Parser. Unlike the specialised
-parsers (nmap/ffuf/gobuster/browser), this does not attempt structural
-extraction — it stores the raw observation as a single low-confidence
-KnowledgeEntry proposal and produces no graph deltas, so unrecognised tool
-output is never silently dropped.
+Implements memfabric.coordination.protocols.Parser.
+
+Dispatch logic inside ``parse()``:
+  source == "curl" and output starts with "HTTP/" → parse HTTP headers into
+    Endpoint + Tech EKG nodes.
+  Anything else → single low-confidence KnowledgeEntry staged for Reflector
+    promotion so non-empty output is never silently dropped.
 """
 from __future__ import annotations
 
-from memfabric.ids import now
-from memfabric.types import KnowledgeEntry, ParsedObservation, RawObservation
+import re
+from typing import Any
+
+from memfabric.ids import new_id, now
+from memfabric.types import Edge, KnowledgeEntry, Node, ParsedObservation, RawObservation
+
+_HTTP_STATUS_RE = re.compile(r"^HTTP/[\d.]+\s+(?P<code>\d{3})")
+_HEADER_LINE_RE = re.compile(r"^(?P<name>[A-Za-z-]+):\s*(?P<value>.+)$")
+_SERVER_PRODUCT_RE = re.compile(r"^(?P<product>[A-Za-z][^\s/(]*)(?:/(?P<version>[\d.]+))?")
+
+
+def _host_from_target(target: str) -> str:
+    """Strip scheme and path from target to get the bare host."""
+    return target.split("//")[-1].split("/")[0]
+
+
+def _normalize_url(target: str) -> str:
+    if target.startswith("http://") or target.startswith("https://"):
+        return target
+    return f"http://{target}"
 
 
 class CommandParser:
-    """Stateless fallback parser: RawObservation -> ParsedObservation."""
+    """Stateless parser: RawObservation -> ParsedObservation.
+
+    Handles curl HTTP headers structurally; wraps everything else as a
+    low-confidence KnowledgeEntry so output is never silently dropped.
+    """
 
     def parse(self, raw: RawObservation) -> ParsedObservation:
         text = raw.raw.strip()
         if not text:
             return ParsedObservation()
 
+        source = str(raw.metadata.get("source", "command"))
+        target = str(raw.metadata.get("target", ""))
+
+        if source == "curl" and text.startswith("HTTP/"):
+            return self._parse_curl_headers(text, target=target, source=source)
+
+        return self._fallback_knowledge(text, raw=raw, source=source)
+
+    # ------------------------------------------------------------------
+    # curl -I / --head response header parsing
+    # ------------------------------------------------------------------
+
+    def _parse_curl_headers(
+        self, text: str, *, target: str, source: str
+    ) -> ParsedObservation:
+        nodes: list[Node] = []
+        edges: list[Edge] = []
+        timestamp = now()
+
+        lines = text.splitlines()
+        status_code = ""
+        headers: dict[str, str] = {}
+
+        if lines:
+            m = _HTTP_STATUS_RE.match(lines[0].strip())
+            if m:
+                status_code = m.group("code")
+        for line in lines[1:]:
+            hm = _HEADER_LINE_RE.match(line.strip())
+            if hm:
+                # Last-seen wins for duplicate headers
+                headers[hm.group("name").lower()] = hm.group("value").strip()
+
+        url = _normalize_url(target)
+        host = _host_from_target(target)
+        host_id = f"host:{host}"
+        endpoint_id = f"endpoint:{url}"
+
+        nodes.append(
+            Node(
+                id=endpoint_id,
+                type="endpoint",
+                props={
+                    "url": url,
+                    "status": status_code,
+                    "content_type": headers.get("content-type", ""),
+                    "server": headers.get("server", ""),
+                },
+                confidence=0.85,
+                source=source,
+                first_seen=timestamp,
+                last_seen=timestamp,
+            )
+        )
+        edges.append(
+            Edge(
+                id=new_id(),
+                from_id=host_id,
+                to_id=endpoint_id,
+                type="exposes",
+                props={},
+                confidence=0.85,
+                source=source,
+                first_seen=timestamp,
+                last_seen=timestamp,
+            )
+        )
+
+        server_hdr = headers.get("server", "")
+        if server_hdr:
+            sm = _SERVER_PRODUCT_RE.match(server_hdr)
+            if sm:
+                product = sm.group("product").strip()
+                version = sm.group("version") or ""
+                slug = re.sub(r"[^a-z0-9]+", "_", product.lower()).strip("_")
+                tech_id = f"tech:{host}:{slug}"
+                nodes.append(
+                    Node(
+                        id=tech_id,
+                        type="tech",
+                        props={"name": product, "version": version, "source_header": "server"},
+                        confidence=0.8,
+                        source=source,
+                        first_seen=timestamp,
+                        last_seen=timestamp,
+                    )
+                )
+                edges.append(
+                    Edge(
+                        id=new_id(),
+                        from_id=endpoint_id,
+                        to_id=tech_id,
+                        type="runs",
+                        props={},
+                        confidence=0.8,
+                        source=source,
+                        first_seen=timestamp,
+                        last_seen=timestamp,
+                    )
+                )
+
+        return ParsedObservation(node_deltas=nodes, edge_deltas=edges)
+
+    # ------------------------------------------------------------------
+    # curl body (GET response) parsing — title + relative links
+    # ------------------------------------------------------------------
+
+    def parse_curl_body(self, raw: RawObservation) -> ParsedObservation:
+        """Parse a ``curl -s <url>`` body response.
+
+        Extracts the HTML ``<title>`` and relative ``href`` links (paths
+        starting with ``/``) and represents them as ``endpoint`` nodes.
+        Non-HTML responses fall back to ``_fallback_knowledge``.
+
+        At most 20 link endpoint nodes are created per call to stay bounded.
+        """
+        text = raw.raw.strip()
+        if not text:
+            return ParsedObservation()
+
+        source = str(raw.metadata.get("source", "curl_body"))
+        target = str(raw.metadata.get("target", ""))
+
+        lower = text.lower()
+        if "<html" not in lower and "<!doctype" not in lower and "<title" not in lower:
+            return self._fallback_knowledge(text, raw=raw, source=source)
+
+        timestamp = now()
+        url = _normalize_url(target)
+        host = _host_from_target(target)
+        host_id = f"host:{host}"
+        endpoint_id = f"endpoint:{url}"
+
+        # Extract page title
+        title = ""
+        tm = re.search(r"<title[^>]*>([^<]{1,300})</title>", text, re.IGNORECASE)
+        if tm:
+            title = " ".join(tm.group(1).split())  # collapse whitespace
+
+        nodes: list[Node] = [
+            Node(
+                id=endpoint_id,
+                type="endpoint",
+                props={"url": url, "title": title},
+                confidence=0.75,
+                source=source,
+                first_seen=timestamp,
+                last_seen=timestamp,
+            )
+        ]
+        edges: list[Edge] = [
+            Edge(
+                id=new_id(),
+                from_id=host_id,
+                to_id=endpoint_id,
+                type="exposes",
+                props={},
+                confidence=0.75,
+                source=source,
+                first_seen=timestamp,
+                last_seen=timestamp,
+            )
+        ]
+
+        # Extract relative-path hrefs (skip external URLs and anchors)
+        seen_paths: set[str] = set()
+        for m in re.finditer(r"""href=["']([^"'#?]+)["']""", text, re.IGNORECASE):
+            href = m.group(1).strip()
+            # Skip external absolute URLs and non-path values
+            if href.startswith("http://") or href.startswith("https://"):
+                continue
+            if not href.startswith("/"):
+                continue
+            path = href.split("?")[0].rstrip("/") or "/"
+            if path in seen_paths or path == "/":
+                continue
+            seen_paths.add(path)
+            if len(seen_paths) > 20:  # bounded — stop after 20 link endpoints
+                break
+            link_url = f"{url.rstrip('/')}{path}"
+            link_id = f"endpoint:{link_url}"
+            nodes.append(
+                Node(
+                    id=link_id,
+                    type="endpoint",
+                    props={"url": link_url, "path": path},
+                    confidence=0.5,
+                    source=source,
+                    first_seen=timestamp,
+                    last_seen=timestamp,
+                )
+            )
+            edges.append(
+                Edge(
+                    id=new_id(),
+                    from_id=endpoint_id,
+                    to_id=link_id,
+                    type="contains",
+                    props={},
+                    confidence=0.5,
+                    source=source,
+                    first_seen=timestamp,
+                    last_seen=timestamp,
+                )
+            )
+
+        return ParsedObservation(node_deltas=nodes, edge_deltas=edges)
+
+    # ------------------------------------------------------------------
+    # Fallback: stage as KnowledgeEntry for Reflector
+    # ------------------------------------------------------------------
+
+    def _fallback_knowledge(
+        self, text: str, *, raw: RawObservation, source: str
+    ) -> ParsedObservation:
         entry = KnowledgeEntry(
             text=text[:2000],
-            source=str(raw.metadata.get("source", "command")),
+            source=source,
             confidence=0.3,
             timestamp=now(),
             metadata={**raw.metadata, "tier": "semantic", "kind": "raw_command_output"},

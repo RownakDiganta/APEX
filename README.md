@@ -243,3 +243,103 @@ python -m apex_host.main --target 127.0.0.1 --payload-repo ./payloads --dry-run
 ```
 
 runs the full engagement end-to-end with **zero real command execution**.
+
+---
+
+## APEX Host Quickstart
+
+### 1. Install dependencies
+
+```bash
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+```
+
+Install local tools (macOS with Homebrew):
+
+```bash
+brew install nmap ffuf
+```
+
+`curl`, `python3`, and `nc` ship with macOS and need no extra install.
+
+### 2. Preflight check
+
+Verify that your allowed tools are in `PATH` before running a live engagement:
+
+```bash
+python -m apex_host.main --target <HTB_IP> --preflight
+```
+
+This prints a per-tool OK / MISSING table and exits with code 1 if anything
+is absent.  Dry-run mode is unaffected by missing tools (no PATH check needed).
+
+### 3. Dry-run engagement (safe default — no real commands)
+
+```bash
+python -m apex_host.eval.run_htb_local \
+    --target <HTB_IP> \
+    --payload-repo ./payloads \
+    --dry-run
+```
+
+No network traffic is generated.  Tool invocations are simulated, EKG writes
+happen, the Reflector runs, and the full report is printed.  Use this to
+verify routing logic and phase progression before going live.
+
+Export the run report to JSON for inspection:
+
+```bash
+python -m apex_host.eval.run_htb_local \
+    --target <HTB_IP> --payload-repo ./payloads --dry-run \
+    --export-json ./run_reports/dry_run.json
+```
+
+### 4. Live authorized HTB run
+
+> **Authorization required.** Only run with `--no-dry-run` against an
+> authorized machine — HTB machines accessed over the official HTB OpenVPN
+> connection, or another explicitly authorized lab environment.
+
+```bash
+# Connect to HTB VPN first:
+#   sudo openvpn --config ~/htb.ovpn
+
+python -m apex_host.eval.run_htb_local \
+    --target <HTB_IP> \
+    --payload-repo ./payloads \
+    --no-dry-run \
+    --username root \
+    --password "" \
+    --export-json ./run_reports/live_run.json
+```
+
+All commands are still gated by `apex_host/tools/safety.py` (allowlist +
+unconditional destructive-command block) even in live mode.
+
+Export the EKG as JSON after the run:
+
+```bash
+python -m apex_host.eval.run_htb_local \
+    --target <HTB_IP> --no-dry-run \
+    --export-graph ./ekg_snapshot.json
+```
+
+### 5. Troubleshooting missing tools
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `tool 'nmap' not found in PATH` | nmap not installed | `brew install nmap` |
+| `tool 'ffuf' not found in PATH` | ffuf not installed | `brew install ffuf` |
+| `AbandonSignal: no web-capable tools` | curl not in `allowed_tools` | `curl` is in the default list; confirm `ApexConfig.allowed_tools` |
+| `AbandonSignal: no credentials configured` | telnet cap found but no `--username` | Pass `--username <user> --password <pass>` |
+| Dry-run report shows no EKG nodes | Parser received synthetic output | Expected — dry-run nmap output is not valid nmap XML; use `--no-dry-run` for real parsing |
+
+### 6. Run the test suite
+
+```bash
+.venv/bin/python -m pytest tests/ -q
+```
+
+All tests run in dry-run mode with no network access.

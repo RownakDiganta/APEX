@@ -1,3 +1,5 @@
+# global_planner.py
+# Rule-based global phase router that decides which ApexPhase the engagement should enter next based on observed EKG node types and the turn budget.
 """Rule-based phase router for the top-level APEX engagement.
 
 Unlike the other planners in this package, GlobalPlanner does not implement

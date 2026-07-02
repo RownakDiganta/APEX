@@ -1,3 +1,5 @@
+# execute_executor.py
+# Generic bounded-command executor that dispatches allowlisted tools through the safety-gated runner for web, credential, and priv_esc phases.
 """Generic bounded-command executor for the web/credential/priv_esc phases.
 
 Implements memfabric.coordination.protocols.Executor. Dispatches the parser

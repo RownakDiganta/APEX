@@ -1,3 +1,5 @@
+# config.py
+# Typed Config dataclass holding all tunable thresholds for conflict detection, retrieval gating, Reflector gates, scheduler limits, and vector index dimensions.
 """Typed configuration dataclass.  All tunable thresholds live here;
 nothing is hardcoded in module logic."""
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# safety.py
+# Command safety gate that enforces the tool allowlist, unconditionally blocks destructive commands, and rejects shell metacharacters in any argument token.
 """Command safety gate.
 
 Every ToolCommand passes through ``check_command`` before

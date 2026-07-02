@@ -1,3 +1,5 @@
+# gate.py
+# Pure, stateless low-confidence gate function that decides whether expensive retrieval channels (dense vector, graph matcher) should fire based on the BM25 score distribution.
 """Low-confidence gate.
 
 Decides whether the expensive retrieval channels (dense vector, graph matcher)

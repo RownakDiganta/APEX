@@ -1,3 +1,5 @@
+# seed_loader.py
+# Bootstrap helper that loads the payload repository into staged knowledge and immediately runs one Reflector promotion pass before engagement starts.
 """Bootstrap helper: load the payload repo, then run one Reflector pass so the
 staged entries clear the promotion gate before the engagement starts.
 

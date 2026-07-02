@@ -1,3 +1,5 @@
+# budget.py
+# Per-phase token/turn budget accounting — pure synchronous accounting consulted by the orchestrator before allocating new tasks to a phase.
 """Per-phase token/turn budget accounting.
 
 Pure accounting — no I/O, fully synchronous, trivially unit-testable.

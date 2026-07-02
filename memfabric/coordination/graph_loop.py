@@ -1,3 +1,5 @@
+# graph_loop.py
+# LangGraph StateGraph for the generic one-turn coordination loop: read_context → plan → dispatch → merge, with all infrastructure injected via closures.
 """LangGraph StateGraph for the coordination loop.
 
 ``build_graph()`` compiles the turn state machine:

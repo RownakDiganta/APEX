@@ -1,3 +1,5 @@
+# browser_parser.py
+# Stateless parser that converts a BrowserObservation into Endpoint, Form, AuthFlow, and Token EKG node/edge deltas.
 """Parses a BrowserObservation (real or synthetic, dry_run-aware) into
 memfabric Node/Edge deltas — Endpoint, Form, AuthFlow, Token nodes.
 """

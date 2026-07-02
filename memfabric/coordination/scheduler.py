@@ -1,3 +1,5 @@
+# scheduler.py
+# Concurrency-capped task dispatcher that runs TaskSpecs up to a configurable cap via an asyncio Semaphore and returns results in completion order.
 """Concurrency-capped task dispatcher.
 
 Rules:

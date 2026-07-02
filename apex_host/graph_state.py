@@ -1,3 +1,5 @@
+# graph_state.py
+# ApexGraphState TypedDict holding only JSON-serializable engagement fields for the APEX LangGraph; no infrastructure objects in state payloads.
 """ApexGraphState TypedDict for the APEX multi-phase engagement LangGraph.
 
 This is a **separate** state shape from memfabric.coordination.graph_state.

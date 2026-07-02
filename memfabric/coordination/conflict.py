@@ -1,3 +1,5 @@
+# conflict.py
+# EKG conflict detection and resolution policy — creates Conflict records for contradictory high-confidence field writes and resolves them by confidence then recency.
 """EKG conflict detection and resolution policy.
 
 This module provides helpers used by MemoryAPI.upsert_node.  The actual

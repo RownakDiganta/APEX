@@ -1,0 +1,404 @@
+# test_report.py
+# Tests for apex_host/eval/report.py: RunReport construction, text formatting, JSON serialization, and file export.
+"""Acceptance tests for the run-report module.
+
+Acceptance criteria:
+1. build_report produces a RunReport with correct field values.
+2. phases_reached is derived from findings, not stored elsewhere.
+3. node/edge counts by type match the supplied subgraph.
+4. format_text output contains all required sections.
+5. to_json_dict is JSON-serialisable and has the expected keys.
+6. write_report_json writes a valid JSON file to disk.
+7. episodes_by_outcome is populated even without an explicit argument.
+"""
+from __future__ import annotations
+
+import json
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from memfabric.ids import new_id, now
+from memfabric.types import Edge, Node, SubgraphView
+
+from apex_host.config import ApexConfig
+from apex_host.eval.report import (
+    RunReport,
+    build_report,
+    format_text,
+    to_json_dict,
+    write_report_json,
+)
+from apex_host.graph_state import ApexGraphState
+
+# ---------------------------------------------------------------------------
+# Shared fixtures
+# ---------------------------------------------------------------------------
+
+_TARGET = "10.10.10.99"
+_ANCHOR = f"host:{_TARGET}"
+
+
+def _config(*, dry_run: bool = True) -> ApexConfig:
+    return ApexConfig(target=_TARGET, dry_run=dry_run)
+
+
+def _state(
+    *,
+    findings: list[dict[str, Any]] | None = None,
+    turn_count: int = 4,
+    phase: str = "credential",
+    completed: bool = True,
+    last_error: str | None = None,
+    evidence_summary: str = "",
+) -> ApexGraphState:
+    return {
+        "run_id": "test-run-1",
+        "target": _TARGET,
+        "phase": phase,
+        "goal": "test",
+        "current_task": None,
+        "evidence_summary": evidence_summary,
+        "findings": findings or [],
+        "last_tool_result": None,
+        "last_error": last_error,
+        "completed": completed,
+        "turn_count": turn_count,
+    }
+
+
+def _ts() -> str:
+    return now()
+
+
+def _node(ntype: str) -> Node:
+    nid = new_id()
+    ts = _ts()
+    return Node(
+        id=nid, type=ntype,
+        props={"label": ntype},
+        confidence=0.8, source="test",
+        first_seen=ts, last_seen=ts,
+    )
+
+
+def _edge(etype: str, from_id: str = "a", to_id: str = "b") -> Edge:
+    ts = _ts()
+    return Edge(
+        id=new_id(), from_id=from_id, to_id=to_id, type=etype,
+        props={}, confidence=0.8, source="test",
+        first_seen=ts, last_seen=ts,
+    )
+
+
+def _subgraph(nodes: list[Node] | None = None, edges: list[Edge] | None = None) -> SubgraphView:
+    return SubgraphView(anchor=_ANCHOR, nodes=nodes or [], edges=edges or [], depth=10)
+
+
+def _finding(phase: str, title: str = "test", confidence: float = 0.9) -> dict[str, Any]:
+    return {"id": new_id(), "phase": phase, "title": title, "confidence": confidence, "source": "test", "detail": ""}
+
+
+# ---------------------------------------------------------------------------
+# build_report: field correctness
+# ---------------------------------------------------------------------------
+
+class TestBuildReport:
+    def test_target_matches_config(self) -> None:
+        report = build_report(_state(), _subgraph(), _config())
+        assert report.target == _TARGET
+
+    def test_mode_dry_run(self) -> None:
+        report = build_report(_state(), _subgraph(), _config(dry_run=True))
+        assert report.mode == "dry-run"
+
+    def test_mode_live(self) -> None:
+        report = build_report(_state(), _subgraph(), _config(dry_run=False))
+        assert report.mode == "live"
+
+    def test_turns_used(self) -> None:
+        report = build_report(_state(turn_count=7), _subgraph(), _config())
+        assert report.turns_used == 7
+
+    def test_completed_true(self) -> None:
+        report = build_report(_state(completed=True), _subgraph(), _config())
+        assert report.completed is True
+
+    def test_completed_false(self) -> None:
+        report = build_report(_state(completed=False), _subgraph(), _config())
+        assert report.completed is False
+
+    def test_final_phase(self) -> None:
+        report = build_report(_state(phase="web"), _subgraph(), _config())
+        assert report.final_phase == "web"
+
+    def test_last_error_none(self) -> None:
+        report = build_report(_state(last_error=None), _subgraph(), _config())
+        assert report.last_error is None
+
+    def test_last_error_string(self) -> None:
+        report = build_report(_state(last_error="timeout"), _subgraph(), _config())
+        assert report.last_error == "timeout"
+
+    def test_finding_count(self) -> None:
+        findings = [_finding("recon"), _finding("web")]
+        report = build_report(_state(findings=findings), _subgraph(), _config())
+        assert report.finding_count == 2
+
+    def test_findings_list_preserved(self) -> None:
+        findings = [_finding("recon", title="host discovered")]
+        report = build_report(_state(findings=findings), _subgraph(), _config())
+        assert report.findings[0]["title"] == "host discovered"
+
+
+# ---------------------------------------------------------------------------
+# build_report: phases_reached derived from findings
+# ---------------------------------------------------------------------------
+
+class TestPhasesReached:
+    def test_phases_derived_from_findings(self) -> None:
+        findings = [
+            _finding("recon"),
+            _finding("web"),
+            _finding("recon"),   # duplicate — should appear once
+        ]
+        report = build_report(_state(findings=findings), _subgraph(), _config())
+        assert sorted(report.phases_reached) == ["recon", "web"]
+
+    def test_phases_empty_when_no_findings(self) -> None:
+        report = build_report(_state(findings=[]), _subgraph(), _config())
+        assert report.phases_reached == []
+
+    def test_phases_sorted_alphabetically(self) -> None:
+        findings = [_finding("web"), _finding("credential"), _finding("recon")]
+        report = build_report(_state(findings=findings), _subgraph(), _config())
+        assert report.phases_reached == sorted(report.phases_reached)
+
+    def test_phases_not_taken_from_final_phase(self) -> None:
+        # final_phase="done" but no finding with phase="done" → "done" not in phases_reached
+        report = build_report(_state(phase="done", findings=[_finding("recon")]), _subgraph(), _config())
+        assert "done" not in report.phases_reached
+        assert "recon" in report.phases_reached
+
+
+# ---------------------------------------------------------------------------
+# build_report: node and edge counts from subgraph
+# ---------------------------------------------------------------------------
+
+class TestNodeEdgeCounts:
+    def test_node_counts_by_type(self) -> None:
+        nodes = [_node("host"), _node("service"), _node("service")]
+        report = build_report(_state(), _subgraph(nodes=nodes), _config())
+        assert report.node_counts == {"host": 1, "service": 2}
+
+    def test_edge_counts_by_type(self) -> None:
+        edges = [_edge("exposes"), _edge("runs"), _edge("exposes")]
+        report = build_report(_state(), _subgraph(edges=edges), _config())
+        assert report.edge_counts == {"exposes": 2, "runs": 1}
+
+    def test_total_nodes(self) -> None:
+        nodes = [_node("host"), _node("service"), _node("tech")]
+        report = build_report(_state(), _subgraph(nodes=nodes), _config())
+        assert report.total_nodes == 3
+
+    def test_total_edges(self) -> None:
+        edges = [_edge("exposes"), _edge("runs")]
+        report = build_report(_state(), _subgraph(edges=edges), _config())
+        assert report.total_edges == 2
+
+    def test_empty_subgraph_gives_zero_counts(self) -> None:
+        report = build_report(_state(), _subgraph(), _config())
+        assert report.total_nodes == 0
+        assert report.total_edges == 0
+        assert report.node_counts == {}
+        assert report.edge_counts == {}
+
+
+# ---------------------------------------------------------------------------
+# build_report: episodes_by_outcome default derivation
+# ---------------------------------------------------------------------------
+
+class TestEpisodesByOutcome:
+    def test_total_turns_in_default_outcomes(self) -> None:
+        report = build_report(_state(turn_count=5), _subgraph(), _config())
+        assert report.episodes_by_outcome.get("total_turns") == 5
+
+    def test_caller_supplied_outcomes_respected(self) -> None:
+        custom = {"success": 3, "script_error": 1}
+        report = build_report(_state(), _subgraph(), _config(), episodes_by_outcome=custom)
+        assert report.episodes_by_outcome == custom
+
+    def test_with_findings_key_bounded_by_turn_count(self) -> None:
+        # Ensure turns_with_findings <= total turns even with many findings
+        findings = [_finding("recon")] * 10
+        report = build_report(_state(turn_count=3, findings=findings), _subgraph(), _config())
+        assert report.episodes_by_outcome.get("turns_with_findings", 0) <= 3
+
+
+# ---------------------------------------------------------------------------
+# build_report: evidence_samples
+# ---------------------------------------------------------------------------
+
+class TestEvidenceSamples:
+    def test_samples_from_evidence_summary(self) -> None:
+        summary = "line one\nline two\nline three"
+        report = build_report(_state(evidence_summary=summary), _subgraph(), _config())
+        assert "line one" in report.evidence_samples
+        assert "line two" in report.evidence_samples
+
+    def test_samples_capped_at_five(self) -> None:
+        summary = "\n".join(f"item {i}" for i in range(20))
+        report = build_report(_state(evidence_summary=summary), _subgraph(), _config())
+        assert len(report.evidence_samples) <= 5
+
+    def test_blank_summary_gives_empty_samples(self) -> None:
+        report = build_report(_state(evidence_summary=""), _subgraph(), _config())
+        assert report.evidence_samples == []
+
+    def test_caller_supplied_samples_respected(self) -> None:
+        report = build_report(
+            _state(), _subgraph(), _config(),
+            evidence_samples=["custom sample"],
+        )
+        assert report.evidence_samples == ["custom sample"]
+
+
+# ---------------------------------------------------------------------------
+# format_text: section presence
+# ---------------------------------------------------------------------------
+
+class TestFormatText:
+    def _report(self, **kwargs: Any) -> RunReport:
+        return build_report(_state(**kwargs), _subgraph(), _config())
+
+    def test_contains_target(self) -> None:
+        text = format_text(self._report())
+        assert _TARGET in text
+
+    def test_contains_phase_summary_header(self) -> None:
+        text = format_text(self._report())
+        assert "Phase Summary" in text
+
+    def test_contains_findings_header(self) -> None:
+        text = format_text(self._report())
+        assert "Findings" in text
+
+    def test_contains_ekg_summary_header(self) -> None:
+        text = format_text(self._report())
+        assert "EKG Summary" in text
+
+    def test_contains_episodes_header(self) -> None:
+        text = format_text(self._report())
+        assert "Episodes" in text
+
+    def test_dry_run_label_present(self) -> None:
+        text = format_text(self._report())
+        assert "dry-run" in text
+
+    def test_live_label_when_not_dry_run(self) -> None:
+        report = build_report(_state(), _subgraph(), _config(dry_run=False))
+        text = format_text(report)
+        assert "live" in text
+
+    def test_finding_count_in_output(self) -> None:
+        findings = [_finding("recon"), _finding("web")]
+        text = format_text(build_report(_state(findings=findings), _subgraph(), _config()))
+        assert "2 total" in text
+
+    def test_phase_name_appears_in_phase_summary(self) -> None:
+        findings = [_finding("recon")]
+        text = format_text(build_report(_state(findings=findings), _subgraph(), _config()))
+        assert "recon" in text
+
+    def test_evidence_section_when_samples_present(self) -> None:
+        report = build_report(
+            _state(), _subgraph(), _config(),
+            evidence_samples=["something interesting"],
+        )
+        text = format_text(report)
+        assert "Evidence" in text
+        assert "something interesting" in text
+
+    def test_no_evidence_section_when_no_samples(self) -> None:
+        report = build_report(_state(evidence_summary=""), _subgraph(), _config())
+        text = format_text(report)
+        assert "Retrieved Evidence" not in text
+
+
+# ---------------------------------------------------------------------------
+# to_json_dict: structure
+# ---------------------------------------------------------------------------
+
+class TestToJsonDict:
+    def _report(self) -> RunReport:
+        return build_report(
+            _state(findings=[_finding("recon")]),
+            _subgraph(nodes=[_node("host")], edges=[_edge("exposes")]),
+            _config(),
+        )
+
+    def test_top_level_keys(self) -> None:
+        d = to_json_dict(self._report())
+        for key in ("target", "mode", "turns_used", "completed", "final_phase",
+                    "phases_reached", "finding_count", "findings",
+                    "ekg", "episodes_by_outcome", "evidence_samples", "last_error"):
+            assert key in d, f"missing key: {key}"
+
+    def test_ekg_subdict_keys(self) -> None:
+        d = to_json_dict(self._report())
+        for key in ("total_nodes", "total_edges", "node_counts", "edge_counts"):
+            assert key in d["ekg"], f"missing ekg key: {key}"
+
+    def test_json_serialisable(self) -> None:
+        d = to_json_dict(self._report())
+        serialised = json.dumps(d)  # must not raise
+        assert isinstance(serialised, str)
+
+    def test_target_value(self) -> None:
+        d = to_json_dict(self._report())
+        assert d["target"] == _TARGET
+
+    def test_finding_count_matches_findings_list_length(self) -> None:
+        d = to_json_dict(self._report())
+        assert d["finding_count"] == len(d["findings"])
+
+    def test_node_counts_in_ekg(self) -> None:
+        d = to_json_dict(self._report())
+        assert d["ekg"]["node_counts"].get("host") == 1
+
+
+# ---------------------------------------------------------------------------
+# write_report_json: file output
+# ---------------------------------------------------------------------------
+
+class TestWriteReportJson:
+    def _report(self) -> RunReport:
+        return build_report(_state(), _subgraph(), _config())
+
+    def test_file_is_written(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "run_report.json"
+            write_report_json(self._report(), path)
+            assert path.exists()
+
+    def test_file_is_valid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "run_report.json"
+            write_report_json(self._report(), path)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            assert isinstance(data, dict)
+
+    def test_file_contains_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "run_report.json"
+            write_report_json(self._report(), path)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            assert data["target"] == _TARGET
+
+    def test_parent_directories_created(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "nested" / "dir" / "report.json"
+            write_report_json(self._report(), path)
+            assert path.exists()

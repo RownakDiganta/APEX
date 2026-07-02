@@ -1,3 +1,5 @@
+# test_stores.py
+# Tests for all reference store implementations: GraphStore, EpisodicStore, VectorIndex, LexicalIndex, and KVStore.
 """Tests for Module 2: stores/.
 
 Covers:

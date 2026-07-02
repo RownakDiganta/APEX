@@ -1,3 +1,5 @@
+# test_tool_safety.py
+# Tests for apex_host/tools/safety.py and runner.py covering allowlist enforcement, destructive-command blocking, shell-operator rejection, dry-run simulation, and timeout handling.
 from __future__ import annotations
 
 import pytest
@@ -81,3 +83,51 @@ async def test_real_execution_timeout_enforced() -> None:
     result = await run_command(cmd, cfg)
     assert result.error is not None
     assert "timed out" in result.error
+
+
+# ---------------------------------------------------------------------------
+# nc / netcat safety tests
+# ---------------------------------------------------------------------------
+
+def test_nc_allowed_when_in_allowlist() -> None:
+    cfg = _config(allowed_tools=["nc"])
+    cmd = ToolCommand(tool="nc", args=["-z", "-v", "127.0.0.1", "22"])
+    check_command(cmd, cfg)  # must not raise
+
+
+def test_netcat_allowed_when_in_allowlist() -> None:
+    cfg = _config(allowed_tools=["netcat"])
+    cmd = ToolCommand(tool="netcat", args=["-z", "-v", "127.0.0.1", "80"])
+    check_command(cmd, cfg)  # must not raise
+
+
+def test_nc_blocked_when_not_in_allowlist() -> None:
+    cfg = _config(allowed_tools=["nmap"])  # nc not in list
+    cmd = ToolCommand(tool="nc", args=["-z", "127.0.0.1", "22"])
+    with pytest.raises(ValueError, match="not in allowed_tools"):
+        check_command(cmd, cfg)
+
+
+def test_nc_blocks_shell_operator_in_args() -> None:
+    cfg = _config(allowed_tools=["nc"])
+    cmd = ToolCommand(tool="nc", args=["127.0.0.1", "22", ";", "cat", "/etc/passwd"])
+    with pytest.raises(ValueError, match="shell operator"):
+        check_command(cmd, cfg)
+
+
+async def test_nc_dry_run_simulates_without_execution() -> None:
+    cfg = _config(allowed_tools=["nc"])
+    cmd = ToolCommand(tool="nc", args=["-z", "-v", "127.0.0.1", "22"])
+    result = await run_command(cmd, cfg)
+    assert result.dry_run is True
+    assert "dry-run" in result.stdout
+
+
+async def test_missing_tool_in_live_mode_returns_error() -> None:
+    """If a tool is not found in PATH, runner returns ToolResult with error (no crash)."""
+    cfg = _config(allowed_tools=["_apex_nonexistent_tool_xyz"], dry_run=False)
+    cmd = ToolCommand(tool="_apex_nonexistent_tool_xyz", args=[])
+    result = await run_command(cmd, cfg)
+    assert result.error is not None
+    assert "not found in PATH" in result.error
+    assert result.returncode == -1
