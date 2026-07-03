@@ -9,17 +9,37 @@ engagement workflow:
 
     START -> load_context -> global_plan -> route_phase
           -> [recon_agent | web_agent | browser_agent | execute_agent | priv_esc_agent]
-          -> parse_observation -> write_memory -> reflect_or_continue
-          -> END  (or loop back to load_context)
+          -> parse_observation -> write_memory
+          -> route_after_write -> repair_agent (optional)
+          -> reflect_or_continue -> END  (or loop back to load_context)
 
 MemoryAPI, the ToolRegistry, planners, and config are captured via closures
 in build_apex_graph() — they never appear in ApexGraphState payloads
 (mirrors memfabric Invariant 1 and Invariant 7). Tool execution only ever
 happens through apex_host/tools/runner.py (which is itself safety-gated by
 tools/safety.py and dry_run-aware) — no raw subprocess calls live here.
+
+Complete planning loop additions
+---------------------------------
+- Concurrent multi-task execution: _run_tasks() runs all planner-produced
+  TaskSpecs concurrently (asyncio.gather with semaphore cap) and stores all
+  results in state["tool_results"].  parse_observation and write_memory
+  iterate over tool_results so every result is parsed and logged.
+- Decision logging: every planner invocation produces a PlanDecision record
+  (from planner.last_decision) stored in state["planner_decisions"].
+- Repair agent: when a task fails with script_error or fixable outcome,
+  repair_agent calls RepairEngine to produce a corrected TaskSpec, executes
+  it, and writes the repaired observation through MemoryAPI.  No repair in
+  dry_run mode (RepairEngine returns None immediately).
+- Dynamic replanning: reflect_or_continue peeks at the current EKG after
+  every write_memory pass and updates state["phase"] to the freshest phase
+  the GlobalPlanner would select.  This ensures state snapshots between
+  turns always carry an accurate phase hint without charging the budget
+  counter (global_plan charges the counter at the start of each turn).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -47,17 +67,21 @@ from apex_host.parsers.command_parser import CommandParser
 from apex_host.parsers.ffuf_parser import FfufParser
 from apex_host.parsers.gobuster_parser import GobusterParser
 from apex_host.parsers.nmap_parser import NmapParser
+from apex_host.planners.capabilities import capabilities_from_subgraph
 from apex_host.planners.credential_planner import CredentialPlanner
 from apex_host.planners.global_planner import GlobalPlanner
 from apex_host.planners.priv_esc_planner import PrivEscPlanner
 from apex_host.planners.recon_planner import ReconPlanner
 from apex_host.planners.web_planner import WebPlanner
+from apex_host.planning.models import PlanDecision
+from apex_host.planning.repair import RepairEngine
 from apex_host.tools.registry import ToolRegistry
 from apex_host.tools.runner import run_command
 from apex_host.types import ApexPhase, BrowserObservation, ToolCommand
 
 if TYPE_CHECKING:
     from apex_host.config import ApexConfig
+    from apex_host.llm.router import ModelRouter
     from memfabric.api import MemoryAPI
     from memfabric.coordination.protocols import Planner
 
@@ -120,28 +144,104 @@ def _findings_from_parsed(
     return findings
 
 
+def _parse_single_result(
+    tool_result: dict[str, Any], state: ApexGraphState
+) -> tuple[ParsedObservation, str]:
+    """Parse ONE tool_result dict into (ParsedObservation, source_str).
+
+    Extracted from parse_observation so it can be reused by repair_agent.
+    Returns the parsed observation and the source label for findings.
+    """
+    if tool_result.get("kind") == "browser":
+        obs_dict = tool_result.get("obs") or {}
+        fallback_url = tool_result["url"]
+        fallback_title = "(dry-run)" if tool_result.get("dry_run") else ""
+        obs = BrowserObservation(
+            url=str(obs_dict.get("url", fallback_url)),
+            html_snippet="",
+            title=str(obs_dict.get("title", fallback_title)),
+            forms=list(obs_dict.get("forms", [])),
+            tokens=list(obs_dict.get("tokens", [])),
+            auth_hints=list(obs_dict.get("auth_hints", [])),
+            links=list(obs_dict.get("links", [])),
+        )
+        obs_target = str(obs_dict.get("url", fallback_url))
+        parsed = _BROWSER_PARSER.parse_observation(obs, target=obs_target, source="browser")
+        return parsed, "browser"
+    else:
+        target = tool_result.get("target", state["target"])
+        stdout = tool_result.get("stdout", "")
+        parser_name = tool_result.get("parser", "command")
+        tool_name = tool_result.get("tool", "")
+        if parser_name == "nmap" or tool_name == "nmap":
+            parsed = _NMAP.parse_text(stdout, target=target)
+        elif parser_name == "ffuf":
+            parsed = _FFUF.parse_text(stdout, target=target)
+        elif parser_name == "gobuster":
+            parsed = _GOBUSTER.parse_text(stdout, target=target)
+        elif tool_name in ("nc", "netcat") or parser_name == "banner":
+            port = _port_from_nc_args(tool_result.get("args", []))
+            parsed = _BANNER.parse_text(stdout, target=target, source=tool_name, port=port)
+        elif parser_name == "access":
+            username = str(tool_result.get("username", ""))
+            parsed = _ACCESS.parse_text(
+                stdout, target=target, username=username,
+                source=str(tool_result.get("tool", "telnet_access")),
+                port=str(tool_result.get("port", "")),
+                proto=str(tool_result.get("proto", "tcp")),
+            )
+        elif parser_name == "curl_body":
+            raw = RawObservation(raw=stdout, metadata={"source": "curl_body", "target": target})
+            parsed = _COMMAND.parse_curl_body(raw)
+        else:
+            raw = RawObservation(raw=stdout, metadata={"source": tool_name, "target": target})
+            parsed = _COMMAND.parse(raw)
+        return parsed, tool_result.get("tool", "command")
+
+
 def build_apex_graph(
     api: "MemoryAPI",
     registry: ToolRegistry,
     config: "ApexConfig",
     *,
     checkpointer: Any | None = None,
+    model_router: "ModelRouter | None" = None,
 ) -> CompiledApexGraph:
     """Compile and return the APEX engagement StateGraph.
 
     ``api``, ``registry``, and ``config`` are captured in node closures.
     Planners are constructed here (bound to ``config.target`` + ``registry``,
     consistent with the closure-DI pattern used throughout planners/).
+
+    When ``model_router`` is provided (non-None), each domain planner is wired
+    to a ``PlanningEngine`` that may call the LLM for reasoning, with automatic
+    fallback to the deterministic core on any error or low confidence.
+    The default (``None``) preserves the fully-deterministic behaviour so that
+    existing tests and dry-run engagements need no changes.
     """
+    _ct = getattr(config, "planning_confidence_threshold", 0.4)
+    _mr = getattr(config, "max_planning_retries", 1)
+    _max_repair = getattr(config, "max_repair_attempts", 1)
 
     global_planner = GlobalPlanner(max_turns=config.max_turns)
     phase_planners: dict[str, "Planner"] = {
-        ApexPhase.recon.value: ReconPlanner(config.target, registry),
+        ApexPhase.recon.value: ReconPlanner(
+            config.target,
+            registry,
+            model_router=model_router,
+            allowed_tools=config.allowed_tools if model_router else None,
+            confidence_threshold=_ct,
+            max_retries=_mr,
+        ),
         ApexPhase.web.value: WebPlanner(
             config.target,
             registry,
             web_wordlist_path=config.web_wordlist_path,
             max_web_paths=config.max_web_paths,
+            model_router=model_router,
+            allowed_tools=config.allowed_tools if model_router else None,
+            confidence_threshold=_ct,
+            max_retries=_mr,
         ),
         ApexPhase.credential.value: CredentialPlanner(
             config.target,
@@ -149,11 +249,32 @@ def build_apex_graph(
             username_candidates=config.username_candidates,
             password_candidates=config.password_candidates,
             max_access_attempts=config.max_access_attempts,
+            model_router=model_router,
+            allowed_tools=config.allowed_tools if model_router else None,
+            confidence_threshold=_ct,
+            max_retries=_mr,
         ),
-        ApexPhase.priv_esc.value: PrivEscPlanner(config.target, registry),
+        ApexPhase.priv_esc.value: PrivEscPlanner(
+            config.target,
+            registry,
+            model_router=model_router,
+            allowed_tools=config.allowed_tools if model_router else None,
+            confidence_threshold=_ct,
+            max_retries=_mr,
+        ),
     }
     browser_executor = BrowserExecutor(config)
     telnet_executor = TelnetExecutor(config)
+
+    # RepairEngine: dry_run=True means no real repairs (all dry-run failures
+    # are synthetic and do not need LLM-backed correction).
+    # model_router=None is accepted by RepairEngine (it returns None immediately).
+    repair_engine = RepairEngine(
+        model_router=model_router,
+        allowed_tools=config.allowed_tools,
+        target=config.target,
+        dry_run=config.dry_run,
+    )
 
     def _anchor() -> str:
         return f"host:{config.target}"
@@ -171,9 +292,18 @@ def build_apex_graph(
     async def global_plan(state: ApexGraphState) -> dict[str, Any]:
         subgraph: SubgraphView = await api.get_subgraph(_anchor(), depth=3)
         node_types_seen = {n.type for n in subgraph.nodes}
+        current_phase: str | None = state.get("phase")
+        caps = capabilities_from_subgraph(subgraph)
+        has_web = any(c.name == "web_probe" for c in caps)
         phase = global_planner.decide_phase(
-            node_types_seen=node_types_seen, turn_count=state["turn_count"]
+            node_types_seen=node_types_seen,
+            turn_count=state["turn_count"],
+            current_phase=current_phase,
+            has_web_capability=has_web,
         )
+        # Record that a turn was consumed in the decided phase for budget tracking.
+        if phase != ApexPhase.done:
+            global_planner.record_turn(phase)
         goal_text = global_planner.goal_for_phase(phase, config.target)
         return {
             "phase": phase.value,
@@ -201,63 +331,109 @@ def build_apex_graph(
         return _PHASE_NODE.get(phase, END)
 
     # ------------------------------------------------------------------
-    # Shared helper: ask a phase planner for tasks, run the first one.
+    # Shared helper: ask a phase planner for tasks, run ALL concurrently.
     # ------------------------------------------------------------------
-    async def _run_one_task(state: ApexGraphState, planner: "Planner") -> dict[str, Any]:
+    async def _run_tasks(state: ApexGraphState, planner: "Planner") -> dict[str, Any]:
         anchor = _anchor()
-        goal = Goal(id=state["run_id"], description=state["goal"], phase=state["phase"], anchor_node=anchor)
+        goal = Goal(
+            id=state["run_id"],
+            description=state["goal"],
+            phase=state["phase"],
+            anchor_node=anchor,
+        )
         subgraph = await api.get_subgraph(anchor, depth=2)
         evidence = await api.query(text=goal.description, subgraph_anchor=anchor)
 
         plan_result = await planner.plan(goal, subgraph, evidence)
+
+        # Collect decision log from the planner wrapper
+        decision: PlanDecision | None = getattr(planner, "last_decision", None)
+        decision_list: list[dict[str, Any]] = (
+            [decision.to_dict()] if decision is not None else []
+        )
+
         if isinstance(plan_result, AbandonSignal):
             logger.info("phase %s abandoned: %s", state["phase"], plan_result.reason)
-            return {"current_task": None, "last_tool_result": None, "last_error": plan_result.reason}
+            return {
+                "current_task": None,
+                "last_tool_result": None,
+                "tool_results": None,
+                "last_error": plan_result.reason,
+                "planner_decisions": decision_list,
+            }
 
         tasks: list[TaskSpec] = list(plan_result) if plan_result else []
         if not tasks:
-            return {"current_task": None, "last_tool_result": None, "last_error": "planner returned no tasks"}
-
-        task = tasks[0]
-        tool = str(task.params.get("tool", ""))
-        args = [str(a) for a in task.params.get("args", [])]
-        target = str(task.params.get("target", config.target))
-        parser_name = str(task.params.get("parser", "command"))
-
-        cmd = ToolCommand(tool=tool, args=args, timeout_seconds=config.max_command_seconds)
-        try:
-            result = await run_command(cmd, config)
-        except ValueError as exc:
             return {
-                "current_task": {"id": task.id, "executor_domain": task.executor_domain, "params": task.params},
+                "current_task": None,
                 "last_tool_result": None,
-                "last_error": str(exc),
+                "tool_results": None,
+                "last_error": "planner returned no tasks",
+                "planner_decisions": decision_list,
             }
 
-        tool_result = {
-            "task_id": task.id,
-            "tool": tool,
-            "args": args,
-            "target": target,
-            "parser": parser_name,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "returncode": result.returncode,
-            "dry_run": result.dry_run,
-            "error": result.error,
-            "phase": state["phase"],
-        }
+        # Concurrency cap from config; always at least 1.
+        concurrency_cap = max(1, min(config.max_concurrency, len(tasks)))
+        sem = asyncio.Semaphore(concurrency_cap)
+
+        async def _run_one_cmd(task: TaskSpec) -> dict[str, Any]:
+            async with sem:
+                tool = str(task.params.get("tool", ""))
+                args = [str(a) for a in task.params.get("args", [])]
+                target = str(task.params.get("target", config.target))
+                parser_name = str(task.params.get("parser", "command"))
+                cmd = ToolCommand(tool=tool, args=args, timeout_seconds=config.max_command_seconds)
+                try:
+                    result = await run_command(cmd, config)
+                except ValueError as exc:
+                    return {
+                        "task_id": task.id,
+                        "tool": tool,
+                        "args": args,
+                        "target": target,
+                        "parser": parser_name,
+                        "stdout": "",
+                        "stderr": "",
+                        "returncode": 1,
+                        "dry_run": config.dry_run,
+                        "error": str(exc),
+                        "phase": state["phase"],
+                    }
+                return {
+                    "task_id": task.id,
+                    "tool": tool,
+                    "args": args,
+                    "target": target,
+                    "parser": parser_name,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "returncode": result.returncode,
+                    "dry_run": result.dry_run,
+                    "error": result.error,
+                    "phase": state["phase"],
+                }
+
+        results = list(await asyncio.gather(*[_run_one_cmd(t) for t in tasks]))
+        first_result = results[0] if results else None
+        first_task = tasks[0] if tasks else None
+
         return {
-            "current_task": {"id": task.id, "executor_domain": task.executor_domain, "params": task.params},
-            "last_tool_result": tool_result,
-            "last_error": result.error,
+            "current_task": {
+                "id": first_task.id,
+                "executor_domain": first_task.executor_domain,
+                "params": first_task.params,
+            } if first_task else None,
+            "last_tool_result": first_result,
+            "tool_results": results,
+            "last_error": first_result.get("error") if first_result else None,
+            "planner_decisions": decision_list,
         }
 
     async def recon_agent(state: ApexGraphState) -> dict[str, Any]:
-        return await _run_one_task(state, phase_planners[ApexPhase.recon.value])
+        return await _run_tasks(state, phase_planners[ApexPhase.recon.value])
 
     async def web_agent(state: ApexGraphState) -> dict[str, Any]:
-        return await _run_one_task(state, phase_planners[ApexPhase.web.value])
+        return await _run_tasks(state, phase_planners[ApexPhase.web.value])
 
     async def execute_agent(state: ApexGraphState) -> dict[str, Any]:
         """Credential-phase agent: routes to TelnetExecutor or run_command."""
@@ -269,16 +445,33 @@ def build_apex_graph(
         subgraph = await api.get_subgraph(anchor, depth=2)
         evidence = await api.query(text=goal.description, subgraph_anchor=anchor)
 
-        plan_result = await phase_planners[ApexPhase.credential.value].plan(
-            goal, subgraph, evidence
+        planner = phase_planners[ApexPhase.credential.value]
+        plan_result = await planner.plan(goal, subgraph, evidence)
+
+        decision: PlanDecision | None = getattr(planner, "last_decision", None)
+        decision_list: list[dict[str, Any]] = (
+            [decision.to_dict()] if decision is not None else []
         )
+
         if isinstance(plan_result, AbandonSignal):
             logger.info("credential phase abandoned: %s", plan_result.reason)
-            return {"current_task": None, "last_tool_result": None, "last_error": plan_result.reason}
+            return {
+                "current_task": None,
+                "last_tool_result": None,
+                "tool_results": None,
+                "last_error": plan_result.reason,
+                "planner_decisions": decision_list,
+            }
 
         tasks: list[TaskSpec] = list(plan_result) if plan_result else []
         if not tasks:
-            return {"current_task": None, "last_tool_result": None, "last_error": "planner returned no tasks"}
+            return {
+                "current_task": None,
+                "last_tool_result": None,
+                "tool_results": None,
+                "last_error": "planner returned no tasks",
+                "planner_decisions": decision_list,
+            }
 
         task = tasks[0]
         tool = str(task.params.get("tool", ""))
@@ -291,8 +484,6 @@ def build_apex_graph(
         }
 
         if tool == "telnet_access":
-            # Bounded authorized login validation — uses asyncio TCP, not runner.py.
-            # Dry-run is enforced inside TelnetExecutor (no network in dry_run mode).
             result = await telnet_executor.run(task, evidence)
             ep_data = result.episode.data
             outcome_is_success = result.episode.outcome == Outcome.success
@@ -314,11 +505,15 @@ def build_apex_graph(
                 "error": error_str,
                 "phase": state["phase"],
                 "username": str(task.params.get("username", "")),
+                "port": str(task.params.get("port", "")),
+                "proto": "tcp",
             }
             return {
                 "current_task": current_task_info,
                 "last_tool_result": tool_result,
+                "tool_results": [tool_result],
                 "last_error": error_str,
+                "planner_decisions": decision_list,
             }
 
         # Fallback: shell-based tools via safety-gated runner.py
@@ -330,7 +525,9 @@ def build_apex_graph(
             return {
                 "current_task": current_task_info,
                 "last_tool_result": None,
+                "tool_results": None,
                 "last_error": str(exc),
+                "planner_decisions": decision_list,
             }
         cmd_tool_result: dict[str, Any] = {
             "task_id": task.id,
@@ -348,16 +545,16 @@ def build_apex_graph(
         return {
             "current_task": current_task_info,
             "last_tool_result": cmd_tool_result,
+            "tool_results": [cmd_tool_result],
             "last_error": run_result.error,
+            "planner_decisions": decision_list,
         }
 
     async def priv_esc_agent(state: ApexGraphState) -> dict[str, Any]:
-        return await _run_one_task(state, phase_planners[ApexPhase.priv_esc.value])
+        return await _run_tasks(state, phase_planners[ApexPhase.priv_esc.value])
 
     # ------------------------------------------------------------------
     # Node: browser_agent
-    # Drives Playwright only when config.dry_run is False; stateless
-    # across tasks (no browser handle is held on self).
     # ------------------------------------------------------------------
     async def browser_agent(state: ApexGraphState) -> dict[str, Any]:
         anchor = _anchor()
@@ -385,120 +582,266 @@ def build_apex_graph(
             "dry_run": config.dry_run,
             "outcome": result.episode.outcome.value,
             "phase": state["phase"],
-            # obs dict carries forms/tokens/auth_hints/links for parse_observation
             "obs": ep_data.get("obs", {}),
         }
         return {
             "current_task": {"id": task.id, "executor_domain": "browser", "params": task.params},
             "last_tool_result": tool_result,
+            "tool_results": [tool_result],
             "last_error": last_error,
+            "planner_decisions": [],  # browser_agent has no planner decision
         }
 
     # ------------------------------------------------------------------
     # Node: parse_observation
-    # Re-parses the raw tool output recorded in last_tool_result and
-    # writes node/edge deltas through MemoryAPI immediately (deltas are
-    # not state-serializable, so they cannot be deferred to a later node).
+    # Iterates over tool_results (or falls back to last_tool_result) and
+    # writes all node/edge deltas through MemoryAPI.
     # ------------------------------------------------------------------
     async def parse_observation(state: ApexGraphState) -> dict[str, Any]:
-        tool_result = state["last_tool_result"]
-        if not tool_result:
+        raw_results = state.get("tool_results")
+        results_to_parse: list[dict[str, Any]]
+        if raw_results:
+            results_to_parse = raw_results
+        elif state["last_tool_result"]:
+            results_to_parse = [state["last_tool_result"]]
+        else:
             return {}
 
-        phase = state["phase"]
-        timestamp = tool_result.get("timestamp", "")
-
-        if tool_result.get("kind") == "browser":
-            # Reconstruct the full BrowserObservation from the serialised obs dict
-            # that browser_agent stored in tool_result.  An empty dict (e.g. on
-            # executor failure) produces a minimal obs that generates only the
-            # endpoint node — safe, no crash.
-            obs_dict = tool_result.get("obs") or {}
-            fallback_url = tool_result["url"]
-            fallback_title = "(dry-run)" if tool_result.get("dry_run") else ""
-            obs = BrowserObservation(
-                url=str(obs_dict.get("url", fallback_url)),
-                html_snippet="",
-                title=str(obs_dict.get("title", fallback_title)),
-                forms=list(obs_dict.get("forms", [])),
-                tokens=list(obs_dict.get("tokens", [])),
-                auth_hints=list(obs_dict.get("auth_hints", [])),
-                links=list(obs_dict.get("links", [])),
+        all_findings: list[dict[str, Any]] = []
+        for tool_result in results_to_parse:
+            parsed, source = _parse_single_result(tool_result, state)
+            await api.apply_deltas(
+                nodes=parsed.node_deltas,
+                edges=parsed.edge_deltas,
+                knowledge=parsed.proposed_knowledge,
             )
-            obs_target = str(obs_dict.get("url", fallback_url))
-            parsed = _BROWSER_PARSER.parse_observation(obs, target=obs_target, source="browser")
-            source = "browser"
-        else:
-            target = tool_result.get("target", state["target"])
-            stdout = tool_result.get("stdout", "")
-            parser_name = tool_result.get("parser", "command")
-            tool_name = tool_result.get("tool", "")
-            if parser_name == "nmap" or tool_name == "nmap":
-                parsed = _NMAP.parse_text(stdout, target=target)
-            elif parser_name == "ffuf":
-                parsed = _FFUF.parse_text(stdout, target=target)
-            elif parser_name == "gobuster":
-                parsed = _GOBUSTER.parse_text(stdout, target=target)
-            elif tool_name in ("nc", "netcat") or parser_name == "banner":
-                port = _port_from_nc_args(tool_result.get("args", []))
-                parsed = _BANNER.parse_text(stdout, target=target, source=tool_name, port=port)
-            elif parser_name == "access":
-                username = str(tool_result.get("username", ""))
-                parsed = _ACCESS.parse_text(
-                    stdout, target=target, username=username,
-                    source=str(tool_result.get("tool", "telnet_access")),
-                )
-            elif parser_name == "curl_body":
-                raw = RawObservation(raw=stdout, metadata={"source": "curl_body", "target": target})
-                parsed = _COMMAND.parse_curl_body(raw)
-            else:
-                raw = RawObservation(raw=stdout, metadata={"source": tool_name, "target": target})
-                parsed = _COMMAND.parse(raw)
-            source = tool_result.get("tool", "command")
+            phase = state["phase"]
+            timestamp = tool_result.get("timestamp", "")
+            all_findings.extend(
+                _findings_from_parsed(parsed, phase=phase, source=source, timestamp=timestamp)
+            )
 
-        for node in parsed.node_deltas:
-            await api.upsert_node(node)
-        for edge in parsed.edge_deltas:
-            await api.upsert_edge(edge)
-        for entry in parsed.proposed_knowledge:
-            await api.propose_knowledge(entry)
-
-        new_findings = _findings_from_parsed(parsed, phase=phase, source=source, timestamp=timestamp)
-        return {"findings": new_findings}
+        return {"findings": all_findings}
 
     # ------------------------------------------------------------------
     # Node: write_memory
-    # Appends this turn's Episode (built from primitives in state).
+    # Creates one Episode per tool_result and appends all via apply_deltas.
     # ------------------------------------------------------------------
     async def write_memory(state: ApexGraphState) -> dict[str, Any]:
-        tool_result = state["last_tool_result"]
-        if not tool_result:
+        raw_results = state.get("tool_results")
+        results_to_write: list[dict[str, Any]]
+        if raw_results:
+            results_to_write = raw_results
+        elif state["last_tool_result"]:
+            results_to_write = [state["last_tool_result"]]
+        else:
             return {}
 
-        outcome = _outcome_for(
-            int(tool_result.get("returncode", 0) or 0), tool_result.get("error")
-        ) if tool_result.get("kind") != "browser" else (
-            Outcome.success if not state.get("last_error") else Outcome.fundamental
-        )
+        error_entries: list[dict[str, Any]] = []
+        for tool_result in results_to_write:
+            if tool_result.get("kind") == "browser":
+                outcome = (
+                    Outcome.success if not state.get("last_error") else Outcome.fundamental
+                )
+            else:
+                outcome = _outcome_for(
+                    int(tool_result.get("returncode", 0) or 0),
+                    tool_result.get("error"),
+                )
 
-        episode = Episode(
-            agent=f"apex.{state['phase']}",
-            action=f"{tool_result.get('tool', tool_result.get('kind', 'unknown'))} {tool_result.get('target', tool_result.get('url', ''))}".strip(),
-            outcome=outcome,
-            data=tool_result,
-            task_id=tool_result.get("task_id"),
+            episode = Episode(
+                agent=f"apex.{state['phase']}",
+                action=(
+                    f"{tool_result.get('tool', tool_result.get('kind', 'unknown'))} "
+                    f"{tool_result.get('target', tool_result.get('url', ''))}"
+                ).strip(),
+                outcome=outcome,
+                data=tool_result,
+                task_id=tool_result.get("task_id"),
+                phase=state["phase"],
+            )
+            await api.apply_deltas(episodes=[episode])
+
+            if outcome != Outcome.success:
+                error_entries.append({
+                    "outcome": outcome.value,
+                    "tool": tool_result.get("tool", tool_result.get("kind", "unknown")),
+                    "error": tool_result.get("error") or state.get("last_error"),
+                    "phase": state["phase"],
+                })
+
+        return {"error_episodes": error_entries} if error_entries else {}
+
+    # ------------------------------------------------------------------
+    # Routing: after write_memory — try repair if first result failed and
+    # repair budget allows; otherwise go to reflect_or_continue.
+    # ------------------------------------------------------------------
+    def route_after_write(state: ApexGraphState) -> str:
+        tool_result = state.get("last_tool_result")
+        if not tool_result or tool_result.get("kind") == "browser":
+            return "reflect_or_continue"
+
+        outcome = _outcome_for(
+            int(tool_result.get("returncode", 0) or 0),
+            tool_result.get("error"),
+        )
+        repair_count = int(state.get("repair_count") or 0)
+        if (
+            outcome in (Outcome.script_error, Outcome.fixable)
+            and repair_count < _max_repair
+        ):
+            return "repair_agent"
+        return "reflect_or_continue"
+
+    # ------------------------------------------------------------------
+    # Node: repair_agent
+    # Calls RepairEngine to get a corrected TaskSpec, executes it,
+    # parses + writes results through MemoryAPI, updates repair_count.
+    # No-op when RepairEngine returns None (dry_run or no LLM).
+    # ------------------------------------------------------------------
+    async def repair_agent(state: ApexGraphState) -> dict[str, Any]:
+        tool_result = state.get("last_tool_result")
+        if not tool_result:
+            return {"repair_count": int(state.get("repair_count") or 0) + 1}
+
+        failed_task_params = (state.get("current_task") or {}).get("params", {})
+        error = str(tool_result.get("error") or state.get("last_error") or "non-zero returncode")
+
+        # Reconstruct a minimal TaskSpec for the repair engine
+        failed_task = TaskSpec(
+            id=str(tool_result.get("task_id", "unknown")),
+            goal_id=state["run_id"],
+            executor_domain=str(
+                (state.get("current_task") or {}).get("executor_domain", "recon")
+            ),
+            params=dict(failed_task_params),
+            subgraph_anchor=_anchor(),
             phase=state["phase"],
         )
-        await api.append_episode(episode)
-        return {}
+
+        anchor = _anchor()
+        subgraph = await api.get_subgraph(anchor, depth=2)
+        evidence = await api.query(text=state["goal"], subgraph_anchor=anchor)
+
+        repaired_task = await repair_engine.repair(
+            failed_task=failed_task,
+            error=error,
+            phase=state["phase"],
+            evidence=evidence,
+            subgraph=subgraph,
+        )
+
+        new_repair_count = int(state.get("repair_count") or 0) + 1
+
+        if repaired_task is None:
+            # No repair available — proceed to reflect_or_continue unchanged.
+            logger.debug("repair_agent: no repair available for phase=%s", state["phase"])
+            return {"repair_count": new_repair_count}
+
+        # Execute the repaired task via runner.py (safety-gated, dry_run-aware).
+        r_tool = str(repaired_task.params.get("tool", ""))
+        r_args = [str(a) for a in repaired_task.params.get("args", [])]
+        r_target = str(repaired_task.params.get("target", config.target))
+        r_parser = str(repaired_task.params.get("parser", "command"))
+        r_cmd = ToolCommand(tool=r_tool, args=r_args, timeout_seconds=config.max_command_seconds)
+        try:
+            r_result = await run_command(r_cmd, config)
+        except ValueError as exc:
+            logger.warning("repair_agent: repaired task raised ValueError: %s", exc)
+            return {"repair_count": new_repair_count}
+
+        repaired_tool_result: dict[str, Any] = {
+            "task_id": repaired_task.id,
+            "tool": r_tool,
+            "args": r_args,
+            "target": r_target,
+            "parser": r_parser,
+            "stdout": r_result.stdout,
+            "stderr": r_result.stderr,
+            "returncode": r_result.returncode,
+            "dry_run": r_result.dry_run,
+            "error": r_result.error,
+            "phase": state["phase"],
+            "repaired": True,
+        }
+
+        # Parse + write the repaired observation through MemoryAPI.
+        parsed, source = _parse_single_result(repaired_tool_result, state)
+        await api.apply_deltas(
+            nodes=parsed.node_deltas,
+            edges=parsed.edge_deltas,
+            knowledge=parsed.proposed_knowledge,
+        )
+
+        r_outcome = _outcome_for(r_result.returncode, r_result.error)
+        repair_episode = Episode(
+            agent=f"apex.{state['phase']}.repair",
+            action=f"repair/{r_tool} {r_target}".strip(),
+            outcome=r_outcome,
+            data=repaired_tool_result,
+            task_id=repaired_task.id,
+            phase=state["phase"],
+        )
+        await api.apply_deltas(episodes=[repair_episode])
+
+        return {
+            "repair_count": new_repair_count,
+            "last_tool_result": repaired_tool_result,
+            "last_error": r_result.error,
+        }
 
     # ------------------------------------------------------------------
     # Node: reflect_or_continue
+    # Dynamic replanning: peek at current EKG after write_memory to update
+    # the phase hint in state without charging the GlobalPlanner budget
+    # (global_plan charges the budget at the start of the next turn).
     # ------------------------------------------------------------------
     async def reflect_or_continue(state: ApexGraphState) -> dict[str, Any]:
         turn_count = state["turn_count"] + 1
         completed = state["completed"] or turn_count >= config.max_turns
-        return {"turn_count": turn_count, "completed": completed}
+
+        # Dynamic replanning: derive the freshest phase from live EKG state
+        # so that state checkpoints between turns are accurate.
+        # global_plan will re-derive and charge the budget at the next turn start.
+        next_phase_value = state["phase"]
+        if not completed:
+            try:
+                subgraph = await api.get_subgraph(_anchor(), depth=2)
+                node_types_seen = {n.type for n in subgraph.nodes}
+
+                # Early stop: access_state in the EKG means a successful login
+                # was recorded this turn.  The primary objective is achieved —
+                # stop now rather than burning remaining turns on priv_esc probes
+                # that the rule-based planner cannot act on yet.
+                if "access_state" in node_types_seen:
+                    logger.info(
+                        "access_state in EKG after turn %d — engagement succeeded, stopping early",
+                        turn_count,
+                    )
+                    return {
+                        "turn_count": turn_count,
+                        "completed": True,
+                        "phase": ApexPhase.done.value,
+                        "repair_count": 0,
+                    }
+
+                peek_caps = capabilities_from_subgraph(subgraph)
+                has_web_peek = any(c.name == "web_probe" for c in peek_caps)
+                next_phase = global_planner.decide_phase(
+                    node_types_seen=node_types_seen,
+                    turn_count=turn_count,
+                    has_web_capability=has_web_peek,
+                )
+                next_phase_value = next_phase.value
+            except Exception as exc:
+                logger.debug("reflect_or_continue: dynamic replan peek failed (%s)", exc)
+
+        return {
+            "turn_count": turn_count,
+            "completed": completed,
+            "phase": next_phase_value,
+            "repair_count": 0,  # reset for next turn
+        }
 
     def route_after_reflect(state: ApexGraphState) -> str:
         return END if state["completed"] else "load_context"
@@ -517,6 +860,7 @@ def build_apex_graph(
     builder.add_node("priv_esc_agent", priv_esc_agent)
     builder.add_node("parse_observation", parse_observation)
     builder.add_node("write_memory", write_memory)
+    builder.add_node("repair_agent", repair_agent)
     builder.add_node("reflect_or_continue", reflect_or_continue)
 
     builder.add_edge(START, "load_context")
@@ -536,7 +880,15 @@ def build_apex_graph(
     for agent_node in ("recon_agent", "web_agent", "browser_agent", "execute_agent", "priv_esc_agent"):
         builder.add_edge(agent_node, "parse_observation")
     builder.add_edge("parse_observation", "write_memory")
-    builder.add_edge("write_memory", "reflect_or_continue")
+    builder.add_conditional_edges(
+        "write_memory",
+        route_after_write,
+        {
+            "repair_agent": "repair_agent",
+            "reflect_or_continue": "reflect_or_continue",
+        },
+    )
+    builder.add_edge("repair_agent", "reflect_or_continue")
     builder.add_conditional_edges(
         "reflect_or_continue",
         route_after_reflect,

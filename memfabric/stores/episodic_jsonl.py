@@ -99,6 +99,26 @@ class JSONLEpisodicStore:
             logger.debug("append episode id=%s outcome=%s", episode.id, episode.outcome.value)
             return episode.id
 
+    async def _pop_episodes(self, episode_ids: list[str]) -> None:
+        """Internal rollback: remove episodes by ID.
+
+        NOT part of the ``EpisodicStore`` Protocol — called only by
+        ``MemoryAPI.apply_deltas`` to support transactional batch rollback.
+        Episodes returned by ``all()`` / ``tail()`` / ``since()`` will not
+        include rolled-back episodes after this call.
+
+        In-memory mode only: in-process dict mutation is sufficient.
+        A durable (file-backed) store would need explicit file-level
+        transaction support to guarantee rollback survives a crash.
+        """
+        async with self._lock:
+            for eid in episode_ids:
+                self._index.pop(eid, None)
+                try:
+                    self._order.remove(eid)
+                except ValueError:
+                    pass
+
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------

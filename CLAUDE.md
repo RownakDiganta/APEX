@@ -52,6 +52,24 @@ Treat them as hard constraints, not suggestions.
    *that field only* — never clobber the whole node. Every node and edge carries
    `confidence`, `source`, `first_seen`, `last_seen`.
 
+   **LWW ordering rule (non-negotiable):** "Later write" is determined by a
+   monotonic `logical_version` counter maintained inside `MemoryAPI`
+   (`_write_clock`), incremented at the moment each `upsert_node` / `upsert_edge`
+   call is received. `logical_version` is the **primary** ordering key.
+   Wall-clock timestamps (`last_seen`, `first_seen`) on the `Node`/`Edge` objects
+   are **observational metadata only** — they are NOT the ordering authority.
+   A caller that supplies a back-dated or future-dated `last_seen` cannot cause
+   its write to win or lose based on the wall-clock value alone. Timestamps are
+   used only as a tie-breaker when two calls share the same `logical_version`
+   (which should not occur in normal sequential execution).
+
+   Per-field provenance records: `value`, `source`, `timestamp`, `confidence`,
+   **and `logical_version`**. Conflict detection is **epistemic** (do two
+   high-confidence sources disagree on the value?) and fires regardless of
+   `logical_version` ordering — a logically-later write that contradicts a
+   high-confidence existing value still creates a `Conflict` rather than
+   silently overwriting.
+
 4. **Semantic and procedural writes are _proposals_, not commits.** A `propose_*`
    call stages an entry. It does **not** become retrievable until the Reflector
    promotes it through a quality gate. One bad turn must not be able to poison the
@@ -115,6 +133,205 @@ things you should adapt rather than reinvent:
   degradation.** Reuse the structure for the same behaviors here.
 These are the only two pieces to port. Port the *shape and the lessons*
 (graceful degradation, lazy indexing, dedup), not any task content.
+
+### Logical vs physical tier storage (read before writing tier-related code)
+
+The "four-tier memory fabric" label refers to **logical tiers distinguished by
+metadata at retrieval time**.  The physical backend mapping is:
+
+| Tier | Dedicated physical store | Also indexed in |
+|---|---|---|
+| `working` | `GraphStore` (EKG nodes + edges) | Shared `LexicalIndex` — `tier=working` metadata |
+| `episodic` | `EpisodicStore` (append-only JSONL) | Shared `LexicalIndex` — `tier=episodic` metadata |
+| `semantic` | **None — logical tier only** | Shared `LexicalIndex` + `VectorIndex` — `tier=semantic` metadata |
+| `procedural` | **None — logical tier only** | Shared `LexicalIndex` + `VectorIndex` — `tier=procedural` metadata |
+
+`semantic` and `procedural` are **metadata-distinguished entries in the same
+shared BM25 and vector indexes** that serve all tiers.  When
+`MemoryAPI.promote_knowledge()` or `promote_skill()` is called, the entry is
+added to the same `LexicalIndex`/`VectorIndex` instance as working and episodic
+content — the only difference is `"tier": "semantic"` or `"tier": "procedural"`
+in the metadata dict.  `MemoryAPI.query(tiers=[...])` enforces tier boundaries
+by post-filtering on that metadata field inside `HybridRetriever.search()`.
+
+**Do not claim physical tier isolation** in code comments, docstrings, or tests
+unless you have explicitly configured separate backend instances.  The staging
+gate and Reflector promotion are quality/provenance boundaries, not storage
+boundaries.
+
+Physical backend separation (a dedicated `LexicalIndex` or `VectorIndex`
+instance per tier) is possible by injecting different store implementations
+through the Protocol seams in `stores/protocols.py`.  It is **not the default**
+and the substrate does not require it.
+
+### No domain-specific regex in memfabric (non-negotiable)
+
+`memfabric` is domain-agnostic.  **No domain-specific identifier patterns may
+appear in any `memfabric/` source file**, including the Reflector.
+
+The only built-in slot-extraction pattern in `memfabric/reflector/consolidate.py`
+is UUID v4 — universally opaque in any domain.  All other patterns (IPv4,
+port numbers, CVE IDs, hostnames, medical record IDs, financial tickers, etc.)
+are supplied by the host application via `Config.slot_patterns`.
+
+**Rules:**
+
+1. **`Config.slot_patterns` defaults to `[]`** (empty list).  With the default,
+   only UUIDs are replaced with slot references during skill generalization.
+   The substrate ships neutral and produces useful skills for any domain.
+
+2. **Host apps own domain-specific patterns.**  The cybersecurity host supplies
+   IPv4 and port patterns through `ApexConfig.slot_patterns`, which are copied
+   into a `memfabric.Config` at runtime.  A medical host would supply MRN
+   patterns; a financial host would supply ticker/ISIN patterns — all through
+   the same `Config.slot_patterns` field.
+
+3. **`generalize()` accepts `slot_patterns` as a parameter.**  The Reflector
+   worker passes `config.slot_patterns` through to every `generalize()` call.
+   Direct callers may supply patterns inline.
+
+4. **The static scan in `tests/test_reflector_domain_agnostic.py` is
+   authoritative.**  The parametrized test `test_no_cybersecurity_terms_in_memfabric_reflector`
+   scans every `memfabric/reflector/*.py` file for cybersecurity terminology in
+   non-comment lines and fails the build if any is found.  When adding new
+   reflector code, ensure it passes this scan.
+
+5. **CVE/CWE patterns remain in `apex_host/knowledge/cve_patterns.py`.**  That
+   file feeds the `HybridRetriever`'s regex channel, which is a separate
+   extension point from the slot-extraction mechanism.
+
+### LWW ordering policy (read before writing graph-write code)
+
+`MemoryAPI` maintains a monotonic `_write_clock: int` counter.  Every call to
+`upsert_node` or `upsert_edge` increments the counter and assigns its current
+value as the `logical_version` for that write.  The ordering rules are:
+
+1. **`logical_version` is the primary ordering key.**  The write with the
+   higher `logical_version` wins, always — regardless of the `last_seen` /
+   `first_seen` timestamps on the `Node` or `Edge` objects.
+2. **Wall-clock timestamps are observational metadata only.**  They are stored
+   in per-field provenance for auditability but must never be the sole reason
+   one write beats another.  A caller supplying a back-dated `last_seen` does
+   not cause its write to lose (or win) based on the timestamp alone.
+3. **Timestamp is a tie-breaker only.**  Used only when two writes share the
+   same `logical_version`, which should not occur in normal sequential execution.
+4. **Conflict detection is epistemic, not temporal.**  When both the existing
+   value and the incoming value have `confidence >= conflict_confidence_floor`
+   and the values differ, a `Conflict` is created regardless of the
+   `logical_version` ordering.  A logically-later write does not automatically
+   win over a high-confidence existing claim — the contradiction is escalated.
+5. **`logical_version` is recorded in per-field provenance.**  Every field
+   provenance dict includes `{value, source, timestamp, confidence,
+   logical_version}`.  `Conflict.claim_a` and `Conflict.claim_b` both carry
+   `logical_version` so the orchestrator can see causal ordering.
+
+**Do not implement LWW using only wall-clock comparison.** If you find code
+that compares `last_seen` strings without consulting `logical_version` first,
+it violates this invariant and must be fixed.
+
+### Working-tier retrieval freshness (non-negotiable)
+
+Every `upsert_node` and `upsert_edge` call must **synchronously** refresh
+the retrieval indexes so that the immediately following `query()` call sees
+the written data — no lag, no cache TTL wait, no Reflector promotion required
+for working-tier state.
+
+Three surfaces that must be kept fresh on every graph write:
+
+1. **Lexical (BM25) index** — `_refresh_working_indexes()` calls
+   `lexical.add(id, text, meta)` which updates in-place (no stale duplicate
+   doc per id).  This is always active.
+2. **Retrieval cache** — `_refresh_working_indexes()` calls
+   `kv.delete_prefix("retrieval:")` which deletes all cached query results.
+   Without this, a second call with the same query text returns stale data
+   from the KVStore even after the index is updated.  This is always active.
+3. **Vector (dense) index** — when an `Embedder` is injected into `MemoryAPI`
+   at construction time (`embedder=` keyword arg), `_refresh_working_indexes()`
+   also calls `embedder.embed([text])` and `vector.add(id, vec, meta)`.  If no
+   embedder is provided (the default), the vector index is not updated on writes
+   and the dense channel will return no working-tier results when it fires.
+
+**Invariant:** a fresh `query()` immediately after a graph write must see that
+write.  If you add any new code path that writes to the `GraphStore` directly
+without going through `MemoryAPI`, or if you add a caching layer without
+corresponding invalidation, you break this invariant.
+
+### Conflict lifecycle (non-negotiable)
+
+Every `Conflict` record goes through a defined lifecycle managed by
+`memfabric/coordination/conflict.py`.  The lifecycle prevents conflicts from
+accumulating forever while preserving full provenance.
+
+**Statuses** (`ConflictStatus` enum, `memfabric/types.py`):
+
+| Status | Meaning | Blocks dependents? |
+|---|---|---|
+| `open` | Detected, awaiting resolution | **Yes** |
+| `resolved` | Winner chosen by policy or orchestrator | No |
+| `superseded` | A later write made both claims moot | No |
+| `quarantined` | Reflector marked the field as untrusted | No |
+
+**Default resolution policy** (applied by `resolve_by_policy` in `conflict.py`):
+1. Higher `confidence` claim wins.
+2. Tie → higher `logical_version` claim wins.
+3. Still tied → conflict **remains `open`** (returns `False`); human intervention required.
+
+**Invariants:**
+- Only `open` conflicts block dependents (`dependents_blocked()` predicate).
+- `resolved`, `superseded`, and `quarantined` conflicts do **not** block.
+- Every status transition appends an entry to `Conflict.history` (append-only
+  provenance log).  Conflict records are never deleted.
+- `claim_a` and `claim_b` dicts are never mutated after creation; they are the
+  exact provenance state at the moment of detection.
+- The `resolved: bool` field is kept for backward compatibility; it is `True`
+  whenever `status` is anything other than `open`.
+
+**`MemoryAPI` conflict surface:**
+- `get_conflicts(node_id=, status=)` — filter by node and/or lifecycle status.
+- `resolve_conflict(id, resolution=None)` — apply policy (if no string given) or
+  record an explicit orchestrator override.
+- `auto_resolve_conflict(id)` — apply policy only, returns `False` on tie.
+- `supersede_conflict(id, reason=)` — mark superseded.
+- `quarantine_conflict(id, reason=)` — mark quarantined.
+- `dependents_blocked_by(node_id, field_name)` — True if any open conflict
+  contests that field.
+
+**Unresolved conflicts must block dependents** — any planning or query path that
+reads a contested field must call `dependents_blocked_by()` first and skip or
+escalate if it returns `True`.
+
+### Graph merge must be transactional (non-negotiable)
+
+`MemoryAPI.apply_deltas(nodes=..., edges=..., episodes=..., knowledge=..., skills=...)`
+is the atomic batch-write surface.  **All writes in a batch succeed together or
+none are visible** — no partial state is exposed to future `query()` calls.
+
+Rules:
+1. **Write order within a batch:** nodes → edges → episodes → knowledge proposals
+   → skill proposals.  A failure at any step triggers full rollback of everything
+   committed earlier in the same batch.
+2. **Rollback for new entries:** newly-created nodes/edges are deleted via
+   `delete_node` / `delete_edge`; their lexical/vector index entries are removed.
+3. **Rollback for updated entries:** the pre-batch snapshot captured before
+   writes began is restored via `put_node` / `put_edge`; indexes are re-synced
+   to the restored state.
+4. **Episode rollback:** `JSONLEpisodicStore._pop_episodes` is a private rollback
+   method (NOT on the `EpisodicStore` Protocol — it does not violate the
+   immutability invariant for normal code paths).  `apply_deltas` calls it via
+   `getattr`; stores without it log a warning and leave those episodes in place.
+5. **Proposal rollback:** staged knowledge/skill dicts are cleaned up in reverse
+   write order.
+6. **Cache bust after rollback:** `kv.delete_prefix("retrieval:")` is called
+   after rollback so stale cache entries from the failed batch are not returned.
+7. **`apex_host/graph.py` must use `apply_deltas`:** `parse_observation` calls
+   `apply_deltas(nodes=..., edges=..., knowledge=...)` and `write_memory` calls
+   `apply_deltas(episodes=[episode])`.  Individual `upsert_node` / `upsert_edge`
+   / `propose_knowledge` / `append_episode` calls are no longer acceptable in
+   these graph nodes.
+
+**Invariant:** after any exception during an `apply_deltas` call, the fabric
+state must be byte-for-byte identical to its state immediately before the call.
+A test that queries for rolled-back entries must find nothing.
 
 ---
 
@@ -832,6 +1049,38 @@ curl: `["-s", "-I", url]`).
   an **authorized** HTB/VPN target. All safety gates in `tools/safety.py`
   still apply. `nc` banner probes are similarly gated.
 
+#### Recon success criteria (non-negotiable)
+
+A recon turn is only considered **meaningful** when the resulting EKG contains
+at least one `service` node in addition to the `host` node.  A host node alone
+(IP discovered, no open ports recorded) is **not** sufficient to advance the
+phase — the GlobalPlanner must not advance from `recon` to `web` or `credential`
+unless at least one `service` node with a valid `port` prop exists in the subgraph.
+
+This rule prevents the engagement from skipping to exploitation phases based on
+a bare ping or a failed nmap run.  It is enforced by `GlobalPlanner.decide_phase`
+reading `capabilities_from_subgraph()` — the phase advances only when one or
+more capabilities (which require service nodes) are present.
+
+**`NmapParser` acceptance criteria** — the parser MUST produce:
+
+| Output | Condition |
+|---|---|
+| One `host` node | Always, when the IP is present in the output |
+| One `service` node per open port | `port`, `proto`, and `service` props required |
+| One `exposes` edge per service | `host:<ip>` → `service:<ip>:<port>` |
+| One `tech` node per version string | Only when the nmap version field is non-empty |
+| One `runs` edge per tech node | `service:<ip>:<port>` → `tech:<name>` |
+
+If nmap output contains no open ports (all filtered or closed), the parser
+produces only the `host` node.  That is valid output but insufficient for phase
+advancement (see above).
+
+**No machine-specific solver logic** — `NmapParser`, `ReconPlanner`, and
+`GlobalPlanner` must not contain hardcoded expected services, expected ports, or
+expected credential paths for any specific target.  Every routing decision is
+driven exclusively by the live EKG state after parsing.
+
 ### 12.10 Payload RAG Prototype
 
 #### Source of truth
@@ -1455,3 +1704,534 @@ be config-driven so tests can override it.
 **Add new EKG node/edge types**: Document them in CLAUDE.md Section 12.8
 (the node/edge type convention table). Add parsers that produce them. Add
 tests that verify the correct node type and props are created.
+
+---
+
+## 14. LLM Planning Layer (`apex_host/planning/`)
+
+The planning layer provides an optional LLM backend for all `apex_host`
+planners.  It is **additive** — existing rule-based planners continue to work
+unchanged and are registered as the fallback inside `PlanningEngine`.
+
+### 14.1 Module map
+
+```
+apex_host/planning/
+├── __init__.py          # public exports
+├── models.py            # Pydantic v2: PlannerOutput, PlannedTask
+├── prompt_builder.py    # PromptBuilder — builds system+user messages
+├── validator.py         # Validator — safety gate on raw LLM text
+└── engine.py            # PlanningEngine — the sole ModelRouter caller
+```
+
+### 14.2 Invariants (non-negotiable)
+
+1. **`PlanningEngine` is the only component permitted to call
+   `ModelRouter.planner_llm()`.**  No planner, executor, parser, or graph
+   node may call the router directly.
+
+2. **Planners never construct prompts manually.**  Any component that needs
+   to send a planning prompt to an LLM must go through `PlanningEngine`,
+   which delegates to `PromptBuilder`.
+
+3. **Executors never call LLMs.**  Executors are stateless tool runners;
+   all reasoning lives in the planning layer.
+
+4. **`MemoryAPI` remains the only state source.**  `PlanningEngine` reads
+   context through the `EvidenceBundle` and `SubgraphView` passed in — it
+   never queries `MemoryAPI` directly.
+
+5. **Fallback is mandatory.**  Every `PlanningEngine` instance must be
+   constructed with a `fallback_planner`.  Any LLM failure, network error,
+   or validator rejection triggers the fallback — the engagement never
+   stalls due to LLM unavailability.
+
+6. **`FakeModelRouter` returns `None`.**  When `planner_llm()` returns
+   `None`, `PlanningEngine` immediately delegates to the fallback without
+   attempting any LLM call.  This is what makes dry-run and tests safe by
+   default.
+
+### 14.3 Flow
+
+```
+PlanningEngine.plan(goal, phase, subgraph, evidence)
+  │
+  ├── router.planner_llm() → None?
+  │     └── yes → fallback_planner.plan() → TaskSpec list
+  │
+  ├── PromptBuilder.build_messages(goal, phase, evidence, ekg_summary, allowed_tools)
+  │     └── [system_msg, user_msg]
+  │
+  ├── llm.invoke(messages) → raw string
+  │     └── exception → fallback_planner.plan()
+  │
+  ├── Validator.validate(raw, allowed_tools)
+  │     ├── JSON parse failure → None → fallback
+  │     ├── schema mismatch   → None → fallback
+  │     ├── unsupported tool  → None → fallback
+  │     ├── destructive tool  → None → fallback
+  │     ├── shell metachar    → None → fallback
+  │     └── unknown domain    → None → fallback
+  │
+  ├── stop_reason set? → AbandonSignal(reason)
+  │
+  ├── no selected_tasks? → fallback_planner.plan()
+  │
+  └── _to_task_spec() × N → list[TaskSpec]
+```
+
+### 14.4 `PlannerOutput` schema (Pydantic v2)
+
+```python
+class PlannedTask(BaseModel):
+    tool: str               # must be in allowed_tools
+    args: list[str]         # no shell metacharacters
+    parser: str             # nmap | banner | command | curl_body | ffuf | gobuster | access
+    executor_domain: str    # recon | web | credential | priv_esc | execute | browser
+    target: str             # IP or URL; engine fills in default if blank
+    rationale: str          # one-line explanation (stored for auditability)
+
+class PlannerOutput(BaseModel):
+    reasoning: str          # chain-of-thought (not forwarded to executors)
+    confidence: float       # 0..1 (< 0.35 → advisory warning, not a hard reject)
+    selected_tasks: list[PlannedTask]
+    rejected_tasks: list[dict]  # considered but not selected (for Reflector)
+    stop_reason: str | None     # set → AbandonSignal; None → execute tasks
+    next_phase: str | None      # phase hint for GlobalPlanner (informational)
+```
+
+### 14.5 Validator rejection rules
+
+The `Validator` returns `None` (triggering fallback) on any of these:
+
+| Condition | Why rejected |
+|---|---|
+| `json.JSONDecodeError` | Malformed JSON |
+| `pydantic.ValidationError` | Missing required field or type mismatch |
+| `task.tool` not in `allowed_tools` | Unsupported / not allowlisted |
+| `task.tool` in destructive blocklist | `rm`, `mkfs`, `dd`, `shutdown`, … |
+| Shell metachar in any `task.args` token | `;`, `&&`, `\|\|`, `\|`, `>`, `>>`, `<`, `$(`, `` ` `` |
+| `task.executor_domain` not in known set | Unknown action type |
+
+JSON wrapped in a ` ```json … ``` ` code fence is automatically stripped
+before parsing — a common LLM output format.
+
+### 14.6 `PromptBuilder` contract
+
+`PromptBuilder.build_messages(goal, phase, evidence, ekg_summary, allowed_tools)`
+returns `[{"role": "system", "content": …}, {"role": "user", "content": …}]`.
+
+The system message contains:
+- Critical safety rules (no destructive commands, no shell operators)
+- The `PlannerOutput` JSON schema
+
+The user message contains:
+- Current phase and goal description
+- Allowed tools list
+- EKG summary (from `summarize_subgraph()`)
+- Retrieved semantic knowledge (up to 5 entries)
+- Retrieved procedural skills (up to 3 entries)
+- Recent episodic lessons (up to 4 entries)
+
+### 14.7 Wiring into `apex_host`
+
+To use `PlanningEngine` with an existing planner as fallback:
+
+```python
+from apex_host.planning import PlanningEngine
+from apex_host.llm.router import OpenAIModelRouter
+
+engine = PlanningEngine(
+    model_router=OpenAIModelRouter(config),
+    fallback_planner=ReconPlanner(target, registry),
+    allowed_tools=config.allowed_tools,
+    target=config.target,
+)
+
+# In graph.py — call engine.plan() instead of planner.plan() directly:
+result = await engine.plan(goal, phase, subgraph, evidence)
+```
+
+In tests and dry-run mode, `FakeModelRouter` returns `None` for all roles,
+so `PlanningEngine` always falls back to the deterministic planner — no LLM
+calls, no network, no API key required.
+
+### 14.8 Extension rules for Claude Code
+
+- **Adding a new planner**: register the deterministic planner as
+  `fallback_planner` inside `PlanningEngine`.  Wire `PlanningEngine` into
+  `graph.py` rather than the raw planner.
+- **Changing the prompt format**: edit `PromptBuilder` only — never add
+  prompt-building logic to a planner or executor.
+- **Changing validation rules**: edit `Validator` only.  If a new tool
+  should be blocked unconditionally, add it to `_DESTRUCTIVE_COMMANDS` in
+  `validator.py`.
+- **Tests**: every new planning behavior needs a test in
+  `tests/apex_host/test_planning_engine.py`.  Use `_StubLLM` /
+  `_StubRouter` patterns already established there; do not call real LLMs
+  in tests.
+---
+
+## 15. Planner Responsibilities
+
+### 15.1 Separation of responsibilities
+
+| Component | Responsible for | Must NOT do |
+|---|---|---|
+| `GlobalPlanner` | Phase selection, budget allocation, goal text | Emit TaskSpecs, call LLM directly |
+| Domain planners (Recon, Web, Credential, PrivEsc) | TaskSpec production within their phase | Phase routing, LLM calls, memory writes |
+| `PlanningEngine` | LLM call, prompt building, validation, TaskSpec conversion, fallback | Hold state, write memory, call executors |
+| Executors | Tool execution (safety-gated) | Plan tasks, write memory |
+| Parsers | Tool output → EKG node/edge deltas | Execute tools, plan tasks |
+| `MemoryAPI` | All reads and writes to the fabric | None (it is the sole state surface) |
+
+### 15.2 Domain planner structure (`_<Name>Deterministic` + thin wrapper)
+
+Every domain planner follows this two-class pattern:
+
+```python
+class _ReconDeterministic:
+    """Pure rule-based fallback — no LLM dependency."""
+    async def plan(self, goal, subgraph, evidence) -> list[TaskSpec] | AbandonSignal: ...
+
+class ReconPlanner:
+    """Thin wrapper — routes through PlanningEngine when model_router provided."""
+    def __init__(self, target, registry, *, model_router=None, allowed_tools=None,
+                 confidence_threshold=0.4, max_retries=1) -> None:
+        self._core = _ReconDeterministic(target, registry)
+        if model_router is not None:
+            self._engine = PlanningEngine(model_router, self._core, ...)
+    
+    async def plan(self, goal, subgraph, evidence) -> list[TaskSpec] | AbandonSignal:
+        if self._engine is not None:
+            return await self._engine.plan(goal, <PHASE>, subgraph, evidence)
+        return await self._core.plan(goal, subgraph, evidence)
+```
+
+**Rules:**
+- The `_<Name>Deterministic` class must be self-contained (no LLM imports,
+  no PlanningEngine imports, no model_router references).
+- `model_router=None` is the default — callers that do not supply a router
+  get the fully-deterministic behaviour with no code path changes.
+- The `_engine` attribute is `None` when no router is provided; existence
+  of `_engine` is the sole routing predicate in `plan()`.
+
+### 15.3 Fallback policy
+
+When `PlanningEngine` falls back to the deterministic planner it does so on:
+
+| Trigger | Retry before fallback? |
+|---|---|
+| `ModelRouter.planner_llm()` returns `None` | No — immediate fallback |
+| LLM invocation raises an exception | Yes — up to `max_retries` times |
+| `Validator.validate()` returns `None` | Yes — up to `max_retries` times |
+| LLM output confidence < `confidence_threshold` | No — epistemic signal, not transient |
+| LLM output has no `selected_tasks` | Yes — up to `max_retries` times |
+
+The deterministic planner ALWAYS produces a valid result (or `AbandonSignal`).
+The LLM path is strictly opt-in: `FakeModelRouter` (the default) returns
+`None`, ensuring no LLM calls in tests or dry-run mode.
+
+### 15.4 GlobalPlanner budget allocation
+
+`GlobalPlanner` tracks per-phase turn budgets to prevent the engagement from
+getting stuck in a single phase indefinitely:
+
+```python
+gp = GlobalPlanner(max_turns=20, phase_budgets={"recon": 6, "web": 5})
+gp.record_turn(ApexPhase.recon)   # call once per turn, AFTER decide_phase
+remaining = gp.budget_remaining(ApexPhase.recon)
+```
+
+`graph.py` calls `record_turn(phase)` inside `global_plan` after `decide_phase`
+returns a non-`done` phase.  When a phase's budget is exhausted, `decide_phase`
+force-advances to the next phase (as if the phase's completion EKG-node had
+already been observed).  This prevents indefinite recon or web loops when
+real tool output fails to produce the expected node types.
+
+`decide_phase` now accepts an optional `current_phase` kwarg (the phase value
+currently stored in `ApexGraphState`).  Passing it enables the budget
+force-advance logic; omitting it preserves backward-compatible behaviour.
+
+### 15.5 Wiring model_router into graph.py
+
+```python
+from apex_host.llm.router import OpenAIModelRouter
+from apex_host.graph import build_apex_graph
+
+graph = build_apex_graph(
+    api, registry, config,
+    model_router=OpenAIModelRouter(config),   # optional; omit for deterministic
+)
+```
+
+When `model_router` is `None` (the default), `build_apex_graph` constructs
+each planner without a router, preserving fully-deterministic behavior.
+When a router is provided, each domain planner wraps its deterministic core
+in a `PlanningEngine` with `config.planning_confidence_threshold` and
+`config.max_planning_retries`.
+
+### 15.6 Tests
+
+New tests for planner + engine wiring live in
+`tests/apex_host/test_planners_with_engine.py`.  Key patterns:
+
+- Use `_StubRouter(_StubLLM(json_str))` to inject a deterministic LLM stub.
+- Use `_FakeModelRouter()` to exercise the deterministic-only path.
+- Use `_RaisingLLM()` to test retry + fallback behavior.
+- Use `_RotatingLLM(bad_count, good_json)` to test retry-until-success.
+- `_FallbackCounter` wraps a real deterministic planner and counts calls.
+- All tests use `dry_run=True` (the default) — no real LLM calls ever.
+
+---
+
+## 16. Complete LLM Planning Loop
+
+This section documents the operational planning architecture added in Phase 5
+(complete APEX-Nexus loop).  All components are in production and covered
+by `tests/apex_host/test_repair_engine.py` (26 tests).
+
+### 16.1 EvidenceBundle Summarization
+
+`PromptBuilder.build_messages()` now accepts two optional keyword arguments:
+
+- `findings: list[dict[str, Any]] | None` — accumulated findings from
+  `ApexGraphState.findings` (last 10 entries, confidence-annotated).  The
+  LLM sees a compact summary of what has been discovered so far without
+  receiving the full EKG graph.
+- `candidate_tasks: list[str] | None` — human-readable descriptions of the
+  tasks the deterministic fallback planner would emit.  Helps the LLM
+  understand what the rule-based fallback would do and why it might choose
+  differently.
+
+The full graph is never sent to the LLM.  Context is always a bounded
+summary: EKG node-type counts, findings list (capped at 10), and retrieved
+evidence entries (5 semantic, 3 procedural, 4 episodic).
+
+### 16.2 Dynamic Replanning
+
+After every `write_memory` pass, `reflect_or_continue` queries the live
+EKG (depth-2 subgraph) and calls `global_planner.decide_phase()` (read-only,
+no budget charge) to derive the freshest phase.  This updates `state["phase"]`
+before the state checkpoint is written so that debuggers and the JSON export
+always show the most current phase, not the one selected at the start of the
+turn.
+
+`global_plan` continues to own phase selection at the start of each turn
+(with budget charging via `record_turn()`).  `reflect_or_continue` peeks
+only — it does not double-charge the budget.
+
+### 16.3 Planner Reflection (Repair Agent)
+
+`apex_host/planning/repair.py` implements `RepairEngine`:
+
+- Called by `repair_agent` when a task fails with `script_error` or
+  `fixable` outcome and `repair_count < config.max_repair_attempts`.
+- Returns `None` immediately when `config.dry_run=True` (the default) — no
+  repair in dry-run mode; the failure was synthetic.
+- Returns `None` when `ModelRouter.planner_llm()` returns `None`
+  (`FakeModelRouter` path).
+- Builds a focused repair prompt via `_build_repair_messages()` — a separate
+  prompt from the main planner prompt, describing only the failure context.
+- Validates the LLM output through the same `Validator` used by
+  `PlanningEngine` (same safety gate: destructive tools blocked, shell
+  metacharacters blocked).
+- On success: executes the repaired task via `run_command()`, parses +
+  writes through `MemoryAPI`, appends a repair `Episode` with
+  `agent=f"apex.{phase}.repair"`.
+- `fundamental` outcomes are never repaired — `route_after_write` routes
+  directly to `reflect_or_continue`.
+
+**Graph topology after Phase 5:**
+```
+agent → parse_observation → write_memory
+      → route_after_write → repair_agent (script_error/fixable, budget OK)
+                          → reflect_or_continue (fundamental, or budget exhausted)
+repair_agent → reflect_or_continue
+```
+
+`config.max_repair_attempts` defaults to 1.  `repair_count` is reset to 0
+by `reflect_or_continue` at the end of every turn.
+
+### 16.4 Planner Decision Logging
+
+Every planner invocation produces a `PlanDecision` record stored in
+`ApexGraphState.planner_decisions` (append-only, `operator.add` reducer).
+
+`PlanDecision` fields: `planner_model` ("llm" | "deterministic"),
+`confidence`, `selected_task_count`, `rejected_task_count`,
+`reasoning_summary`, `fallback_used`, `timestamp`, `phase`.
+
+**How it flows:**
+
+1. `PlanningEngine.plan()` records the decision via `_record_llm()` or
+   `_record_fallback()` at every exit point.
+2. Each planner wrapper (`ReconPlanner`, etc.) exposes `last_decision:
+   PlanDecision | None` which reads from `_engine.last_decision` when an
+   engine is configured, or from a locally-set `_last_decision` in the
+   deterministic path.
+3. `_run_tasks()` / `execute_agent` in `graph.py` reads `planner.last_decision`
+   after `plan()` returns and includes it in `planner_decisions: [decision.to_dict()]`.
+4. `RunReport.planner_decisions` and `to_json_dict()` export the full list.
+5. `format_text()` prints a condensed summary (total / LLM-backed /
+   deterministic counts + last 5 per-turn details).
+
+### 16.5 Concurrent Task Execution
+
+`_run_tasks()` in `graph.py` now runs **all tasks** produced by a planner
+concurrently using `asyncio.gather` with a `Semaphore` cap of
+`min(config.max_concurrency, len(tasks))`.
+
+All tool results are stored in `state["tool_results"]: list[dict]`.
+`parse_observation` and `write_memory` iterate over `tool_results` (or fall
+back to `[last_tool_result]` for backward compatibility).  One Episode is
+created per tool result.
+
+`execute_agent` (credential phase) always runs one task (CredentialPlanner
+emits exactly one task per turn per §12.12 safety invariants).
+
+### 16.6 Reflector Integration
+
+`ApexRuntime.run()` now triggers one `ReflectorWorker.run_once()` pass
+after the engagement graph completes.  This promotes staged knowledge/skill
+entries above the quality gate, applies confidence decay to unused skills,
+and quarantines skills whose win-rate fell below `config.winrate_floor`.
+
+The Reflector is the **only** component allowed to promote proposals
+(CLAUDE.md §13.10).  The `run_once()` call in `ApexRuntime.run()` is
+wrapped in a `try/except` so a Reflector failure does not crash the
+engagement — it is logged as a warning and the final state is returned
+regardless.
+
+### 16.7 New State Fields
+
+| Field | Type | Reducer | Purpose |
+|---|---|---|---|
+| `planner_decisions` | `list[dict]` | `operator.add` | Audit log, one dict per planner call |
+| `tool_results` | `list[dict] \| None` | overwrite | All tool results from current turn |
+| `repair_count` | `int` | overwrite | Repairs consumed this turn; reset to 0 by reflect_or_continue |
+
+### 16.8 New Config Fields
+
+| Field | Default | Purpose |
+|---|---|---|
+| `max_repair_attempts` | `1` | Max repair calls per turn; 0 disables repair |
+
+### 16.9 Authorization requirement (inherited from §12.3)
+
+All real-execution runs (`--no-dry-run`) **must** target authorized lab
+machines.  `RepairEngine` and concurrent task execution are both no-ops in
+dry-run mode.  The safety invariants from §11.2 and §12.3 apply to all new
+components without exception.
+
+---
+
+## 17. LLM Runtime Wiring
+
+This section documents the LLM wiring layer added in Phase 6.  It connects
+the existing `OpenAIModelRouter` and `PlanningEngine` to the actual CLI and
+runtime so operators can enable LLM planning with a single flag.
+
+### 17.1 Design invariants (additive to §1 and §16)
+
+1. **Default is always deterministic.**  `ApexConfig.use_llm` defaults to
+   `False`.  Without `--use-llm`, `FakeModelRouter` is used and no API calls
+   are made — no key, no network, no cost.
+
+2. **Router construction is owned by `ApexRuntime.run()`.**  No planner,
+   executor, parser, graph node, or test helper constructs a `ModelRouter`
+   directly.  The single construction point is `runtime.py`, so swapping
+   the provider is always a one-file change.
+
+3. **LLM objects are never stored in `ApexGraphState`.**  The router is a
+   local variable in `run()`; it is closed over by `build_apex_graph()` and
+   never serialised into state (memfabric Invariant 1, CLAUDE.md §16.3).
+
+4. **`use_llm=True` + `llm_provider="fake"` still uses `FakeModelRouter`.**
+   Setting `llm_provider="fake"` (the default) is a safety backstop —
+   even if `--use-llm` is mistakenly passed without an explicit provider,
+   no real API calls occur.
+
+5. **`llm_base_url` takes precedence over `OPENAI_BASE_URL` env var.**
+   Operators supplying `--llm-base-url` get consistent routing regardless
+   of what `OPENAI_BASE_URL` is set to in the environment.
+
+### 17.2 New `ApexConfig` fields
+
+| Field | Type | Default | Purpose |
+|---|---|---|---|
+| `use_llm` | `bool` | `False` | Enable real LLM via `OpenAIModelRouter` |
+| `llm_provider` | `str` | `"fake"` | Provider ID; `"fake"` → `FakeModelRouter`, `"openai"` → `OpenAIModelRouter` |
+| `llm_base_url` | `str \| None` | `None` | Overrides `OPENAI_BASE_URL` env var (e.g. `https://openrouter.ai/api/v1`) |
+| `planner_model` | `str` | `"openai/gpt-5.5"` | Updated from `gpt-4o-mini` |
+| `executor_model` | `str` | `"openai/gpt-5.5"` | Updated from `gpt-4o-mini` |
+| `parser_model` | `str` | `"openai/gpt-5.5"` | Updated from `gpt-4o-mini` |
+
+### 17.3 New CLI flags (both `main.py` and `run_htb_local.py`)
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--use-llm` | `False` | Enable LLM planning |
+| `--llm-provider PROVIDER` | `"openai"` | Provider for real LLM (only "openai" is supported today) |
+| `--llm-model MODEL` | `None` | Sets `planner_model`, `executor_model`, `parser_model` simultaneously |
+| `--llm-base-url URL` | `None` | Override API base URL (e.g. OpenRouter) |
+
+### 17.4 Runtime routing logic (`apex_host/runtime.py`)
+
+```python
+if config.use_llm and config.llm_provider != "fake":
+    model_router = OpenAIModelRouter(config)   # reads OPENAI_API_KEY from env
+else:
+    model_router = FakeModelRouter()           # safe default: no API calls
+
+graph = build_apex_graph(api, registry, config, model_router=model_router)
+```
+
+`OpenAIModelRouter` reads `config.llm_base_url` first, then falls back to
+`os.environ.get("OPENAI_BASE_URL")`.  API keys are never stored in config —
+they are read from `OPENAI_API_KEY` at the moment `_build()` is called.
+
+### 17.5 Exact CLI command for OpenRouter
+
+```bash
+export OPENAI_API_KEY=sk-or-...   # OpenRouter API key
+
+python -m apex_host.eval.run_htb_local \
+  --target <HTB_TARGET_IP> \
+  --payload-repo ./payloads \
+  --dry-run \
+  --use-llm \
+  --llm-provider openai \
+  --llm-model openai/gpt-5.5 \
+  --llm-base-url https://openrouter.ai/api/v1
+```
+
+Add `--no-dry-run` only for authorized HTB VPN targets.
+
+### 17.6 Tests (`tests/apex_host/test_llm_wiring.py`)
+
+37 tests covering:
+- `ApexConfig` new fields have correct defaults
+- Model names updated to `"openai/gpt-5.5"`
+- `FakeModelRouter` returns `None` for all roles
+- `OpenAIModelRouter._base_url` prefers `config.llm_base_url` over env var
+- `main.py` and `run_htb_local.py` parse all four new flags correctly
+- `--llm-model` sets planner/executor/parser models simultaneously
+- `ApexRuntime.run()` uses `FakeModelRouter` when `use_llm=False`
+- `ApexRuntime.run()` constructs `OpenAIModelRouter` when `use_llm=True` and `llm_provider != "fake"`
+- `llm_provider="fake"` keeps `FakeModelRouter` even with `use_llm=True`
+- `PlanningEngine` falls back to deterministic when LLM returns invalid output
+- Dry-run engagement completes with `FakeModelRouter` (baseline)
+
+### 17.7 Extension rules for Claude Code
+
+- **Adding a new provider**: add a new `*ModelRouter` class in `router.py`,
+  add its provider string to the `if/elif` chain in `ApexRuntime.run()`,
+  and add a `--llm-provider` option to the CLI help text.
+- **Changing the default model**: update `planner_model`, `executor_model`,
+  and `parser_model` in `ApexConfig` — never hardcode a model name outside
+  that class.
+- **Tests**: any new routing behavior needs tests in
+  `tests/apex_host/test_llm_wiring.py`.  Never construct `OpenAIModelRouter`
+  in a test without patching it — use `FakeModelRouter` or a `_StubRouter`
+  to avoid API key requirements.

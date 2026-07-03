@@ -397,6 +397,268 @@ class TestStagingIsolation:
 
 
 # ---------------------------------------------------------------------------
+# Tier metadata preservation — logical tier correctness
+# These tests verify that the tier distinction is implemented through metadata
+# in the shared BM25 index, not through separate physical stores.
+# ---------------------------------------------------------------------------
+
+class TestTierMetadataPreservation:
+    """Entries from each tier must carry the correct 'tier' value in BM25 metadata.
+
+    semantic and procedural are LOGICAL tiers: they share the same BM25/vector
+    indexes as working and episodic, distinguished only by the 'tier' field in
+    each index entry's metadata dict.  These tests assert that this metadata
+    contract is upheld after each write path.
+    """
+
+    async def test_promoted_knowledge_has_semantic_tier_in_index(self) -> None:
+        api = make_api()
+        entry = KnowledgeEntry(
+            text="reusable protocol knowledge entry",
+            source="test",
+            confidence=0.9,
+        )
+        await api.propose_knowledge(entry)
+        await api.promote_knowledge(entry.id)
+
+        results = await api._lexical.search("reusable protocol knowledge", k=5)
+        tier_by_id = {r[0]: r[2].get("tier") for r in results}
+        assert tier_by_id.get(entry.id) == Tier.semantic.value, (
+            "promoted KnowledgeEntry must carry tier=semantic in the shared BM25 index"
+        )
+
+    async def test_promoted_skill_has_procedural_tier_in_index(self) -> None:
+        api = make_api()
+        skill = Skill(
+            name="probe_skill",
+            description="generic scan probe procedure template",
+            template={},
+            preconditions={},
+            source_episodes=[],
+            confidence=0.8,
+            evidence_count=2,
+        )
+        await api.propose_skill(skill)
+        await api.promote_skill(skill.id)
+
+        results = await api._lexical.search("generic scan probe procedure", k=5)
+        tier_by_id = {r[0]: r[2].get("tier") for r in results}
+        assert tier_by_id.get(skill.id) == Tier.procedural.value, (
+            "promoted Skill must carry tier=procedural in the shared BM25 index"
+        )
+
+    async def test_upserted_node_has_working_tier_in_index(self) -> None:
+        api = make_api()
+        n = make_node("n-tier-wk", type="host", ip="10.0.0.1")
+        await api.upsert_node(n)
+
+        results = await api._lexical.search("node type=host ip", k=5)
+        tier_by_id = {r[0]: r[2].get("tier") for r in results}
+        assert tier_by_id.get("n-tier-wk") == Tier.working.value, (
+            "upserted Node must carry tier=working in the shared BM25 index"
+        )
+
+    async def test_appended_episode_has_episodic_tier_in_index(self) -> None:
+        api = make_api()
+        ep = Episode(
+            agent="test-agent",
+            action="login_probe_action",
+            outcome=Outcome.success,
+            data={},
+        )
+        eid = await api.append_episode(ep)
+
+        results = await api._lexical.search("login probe action", k=5)
+        tier_by_id = {r[0]: r[2].get("tier") for r in results}
+        assert tier_by_id.get(eid) == Tier.episodic.value, (
+            "appended Episode must carry tier=episodic in the shared BM25 index"
+        )
+
+    async def test_semantic_and_working_share_same_index_instance(self) -> None:
+        """Assert the logical tier model: both semantic and working entries exist
+        in the same BM25 index — the index is a shared backend, not tier-scoped."""
+        api = make_api()
+        # Add working-tier node
+        n = make_node("n-shared", type="host", label="shared-index-test")
+        await api.upsert_node(n)
+        # Add semantic-tier entry
+        entry = KnowledgeEntry(
+            text="shared index semantic knowledge label",
+            source="test",
+            confidence=0.9,
+        )
+        await api.propose_knowledge(entry)
+        await api.promote_knowledge(entry.id)
+
+        # Both appear in the same BM25 index; each has its own tier tag
+        wk_results = await api._lexical.search("node type=host label", k=10)
+        sem_results = await api._lexical.search("shared index semantic knowledge", k=10)
+        wk_ids = {r[0] for r in wk_results}
+        sem_ids = {r[0] for r in sem_results}
+        assert "n-shared" in wk_ids
+        assert entry.id in sem_ids
+
+
+# ---------------------------------------------------------------------------
+# Tier filtering via query() — metadata-based logical boundary
+# These tests wire a real HybridRetriever to verify that MemoryAPI.query()
+# with a restricted tiers= set correctly excludes entries from other tiers.
+# ---------------------------------------------------------------------------
+
+def make_api_with_retriever() -> MemoryAPI:
+    """Return a fully-wired MemoryAPI with a real HybridRetriever for query() tests."""
+    from memfabric.retrieval.engine import HybridRetriever
+    from memfabric.retrieval.protocols import PassthroughReranker, StubEmbedder, TextGraphMatcher
+
+    cfg = Config()
+    graph = NetworkXGraphStore()
+    episodic = JSONLEpisodicStore(path=None)
+    lexical = BM25LexicalIndex()
+    vector = FaissVectorIndex(dim=cfg.vector_dim)
+    kv = InMemoryKVStore()
+
+    api = MemoryAPI(
+        graph=graph, episodic=episodic, lexical=lexical,
+        vector=vector, kv=kv, config=cfg,
+    )
+    retriever = HybridRetriever(
+        lexical=lexical, vector=vector,
+        embedder=StubEmbedder(), reranker=PassthroughReranker(),
+        graph=graph, graph_matcher=TextGraphMatcher(),
+        kv=kv, config=cfg,
+    )
+    api.set_retriever(retriever)
+    return api
+
+
+class TestTierFilteringViaQuery:
+    """query(tiers=[...]) must exclude entries from tiers not in the requested set.
+
+    This works via metadata post-filtering inside HybridRetriever, not physical
+    store separation.  These tests confirm the logical boundary holds end-to-end.
+    """
+
+    async def test_semantic_only_query_excludes_working_entries(self) -> None:
+        api = make_api_with_retriever()
+        # Write a working-tier node
+        n = make_node("wk-excl", type="host", description="exclusion test host node")
+        await api.upsert_node(n)
+        # Write and promote a semantic-tier entry
+        entry = KnowledgeEntry(
+            text="exclusion test semantic knowledge entry",
+            source="test",
+            confidence=0.9,
+        )
+        await api.propose_knowledge(entry)
+        await api.promote_knowledge(entry.id)
+
+        bundle = await api.query(
+            text="exclusion test semantic knowledge host",
+            tiers=[Tier.semantic],
+        )
+        ids = {e.id for e in bundle.entries}
+        assert entry.id in ids, "promoted knowledge must appear in semantic-only query"
+        assert "wk-excl" not in ids, "working-tier node must be excluded from semantic-only query"
+
+    async def test_working_only_query_excludes_promoted_knowledge(self) -> None:
+        api = make_api_with_retriever()
+        n = make_node("wk-only", type="host", description="working only filter host")
+        await api.upsert_node(n)
+        entry = KnowledgeEntry(
+            text="working only filter promoted semantic entry",
+            source="test",
+            confidence=0.9,
+        )
+        await api.propose_knowledge(entry)
+        await api.promote_knowledge(entry.id)
+
+        bundle = await api.query(
+            text="working only filter host semantic",
+            tiers=[Tier.working],
+        )
+        ids = {e.id for e in bundle.entries}
+        assert "wk-only" in ids, "working node must appear in working-only query"
+        assert entry.id not in ids, "promoted knowledge must be excluded from working-only query"
+
+    async def test_procedural_only_query_excludes_semantic_entries(self) -> None:
+        api = make_api_with_retriever()
+        # Write and promote a semantic entry
+        ke = KnowledgeEntry(
+            text="procedural exclusion semantic knowledge item",
+            source="test",
+            confidence=0.9,
+        )
+        await api.propose_knowledge(ke)
+        await api.promote_knowledge(ke.id)
+        # Write and promote a procedural skill
+        skill = Skill(
+            name="filter_skill",
+            description="procedural exclusion filter skill template",
+            template={},
+            preconditions={},
+            source_episodes=[],
+            confidence=0.8,
+            evidence_count=2,
+        )
+        await api.propose_skill(skill)
+        await api.promote_skill(skill.id)
+
+        bundle = await api.query(
+            text="procedural exclusion filter skill template",
+            tiers=[Tier.procedural],
+        )
+        ids = {e.id for e in bundle.entries}
+        assert skill.id in ids, "promoted skill must appear in procedural-only query"
+        assert ke.id not in ids, "semantic entry must be excluded from procedural-only query"
+
+    async def test_all_tiers_query_sees_working_and_semantic(self) -> None:
+        api = make_api_with_retriever()
+        n = make_node("wk-all", type="host", description="all tiers host node")
+        await api.upsert_node(n)
+        entry = KnowledgeEntry(
+            text="all tiers semantic knowledge entry unique",
+            source="test",
+            confidence=0.9,
+        )
+        await api.propose_knowledge(entry)
+        await api.promote_knowledge(entry.id)
+
+        bundle = await api.query(
+            text="all tiers host semantic knowledge",
+            tiers=list(ALL_TIERS),
+        )
+        tiers_seen = {e.tier for e in bundle.entries}
+        assert Tier.working.value in tiers_seen, "working tier must appear in all-tiers query"
+        assert Tier.semantic.value in tiers_seen, "semantic tier must appear in all-tiers query"
+
+    async def test_query_tiers_queried_field_reflects_requested_tiers(self) -> None:
+        api = make_api_with_retriever()
+        bundle = await api.query(
+            text="any query text",
+            tiers=[Tier.semantic, Tier.procedural],
+        )
+        assert set(bundle.tiers_queried) == {Tier.semantic.value, Tier.procedural.value}
+
+    async def test_tier_metadata_preserved_in_scored_entry(self) -> None:
+        """ScoredEntry.tier must reflect the index metadata tier, not a default."""
+        api = make_api_with_retriever()
+        entry = KnowledgeEntry(
+            text="tier metadata scored entry test fact",
+            source="test",
+            confidence=0.9,
+        )
+        await api.propose_knowledge(entry)
+        await api.promote_knowledge(entry.id)
+
+        bundle = await api.query(text="tier metadata scored entry fact", tiers=list(ALL_TIERS))
+        matched = [e for e in bundle.entries if e.id == entry.id]
+        assert matched, "promoted entry must appear in query results"
+        assert matched[0].tier == Tier.semantic.value, (
+            "ScoredEntry.tier must be 'semantic' for a promoted KnowledgeEntry"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Open-task view (derived, not stored)
 # ---------------------------------------------------------------------------
 
@@ -481,7 +743,13 @@ class TestUpsertEdge:
         assert result is not None
         assert result.type == "owns"
 
-    async def test_older_edge_write_does_not_win(self) -> None:
+    async def test_second_edge_write_wins_regardless_of_timestamp(self) -> None:
+        """Under logical-version LWW, call order is the primary ordering key.
+
+        The second upsert_edge call wins even when its edge carries an earlier
+        wall-clock timestamp than the first.  This is the clock-skew invariant:
+        callers cannot manipulate outcome by back-dating their edge.last_seen.
+        """
         import time
 
         api = make_api()
@@ -489,18 +757,21 @@ class TestUpsertEdge:
         await api.upsert_node(make_node("b"))
 
         edge_id = new_id()
-        t_new = now()
+        t_old = now()
         time.sleep(0.01)
-
-        # Write newer edge first
         t_newer = now()
-        e_new = Edge(edge_id, "a", "b", "v1", {}, 0.9, "s", t_newer, t_newer)
-        await api.upsert_edge(e_new)
 
-        # Try to overwrite with older timestamp
-        e_old = Edge(edge_id, "a", "b", "v2", {}, 0.9, "s", t_new, t_new)
-        await api.upsert_edge(e_old)
+        # First call: edge with a NEWER wall-clock timestamp (write_lv = N)
+        e_first = Edge(edge_id, "a", "b", "v1", {}, 0.9, "s", t_newer, t_newer)
+        await api.upsert_edge(e_first)
+
+        # Second call: edge with an OLDER wall-clock timestamp (write_lv = N+1)
+        # Under logical-version ordering the second call wins despite older timestamp.
+        e_second = Edge(edge_id, "a", "b", "v2", {}, 0.9, "s", t_old, t_old)
+        await api.upsert_edge(e_second)
 
         result = await api._graph.get_edge(edge_id)
         assert result is not None
-        assert result.type == "v1"   # newer write preserved
+        assert result.type == "v2", (
+            "second write must win (higher logical_version) even with older wall-clock timestamp"
+        )

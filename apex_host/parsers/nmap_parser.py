@@ -16,6 +16,11 @@ _PORT_RE = re.compile(
     r"^(?P<port>\d+)/(?P<proto>tcp|udp)\s+(?P<state>\S+)\s+(?P<service>\S+)(?:\s+(?P<version>.*))?$"
 )
 
+# States that indicate the port is reachable — create EKG nodes for these only.
+# "open|filtered" is a valid nmap state for UDP services or when packet-filter
+# ambiguity exists; we include it so UDP recon is not silently dropped.
+_OPEN_STATES: frozenset[str] = frozenset({"open", "open|filtered"})
+
 
 def _extract_tech(version_str: str) -> tuple[str, str] | None:
     """Return (display_name, version_string) from an nmap version field, or None.
@@ -80,7 +85,18 @@ class NmapParser:
             proto = pm.group("proto")
             state = pm.group("state")
             service = pm.group("service")
-            version = (pm.group("version") or "").strip()
+            # raw_version: the full nmap version banner as-is (may be empty)
+            raw_version = (pm.group("version") or "").strip()
+
+            # Only create EKG nodes for ports that are reachable.
+            # Closed/filtered ports carry no actionable service info.
+            if state not in _OPEN_STATES:
+                continue
+
+            # Extract product/short-version from the raw banner for the tech node
+            # and for the service node's version field.
+            tech = _extract_tech(raw_version)
+            short_version = tech[1] if tech else ""
 
             service_id = f"service:{host_addr}:{port}/{proto}"
             nodes.append(
@@ -92,7 +108,11 @@ class NmapParser:
                         "proto": proto,
                         "state": state,
                         "service": service,
-                        "version": version,
+                        "target": host_addr,
+                        # raw_version: full nmap version banner (may include OS/extra info)
+                        "raw_version": raw_version,
+                        # version: short product-version string extracted from banner
+                        "version": short_version,
                     },
                     confidence=0.85,
                     source=source,
@@ -115,7 +135,6 @@ class NmapParser:
             )
 
             # Tech node: only when version banner is non-empty and parseable
-            tech = _extract_tech(version)
             if tech:
                 tech_name, tech_ver = tech
                 tid = _tech_id(host_addr, tech_name)

@@ -18,10 +18,35 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 class Tier(str, Enum):
-    working = "working"       # EKG graph (nodes + edges)
-    episodic = "episodic"     # append-only episode log
-    semantic = "semantic"     # promoted knowledge entries
-    procedural = "procedural" # promoted skills
+    """Logical retrieval tier.
+
+    **Physical reality:** `working` and `episodic` each have a dedicated physical
+    store (``GraphStore`` and ``EpisodicStore``).  ``semantic`` and ``procedural``
+    do NOT — they are **metadata-distinguished entries in the shared BM25 and
+    vector indexes**.  After Reflector promotion, a ``KnowledgeEntry`` or ``Skill``
+    is indexed into the same ``LexicalIndex``/``VectorIndex`` that serves working
+    and episodic entries, but with a different ``"tier"`` value in the metadata
+    dict.  Retrieval tier filtering (the ``tiers`` parameter on
+    ``MemoryAPI.query()``) works by post-filtering on that metadata field — not by
+    routing to a separate physical store.
+
+    Physical backend separation per tier is possible by injecting different
+    ``LexicalIndex`` / ``VectorIndex`` implementations through the Protocol seams
+    in ``stores/protocols.py``.  It is **not the default** and the substrate does
+    not require it.
+
+    Summary:
+      working:    dedicated GraphStore + shared LexicalIndex (``tier=working``)
+      episodic:   dedicated EpisodicStore + shared LexicalIndex (``tier=episodic``)
+      semantic:   logical tier only — shared LexicalIndex/VectorIndex (``tier=semantic``)
+      procedural: logical tier only — shared LexicalIndex/VectorIndex (``tier=procedural``)
+      staged:     debug view of un-promoted proposals; never indexed in live stores
+    """
+
+    working = "working"
+    episodic = "episodic"
+    semantic = "semantic"     # logical tier: promoted KnowledgeEntry objects
+    procedural = "procedural" # logical tier: promoted Skill objects
     staged = "staged"         # debug: view un-promoted proposals
 
 
@@ -167,17 +192,56 @@ class EvidenceBundle:
 # Conflict record
 # ---------------------------------------------------------------------------
 
+class ConflictStatus(str, Enum):
+    """Lifecycle status of a Conflict record.
+
+    Statuses:
+      open        — created, awaiting resolution; **blocks dependents**.
+      resolved    — winner chosen by policy or orchestrator; dependents may proceed.
+      superseded  — a later write on the same field made this conflict moot
+                    (e.g. both claimants were overwritten by a third authoritative
+                    source); kept for audit but does not block.
+      quarantined — the contested field has been quarantined by the Reflector
+                    because neither claim could be validated; dependents must treat
+                    the field as absent.
+    """
+    open = "open"
+    resolved = "resolved"
+    superseded = "superseded"
+    quarantined = "quarantined"
+
+
 @dataclass(slots=True)
 class Conflict:
-    """Records a contradiction between two high-confidence field writes."""
+    """Records a contradiction between two high-confidence field writes.
+
+    Lifecycle (see ``ConflictStatus``):
+    - All conflicts start as ``open`` and block any component that depends on
+      the contested field.
+    - ``resolved`` after the default policy (or an explicit orchestrator call)
+      picks a winner; ``winning_value`` is set.
+    - ``superseded`` when a later high-confidence write makes both claims moot.
+    - ``quarantined`` when the Reflector marks the field as untrusted.
+
+    Provenance: ``history`` is an append-only list of audit entries so every
+    status transition can be traced.  ``claim_a`` and ``claim_b`` are never
+    mutated; they record the exact state of the two competing provenance dicts
+    at the moment the conflict was detected.
+    """
     id: str
     node_id: str
     field_name: str
-    claim_a: dict[str, Any]   # {value, confidence, source, timestamp}
+    claim_a: dict[str, Any]   # {value, confidence, source, timestamp, logical_version}
     claim_b: dict[str, Any]
-    timestamp: str
-    resolved: bool = False
+    timestamp: str            # wall-clock time the conflict was detected
+    # Lifecycle
+    status: ConflictStatus = ConflictStatus.open
+    winning_value: Any = None
     resolution: str | None = None
+    # Audit trail — each entry: {event, timestamp, detail}
+    history: list[dict[str, Any]] = field(default_factory=list)
+    # Legacy compat: True iff status is not open (derived, kept for old callers)
+    resolved: bool = False
 
 
 # ---------------------------------------------------------------------------

@@ -44,6 +44,21 @@ class NetworkXGraphStore:
             logger.debug("put_node id=%s type=%s", node.id, node.type)
             return node.id
 
+    async def delete_node(self, node_id: str) -> None:
+        """Remove a node and its incident edges from the graph (rollback use only)."""
+        async with self._lock:
+            if not self._g.has_node(node_id):
+                return
+            # Remove incident edges from the edges dict before removing the node
+            stale_eids = [
+                eid for eid, e in self._edges.items()
+                if e.from_id == node_id or e.to_id == node_id
+            ]
+            for eid in stale_eids:
+                self._edges.pop(eid, None)
+            self._g.remove_node(node_id)
+            logger.debug("delete_node id=%s", node_id)
+
     async def get_nodes_by_type(self, node_type: str) -> list[Node]:
         async with self._lock:
             return [
@@ -70,6 +85,16 @@ class NetworkXGraphStore:
             self._g.add_edge(edge.from_id, edge.to_id, id=edge.id, data=edge)
             logger.debug("put_edge id=%s type=%s", edge.id, edge.type)
             return edge.id
+
+    async def delete_edge(self, edge_id: str) -> None:
+        """Remove a single edge from the graph (rollback use only)."""
+        async with self._lock:
+            edge = self._edges.pop(edge_id, None)
+            if edge is None:
+                return
+            if self._g.has_edge(edge.from_id, edge.to_id):
+                self._g.remove_edge(edge.from_id, edge.to_id)
+            logger.debug("delete_edge id=%s", edge_id)
 
     async def get_edges_for_node(self, node_id: str) -> list[Edge]:
         async with self._lock:

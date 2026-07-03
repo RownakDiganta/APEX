@@ -74,6 +74,41 @@ class Config:
     )
     """Edge types that close an actionable node."""
 
+    # --- slot extraction patterns ---
+    slot_patterns: list[str] = field(default_factory=list)
+    """Additional regex patterns (as raw strings) used by the Reflector to
+    identify concrete values that should be replaced with slot references when
+    generalising episode chains into Skill templates.
+
+    Default: empty — only UUID v4 strings are slotted by the built-in pattern.
+
+    Host applications supply domain-specific patterns here.  For example,
+    a cybersecurity host would add IPv4 and port patterns::
+
+        Config(slot_patterns=[
+            r"\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}",   # IPv4
+            r"\\d{4,6}",                                       # port/numeric ID
+        ])
+
+    The substrate itself must contain no domain-specific patterns.
+    """
+
+    # --- reflector throttling ---
+    reflector_max_promotions_per_run: int = 100
+    """Maximum combined knowledge+skill promotions per run_once() call.
+
+    Prevents log floods when seeding large corpora (e.g. a payload repo with
+    hundreds of chunks).  Entries not promoted in one run are processed in the
+    next call because they remain staged with ``promoted=False``.
+    """
+
+    reflector_log_every_n: int = 25
+    """Emit a per-item DEBUG log every N promotions during a run_once() pass.
+
+    Individual promotion logs are always at DEBUG; only the end-of-pass
+    summary (promoted=N skipped=M remaining=K) is at INFO.
+    """
+
     # --- vector index ---
     vector_dim: int = 384
     """Embedding dimensionality for the dense vector index."""

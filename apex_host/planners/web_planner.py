@@ -1,8 +1,13 @@
 # web_planner.py
-# Deterministic web-phase planner that emits safe, bounded curl probes and optional wordlist-based discovery.
-"""Deterministic web-phase planner.
+# Deterministic web-phase planner with an optional PlanningEngine LLM seam.
+"""Deterministic web-phase planner with optional LLM backend.
 
-Implements memfabric.coordination.protocols.Planner.
+``_WebDeterministic`` contains the original rule-based logic — safe, bounded
+curl probes with optional wordlist-based discovery.
+
+``WebPlanner`` is the public thin wrapper: when a ``model_router`` is
+provided it constructs a ``PlanningEngine`` and routes through it; otherwise
+it delegates directly to ``_WebDeterministic``.
 
 Probing strategy (in emission order — graph.py executes the first task per
 web_agent turn):
@@ -38,11 +43,19 @@ Safety rules
 """
 from __future__ import annotations
 
-from memfabric.ids import new_id
+from typing import TYPE_CHECKING
+
+from memfabric.ids import new_id, now
 from memfabric.types import AbandonSignal, EvidenceBundle, Goal, SubgraphView, TaskSpec
 
 from apex_host.planners.capabilities import capabilities_from_subgraph
+from apex_host.planning.models import PlanDecision
 from apex_host.tools.registry import ToolRegistry
+from apex_host.types import ApexPhase
+
+if TYPE_CHECKING:
+    from apex_host.llm.router import ModelRouter
+    from apex_host.planning.engine import PlanningEngine
 
 
 def _base_url(target: str) -> str:
@@ -59,7 +72,9 @@ def _url_from_cap(target: str, port: str) -> str:
     return f"{scheme}://{target}{suffix}"
 
 
-class WebPlanner:
+class _WebDeterministic:
+    """Pure rule-based web planner — the fallback for PlanningEngine."""
+
     def __init__(
         self,
         target: str,
@@ -182,3 +197,63 @@ class WebPlanner:
                 )
             )
         return tasks
+
+
+class WebPlanner:
+    """Thin wrapper: routes through PlanningEngine when model_router is provided,
+    falls back to _WebDeterministic otherwise."""
+
+    def __init__(
+        self,
+        target: str,
+        registry: ToolRegistry,
+        *,
+        web_wordlist_path: str | None = None,
+        max_web_paths: int = 50,
+        model_router: "ModelRouter | None" = None,
+        allowed_tools: list[str] | None = None,
+        confidence_threshold: float = 0.4,
+        max_retries: int = 1,
+    ) -> None:
+        self._core = _WebDeterministic(
+            target, registry,
+            web_wordlist_path=web_wordlist_path,
+            max_web_paths=max_web_paths,
+        )
+        self._engine: PlanningEngine | None = None
+        self._last_decision: PlanDecision | None = None
+        if model_router is not None:
+            from apex_host.planning.engine import PlanningEngine as _PE
+            tools = allowed_tools if allowed_tools is not None else registry.available()
+            self._engine = _PE(
+                model_router=model_router,
+                fallback_planner=self._core,
+                allowed_tools=tools,
+                target=target,
+                confidence_threshold=confidence_threshold,
+                max_retries=max_retries,
+            )
+
+    @property
+    def last_decision(self) -> PlanDecision | None:
+        """Most recent ``PlanDecision`` from the last ``plan()`` call."""
+        if self._engine is not None:
+            return self._engine.last_decision
+        return self._last_decision
+
+    async def plan(
+        self, goal: Goal, subgraph: SubgraphView, evidence: EvidenceBundle
+    ) -> list[TaskSpec] | AbandonSignal:
+        if self._engine is not None:
+            return await self._engine.plan(goal, ApexPhase.web, subgraph, evidence)
+        self._last_decision = PlanDecision(
+            planner_model="deterministic",
+            confidence=1.0,
+            selected_task_count=0,
+            rejected_task_count=0,
+            reasoning_summary="deterministic",
+            fallback_used=True,
+            timestamp=now(),
+            phase=ApexPhase.web.value,
+        )
+        return await self._core.plan(goal, subgraph, evidence)

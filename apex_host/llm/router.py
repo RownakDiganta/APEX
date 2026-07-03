@@ -54,7 +54,8 @@ class OpenAIModelRouter:
 
     def __init__(self, config: "ApexConfig") -> None:
         self._config = config
-        self._base_url = os.environ.get("OPENAI_BASE_URL")
+        # Config-level base URL (from --llm-base-url) takes precedence over env var.
+        self._base_url = getattr(config, "llm_base_url", None) or os.environ.get("OPENAI_BASE_URL")
         self._api_key = os.environ.get("OPENAI_API_KEY")
 
     def _build(self, model: str) -> object:

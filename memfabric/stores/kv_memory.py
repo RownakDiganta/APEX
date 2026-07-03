@@ -38,3 +38,9 @@ class InMemoryKVStore:
     async def delete(self, key: str) -> None:
         async with self._lock:
             self._data.pop(key, None)
+
+    async def delete_prefix(self, prefix: str) -> None:
+        async with self._lock:
+            to_remove = [k for k in self._data if k.startswith(prefix)]
+            for k in to_remove:
+                del self._data[k]

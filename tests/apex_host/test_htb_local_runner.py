@@ -337,6 +337,7 @@ class TestGraphCredentialRouting:
             "current_task": None,
             "evidence_summary": "",
             "findings": [],
+            "error_episodes": [],
             "last_tool_result": None,
             "last_error": None,
             "completed": False,
@@ -363,7 +364,7 @@ class TestGraphCredentialRouting:
 # ---------------------------------------------------------------------------
 
 class TestFormatReport:
-    def _make_state(self, *, findings: list[dict] | None = None) -> ApexGraphState:
+    def _make_state(self, *, findings: list[dict] | None = None) -> ApexGraphState:  # type: ignore[override]
         return {
             "run_id": "r1",
             "target": _TARGET,
@@ -372,6 +373,7 @@ class TestFormatReport:
             "current_task": None,
             "evidence_summary": "",
             "findings": findings or [],
+            "error_episodes": [],
             "last_tool_result": None,
             "last_error": None,
             "completed": True,

@@ -24,8 +24,11 @@ from memfabric.stores.kv_memory import InMemoryKVStore
 from memfabric.stores.lexical_bm25 import BM25LexicalIndex
 from memfabric.stores.vector_faiss import FaissVectorIndex
 
+from memfabric.reflector.worker import ReflectorWorker
+
 from apex_host.config import ApexConfig
 from apex_host.graph import build_apex_graph
+from apex_host.llm.router import FakeModelRouter, ModelRouter, OpenAIModelRouter
 from apex_host.graph_state import ApexGraphState
 from apex_host.knowledge.cve_patterns import default_identifier_patterns
 from apex_host.knowledge.seed_loader import seed_payload_repo
@@ -49,8 +52,28 @@ class ApexRuntime:
         return await seed_payload_repo(self.config.payload_repo_path, self.api, self.memfabric_config)
 
     async def run(self) -> ApexGraphState:
-        """Run the APEX engagement graph to completion and return final state."""
-        graph = build_apex_graph(self.api, self.registry, self.config)
+        """Run the APEX engagement graph to completion and return final state.
+
+        After the graph completes, one pass of the ``ReflectorWorker`` is
+        triggered so that successful episode chains are generalised into
+        staged skills and below-threshold skills decay or are quarantined.
+        The Reflector runs asynchronously within this coroutine (not in the
+        hot path) — it is the only component allowed to promote proposals
+        (memfabric Invariant 4, CLAUDE.md §13.10).
+        """
+        model_router: ModelRouter
+        if self.config.use_llm and self.config.llm_provider != "fake":
+            model_router = OpenAIModelRouter(self.config)
+            logger.info(
+                "LLM planning enabled: provider=%s model=%s base_url=%s",
+                self.config.llm_provider,
+                self.config.planner_model,
+                self.config.llm_base_url or "(env OPENAI_BASE_URL)",
+            )
+        else:
+            model_router = FakeModelRouter()
+
+        graph = build_apex_graph(self.api, self.registry, self.config, model_router=model_router)
         run_id = new_id()
         initial: ApexGraphState = {
             "run_id": run_id,
@@ -60,16 +83,31 @@ class ApexRuntime:
             "current_task": None,
             "evidence_summary": "",
             "findings": [],
+            "error_episodes": [],
             "last_tool_result": None,
             "last_error": None,
             "completed": False,
             "turn_count": 0,
+            "planner_decisions": [],
+            "tool_results": None,
+            "repair_count": 0,
         }
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": run_id},
             "recursion_limit": max(50, self.config.max_turns * 10),
         }
         final_state: ApexGraphState = await graph.ainvoke(initial, config=invoke_config)
+
+        # Post-engagement Reflector pass — generalise success chains into
+        # staged skills, promote entries above the quality gate, apply decay
+        # and quarantine to stale/losing skills.
+        try:
+            reflector = ReflectorWorker(self.api, self.memfabric_config)
+            await reflector.run_once()
+            logger.info("reflector.run_once() completed after engagement")
+        except Exception as exc:
+            logger.warning("reflector.run_once() failed (non-fatal): %s", exc)
+
         return final_state
 
 

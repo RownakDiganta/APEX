@@ -1,13 +1,20 @@
 # recon_planner.py
-# Deterministic two-phase recon planner: nmap enumeration when no services are known, nc banner probes when services are already in the EKG.
-"""Deterministic recon-phase planner.
+# Deterministic two-phase recon planner with an optional PlanningEngine LLM seam.
+"""Deterministic recon-phase planner with optional LLM backend.
 
-Implements memfabric.coordination.protocols.Planner.  Two-phase logic
-driven entirely by the SubgraphView passed in — no direct MemoryAPI
-calls, consistent with the blackboard model (Invariant 7):
+``_ReconDeterministic`` contains the original rule-based logic — two phases
+driven entirely by the SubgraphView passed in, no direct MemoryAPI calls
+(blackboard model, Invariant 7).
+
+``ReconPlanner`` is the public thin wrapper: when a ``model_router`` is
+provided it constructs a ``PlanningEngine`` and routes through it; otherwise
+it delegates directly to ``_ReconDeterministic``.  The public ``plan()``
+signature is identical in both cases so ``graph.py`` needs no changes.
+
+Two-phase deterministic logic:
 
 Phase 1 — no service nodes in subgraph:
-    Emit one ``nmap -sV -T4 <target>`` TaskSpec.
+    Emit one ``nmap -sV -T4 -Pn <target>`` TaskSpec.
 
 Phase 2 — service nodes exist:
     Derive capabilities from the subgraph via ``capabilities_from_subgraph``
@@ -20,7 +27,9 @@ All emitted args are **complete** (target already included), so
 """
 from __future__ import annotations
 
-from memfabric.ids import new_id
+from typing import TYPE_CHECKING
+
+from memfabric.ids import new_id, now
 from memfabric.types import (
     AbandonSignal,
     EvidenceBundle,
@@ -30,7 +39,13 @@ from memfabric.types import (
 )
 
 from apex_host.planners.capabilities import capabilities_from_subgraph
+from apex_host.planning.models import PlanDecision
 from apex_host.tools.registry import ToolRegistry
+from apex_host.types import ApexPhase
+
+if TYPE_CHECKING:
+    from apex_host.llm.router import ModelRouter
+    from apex_host.planning.engine import PlanningEngine
 
 # Capability names that a raw nc banner probe is safe and informative for.
 # All service-classification knowledge lives in capabilities.py; this set
@@ -44,7 +59,9 @@ _BANNER_PROBE_CAPABILITIES: frozenset[str] = frozenset({
 _MAX_BANNER_TASKS: int = 3
 
 
-class ReconPlanner:
+class _ReconDeterministic:
+    """Pure rule-based recon planner — the fallback for PlanningEngine."""
+
     def __init__(self, target: str, registry: ToolRegistry) -> None:
         self._target = target
         self._registry = registry
@@ -74,7 +91,10 @@ class ReconPlanner:
                 executor_domain="recon",
                 params={
                     "tool": "nmap",
-                    "args": ["-sV", "-T4", self._target],
+                    # -Pn skips host-discovery ping — required on HTB networks
+                    # where ICMP is blocked; without it nmap reports "host down"
+                    # and exits with rc=1 even when the target is reachable.
+                    "args": ["-sV", "-T4", "-Pn", self._target],
                     "target": self._target,
                     "parser": "nmap",
                 },
@@ -94,6 +114,14 @@ class ReconPlanner:
         if nc_tool is None:
             return []
 
+        # Loop guard: skip services whose banner has already been captured.
+        # A 'runs' edge from a service node to a tech node signals that
+        # BannerParser (or NmapParser) already produced banner information for
+        # that port — probing it again with nc would be redundant.
+        services_with_tech: set[str] = {
+            e.from_id for e in subgraph.edges if e.type == "runs"
+        }
+
         # Derive probeable services via the capability layer — no scattered
         # service-name or port sets here; that knowledge lives in capabilities.py.
         caps = capabilities_from_subgraph(subgraph)
@@ -106,6 +134,9 @@ class ReconPlanner:
             if len(tasks) >= _MAX_BANNER_TASKS:
                 break
             if not cap.port or cap.port in seen_ports:
+                continue
+            # Skip services that already have tech/banner information.
+            if cap.source_node_id in services_with_tech:
                 continue
             seen_ports.add(cap.port)
             tasks.append(
@@ -126,3 +157,57 @@ class ReconPlanner:
             )
 
         return tasks
+
+
+class ReconPlanner:
+    """Thin wrapper: routes through PlanningEngine when model_router is provided,
+    falls back to _ReconDeterministic otherwise."""
+
+    def __init__(
+        self,
+        target: str,
+        registry: ToolRegistry,
+        *,
+        model_router: "ModelRouter | None" = None,
+        allowed_tools: list[str] | None = None,
+        confidence_threshold: float = 0.4,
+        max_retries: int = 1,
+    ) -> None:
+        self._core = _ReconDeterministic(target, registry)
+        self._engine: PlanningEngine | None = None
+        self._last_decision: PlanDecision | None = None
+        if model_router is not None:
+            from apex_host.planning.engine import PlanningEngine as _PE
+            tools = allowed_tools if allowed_tools is not None else registry.available()
+            self._engine = _PE(
+                model_router=model_router,
+                fallback_planner=self._core,
+                allowed_tools=tools,
+                target=target,
+                confidence_threshold=confidence_threshold,
+                max_retries=max_retries,
+            )
+
+    @property
+    def last_decision(self) -> PlanDecision | None:
+        """Most recent ``PlanDecision`` from the last ``plan()`` call."""
+        if self._engine is not None:
+            return self._engine.last_decision
+        return self._last_decision
+
+    async def plan(
+        self, goal: Goal, subgraph: SubgraphView, evidence: EvidenceBundle
+    ) -> list[TaskSpec] | AbandonSignal:
+        if self._engine is not None:
+            return await self._engine.plan(goal, ApexPhase.recon, subgraph, evidence)
+        self._last_decision = PlanDecision(
+            planner_model="deterministic",
+            confidence=1.0,
+            selected_task_count=0,
+            rejected_task_count=0,
+            reasoning_summary="deterministic",
+            fallback_used=True,
+            timestamp=now(),
+            phase=ApexPhase.recon.value,
+        )
+        return await self._core.plan(goal, subgraph, evidence)

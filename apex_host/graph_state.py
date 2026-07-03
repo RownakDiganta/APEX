@@ -20,10 +20,31 @@ from typing_extensions import TypedDict
 class ApexGraphState(TypedDict):
     """Checkpoint-serialisable state for one APEX engagement run.
 
-    ``findings`` uses ``operator.add`` so each turn's parse_observation node
-    appends rather than replaces. Every other field is overwritten per turn —
-    this is intentional: context is retrieved and scoped fresh each turn
-    (memfabric Invariant 5), never accumulated.
+    ``findings`` and ``error_episodes`` and ``planner_decisions`` use
+    ``operator.add`` so each turn's nodes append rather than replace.
+    Every other field is overwritten per turn — this is intentional: context
+    is retrieved and scoped fresh each turn (memfabric Invariant 5), never
+    accumulated.
+
+    New fields added for the complete planning loop
+    -----------------------------------------------
+    planner_decisions:
+        Append-only audit log of every planner invocation this run.
+        Each entry is a ``PlanDecision.to_dict()`` dict.  Used by the run
+        report, JSON export, and the Reflector to learn from both LLM-backed
+        and deterministic decisions.
+
+    tool_results:
+        List of all tool-result dicts produced by the current turn's agent
+        node (one per task when multiple tasks ran concurrently).  ``None``
+        when the agent abandoned or when only ``last_tool_result`` is set for
+        backward-compatible single-task turns.
+
+    repair_count:
+        Number of repair attempts consumed this turn.  Reset to 0 by
+        ``reflect_or_continue`` at the end of every turn.  The
+        ``repair_agent`` node increments it; ``route_after_write`` gates
+        further repair attempts based on ``config.max_repair_attempts``.
     """
 
     run_id: str
@@ -33,10 +54,17 @@ class ApexGraphState(TypedDict):
     current_task: dict[str, Any] | None
     evidence_summary: str
     findings: Annotated[list[dict[str, Any]], operator.add]
+    # error_episodes accumulates one summary dict per non-success turn so the
+    # report can surface error counts and samples without querying the episodic store.
+    error_episodes: Annotated[list[dict[str, Any]], operator.add]
     last_tool_result: dict[str, Any] | None
     last_error: str | None
     completed: bool
     turn_count: int
+    # Complete planning loop fields
+    planner_decisions: Annotated[list[dict[str, Any]], operator.add]
+    tool_results: list[dict[str, Any]] | None
+    repair_count: int
 
 
 CompiledApexGraph = Any

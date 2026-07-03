@@ -226,30 +226,33 @@ class TestConflictModule:
     def test_resolve_higher_confidence_wins(self) -> None:
         c = make_conflict(
             "n1", "ip",
-            {"value": "A", "confidence": 0.9, "source": "x", "timestamp": now()},
-            {"value": "B", "confidence": 0.7, "source": "y", "timestamp": now()},
+            {"value": "A", "confidence": 0.9, "source": "x", "timestamp": now(), "logical_version": 1},
+            {"value": "B", "confidence": 0.7, "source": "y", "timestamp": now(), "logical_version": 2},
         )
-        resolution = resolve_by_policy(c)
-        assert "claim_a" in resolution
-        assert "A" in resolution
+        resolved = resolve_by_policy(c)
+        assert resolved is True
+        assert c.winning_value == "A"
+        assert "claim_a" in c.resolution
 
-    def test_resolve_tie_broken_by_recency(self) -> None:
-        import time
-        t1 = now()
-        time.sleep(0.01)
-        t2 = now()
+    def test_resolve_tie_broken_by_logical_version(self) -> None:
+        # tie on confidence → higher logical_version wins
         c = make_conflict(
             "n1", "ip",
-            {"value": "A", "confidence": 0.9, "source": "x", "timestamp": t1},
-            {"value": "B", "confidence": 0.9, "source": "y", "timestamp": t2},
+            {"value": "A", "confidence": 0.9, "source": "x", "timestamp": now(), "logical_version": 1},
+            {"value": "B", "confidence": 0.9, "source": "y", "timestamp": now(), "logical_version": 5},
         )
-        resolution = resolve_by_policy(c)
-        # claim_b has later timestamp → wins
-        assert "claim_b" in resolution
+        resolved = resolve_by_policy(c)
+        # claim_b has higher logical_version → wins
+        assert resolved is True
+        assert c.winning_value == "B"
+        assert "claim_b" in c.resolution
 
     def test_dependents_blocked_until_resolved(self) -> None:
+        from memfabric.types import ConflictStatus
         c = make_conflict("n1", "ip", {}, {})
         assert dependents_blocked(c)
+        # Use the official lifecycle transition rather than mutating resolved directly
+        c.status = ConflictStatus.resolved
         c.resolved = True
         assert not dependents_blocked(c)
 

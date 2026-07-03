@@ -114,7 +114,11 @@ class ReflectorWorker:
     async def _generalise_and_propose(self, chain: list[Episode]) -> None:
         # Check for similar existing skill
         staged = await self._api.get_staged_skills()
-        candidate = generalize(chain, confidence=self._config.skill_prior)
+        candidate = generalize(
+            chain,
+            confidence=self._config.skill_prior,
+            slot_patterns=self._config.slot_patterns,
+        )
 
         best_match: Skill | None = None
         best_sim = 0.0
@@ -145,7 +149,11 @@ class ReflectorWorker:
     async def _propose_negative_skill(self, chain: list[Episode]) -> None:
         if not chain:
             return
-        candidate = generalize(chain, confidence=self._config.skill_prior * 0.5)
+        candidate = generalize(
+            chain,
+            confidence=self._config.skill_prior * 0.5,
+            slot_patterns=self._config.slot_patterns,
+        )
         candidate.name = "NEGATIVE_" + candidate.name
         candidate.description = "[negative] " + candidate.description
         candidate.losses += 1
@@ -157,22 +165,65 @@ class ReflectorWorker:
     # ------------------------------------------------------------------
 
     async def _apply_promotion_gate(self) -> None:
-        for entry in await self._api.get_staged_knowledge():
+        """Promote staged knowledge and skills that clear the quality gate.
+
+        Bounded at ``config.reflector_max_promotions_per_run`` combined
+        promotions per call so that large batch seeds do not flood the log.
+        Unpromoted entries remain staged and are picked up on the next
+        ``run_once()`` call.
+
+        Logging contract:
+        - Individual promotions → DEBUG only.
+        - End-of-pass summary (promoted=N skipped=M remaining=K) → INFO.
+        """
+        cap = self._config.reflector_max_promotions_per_run
+        log_every = self._config.reflector_log_every_n
+        promoted = 0
+        skipped = 0
+
+        knowledge_entries = await self._api.get_staged_knowledge()
+        for entry in knowledge_entries:
+            if promoted >= cap:
+                break
             if should_promote_knowledge(
                 entry,
                 min_confidence=self._config.min_confidence,
             ):
                 await self._api.promote_knowledge(entry.id)
-                logger.info("reflector promoted knowledge id=%s", entry.id)
+                promoted += 1
+                if promoted % log_every == 0:
+                    logger.debug(
+                        "reflector promoted knowledge id=%s (%d so far)",
+                        entry.id, promoted,
+                    )
+            else:
+                skipped += 1
 
-        for skill in await self._api.get_staged_skills():
+        skill_entries = await self._api.get_staged_skills()
+        for skill in skill_entries:
+            if promoted >= cap:
+                break
             if should_promote_skill(
                 skill,
                 min_evidence_count=self._config.min_evidence_count,
                 min_confidence=self._config.min_confidence,
             ):
                 await self._api.promote_skill(skill.id)
-                logger.info("reflector promoted skill id=%s name=%s", skill.id, skill.name)
+                promoted += 1
+                if promoted % log_every == 0:
+                    logger.debug(
+                        "reflector promoted skill id=%s name=%s (%d so far)",
+                        skill.id, skill.name, promoted,
+                    )
+            else:
+                skipped += 1
+
+        total = len(knowledge_entries) + len(skill_entries)
+        remaining = max(0, total - promoted - skipped)
+        logger.info(
+            "reflector promotion pass: promoted=%d skipped=%d remaining=%d",
+            promoted, skipped, remaining,
+        )
 
     # ------------------------------------------------------------------
     # Decay and quarantine
