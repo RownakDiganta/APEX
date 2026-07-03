@@ -120,7 +120,8 @@ class TestNmapParserBasic:
 
         ssh = next(s for s in services if s.props["port"] == "22")
         assert ssh.props["service"] == "ssh"
-        assert "OpenSSH" in ssh.props["version"]
+        # raw_version holds the full nmap banner; version holds the extracted short string
+        assert "OpenSSH" in ssh.props["raw_version"]
 
         expose_edges = [e for e in parsed.edge_deltas if e.type == "exposes"]
         assert len(expose_edges) == 3

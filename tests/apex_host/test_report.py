@@ -53,6 +53,7 @@ def _state(
     completed: bool = True,
     last_error: str | None = None,
     evidence_summary: str = "",
+    error_episodes: list[dict[str, Any]] | None = None,
 ) -> ApexGraphState:
     return {
         "run_id": "test-run-1",
@@ -62,6 +63,7 @@ def _state(
         "current_task": None,
         "evidence_summary": evidence_summary,
         "findings": findings or [],
+        "error_episodes": error_episodes if error_episodes is not None else [],
         "last_tool_result": None,
         "last_error": last_error,
         "completed": completed,
@@ -402,3 +404,173 @@ class TestWriteReportJson:
             path = Path(tmpdir) / "nested" / "dir" / "report.json"
             write_report_json(self._report(), path)
             assert path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Status and completed_successfully — correctness of run classification
+# ---------------------------------------------------------------------------
+
+_SCRIPT_ERR = {"outcome": "script_error", "tool": "nmap", "error": "nmap returned rc=1", "phase": "recon"}
+_FIXABLE_ERR = {"outcome": "fixable", "tool": "curl", "error": "connection refused", "phase": "web"}
+_FUND_ERR = {"outcome": "fundamental", "tool": "nc", "error": "host unreachable", "phase": "recon"}
+
+
+def _config_maxturns(max_turns: int = 5) -> "ApexConfig":
+    return ApexConfig(target=_TARGET, max_turns=max_turns)
+
+
+class TestStatusAndCompleteness:
+    """Verify that status and completed_successfully reflect the actual run outcome."""
+
+    def test_success_when_access_state_in_ekg(self) -> None:
+        nodes = [_node("host"), _node("access_state")]
+        report = build_report(_state(turn_count=3, completed=True), _subgraph(nodes=nodes), _config())
+        assert report.status == "success"
+        assert report.completed_successfully is True
+
+    def test_not_successful_when_no_access_state(self) -> None:
+        nodes = [_node("host"), _node("service")]
+        report = build_report(_state(turn_count=5, completed=True), _subgraph(nodes=nodes), _config())
+        assert report.completed_successfully is False
+
+    def test_stopped_max_turns_when_budget_exhausted_no_access(self) -> None:
+        nodes = [_node("host")]
+        report = build_report(
+            _state(turn_count=5, completed=True),
+            _subgraph(nodes=nodes),
+            _config_maxturns(max_turns=5),
+        )
+        assert report.status == "stopped_max_turns"
+
+    def test_stopped_error_when_all_turns_failed_and_no_nodes(self) -> None:
+        errors = [_SCRIPT_ERR, _SCRIPT_ERR, _SCRIPT_ERR]
+        report = build_report(
+            _state(turn_count=3, completed=True, error_episodes=errors),
+            _subgraph(),            # empty EKG — even host node missing
+            _config_maxturns(max_turns=5),
+        )
+        assert report.status == "stopped_error"
+
+    def test_stopped_max_turns_when_errors_but_host_node_exists(self) -> None:
+        # nmap failing loop: host node written but no services; hits max_turns
+        errors = [_SCRIPT_ERR] * 5
+        nodes = [_node("host")]
+        report = build_report(
+            _state(turn_count=5, completed=True, error_episodes=errors),
+            _subgraph(nodes=nodes),
+            _config_maxturns(max_turns=5),
+        )
+        # host node was written so node_counts is non-empty → stopped_max_turns not stopped_error
+        assert report.status == "stopped_max_turns"
+        assert report.completed_successfully is False
+
+    def test_abandoned_when_completed_before_max_turns_no_access(self) -> None:
+        report = build_report(
+            _state(turn_count=0, completed=True),
+            _subgraph(),
+            _config_maxturns(max_turns=10),
+        )
+        assert report.status == "abandoned"
+
+    def test_script_error_count(self) -> None:
+        errors = [_SCRIPT_ERR, _SCRIPT_ERR, _FIXABLE_ERR]
+        report = build_report(_state(error_episodes=errors), _subgraph(), _config())
+        assert report.script_error_count == 2
+        assert report.fixable_count == 1
+        assert report.fundamental_count == 0
+
+    def test_fundamental_count(self) -> None:
+        errors = [_FUND_ERR]
+        report = build_report(_state(error_episodes=errors), _subgraph(), _config())
+        assert report.fundamental_count == 1
+
+    def test_error_samples_populated_from_error_episodes(self) -> None:
+        errors = [_SCRIPT_ERR, _FIXABLE_ERR]
+        report = build_report(_state(error_episodes=errors), _subgraph(), _config())
+        assert len(report.error_samples) == 2
+        assert "nmap returned rc=1" in report.error_samples
+        assert "connection refused" in report.error_samples
+
+    def test_error_samples_capped_at_three(self) -> None:
+        errors = [_SCRIPT_ERR] * 10
+        report = build_report(_state(error_episodes=errors), _subgraph(), _config())
+        assert len(report.error_samples) <= 3
+
+    def test_no_error_samples_when_no_error_field(self) -> None:
+        # error_episodes with no "error" key → no samples
+        errors = [{"outcome": "script_error", "tool": "nmap", "phase": "recon"}]
+        report = build_report(_state(error_episodes=errors), _subgraph(), _config())
+        assert report.error_samples == []
+
+    def test_format_text_shows_status(self) -> None:
+        nodes = [_node("host")]
+        report = build_report(
+            _state(turn_count=5, completed=True),
+            _subgraph(nodes=nodes),
+            _config_maxturns(max_turns=5),
+        )
+        text = format_text(report)
+        assert "STOPPED_MAX_TURNS" in text
+        assert "Successful" in text
+
+    def test_format_text_shows_error_breakdown_when_errors(self) -> None:
+        errors = [_SCRIPT_ERR, _SCRIPT_ERR]
+        report = build_report(_state(error_episodes=errors), _subgraph(), _config())
+        text = format_text(report)
+        assert "Error Breakdown" in text
+        assert "script_error" in text
+
+    def test_format_text_no_error_section_when_no_errors(self) -> None:
+        report = build_report(_state(), _subgraph(), _config())
+        text = format_text(report)
+        assert "Error Breakdown" not in text
+
+    def test_format_text_success_label_when_access_state(self) -> None:
+        nodes = [_node("access_state")]
+        report = build_report(_state(completed=True), _subgraph(nodes=nodes), _config())
+        text = format_text(report)
+        assert "SUCCESS" in text
+        assert "Successful : Yes" in text
+
+    def test_json_dict_has_status_key(self) -> None:
+        report = build_report(_state(), _subgraph(), _config())
+        d = to_json_dict(report)
+        assert "status" in d
+        assert "completed_successfully" in d
+
+    def test_json_dict_has_error_counts(self) -> None:
+        errors = [_SCRIPT_ERR, _FUND_ERR]
+        report = build_report(_state(error_episodes=errors), _subgraph(), _config())
+        d = to_json_dict(report)
+        assert "error_counts" in d
+        assert d["error_counts"]["script_error"] == 1
+        assert d["error_counts"]["fundamental"] == 1
+
+    def test_json_dict_has_error_samples(self) -> None:
+        errors = [_SCRIPT_ERR]
+        report = build_report(_state(error_episodes=errors), _subgraph(), _config())
+        d = to_json_dict(report)
+        assert "error_samples" in d
+        assert len(d["error_samples"]) == 1
+
+    def test_max_turns_without_success_is_not_completed_successfully(self) -> None:
+        # Regression: hitting max_turns must NOT set completed_successfully=True
+        nodes = [_node("host"), _node("service")]
+        report = build_report(
+            _state(turn_count=20, completed=True, phase="recon"),
+            _subgraph(nodes=nodes),
+            _config_maxturns(max_turns=20),
+        )
+        assert report.completed_successfully is False
+        assert report.status != "success"
+
+    def test_last_error_not_hidden_when_errors_occurred(self) -> None:
+        # Regression: last_error must appear in report even when completed=True
+        report = build_report(
+            _state(last_error="nmap returned rc=1", completed=True),
+            _subgraph(),
+            _config(),
+        )
+        assert report.last_error == "nmap returned rc=1"
+        text = format_text(report)
+        assert "nmap returned rc=1" in text

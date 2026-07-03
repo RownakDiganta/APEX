@@ -91,10 +91,14 @@ async def run_synthetic_machine(*, max_turns: int = 5) -> EngagementMetrics:
         "current_task": None,
         "evidence_summary": "",
         "findings": [],
+        "error_episodes": [],
         "last_tool_result": None,
         "last_error": None,
         "completed": False,
         "turn_count": 0,
+        "planner_decisions": [],
+        "tool_results": None,
+        "repair_count": 0,
     }
     final_state: ApexGraphState = await graph.ainvoke(initial)
     return summarize(final_state)

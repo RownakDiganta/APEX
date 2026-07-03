@@ -123,9 +123,18 @@ class TelnetExecutor:
     def _dry_run_result(
         self, task: TaskSpec, target: str, port: str, username: str
     ) -> ExecutorResult:
+        # Synthetic output includes a shell prompt so AccessParser._login_succeeded
+        # returns True and creates an access_state node in the EKG — this lets the
+        # dry-run engagement verify the full credential→priv_esc routing path.
         stdout = (
-            f"[dry-run] would connect telnet {target}:{port} as {username!r}"
-            " — no network activity"
+            f"telnet {target} {port}\r\n"
+            f"Connected to {target}.\r\n"
+            f"Escape character is '^]'.\r\n"
+            f"login: {username}\r\n"
+            f"Password: \r\n"
+            f"Welcome!\r\n"
+            f"[dry-run: no real connection — synthetic shell]\r\n"
+            f"# "
         )
         episode = Episode(
             agent="apex.credential",
@@ -173,15 +182,27 @@ class TelnetExecutor:
         writer.write((username + "\r\n").encode())
         await writer.drain()
 
-        # Read password prompt or shell
+        # Read post-username response (password prompt or shell)
         data = await reader.read(_READ_BYTES)
         chunk = data.decode("utf-8", errors="replace")
         buf.append(chunk)
 
         if "password" in chunk.lower():
+            # Send password — empty string sends only "\r\n" (correct for no-auth services).
             writer.write((password + "\r\n").encode())
             await writer.drain()
             data = await reader.read(_READ_BYTES)
             buf.append(data.decode("utf-8", errors="replace"))
+
+        # If we have a shell, send a harmless command to confirm access level.
+        combined = "".join(buf)
+        if _login_succeeded(combined):
+            try:
+                writer.write(b"id\r\n")
+                await writer.drain()
+                data = await reader.read(_READ_BYTES)
+                buf.append(data.decode("utf-8", errors="replace"))
+            except Exception:
+                pass  # id probe failure is non-fatal; we already know login succeeded
 
         return "".join(buf)

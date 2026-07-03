@@ -47,6 +47,8 @@ class AccessParser:
         target: str,
         username: str,
         source: str = "telnet",
+        port: str = "",
+        proto: str = "tcp",
     ) -> ParsedObservation:
         if not text.strip():
             return ParsedObservation()
@@ -74,6 +76,11 @@ class AccessParser:
         )
 
         if _login_succeeded(text):
+            # Extract a short proof snippet from the last non-empty line of output
+            # (typically the shell prompt or id/whoami command output).
+            proof_lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            proof_snippet = proof_lines[-1][:120] if proof_lines else ""
+
             access_id = f"access_state:{target}:{username}"
             nodes.append(
                 Node(
@@ -83,7 +90,9 @@ class AccessParser:
                         "level": "user",
                         "username": username,
                         "target": target,
+                        "service": source,        # e.g. "telnet_access"
                         "evidence": text[:200],
+                        "proof": proof_snippet,   # last output line (shell prompt / id output)
                     },
                     confidence=0.85,
                     source=source,
@@ -104,5 +113,35 @@ class AccessParser:
                     last_seen=timestamp,
                 )
             )
+            if port:
+                service_id = f"service:{target}:{port}/{proto}"
+                # service → credential: the service received this credential test
+                edges.append(
+                    Edge(
+                        id=new_id(),
+                        from_id=service_id,
+                        to_id=cred_id,
+                        type="tested",
+                        props={},
+                        confidence=0.8,
+                        source=source,
+                        first_seen=timestamp,
+                        last_seen=timestamp,
+                    )
+                )
+                # service → access_state: the service granted this access level
+                edges.append(
+                    Edge(
+                        id=new_id(),
+                        from_id=service_id,
+                        to_id=access_id,
+                        type="grants",
+                        props={},
+                        confidence=0.8,
+                        source=source,
+                        first_seen=timestamp,
+                        last_seen=timestamp,
+                    )
+                )
 
         return ParsedObservation(node_deltas=nodes, edge_deltas=edges)

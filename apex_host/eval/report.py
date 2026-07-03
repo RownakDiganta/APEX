@@ -39,6 +39,9 @@ class RunReport:
     mode: str                           # "dry-run" | "live"
     turns_used: int
     completed: bool
+    # status: "success" | "stopped_max_turns" | "stopped_error" | "abandoned"
+    status: str
+    completed_successfully: bool        # True only when terminal success condition exists
     final_phase: str
     phases_reached: list[str]           # unique phases seen in findings
     finding_count: int
@@ -48,8 +51,45 @@ class RunReport:
     total_nodes: int
     total_edges: int
     episodes_by_outcome: dict[str, int] # derived or runner-supplied
+    script_error_count: int             # turns that produced script_error outcome
+    fixable_count: int                  # turns that produced fixable outcome
+    fundamental_count: int              # turns that produced fundamental outcome
+    error_samples: list[str]            # up to 3 error strings from failed turns
     evidence_samples: list[str]         # text snippets from last evidence
     last_error: str | None
+    planner_decisions: list[dict[str, Any]] = field(default_factory=list)
+    # Accumulated planner audit log: one PlanDecision.to_dict() per invocation.
+
+
+# ---------------------------------------------------------------------------
+# Status helper
+# ---------------------------------------------------------------------------
+
+def _determine_status(
+    node_counts: dict[str, int],
+    turns_used: int,
+    max_turns: int,
+    error_episodes: list[dict[str, Any]],
+    completed: bool,
+) -> str:
+    """Derive a run status string from terminal conditions.
+
+    Returns one of: "success" | "stopped_max_turns" | "stopped_error" | "abandoned"
+    """
+    if "access_state" in node_counts:
+        return "success"
+
+    total_errors = len(error_episodes)
+    if turns_used > 0 and total_errors >= turns_used and not node_counts:
+        return "stopped_error"
+
+    if turns_used >= max_turns:
+        return "stopped_max_turns"
+
+    if completed:
+        return "abandoned"
+
+    return "stopped_max_turns"
 
 
 # ---------------------------------------------------------------------------
@@ -102,11 +142,31 @@ def build_report(
     if evidence_samples is None:
         evidence_samples = _samples_from_summary(final_state)
 
+    turns_used = final_state["turn_count"]
+    error_episodes: list[dict[str, Any]] = list(final_state.get("error_episodes") or [])
+    script_error_count = sum(1 for e in error_episodes if e.get("outcome") == "script_error")
+    fixable_count = sum(1 for e in error_episodes if e.get("outcome") == "fixable")
+    fundamental_count = sum(1 for e in error_episodes if e.get("outcome") == "fundamental")
+    error_samples = [
+        str(e["error"])
+        for e in error_episodes
+        if e.get("error")
+    ][:3]
+
+    completed_successfully = "access_state" in node_counts
+    status = _determine_status(
+        node_counts, turns_used, config.max_turns, error_episodes, final_state["completed"]
+    )
+
+    planner_decisions = list(final_state.get("planner_decisions") or [])
+
     return RunReport(
         target=config.target,
         mode="dry-run" if config.dry_run else "live",
-        turns_used=final_state["turn_count"],
+        turns_used=turns_used,
         completed=final_state["completed"],
+        status=status,
+        completed_successfully=completed_successfully,
         final_phase=final_state["phase"],
         phases_reached=phases_reached,
         finding_count=len(final_state["findings"]),
@@ -116,8 +176,13 @@ def build_report(
         total_nodes=len(subgraph.nodes),
         total_edges=len(subgraph.edges),
         episodes_by_outcome=episodes_by_outcome,
+        script_error_count=script_error_count,
+        fixable_count=fixable_count,
+        fundamental_count=fundamental_count,
+        error_samples=error_samples,
         evidence_samples=evidence_samples,
         last_error=final_state["last_error"],
+        planner_decisions=planner_decisions,
     )
 
 
@@ -135,11 +200,13 @@ def format_text(report: RunReport) -> str:
     """Render a human-readable engagement report string."""
     lines: list[str] = []
 
+    success_label = "Yes" if report.completed_successfully else "No"
     lines += [
         "",
         _SEP,
         " APEX HTB Engagement Report",
         f" Target : {report.target}   Mode : {report.mode}",
+        f" Status : {report.status.upper()}   Successful : {success_label}",
         f" Turns  : {report.turns_used}   "
         f"Final phase : {report.final_phase}   "
         f"Completed : {'Yes' if report.completed else 'No'}",
@@ -182,11 +249,38 @@ def format_text(report: RunReport) -> str:
         lines.append(f"  {k:<24}: {v}")
     lines.append(f"  {'last_error':<24}: {report.last_error or 'none'}")
 
+    # Error breakdown (only shown when errors occurred)
+    total_errors = report.script_error_count + report.fixable_count + report.fundamental_count
+    if total_errors > 0:
+        lines.append("\nError Breakdown")
+        lines.append(f"  {'script_error':<20}: {report.script_error_count}")
+        lines.append(f"  {'fixable':<20}: {report.fixable_count}")
+        lines.append(f"  {'fundamental':<20}: {report.fundamental_count}")
+        if report.error_samples:
+            lines.append("  Samples:")
+            for sample in report.error_samples:
+                lines.append(f"    {sample[:120]}")
+
     # Evidence samples
     if report.evidence_samples:
         lines.append("\nRetrieved Evidence (last turn)")
         for sample in report.evidence_samples:
             lines.append(f"  {sample[:120]}")
+
+    # Planner decisions audit log (condensed summary)
+    if report.planner_decisions:
+        llm_turns = sum(1 for d in report.planner_decisions if not d.get("fallback_used"))
+        fallback_turns = len(report.planner_decisions) - llm_turns
+        lines.append("\nPlanner Decisions")
+        lines.append(f"  Total invocations : {len(report.planner_decisions)}")
+        lines.append(f"  LLM-backed        : {llm_turns}")
+        lines.append(f"  Deterministic     : {fallback_turns}")
+        for d in report.planner_decisions[-5:]:  # last 5
+            phase = d.get("phase", "?")
+            model = d.get("planner_model", "?")
+            conf = float(d.get("confidence", 0.0))
+            fb = " [fallback]" if d.get("fallback_used") else ""
+            lines.append(f"  [{phase:<12}] {model:<16} conf={conf:.2f}{fb}")
 
     lines += ["", _SEP, ""]
     return "\n".join(lines)
@@ -203,6 +297,8 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
         "mode": report.mode,
         "turns_used": report.turns_used,
         "completed": report.completed,
+        "status": report.status,
+        "completed_successfully": report.completed_successfully,
         "final_phase": report.final_phase,
         "phases_reached": report.phases_reached,
         "finding_count": report.finding_count,
@@ -214,8 +310,15 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
             "edge_counts": report.edge_counts,
         },
         "episodes_by_outcome": report.episodes_by_outcome,
+        "error_counts": {
+            "script_error": report.script_error_count,
+            "fixable": report.fixable_count,
+            "fundamental": report.fundamental_count,
+        },
+        "error_samples": report.error_samples,
         "evidence_samples": report.evidence_samples,
         "last_error": report.last_error,
+        "planner_decisions": report.planner_decisions,
     }
 
 

@@ -52,10 +52,14 @@ def make_initial_state(target: str, run_id: str = "run-1") -> ApexGraphState:
         "current_task": None,
         "evidence_summary": "",
         "findings": [],
+        "error_episodes": [],
         "last_tool_result": None,
         "last_error": None,
         "completed": False,
         "turn_count": 0,
+        "planner_decisions": [],
+        "tool_results": None,
+        "repair_count": 0,
     }
 
 
@@ -94,7 +98,7 @@ class TestApexGraphStateStructure:
         hints = get_type_hints(ApexGraphState, include_extras=True)
         for field_name in (
             "run_id", "target", "phase", "goal", "current_task",
-            "evidence_summary", "findings", "last_tool_result",
+            "evidence_summary", "findings", "error_episodes", "last_tool_result",
             "last_error", "completed", "turn_count",
         ):
             assert field_name in hints

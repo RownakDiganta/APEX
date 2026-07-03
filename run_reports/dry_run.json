@@ -1,0 +1,293 @@
+{
+  "target": "10.129.116.48",
+  "mode": "dry-run",
+  "turns_used": 20,
+  "completed": true,
+  "status": "stopped_max_turns",
+  "completed_successfully": false,
+  "final_phase": "web",
+  "phases_reached": [
+    "recon"
+  ],
+  "finding_count": 6,
+  "findings": [
+    {
+      "id": "host:10.129.116.48",
+      "phase": "recon",
+      "title": "host discovered",
+      "detail": "{'ip': '10.129.116.48', 'target': '10.129.116.48'}",
+      "confidence": 0.9,
+      "source": "nmap",
+      "timestamp": ""
+    },
+    {
+      "id": "host:10.129.116.48",
+      "phase": "recon",
+      "title": "host discovered",
+      "detail": "{'ip': '10.129.116.48', 'target': '10.129.116.48'}",
+      "confidence": 0.9,
+      "source": "nmap",
+      "timestamp": ""
+    },
+    {
+      "id": "host:10.129.116.48",
+      "phase": "recon",
+      "title": "host discovered",
+      "detail": "{'ip': '10.129.116.48', 'target': '10.129.116.48'}",
+      "confidence": 0.9,
+      "source": "nmap",
+      "timestamp": ""
+    },
+    {
+      "id": "host:10.129.116.48",
+      "phase": "recon",
+      "title": "host discovered",
+      "detail": "{'ip': '10.129.116.48', 'target': '10.129.116.48'}",
+      "confidence": 0.9,
+      "source": "nmap",
+      "timestamp": ""
+    },
+    {
+      "id": "host:10.129.116.48",
+      "phase": "recon",
+      "title": "host discovered",
+      "detail": "{'ip': '10.129.116.48', 'target': '10.129.116.48'}",
+      "confidence": 0.9,
+      "source": "nmap",
+      "timestamp": ""
+    },
+    {
+      "id": "host:10.129.116.48",
+      "phase": "recon",
+      "title": "host discovered",
+      "detail": "{'ip': '10.129.116.48', 'target': '10.129.116.48'}",
+      "confidence": 0.9,
+      "source": "nmap",
+      "timestamp": ""
+    }
+  ],
+  "ekg": {
+    "total_nodes": 1,
+    "total_edges": 0,
+    "node_counts": {
+      "host": 1
+    },
+    "edge_counts": {}
+  },
+  "episodes_by_outcome": {
+    "total_turns": 20,
+    "turns_with_findings": 6
+  },
+  "error_counts": {
+    "script_error": 0,
+    "fixable": 0,
+    "fundamental": 0
+  },
+  "error_samples": [],
+  "evidence_samples": [
+    "[episodic:] episode agent=apex.recon action=nmap 10.129.116.48 outcome=success task_id=28069300-b862-45a2-8a2e-a5ed576f1037 tool=nma | [episodic:] episode agent=apex.recon action=nmap 10.129.116.48 outcome=success task_id=ecd7ce2b-aec8-4731-a8fe-f84d798d8e87 tool=nma | [episodic:] episode agent=apex.recon action=nmap 10.129.116.48 outcome=success task_id=0a133012-240c-499c-ab89-4127de6dc146 tool=nma | [episodic:] episode agent=apex.recon action=nmap 10.129.116.48 outcome=success task_id=d0793fbf-5ebe-4c79-b662-ed6f16fdca48 tool=nma | [episodic:] episode agent=apex.recon action=nmap 10.129.116.48 outcome=success task_id=14651e2a-e548-43b9-bb94-b993673652a6 tool=nma"
+  ],
+  "last_error": null,
+  "planner_decisions": [
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:27.908825+00:00",
+      "phase": "recon"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:28.124073+00:00",
+      "phase": "recon"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:28.333953+00:00",
+      "phase": "recon"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:28.544059+00:00",
+      "phase": "recon"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:28.784228+00:00",
+      "phase": "recon"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.003625+00:00",
+      "phase": "recon"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.225236+00:00",
+      "phase": "web"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.228049+00:00",
+      "phase": "web"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.230243+00:00",
+      "phase": "web"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.232628+00:00",
+      "phase": "web"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.235162+00:00",
+      "phase": "web"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.237647+00:00",
+      "phase": "web"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.239809+00:00",
+      "phase": "web"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.242039+00:00",
+      "phase": "web"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.244745+00:00",
+      "phase": "web"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.247025+00:00",
+      "phase": "web"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.249117+00:00",
+      "phase": "web"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.251460+00:00",
+      "phase": "web"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.253960+00:00",
+      "phase": "web"
+    },
+    {
+      "planner_model": "deterministic",
+      "confidence": 1.0,
+      "selected_task_count": 0,
+      "rejected_task_count": 0,
+      "reasoning_summary": "deterministic",
+      "fallback_used": true,
+      "timestamp": "2026-07-03T16:03:29.256229+00:00",
+      "phase": "web"
+    }
+  ]
+}

@@ -343,3 +343,382 @@ python -m apex_host.eval.run_htb_local \
 ```
 
 All tests run in dry-run mode with no network access.
+
+---
+
+## Planning architecture
+
+### Overview
+
+`apex_host/planning/` is the optional LLM planning backend.  It sits between
+the rule-based planners and the LLM, implementing a prompt → validate → TaskSpec
+pipeline.  The rule-based planners remain fully functional and are registered as
+the fallback inside `PlanningEngine` — the LLM is an enhancement, not a dependency.
+
+```
+MemoryAPI
+  ↓ (EvidenceBundle + SubgraphView)
+PlanningEngine.plan(goal, phase, subgraph, evidence)
+  │
+  ├── ModelRouter.planner_llm() → None?  ──yes──▶ fallback_planner.plan()
+  │
+  ├── PromptBuilder.build_messages(...)
+  │
+  ├── llm.invoke(messages)  ──error──▶ fallback_planner.plan()
+  │
+  ├── Validator.validate(raw, allowed_tools)  ──None──▶ fallback_planner.plan()
+  │
+  ├── stop_reason?  ──yes──▶ AbandonSignal
+  │
+  └── _to_task_spec() × N ──▶ list[TaskSpec]
+                                  ↓
+                              Executor → Parser → MemoryAPI
+```
+
+### Modules
+
+| Module | Purpose |
+|---|---|
+| `planning/models.py` | Pydantic v2 `PlannerOutput` and `PlannedTask` schemas |
+| `planning/prompt_builder.py` | `PromptBuilder` — the only place that constructs LLM prompts |
+| `planning/validator.py` | `Validator` — safety gate; rejects malformed/unsafe LLM output |
+| `planning/engine.py` | `PlanningEngine` — the only caller of `ModelRouter.planner_llm()` |
+
+### `PlannerOutput` structure
+
+```json
+{
+  "reasoning": "chain-of-thought text (not forwarded to executors)",
+  "confidence": 0.85,
+  "selected_tasks": [
+    {
+      "tool": "nmap",
+      "args": ["-sV", "-T4", "10.10.10.99"],
+      "parser": "nmap",
+      "executor_domain": "recon",
+      "target": "10.10.10.99",
+      "rationale": "Discover open ports and service versions"
+    }
+  ],
+  "rejected_tasks": [],
+  "stop_reason": null,
+  "next_phase": null
+}
+```
+
+### Provider configuration
+
+#### No LLM (dry-run / tests)
+
+The default `FakeModelRouter` returns `None` for every role.  `PlanningEngine`
+immediately delegates to the fallback planner — no API key, no network, no
+latency.
+
+```python
+from apex_host.llm.router import FakeModelRouter
+from apex_host.planning import PlanningEngine
+
+engine = PlanningEngine(
+    model_router=FakeModelRouter(),
+    fallback_planner=recon_planner,
+    allowed_tools=config.allowed_tools,
+    target=config.target,
+)
+```
+
+#### OpenAI / OpenRouter
+
+```bash
+export OPENAI_API_KEY=sk-...
+# Optional: point to OpenRouter or any OpenAI-compatible endpoint
+export OPENAI_BASE_URL=https://openrouter.ai/api/v1
+```
+
+```python
+from apex_host.llm.router import OpenAIModelRouter
+
+engine = PlanningEngine(
+    model_router=OpenAIModelRouter(config),
+    fallback_planner=recon_planner,
+    allowed_tools=config.allowed_tools,
+    target=config.target,
+)
+```
+
+`OpenAIModelRouter` reads `OPENAI_API_KEY` and `OPENAI_BASE_URL` from the
+environment — API keys are never hardcoded.
+
+### Safety invariants
+
+- `PlanningEngine` is the **only** component that calls `ModelRouter.planner_llm()`.
+- Planners **never** construct prompt strings.
+- Executors **never** call LLMs.
+- `MemoryAPI` is still the **only** state source — `PlanningEngine` does not
+  write to any store.
+- Any LLM failure triggers the deterministic fallback; the engagement continues.
+
+### Validator rejection rules
+
+| Condition | Result |
+|---|---|
+| Malformed JSON | Fallback |
+| Schema mismatch | Fallback |
+| Tool not in `allowed_tools` | Fallback |
+| Destructive command (`rm`, `mkfs`, `dd`, …) | Fallback |
+| Shell metacharacter in args | Fallback |
+| Unknown `executor_domain` | Fallback |
+
+### Running the tests
+
+```bash
+.venv/bin/python -m pytest tests/apex_host/test_planning_engine.py -v
+```
+
+### Type checking
+
+```bash
+.venv/bin/python -m mypy apex_host/planning/ --strict
+```
+
+Expected: `Success: no issues found in 5 source files`
+
+---
+
+## Planner workflow
+
+### How planners interact with MemoryAPI
+
+```
+MemoryAPI
+  │
+  ├── get_subgraph() → SubgraphView
+  └── query()        → EvidenceBundle
+          │
+          ▼
+     DomainPlanner.plan(goal, subgraph, evidence)
+          │
+          ├── model_router=None?  ──yes──▶ _NameDeterministic.plan()  ──▶ list[TaskSpec]
+          │
+          └── model_router set?  ──yes──▶ PlanningEngine.plan()
+                                               │
+                                               ├── confidence < threshold?  ──▶ fallback
+                                               ├── LLM error?               ──▶ retry → fallback
+                                               ├── validator rejection?      ──▶ retry → fallback
+                                               └── stop_reason?             ──▶ AbandonSignal
+                                                         │
+                                                         ▼
+                                                   list[TaskSpec]
+                                                         │
+                                                         ▼
+                                                graph.py → Executor → Parser → MemoryAPI
+```
+
+### Planner structure
+
+Each domain planner follows the `_<Name>Deterministic` + thin wrapper pattern:
+
+```python
+# Without LLM (default — fully deterministic)
+planner = ReconPlanner(target, registry)
+
+# With LLM (optional — falls back to deterministic on any failure)
+planner = ReconPlanner(
+    target, registry,
+    model_router=OpenAIModelRouter(config),
+    allowed_tools=config.allowed_tools,
+    confidence_threshold=0.4,   # from config.planning_confidence_threshold
+    max_retries=1,              # from config.max_planning_retries
+)
+```
+
+### Wiring via `build_apex_graph`
+
+```python
+from apex_host.graph import build_apex_graph
+from apex_host.llm.router import OpenAIModelRouter
+
+# Deterministic-only (default, safe)
+graph = build_apex_graph(api, registry, config)
+
+# LLM-backed planning (opt-in)
+graph = build_apex_graph(
+    api, registry, config,
+    model_router=OpenAIModelRouter(config),
+)
+```
+
+`config.planning_confidence_threshold` (default `0.4`) and
+`config.max_planning_retries` (default `1`) control when the engine
+falls back to the deterministic planner.
+
+### GlobalPlanner budget tracking
+
+```python
+gp = GlobalPlanner(max_turns=20, phase_budgets={"recon": 6, "web": 5})
+
+# Inside the graph loop:
+phase = gp.decide_phase(
+    node_types_seen=node_types_seen,
+    turn_count=state["turn_count"],
+    current_phase=state.get("phase"),  # enables budget force-advance
+)
+gp.record_turn(phase)  # call after decide_phase
+```
+
+When a phase exhausts its budget (`budget_remaining == 0`), `decide_phase`
+injects the phase's completion EKG-node type into the decision — forcing
+advancement to the next phase even if real tool output hasn't produced that
+node type yet.
+
+### Running planner + engine tests
+
+```bash
+.venv/bin/python -m pytest tests/apex_host/test_planners_with_engine.py -v
+```
+
+### Test count
+
+| Test file | Tests |
+|---|---|
+| `tests/apex_host/test_planning_engine.py` | 47 |
+| `tests/apex_host/test_planners_with_engine.py` | 58 |
+
+---
+
+## Phase 5 — Complete LLM Planning Loop
+
+This phase makes the planning loop **fully operational** for authorized
+HackTheBox Easy/Medium machines.
+
+### What was added
+
+| Feature | Where |
+|---|---|
+| `PlanDecision` audit log | `apex_host/planning/models.py` |
+| `PlanningEngine.last_decision` | `apex_host/planning/engine.py` |
+| `PromptBuilder` findings + candidate_tasks | `apex_host/planning/prompt_builder.py` |
+| `RepairEngine` (script_error/fixable repair) | `apex_host/planning/repair.py` |
+| `last_decision` on all planner wrappers | `apex_host/planners/*.py` |
+| `planner_decisions`, `tool_results`, `repair_count` in state | `apex_host/graph_state.py` |
+| Concurrent task execution (`asyncio.gather` + semaphore) | `apex_host/graph.py` |
+| `repair_agent` node + `route_after_write` routing | `apex_host/graph.py` |
+| Dynamic replanning in `reflect_or_continue` | `apex_host/graph.py` |
+| Reflector triggered after engagement | `apex_host/runtime.py` |
+| Planner decisions in run report + JSON export | `apex_host/eval/report.py` |
+| `config.max_repair_attempts` | `apex_host/config.py` |
+
+### Updated graph topology
+
+```
+START → load_context → global_plan ──────────────────────── END (done)
+                             │
+                      route_phase
+                             │
+       ┌─────────────────────┴──────────────────────────┐
+   recon_agent  web_agent  browser_agent  execute_agent  priv_esc_agent
+       └─────────────────────┬──────────────────────────┘
+                      parse_observation
+                             │
+                       write_memory
+                             │
+                      route_after_write
+                       │             │
+                  repair_agent    reflect_or_continue ── END
+                       │             │
+                  reflect_or_continue
+                             │
+                       load_context (next turn)
+```
+
+### Running tests
+
+```bash
+# All tests (851 total)
+.venv/bin/python -m pytest tests/ -q
+
+# LLM wiring tests only
+.venv/bin/python -m pytest tests/apex_host/test_llm_wiring.py -v
+
+# Repair engine + complete loop tests
+.venv/bin/python -m pytest tests/apex_host/test_repair_engine.py -v
+```
+
+### Enabling the LLM planning layer
+
+The system defaults to fully deterministic mode (no LLM calls, no API key
+required). Enable LLM planning via CLI:
+
+```bash
+export OPENAI_API_KEY=sk-...
+
+# Via OpenRouter (recommended — access many models with one key)
+python -m apex_host.eval.run_htb_local \
+  --target <HTB_TARGET_IP> \
+  --payload-repo ./payloads \
+  --dry-run \
+  --use-llm \
+  --llm-provider openai \
+  --llm-model openai/gpt-5.5 \
+  --llm-base-url https://openrouter.ai/api/v1
+
+# Via direct OpenAI API
+python -m apex_host.eval.run_htb_local \
+  --target <HTB_TARGET_IP> \
+  --payload-repo ./payloads \
+  --dry-run \
+  --use-llm \
+  --llm-model openai/gpt-5.5
+```
+
+Or in Python:
+
+```python
+from apex_host.config import ApexConfig
+from apex_host.runtime import build_runtime
+
+config = ApexConfig(
+    target="<IP>",
+    use_llm=True,
+    llm_provider="openai",
+    llm_base_url="https://openrouter.ai/api/v1",  # optional; overrides OPENAI_BASE_URL
+    planner_model="openai/gpt-5.5",
+)
+runtime = build_runtime(config)   # wires OpenAIModelRouter automatically
+```
+
+When `use_llm=False` (the default) or `llm_provider="fake"`, `FakeModelRouter`
+is used — all planners run deterministically with zero API calls or network
+traffic. `RepairEngine` is also a no-op in this mode.
+
+### Running an authorized HTB machine (dry-run first, always)
+
+```bash
+# Step 1: dry-run verification (safe, no real commands)
+python -m apex_host.eval.run_htb_local \
+  --target <HTB_TARGET_IP> \
+  --payload-repo ./payloads \
+  --dry-run
+
+# Step 2: real run (authorized HTB VPN target only)
+python -m apex_host.eval.run_htb_local \
+  --target <HTB_TARGET_IP> \
+  --payload-repo ./payloads \
+  --no-dry-run \
+  --username root \
+  --password ""
+
+# Step 3: real run WITH LLM planning (HTB VPN + OPENAI_API_KEY required)
+python -m apex_host.eval.run_htb_local \
+  --target <HTB_TARGET_IP> \
+  --payload-repo ./payloads \
+  --no-dry-run \
+  --use-llm \
+  --llm-provider openai \
+  --llm-model openai/gpt-5.5 \
+  --llm-base-url https://openrouter.ai/api/v1 \
+  --username root \
+  --password ""
+```
+
+**Never** run `--no-dry-run` against a host you do not own or have explicit
+written authorization to test.

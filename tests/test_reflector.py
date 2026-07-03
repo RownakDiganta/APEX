@@ -209,12 +209,21 @@ class TestGeneralize:
         assert len(skill.template["steps"]) == 2
         assert skill.confidence == 0.5
 
-    def test_concrete_ip_replaced_with_slot(self) -> None:
+    def test_ip_not_replaced_without_pattern(self) -> None:
+        # Default (no slot_patterns): IPv4 is NOT replaced — memfabric is domain-agnostic.
         ep = Episode("a", "connect", Outcome.success, {"target": "192.168.1.1"}, id=new_id(), timestamp=now())
         skill = generalize([ep])
-        steps = skill.template["steps"]
-        assert "192.168.1.1" not in str(steps)
-        assert "<SLOT_" in str(steps)
+        steps_str = str(skill.template["steps"])
+        assert "192.168.1.1" in steps_str, "IPv4 must NOT be slotted without an explicit pattern"
+
+    def test_ip_replaced_with_supplied_pattern(self) -> None:
+        # With a host-supplied IPv4 pattern, the address IS replaced.
+        ep = Episode("a", "connect", Outcome.success, {"target": "192.168.1.1"}, id=new_id(), timestamp=now())
+        ipv4_pattern = r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+        skill = generalize([ep], slot_patterns=[ipv4_pattern])
+        steps_str = str(skill.template["steps"])
+        assert "192.168.1.1" not in steps_str
+        assert "<SLOT_" in steps_str
 
     def test_source_episodes_recorded(self) -> None:
         chain = [make_episode("step_a"), make_episode("step_b")]

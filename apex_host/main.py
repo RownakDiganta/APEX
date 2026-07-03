@@ -57,6 +57,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-access-attempts", type=int, default=1,
         help="Maximum access validation attempts per run (default: 1; never brute-forces)",
     )
+    parser.add_argument(
+        "--use-llm", dest="use_llm", action="store_true", default=False,
+        help="Enable LLM-backed planning (default: fully deterministic, no API calls)",
+    )
+    parser.add_argument(
+        "--llm-provider", dest="llm_provider", default="openai", metavar="PROVIDER",
+        help="LLM provider when --use-llm is set (default: openai; supports OpenRouter)",
+    )
+    parser.add_argument(
+        "--llm-model", dest="llm_model", default=None, metavar="MODEL",
+        help="Model for LLM planning (e.g. openai/gpt-5.5); sets planner/executor/parser models",
+    )
+    parser.add_argument(
+        "--llm-base-url", dest="llm_base_url", default=None, metavar="URL",
+        help="Override LLM API base URL (e.g. https://openrouter.ai/api/v1)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     parser.add_argument(
         "--preflight", action="store_true",
@@ -68,7 +84,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 async def run(args: argparse.Namespace) -> None:
     import sys
 
-    config = ApexConfig(
+    config_kwargs: dict[str, object] = dict(
         target=args.target,
         payload_repo_path=args.payload_repo,
         max_turns=args.max_turns,
@@ -78,7 +94,15 @@ async def run(args: argparse.Namespace) -> None:
         username_candidates=list(args.username),
         password_candidates=list(args.password),
         max_access_attempts=args.max_access_attempts,
+        use_llm=args.use_llm,
+        llm_provider=args.llm_provider,
+        llm_base_url=args.llm_base_url,
     )
+    if args.llm_model:
+        config_kwargs["planner_model"] = args.llm_model
+        config_kwargs["executor_model"] = args.llm_model
+        config_kwargs["parser_model"] = args.llm_model
+    config = ApexConfig(**config_kwargs)  # type: ignore[arg-type]
 
     if args.preflight:
         from apex_host.tools.preflight import check_local_tools

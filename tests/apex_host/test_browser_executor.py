@@ -136,6 +136,7 @@ def _make_initial_state(target: str, findings: list[dict[str, Any]] | None = Non
         "current_task": None,
         "evidence_summary": "",
         "findings": findings or [],
+        "error_episodes": [],
         "last_tool_result": None,
         "last_error": None,
         "completed": False,
