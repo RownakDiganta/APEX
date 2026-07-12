@@ -427,13 +427,13 @@ class TestFormatReport:
 class TestRunEngagement:
     async def test_run_engagement_dry_run_completes(self) -> None:
         config = _make_config(dry_run=True, max_turns=3)
-        runtime, final_state = await run_engagement(config)
+        runtime, final_state, _seed = await run_engagement(config)
         assert final_state["turn_count"] >= 0
         assert "phase" in final_state
 
     async def test_run_engagement_returns_live_api(self) -> None:
         config = _make_config(dry_run=True, max_turns=2)
-        runtime, _ = await run_engagement(config)
+        runtime, _, _seed = await run_engagement(config)
         # The API should still be queryable after run
         subgraph = await runtime.api.get_subgraph(_ANCHOR, depth=1)
         assert subgraph is not None

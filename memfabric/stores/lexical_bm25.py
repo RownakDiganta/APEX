@@ -19,7 +19,7 @@ import logging
 import re
 from typing import Any
 
-from rank_bm25 import BM25Plus  # type: ignore[import-untyped]
+from rank_bm25 import BM25Plus
 
 logger = logging.getLogger(__name__)
 

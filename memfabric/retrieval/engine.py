@@ -169,6 +169,14 @@ class HybridRetriever:
         ]
         reranked = await self._reranker.rerank(text, candidates)
 
+        # --- Metadata post-filter ---
+        # Applied after reranking so the cache stores the filtered result.
+        if filters:
+            reranked = [
+                e for e in reranked
+                if all(e.metadata.get(k) == v for k, v in filters.items())
+            ]
+
         # --- Cache ---
         await self._kv.set(
             cache_key, reranked, ttl_seconds=self._config.retrieval_cache_ttl

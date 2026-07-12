@@ -31,7 +31,11 @@ from apex_host.graph import build_apex_graph
 from apex_host.llm.router import FakeModelRouter, ModelRouter, OpenAIModelRouter
 from apex_host.graph_state import ApexGraphState
 from apex_host.knowledge.cve_patterns import default_identifier_patterns
-from apex_host.knowledge.seed_loader import seed_payload_repo
+from apex_host.knowledge.seed_loader import (
+    seed_compiled_knowledge_full,
+    seed_payload_repo,
+)
+from apex_host.planning.budget import LLMBudgetTracker
 from apex_host.tools.registry import ToolRegistry
 from apex_host.types import ApexPhase
 
@@ -46,10 +50,57 @@ class ApexRuntime:
     config: ApexConfig
     memfabric_config: Config
     registry: ToolRegistry
+    # Populated by run() after the graph completes; None before the first run.
+    last_budget: LLMBudgetTracker | None = None
 
     async def seed(self) -> int:
-        """Load the payload repo into staged knowledge and promote it once."""
+        """Load the payload repo into staged knowledge and promote it once.
+
+        Kept for backward compatibility.  Use ``seed_all()`` to also load
+        compiled knowledge families when ``knowledge_root`` is configured.
+        """
         return await seed_payload_repo(self.config.payload_repo_path, self.api, self.memfabric_config)
+
+    async def seed_all(self) -> dict[str, Any]:
+        """Seed both the payload repo and compiled knowledge families.
+
+        Returns a dict with:
+        - ``"payload_repo"`` (int) → records staged from the raw payload repo
+        - ``"policy_db"``, ``"intel_db"``, etc. (int) → records from compiled JSONL
+        - ``"_promotion"`` (dict) → ``PromotionSummary.to_dict()`` when compiled
+          families were staged (absent when no compiled families are configured
+          or the total staged count is 0).
+
+        When ``knowledge_root`` is None and no per-family paths are configured,
+        the compiled-knowledge families are skipped gracefully (count 0).
+        Backward-compatible: integer-keyed family counts are present as before;
+        the ``"_promotion"`` key is additive.
+        """
+        results: dict[str, Any] = {}
+
+        payload_count = await seed_payload_repo(
+            self.config.payload_repo_path, self.api, self.memfabric_config
+        )
+        results["payload_repo"] = payload_count
+
+        _has_knowledge = (
+            self.config.knowledge_root is not None
+            or self.config.policy_db_path is not None
+            or self.config.methodology_db_path is not None
+            or self.config.intel_db_path is not None
+            or self.config.payload_db_path is not None
+        )
+        if _has_knowledge:
+            compiled_counts, promo_summary = await seed_compiled_knowledge_full(
+                self.api, self.config, self.memfabric_config
+            )
+            results.update(compiled_counts)
+            if promo_summary is not None:
+                results["_promotion"] = promo_summary.to_dict()
+        else:
+            logger.debug("seed_all: no knowledge_root configured; skipping compiled families")
+
+        return results
 
     async def run(self) -> ApexGraphState:
         """Run the APEX engagement graph to completion and return final state.
@@ -73,7 +124,21 @@ class ApexRuntime:
         else:
             model_router = FakeModelRouter()
 
-        graph = build_apex_graph(self.api, self.registry, self.config, model_router=model_router)
+        # Create the shared budget tracker for this run.  With FakeModelRouter
+        # the tracker is constructed but its budget is never consulted (all
+        # planners fall back immediately before the budget check).
+        budget = LLMBudgetTracker(
+            max_per_run=self.config.max_llm_calls_per_run,
+            max_per_phase=self.config.max_llm_calls_per_phase,
+            stop_on_repeated_plan=self.config.llm_stop_on_repeated_plan,
+        )
+        self.last_budget = budget
+
+        graph = build_apex_graph(
+            self.api, self.registry, self.config,
+            model_router=model_router,
+            budget_tracker=budget,
+        )
         run_id = new_id()
         initial: ApexGraphState = {
             "run_id": run_id,
@@ -91,6 +156,8 @@ class ApexRuntime:
             "planner_decisions": [],
             "tool_results": None,
             "repair_count": 0,
+            "policy_decisions": [],
+            "duplicate_actions": [],
         }
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": run_id},

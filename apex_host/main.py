@@ -73,10 +73,69 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--llm-base-url", dest="llm_base_url", default=None, metavar="URL",
         help="Override LLM API base URL (e.g. https://openrouter.ai/api/v1)",
     )
+    parser.add_argument(
+        "--knowledge-root", dest="knowledge_root", default=None, metavar="DIR",
+        help=(
+            "Root of the compiled knowledge directory (e.g. ./knowledge). "
+            "Sub-directories (intel_db, methodology_db, payload_db, policy_db) "
+            "are loaded from <knowledge_root>/<family>/compiled/. "
+            "Families whose compiled/ directory is absent are skipped gracefully."
+        ),
+    )
+    parser.add_argument(
+        "--policy-file", dest="policy_file", default=None, metavar="PATH",
+        help=(
+            "Explicit path to the policy YAML file. "
+            "Overrides automatic discovery through --knowledge-root and the "
+            "conventional local-development path. "
+            "Precedence: --policy-file > --knowledge-root discovery > "
+            "conservative default."
+        ),
+    )
+    # LLM call budget flags — only relevant when --use-llm is set.
+    parser.add_argument(
+        "--max-llm-calls", dest="max_llm_calls", type=int, default=None, metavar="N",
+        help="Maximum real LLM calls for the entire run (default: 5).",
+    )
+    parser.add_argument(
+        "--max-llm-calls-per-phase", dest="max_llm_calls_per_phase",
+        type=int, default=None, metavar="N",
+        help="Maximum LLM calls per phase (default: 2).",
+    )
+    parser.add_argument(
+        "--llm-timeout", dest="llm_timeout", type=float, default=None, metavar="SECS",
+        help="Per-call LLM request timeout in seconds (default: 60.0).",
+    )
+    llm_repeat = parser.add_mutually_exclusive_group()
+    llm_repeat.add_argument(
+        "--llm-stop-on-repeated-plan", dest="llm_stop_on_repeated_plan",
+        action="store_true", default=True,
+        help="Skip LLM call when context is unchanged since last call for the same phase (default).",
+    )
+    llm_repeat.add_argument(
+        "--no-llm-stop-on-repeated-plan", dest="llm_stop_on_repeated_plan",
+        action="store_false",
+        help="Always call LLM even when context is unchanged.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
+    parser.add_argument(
+        "--http-debug", dest="http_debug", action="store_true", default=False,
+        help=(
+            "Enable raw HTTP transport debug logs from openai/httpx/httpcore. "
+            "Only use when diagnosing API connectivity issues. Requires -v."
+        ),
+    )
     parser.add_argument(
         "--preflight", action="store_true",
         help="Check which allowed tools are available in PATH then exit",
+    )
+    parser.add_argument(
+        "--trace-records", dest="trace_records", action="store_true", default=False,
+        help=(
+            "Show per-record Reflector promotion logs when -v is set. "
+            "Without this flag, -v shows only interval summaries and the final "
+            "count. Only useful when diagnosing knowledge-seeding issues."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -97,11 +156,22 @@ async def run(args: argparse.Namespace) -> None:
         use_llm=args.use_llm,
         llm_provider=args.llm_provider,
         llm_base_url=args.llm_base_url,
+        knowledge_root=args.knowledge_root,
+        policy_file=args.policy_file,
+        llm_stop_on_repeated_plan=args.llm_stop_on_repeated_plan,
     )
+    if args.max_llm_calls is not None:
+        config_kwargs["max_llm_calls_per_run"] = args.max_llm_calls
+    if args.max_llm_calls_per_phase is not None:
+        config_kwargs["max_llm_calls_per_phase"] = args.max_llm_calls_per_phase
+    if args.llm_timeout is not None:
+        config_kwargs["llm_request_timeout_seconds"] = args.llm_timeout
     if args.llm_model:
         config_kwargs["planner_model"] = args.llm_model
         config_kwargs["executor_model"] = args.llm_model
         config_kwargs["parser_model"] = args.llm_model
+    if getattr(args, "trace_records", False):
+        config_kwargs["trace_knowledge_records"] = True
     config = ApexConfig(**config_kwargs)  # type: ignore[arg-type]
 
     if args.preflight:
@@ -120,8 +190,8 @@ async def run(args: argparse.Namespace) -> None:
 
     runtime = build_runtime(config)
 
-    seeded = await runtime.seed()
-    logger.info("seeded %d payload-repo knowledge chunks", seeded)
+    seed_results = await runtime.seed_all()
+    logger.info("seeded knowledge: %s", seed_results)
 
     final_state = await runtime.run()
 
@@ -134,6 +204,13 @@ async def run(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+    # Suppress chatty HTTP transport libs when -v is set but --http-debug is not.
+    if args.verbose and not getattr(args, "http_debug", False):
+        for _noisy in ("openai", "openai._base_client", "httpx", "httpcore"):
+            logging.getLogger(_noisy).setLevel(logging.WARNING)
+    # Suppress per-record reflector DEBUG logs unless --trace-records is set.
+    if args.verbose and not getattr(args, "trace_records", False):
+        logging.getLogger("memfabric.reflector.worker").setLevel(logging.INFO)
     asyncio.run(run(args))
 
 

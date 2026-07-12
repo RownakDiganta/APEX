@@ -35,6 +35,7 @@ from apex_host.types import ApexPhase
 
 if TYPE_CHECKING:
     from apex_host.llm.router import ModelRouter
+    from apex_host.planning.budget import LLMBudgetTracker
     from apex_host.planning.engine import PlanningEngine
 
 
@@ -162,6 +163,7 @@ class CredentialPlanner:
         allowed_tools: list[str] | None = None,
         confidence_threshold: float = 0.4,
         max_retries: int = 1,
+        budget_tracker: "LLMBudgetTracker | None" = None,
     ) -> None:
         self._core = _CredentialDeterministic(
             target, registry,
@@ -181,6 +183,7 @@ class CredentialPlanner:
                 target=target,
                 confidence_threshold=confidence_threshold,
                 max_retries=max_retries,
+                budget=budget_tracker,
             )
 
     @property

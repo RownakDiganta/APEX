@@ -6,7 +6,7 @@ Invariants verified:
 - At most reflector_max_promotions_per_run entries are promoted per run_once().
 - Entries above the cap remain staged with promoted=False and are picked up
   on the next run_once() call.
-- Per-item logs are at DEBUG (not INFO); a single INFO summary is emitted.
+- Per-item logs are at DEBUG (not INFO); end-of-pass summary is also at DEBUG (Part 5).
 - Already-promoted entries are not re-promoted on subsequent calls.
 """
 from __future__ import annotations
@@ -134,8 +134,15 @@ async def test_below_confidence_not_promoted() -> None:
 
 
 @pytest.mark.asyncio
-async def test_summary_log_at_info_not_per_item(caplog: pytest.LogCaptureFixture) -> None:
-    """Individual promotion logs must be DEBUG; one INFO summary at end."""
+async def test_summary_log_at_debug_not_info(caplog: pytest.LogCaptureFixture) -> None:
+    """Per-pass promotion summary is at DEBUG, not INFO.
+
+    Part 5 moved the per-pass summary from INFO to DEBUG so that 638 Reflector
+    passes during a 63 k-record corpus seed do not flood the terminal under -v.
+    Interval progress logs (every 50 passes) are emitted at INFO by seed_loader.py
+    instead — not by the worker.  Zero INFO lines should come from the worker's
+    promotion pass itself.
+    """
     api, cfg = _make_api(max_promotions=50, log_every_n=5)
     worker = ReflectorWorker(api, cfg)
 
@@ -145,11 +152,16 @@ async def test_summary_log_at_info_not_per_item(caplog: pytest.LogCaptureFixture
     with caplog.at_level(logging.DEBUG, logger="memfabric.reflector.worker"):
         await worker.run_once()
 
-    info_records = [r for r in caplog.records if r.levelno == logging.INFO
-                    and "reflector.worker" in r.name]
-    # Exactly one INFO record: the summary line.
-    assert len(info_records) == 1, f"Expected 1 INFO record, got {len(info_records)}: {info_records}"
-    assert "promoted=" in info_records[0].message
+    # The per-pass summary "promoted=... skipped=... remaining=..." must be at DEBUG.
+    debug_summary = [r for r in caplog.records if r.levelno == logging.DEBUG
+                     and "promoted=" in r.message and "reflector.worker" in r.name]
+    assert len(debug_summary) >= 1, "Expected at least one DEBUG summary record"
+    # No INFO record should contain "promoted=" (that would be the old per-pass INFO).
+    info_with_promoted = [r for r in caplog.records if r.levelno == logging.INFO
+                          and "promoted=" in r.message and "reflector.worker" in r.name]
+    assert len(info_with_promoted) == 0, (
+        f"Per-pass summary must not be at INFO; found: {info_with_promoted}"
+    )
 
 
 @pytest.mark.asyncio
@@ -195,16 +207,19 @@ async def test_config_new_fields_have_correct_defaults() -> None:
 
 
 @pytest.mark.asyncio
-async def test_zero_entries_produces_summary_log(caplog: pytest.LogCaptureFixture) -> None:
-    """run_once() with no staged entries still emits a summary INFO log."""
+async def test_zero_entries_summary_at_debug(caplog: pytest.LogCaptureFixture) -> None:
+    """run_once() with no staged entries emits the pass summary at DEBUG (not INFO).
+
+    Per-pass summaries are at DEBUG since Part 5 so that large corpus seeds
+    (638+ passes) do not flood the terminal under normal -v.
+    """
     api, cfg = _make_api()
     worker = ReflectorWorker(api, cfg)
 
-    with caplog.at_level(logging.INFO, logger="memfabric.reflector.worker"):
+    with caplog.at_level(logging.DEBUG, logger="memfabric.reflector.worker"):
         await worker.run_once()
 
-    info_records = [r for r in caplog.records if r.levelno == logging.INFO
-                    and "reflector.worker" in r.name]
-    summary = [r for r in info_records if "promoted=" in r.message]
-    assert len(summary) == 1
-    assert "promoted=0" in summary[0].message
+    debug_summary = [r for r in caplog.records if r.levelno == logging.DEBUG
+                     and "promoted=" in r.message and "reflector.worker" in r.name]
+    assert len(debug_summary) >= 1, "Expected DEBUG summary even with zero entries"
+    assert "promoted=0" in debug_summary[0].message

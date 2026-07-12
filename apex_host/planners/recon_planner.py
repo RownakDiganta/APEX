@@ -45,6 +45,7 @@ from apex_host.types import ApexPhase
 
 if TYPE_CHECKING:
     from apex_host.llm.router import ModelRouter
+    from apex_host.planning.budget import LLMBudgetTracker
     from apex_host.planning.engine import PlanningEngine
 
 # Capability names that a raw nc banner probe is safe and informative for.
@@ -172,6 +173,7 @@ class ReconPlanner:
         allowed_tools: list[str] | None = None,
         confidence_threshold: float = 0.4,
         max_retries: int = 1,
+        budget_tracker: "LLMBudgetTracker | None" = None,
     ) -> None:
         self._core = _ReconDeterministic(target, registry)
         self._engine: PlanningEngine | None = None
@@ -186,6 +188,7 @@ class ReconPlanner:
                 target=target,
                 confidence_threshold=confidence_threshold,
                 max_retries=max_retries,
+                budget=budget_tracker,
             )
 
     @property
