@@ -38,6 +38,7 @@ from apex_host.planning.validator import Validator
 
 if TYPE_CHECKING:
     from apex_host.llm.router import ModelRouter
+    from apex_host.policy.llm_guard import LLMPolicyGuard
 
 logger = logging.getLogger(__name__)
 
@@ -144,12 +145,14 @@ class RepairEngine:
         allowed_tools: list[str],
         target: str = "",
         dry_run: bool = True,
+        guard: "LLMPolicyGuard | None" = None,
     ) -> None:
         self._router = model_router
         self._allowed_tools = allowed_tools
         self._target = target
         self._dry_run = dry_run
         self._validator = Validator()
+        self._guard = guard
 
     async def repair(
         self,
@@ -191,6 +194,20 @@ class RepairEngine:
         messages = _build_repair_messages(
             failed_task, error, phase, ekg_summary, self._allowed_tools
         )
+
+        # --- LLM policy checkpoint: sanitize + pre-flight prompt check ---
+        if self._guard is not None:
+            messages, n = self._guard.sanitize_messages(messages)
+            if n > 0:
+                logger.debug("repair_engine: %d secret(s) redacted from repair prompt", n)
+            prompt_blocked, prompt_reason = self._guard.check_prompt(messages)
+            if prompt_blocked:
+                logger.warning(
+                    "repair_engine: repair prompt blocked by LLM guard (%s) — repair skipped",
+                    prompt_reason,
+                )
+                return None
+
         chat_llm = cast(_LLMChatModel, llm)
 
         try:
@@ -199,6 +216,16 @@ class RepairEngine:
         except Exception as exc:
             logger.warning("repair_engine: LLM error (%s) — repair skipped", exc)
             return None
+
+        # --- LLM policy checkpoint: post-output check ---
+        if self._guard is not None:
+            out_blocked, out_reason = self._guard.check_output(raw)
+            if out_blocked:
+                logger.warning(
+                    "repair_engine: repair output blocked by LLM guard (%s) — repair skipped",
+                    out_reason,
+                )
+                return None
 
         output = self._validator.validate(raw, self._allowed_tools)
         if output is None:

@@ -1479,6 +1479,80 @@ No network traffic is generated. Tool invocations are simulated and logged.
 Use this to verify routing logic, phase progression, and EKG writes without
 touching a live target.
 
+### Full-stack dry-run with compiled knowledge and explicit policy file
+
+```bash
+python -m apex_host.eval.run_htb_local \
+  --target <HTB-machine-IP> \
+  --payload-repo ./payloads \
+  --knowledge-root ./knowledge \
+  --policy-file ./knowledge/policy_db/compiled/hackthebox_lab.yaml \
+  --dry-run \
+  --export-json ./run_report.json
+```
+
+This is the recommended development workflow command.  It:
+- Seeds all four compiled knowledge families from `./knowledge/` (63,000+ records
+  promoted across ~639 Reflector passes in ~5 s).
+- Loads the explicit policy YAML so `policy_source` is visible in the report.
+- Exports a full structured JSON report to `./run_report.json` for offline inspection.
+- Generates no real network traffic (dry-run mode).
+
+The JSON report includes `policy_gate.policy_source`,
+`knowledge_seeding.promotion` (passes, promoted, remaining, stop_reason),
+and per-family counts.  Verify with:
+
+```bash
+python -c "import json; r=json.load(open('run_report.json')); \
+  print('policy_source:', r['policy_gate']['policy_source']); \
+  print('promoted:', r['knowledge_seeding']['promotion']['records_promoted'])"
+```
+
+### Localhost duplicate-action + logging verification (safe, no real commands)
+
+Use this to verify that:
+- duplicate deterministic fallback tasks are skipped (not repeated),
+- normal `-v` does **not** print per-record promotion IDs,
+- reports show `duplicate_actions` metadata.
+
+```bash
+python -m apex_host.eval.run_htb_local \
+  --target 127.0.0.1 \
+  --knowledge-root ./knowledge \
+  --policy-file ./knowledge/policy_db/compiled/hackthebox_lab.yaml \
+  --dry-run \
+  --use-llm \
+  --llm-provider openai \
+  --llm-model gpt-5 \
+  --max-turns 3 \
+  --max-llm-calls 3 \
+  --max-llm-calls-per-phase 1 \
+  --export-json ./run_reports/duplicate_control_dry.json \
+  --export-graph ./run_reports/duplicate_control_dry_ekg.json \
+  -v
+```
+
+Expected output:
+- At most one identical nmap action executes; subsequent identical fallback tasks
+  are skipped and recorded as `skip_task` in `duplicate_actions`.
+- No per-record promotion IDs appear under normal `-v`; use `--trace-records`
+  to enable those.
+- `run_reports/duplicate_control_dry.json` contains a `"duplicate_actions"` section
+  with `total_skipped ≥ 0`.
+- All safety gates remain active (`policy_decisions` present in JSON).
+
+Verify the JSON report:
+```bash
+python -c "
+import json
+r = json.load(open('./run_reports/duplicate_control_dry.json'))
+print('duplicate_actions:', r.get('duplicate_actions'))
+print('policy_blocked:', r['policy_gate']['policy_blocked_count'])
+"
+```
+
+Add `--trace-records` to also see per-record Reflector promotion logs.
+
 ### Real engagement (authorized HTB/VPN targets only)
 
 ```bash
@@ -2235,3 +2309,1014 @@ Add `--no-dry-run` only for authorized HTB VPN targets.
   `tests/apex_host/test_llm_wiring.py`.  Never construct `OpenAIModelRouter`
   in a test without patching it — use `FakeModelRouter` or a `_StubRouter`
   to avoid API key requirements.
+
+---
+
+## 18. External Knowledge Base Layout
+
+The project keeps an external knowledge directory (`knowledge/` at the repo
+root) that contains raw downloaded files from public sources.  **APEX never
+loads huge raw files directly at runtime.**  Instead, compiler scripts
+(one per family) read the raw sources and write compact JSONL files to a
+`compiled/` subdirectory.  At runtime APEX ingests those compiled files via
+`MemoryAPI.propose_knowledge()` + Reflector promotion — exactly the same
+path as the payload repo loader.
+
+> **Directory name:** the real on-disk directory is `knowledge/` (all
+> lowercase, no typo).  Earlier notes that said `Knowlwdge/` were incorrect.
+> Use `--knowledge-root ./knowledge` on the CLI.
+
+### 18.1 Directory layout
+
+```
+knowledge/
+├── intel_db/                 ← CVE, CWE, CAPEC, MITRE ATT&CK raw data
+│   ├── attack/enterprise-attack.json
+│   ├── capec/capec.xml
+│   ├── cve/nvdcve-2.0-<year>.json  (2002–2026 + modified + recent, 26 files)
+│   └── cwe/cwe.xml
+│
+├── methodology_db/           ← Methodology PDFs (files sit directly at root)
+│   ├── NIST_SP800_115.pdf
+│   ├── OWASP_Code_Review_Guide_v2.pdf
+│   ├── owasp_web_security_testing_guide_v4.pdf
+│   └── ptes_technical_guidelines.pdf
+│
+├── payload_db/               ← 4 living-off-the-land / wordlist sub-projects
+│   ├── GTFOBins/             ← 477 Linux binary abuse entries
+│   │   └── _gtfobins/       ← *** EXTENSIONLESS YAML files, one per binary ***
+│   ├── LOLBAS/               ← 242 Windows binary abuse entries
+│   │   └── yml/{OSBinaries,OSLibraries,OSScripts,...}/*.yml
+│   ├── PayloadsAllTheThings/ ← 67+ web attack payload categories (.md files)
+│   └── SecLists/             ← 6055 wordlist files (manifest-only in RAG)
+│       ├── Discovery/
+│       ├── Passwords/        ← restricted_use="explicit_operator_approval_required"
+│       ├── Fuzzing/
+│       └── …
+│
+└── policy_db/                ← HTB authorisation boundary documents
+    ├── readme.md
+    └── sources/htb/          ← 17 HTB legal documents + legal_index.md
+```
+
+### 18.2 Subdirectory conventions (per family)
+
+Each knowledge family directory may grow the following subdirectories over
+time.  `sources/` contains the raw downloaded originals; `compiled/` is
+written by compiler scripts (all four compilers are now implemented);
+`indexes/` is optional.
+
+```
+<family>/
+├── sources/     ← raw downloaded originals — never modified by code
+├── compiled/    ← JSONL files produced by compiler scripts (runtime source)
+└── indexes/     ← optional prebuilt BM25 / vector index snapshots
+```
+
+**Never point `PayloadRepoLoader` or any runtime loader directly at
+`sources/`.** The raw NVD CVE JSON alone is several gigabytes.  Compiler
+scripts extract, normalise, and chunk the raw data once; APEX ingests the
+compact JSONL output.  **Compiler scripts never fetch from the internet;
+they read only from the local `sources/` directory tree.**
+
+### 18.3 Compiled record schema
+
+All compiled JSONL files use the `CompiledKnowledgeRecord` dataclass defined
+in `apex_host/knowledge/compiler/schemas.py`.  Required fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `str` | Stable content-addressed ID (first 32 hex chars of SHA-256) |
+| `source_family` | `SourceFamily` | `intel_db`, `methodology_db`, `payload_db`, `policy_db` |
+| `source_type` | `SourceType` | `cve`, `cwe`, `capec`, `attack`, `methodology`, `payload`, `wordlist_manifest`, `htb_rule`, `legal_doc` |
+| `source_path` | `str` | Path to the original source file |
+| `title` | `str` | Short label (file name, section heading, CVE ID, …) |
+| `text` | `str` | Normalised textual content indexed by BM25 + vector |
+| `tags` | `list[str]` | Free-form filter labels |
+| `confidence` | `float` | Prior confidence (0–1) |
+| `updated_at` | `str` | ISO-8601 UTC compile timestamp |
+| `metadata` | `dict` | Arbitrary pass-through fields |
+
+### 18.4 Knowledge Compiler Layer
+
+`apex_host/knowledge/compiler/` is the compiler package.  All four source
+families have compiler modules.  The CLI entrypoint drives all of them:
+
+```
+python -m apex_host.knowledge.compiler.compile_knowledge \
+    --knowledge-root ./Knowlwdge
+```
+
+#### Module map
+
+| Module | Purpose |
+|---|---|
+| `schemas.py` | `CompiledKnowledgeRecord`, `SourceFamily`, `SourceType` |
+| `common.py` | `iter_files`, `read_text_safely`, `write_jsonl`, `stable_record_id`, `normalize_whitespace` |
+| `policy_compiler.py` | `compile_policy(sources_path, output_dir) → int` |
+| `methodology_compiler.py` | `compile_methodology(sources_path, output_dir) → int` |
+| `intel_compiler.py` | `compile_intel(intel_db_path, output_dir) → int` |
+| `payload_compiler.py` | `compile_payload(payload_db_path, output_dir) → tuple[int, int]` |
+| `compile_knowledge.py` | CLI entrypoint (`__main__`) for all four compilers |
+
+#### Output files (per family)
+
+| Family | Output file(s) |
+|---|---|
+| `policy_db` | `compiled/policy_records.jsonl`, `compiled/hackthebox_lab.yaml` |
+| `methodology_db` | `compiled/methodology_chunks.jsonl` |
+| `intel_db` | `compiled/attack_techniques.jsonl`, `compiled/cwe_weaknesses.jsonl`, `compiled/capec_patterns.jsonl`, `compiled/cve_slim.jsonl` |
+| `payload_db` | `compiled/payload_records.jsonl`, `compiled/wordlist_manifest.jsonl` |
+
+#### Key design rules
+
+- **Compiled JSONL is the sole runtime source.**  Nothing reads raw sources at
+  runtime.  If a compiled file does not exist, that family is skipped with a
+  warning — no fall-back to raw.
+- **SecLists wordlists are manifest-only.**  `payload_compiler` never ingests
+  individual wordlist lines into RAG.  Each file gets one manifest record
+  (`source_type="wordlist_manifest"`) describing its path, category, approx
+  line count, and recommended use.  `Passwords/` and credential directories
+  carry `metadata.restricted_use="explicit_operator_approval_required"`.
+- **No internet access.**  Compiler scripts read only from the local
+  `sources/` directory tree.  They never issue HTTP requests or shell out
+  to download tools.
+- **PDF stubs.**  When no PDF library is installed, `.pdf` files produce a
+  metadata-only stub record at `confidence=0.4` rather than crashing.
+- **CVE cap.**  `intel_compiler` caps CVE records at `_CVE_RECORDS_PER_FILE =
+  2000` per NVD file to keep compiled output bounded (NVD files can exceed
+  25,000 entries each).
+- **Idempotent IDs.**  `stable_record_id(family, type, path, chunk_index,
+  extra)` produces a stable 32-char hex ID via SHA-256; re-running the
+  compiler on unchanged sources produces the same IDs.
+- **All compiler modules follow §12.6** (two-line file header) and write
+  only to `compiled/`.  They never modify `sources/`.
+
+### 18.5 ApexConfig knowledge fields
+
+`ApexConfig` exposes five optional path fields so the runtime knows where to
+find compiled knowledge at startup:
+
+| Field | Default | CLI flag (future) |
+|---|---|---|
+| `knowledge_root` | `None` | `--knowledge-root` |
+| `policy_db_path` | `None` | `--policy-db-path` |
+| `methodology_db_path` | `None` | `--methodology-db-path` |
+| `intel_db_path` | `None` | `--intel-db-path` |
+| `payload_db_path` | `None` | `--payload-db-path` |
+
+When `knowledge_root` is set, the convention is
+`<knowledge_root>/<family>/compiled/`.  Per-family overrides take
+precedence.  `None` means the family is not loaded at startup — this is
+the safe default.  The existing `payload_repo_path` field and
+`PayloadRepoLoader` are unchanged; `payload_db_path` will eventually
+supersede `payload_repo_path` when a payload compiler script is added.
+
+### 18.6 Rules for Claude Code
+
+- **Never load raw source files at runtime.** Point runtime loaders at
+  `compiled/*.jsonl` only.  If a compiled file does not exist for a family,
+  skip that family and log a warning — do not fall back to raw sources.
+- **Compiler scripts belong under `apex_host/knowledge/`**, not in
+  `memfabric/`.  They may use the `compiler/` package freely.
+- **No domain content in source files.**  Compiler scripts read external
+  directories; they never embed raw payload text, CVE descriptions, or
+  legal excerpts in Python source.
+- **Tests for new compiler scripts** go in
+  `tests/apex_host/test_<family>_compiler.py`.  Tests must use `tmp_path`
+  fixtures and synthetic data — never load real files from `knowledge/`.
+- **`stable_record_id` must be used** for all compiled record IDs so that
+  re-running a compiler on unchanged sources is idempotent (same IDs,
+  no duplicate proposals in the staging area).
+
+### 18.7 External Knowledge Layout Reality Check
+
+This section documents the **real on-disk layout** verified by
+`apex_host/knowledge/compiler/layout.py` and the `--inspect` flag.  Use it
+as the single source of truth before writing path-dependent compiler code.
+
+#### Verified path assumptions
+
+| Family | Real source path | Notes |
+|---|---|---|
+| `policy_db` | `knowledge/policy_db/sources/htb/` | `sources/` subdir exists; `compiled/` does not auto-create |
+| `methodology_db` | `knowledge/methodology_db/` (root) | **No** `sources/` subdir; PDFs sit at root |
+| `intel_db` | `knowledge/intel_db/{attack,capec,cve,cwe}/` | 4 named subdirs; 26 NVD CVE JSON files |
+| `payload_db` | `knowledge/payload_db/` (root) | 4 sub-projects directly under root; **no** `sources/` |
+
+#### GTFOBins format (non-obvious)
+
+GTFOBins entries are **extensionless YAML files** inside `_gtfobins/` (not
+`.yml`).  The tool name is the filename (e.g. `_gtfobins/curl`).  The YAML
+root key is `functions:` mapping category names to a list of `{code, contexts}`
+dicts.  The compiler handles these via `_compile_gtfobins()` and
+`_is_gtfobins_entry()` — do not route them through `_compile_yaml()` which
+expects `.yml` / `.yaml` extensions and `Name`/`Commands` keys.
+
+#### Layout detector
+
+`apex_host/knowledge/compiler/layout.py` provides:
+- `detect_layout(root) → KnowledgeLayout` — structured report (no writes).
+- `format_inspect_report(layout) → str` — human-readable text.
+
+The `--inspect` CLI flag invokes these:
+```bash
+python -m apex_host.knowledge.compiler.compile_knowledge \
+    --knowledge-root ./knowledge --inspect
+```
+
+Exit codes: **0** all compiled outputs present; **1** any output missing or
+root absent.  The flag never writes to disk.
+
+#### Expected compiled outputs after running all compilers
+
+| Family | File | Status |
+|---|---|---|
+| `policy_db` | `policy_db/compiled/policy_records.jsonl` | missing until compiled |
+| `policy_db` | `policy_db/compiled/hackthebox_lab.yaml` | missing until compiled |
+| `methodology_db` | `methodology_db/compiled/methodology_chunks.jsonl` | missing until compiled |
+| `intel_db` | `intel_db/compiled/attack_techniques.jsonl` | missing until compiled |
+| `intel_db` | `intel_db/compiled/cwe_weaknesses.jsonl` | missing until compiled |
+| `intel_db` | `intel_db/compiled/capec_patterns.jsonl` | missing until compiled |
+| `intel_db` | `intel_db/compiled/cve_slim.jsonl` | missing until compiled |
+| `payload_db` | `payload_db/compiled/payload_records.jsonl` | missing until compiled |
+| `payload_db` | `payload_db/compiled/wordlist_manifest.jsonl` | missing until compiled |
+
+To compile everything:
+```bash
+python -m apex_host.knowledge.compiler.compile_knowledge \
+    --knowledge-root ./knowledge
+```
+
+---
+
+### 18.8 Required Compiled Knowledge Outputs
+
+The table below lists every file that must exist under `knowledge/` after the
+compilers run.  This is the authoritative list — it matches the
+`REQUIRED_OUTPUTS` dict in `compile_knowledge.py` and the `--strict` flag
+checks exactly these nine files.
+
+| # | Family | File | Description | Min records |
+|---|---|---|---|---|
+| 1 | `policy_db` | `policy_db/compiled/policy_records.jsonl` | HTB rule + legal doc records | 1 |
+| 2 | `policy_db` | `policy_db/compiled/hackthebox_lab.yaml` | HTB rule summary YAML (human-readable) | — |
+| 3 | `methodology_db` | `methodology_db/compiled/methodology_chunks.jsonl` | PDF/Markdown methodology chunks | 1 |
+| 4 | `intel_db` | `intel_db/compiled/attack_techniques.jsonl` | MITRE ATT&CK enterprise attack patterns | 100 |
+| 5 | `intel_db` | `intel_db/compiled/cwe_weaknesses.jsonl` | CWE weakness descriptions | 100 |
+| 6 | `intel_db` | `intel_db/compiled/capec_patterns.jsonl` | CAPEC attack patterns | 50 |
+| 7 | `intel_db` | `intel_db/compiled/cve_slim.jsonl` | NVD CVE slim records (capped 2000/file) | 1000 |
+| 8 | `payload_db` | `payload_db/compiled/payload_records.jsonl` | GTFOBins/LOLBAS/PAT semantic records | 100 |
+| 9 | `payload_db` | `payload_db/compiled/wordlist_manifest.jsonl` | SecLists wordlist manifests (no line content) | 10 |
+
+#### Compile and verify all 9 outputs
+
+```bash
+# Compile (idempotent — safe to re-run):
+python -m apex_host.knowledge.compiler.compile_knowledge \
+    --knowledge-root ./knowledge
+
+# Compile + verify (exits 1 if any file is missing or empty):
+python -m apex_host.knowledge.compiler.compile_knowledge \
+    --knowledge-root ./knowledge --strict
+
+# Inspect without writing (shows per-file size and OK/MISSING status):
+python -m apex_host.knowledge.compiler.compile_knowledge \
+    --knowledge-root ./knowledge --inspect
+```
+
+#### Record counts from real knowledge/ (as of last full compile)
+
+| Family | File | Records |
+|---|---|---|
+| `policy_db` | `policy_records.jsonl` | 21 |
+| `methodology_db` | `methodology_chunks.jsonl` | 4 (PDF stubs) |
+| `intel_db` | `attack_techniques.jsonl` | 697 |
+| `intel_db` | `cwe_weaknesses.jsonl` | 969 |
+| `intel_db` | `capec_patterns.jsonl` | 571 |
+| `intel_db` | `cve_slim.jsonl` | 51,268 |
+| `payload_db` | `payload_records.jsonl` | 4,171 |
+| `payload_db` | `wordlist_manifest.jsonl` | 6,070 |
+
+#### Rules for Claude Code
+
+- **`REQUIRED_OUTPUTS` in `compile_knowledge.py` is the single source of truth.**
+  `--strict` mode, `layout.py` output expectations, and
+  `tests/apex_host/test_compilers_output.py` all reference the same 9 files.
+  If a compiler is added or renamed, update `REQUIRED_OUTPUTS` first, then
+  the `_*_OUTPUTS` lists in `layout.py`, then the tests.
+- **All 9 must be present before RAG ingestion runs.**  `ApexRuntime` (future)
+  will call `seed_knowledge_db()` which reads compiled JSONL via
+  `MemoryAPI.propose_knowledge()` + Reflector promotion.  A missing file is a
+  no-op for that family (compiler gracefully returns 0), but the knowledge gap
+  will affect retrieval quality.
+- **Never add a 10th output without updating `REQUIRED_OUTPUTS` and the table
+  above.**  The `--strict` flag will silently not check it otherwise.
+
+---
+
+### 18.9 Compiled Knowledge Runtime Seeding
+
+This section documents how compiled JSONL knowledge is loaded into `MemoryAPI` at
+engagement startup.  All four knowledge families (`policy_db`, `methodology_db`,
+`intel_db`, `payload_db`) use the same path: `propose_knowledge()` → Reflector
+promotion → retrievable via `api.query(filters=...)`.
+
+#### Design rules (non-negotiable)
+
+- **Only reads `compiled/` JSONL — never raw sources at runtime.**  The raw NVD CVE
+  JSON alone is several gigabytes.  `compiled_loader.py` reads only the compact
+  output files listed in `_FAMILY_JSONL`.
+- **All writes go through `MemoryAPI.propose_knowledge()`** (memfabric Invariant 1).
+  `compiled_loader.py` never touches a store directly.
+- **Staging gate is preserved** (memfabric Invariant 4, CLAUDE.md §13.10).  Staged
+  entries are NOT retrievable until `ReflectorWorker.run_once()` promotes them.
+  `seed_compiled_knowledge()` calls `run_once()` after all families are staged.
+- **`source_family` survives promotion.**  `promote_knowledge()` in `memfabric/api.py`
+  merges `entry.metadata` into the lexical and vector index metadata so that
+  `source_family` (and other provenance fields) are present on `ScoredEntry.metadata`
+  after retrieval.  `HybridRetriever.search()` applies the `filters` dict as a
+  post-filter after reranking.
+
+#### Module map
+
+| Module | Purpose |
+|---|---|
+| `apex_host/knowledge/compiled_loader.py` | `load_compiled_family(compiled_dir, family, api) → int` — stage one family |
+| `apex_host/knowledge/query_filters.py` | Pre-built filter dicts + post-filter helpers for source_family / source_type |
+| `apex_host/knowledge/seed_loader.py` | `seed_compiled_knowledge(api, config, mf_config) → dict[str, int]` — all families |
+| `apex_host/runtime.py` | `ApexRuntime.seed_all()` — backward-compatible wrapper that calls both seeders |
+
+#### Seeding flow
+
+```
+ApexRuntime.seed_all()
+  ├── seed_payload_repo(payload_repo_path, api, mf_config)    # raw payload repo (unchanged)
+  └── seed_compiled_knowledge(api, apex_config, mf_config)
+        ├── for each family: load_compiled_family(compiled_dir, family, api)
+        │     └── propose_knowledge() per record  → staging area (NOT yet retrievable)
+        └── ReflectorWorker.run_once()             → promotes entries above quality gate
+```
+
+#### Path resolution
+
+| Priority | Source |
+|---|---|
+| 1 (highest) | Explicit per-family field: `ApexConfig.policy_db_path`, `intel_db_path`, etc. |
+| 2 | `ApexConfig.knowledge_root / <family> / compiled` |
+| 3 | Missing / no config → family skipped with count 0 (no crash) |
+
+#### Filter dicts (from `query_filters.py`)
+
+```python
+from apex_host.knowledge.query_filters import (
+    POLICY_FILTER, PAYLOAD_FILTER, INTEL_FILTER, METHODOLOGY_FILTER,
+    WORDLIST_MANIFEST_FILTER,
+    source_family_filter, source_type_filter, combined_filter,
+    filter_by_source_family, filter_by_source_type, filter_by_metadata,
+)
+
+# At query time (post-filter enforced in HybridRetriever):
+bundle = await api.query(text="SQL injection", k=10, filters=INTEL_FILTER)
+
+# Or filter an existing result list:
+intel_hits = filter_by_source_family(bundle.entries, "intel_db")
+```
+
+#### CLI flags (both `main.py` and `run_htb_local.py`)
+
+```bash
+python -m apex_host.main \
+  --target <IP> \
+  --payload-repo ./payloads \
+  --knowledge-root ./knowledge \
+  --dry-run
+```
+
+When `--knowledge-root` is omitted, only the raw payload repo is seeded (backward
+compatible with all existing tests and scripts).
+
+#### Metadata fields preserved after promotion
+
+Every `ScoredEntry` from a compiled knowledge query carries:
+
+| Field | Value |
+|---|---|
+| `source_family` | `"policy_db"`, `"intel_db"`, `"payload_db"`, `"methodology_db"` |
+| `source_type` | `"htb_rule"`, `"legal_doc"`, `"attack"`, `"cve"`, `"cwe"`, `"capec"`, `"payload"`, `"wordlist_manifest"`, `"methodology"` |
+| `source_path` | Absolute path to the original source file |
+| `title` | Short label (e.g. CVE ID, file name, technique name) |
+| `tags` | Free-form filter labels from the compiler |
+| `tier` | `"semantic"` (all compiled knowledge is in the semantic tier) |
+| `restricted_use` | `"general"` or `"explicit_operator_approval_required"` (for Passwords/ entries) |
+
+#### Tests (`tests/apex_host/test_compiled_loader.py`)
+
+32 tests covering:
+- Staging isolation: records not retrievable before `ReflectorWorker.run_once()`
+- `policy_db` filter returns only policy records (no cross-family leakage)
+- `payload_db` filter returns only payload records
+- `intel_db` filter returns only intel records
+- `methodology_db` filter returns only methodology records
+- `seed_compiled_knowledge()` returns correct per-family counts
+- Graceful degradation: missing family produces count 0, no crash
+- No knowledge root configured → all counts 0
+- `ScoredEntry.text` is non-empty after promotion (retrieval text fix)
+- `query_filters.py` helper functions and pre-built constants
+- CLI `--knowledge-root` flag parsed correctly in `main.py` and `run_htb_local.py`
+- Per-family path override takes priority over `knowledge_root`
+- Malformed JSONL lines skipped; valid lines still staged
+- Empty-text records skipped
+- `_record_to_knowledge_entry` preserves all metadata fields and respects confidence override
+
+#### Rules for Claude Code
+
+- **Never bypass the staging gate.**  Do not call internal staging-store methods
+  directly to make compiled entries immediately retrievable.  Only `ReflectorWorker`
+  may promote (§13.10).
+- **`promote_knowledge()` must merge `entry.metadata`.**  The fix in `memfabric/api.py`
+  (`{**entry.metadata, "tier": ..., "source": ..., "_text": ...}`) must be preserved.
+  Reverting it breaks the filter system silently.
+- **`HybridRetriever.search()` must apply `filters` as a post-filter.**  The fix in
+  `memfabric/retrieval/engine.py` (post-filter after reranking) must be preserved.
+  Without it, `api.query(filters=...)` returns unfiltered results.
+- **`seed_all()` is the public seeding surface.**  The old `seed()` method is kept
+  for backward compatibility but callers should prefer `seed_all()`.
+- **Tests for new compiled-knowledge behavior** go in
+  `tests/apex_host/test_compiled_loader.py`.  Use `tmp_path` fixtures and synthetic
+  JSONL data — never load real files from `knowledge/`.
+
+---
+
+### 18.10 Initial Knowledge Promotion Strategy
+
+**Why the default `reflector_max_promotions_per_run=100` cap exists:** During
+normal post-engagement Reflector passes the cap prevents log floods and keeps
+each `run_once()` call bounded.  It is a per-pass limit, not a lifetime limit.
+
+**Why startup seeding needs multiple passes:** `seed_compiled_knowledge_full()`
+stages all compiled records in one shot (e.g. 63,783 at startup), then calls
+`promote_staged_knowledge_until_stable()` which loops `run_once()` until every
+promotable record is indexed.  At cap=100, 63,783 records need ~638 passes,
+taking roughly 5 seconds in-memory.
+
+#### `promote_staged_knowledge_until_stable()` — bounded loop contract
+
+The loop terminates on the **first** condition that triggers:
+
+| Stop reason | When it fires |
+|---|---|
+| `exhausted` | All un-promoted staged entries are now promoted |
+| `no_progress` | A pass promoted zero entries (all remaining are below `min_confidence`) |
+| `max_passes` | `ApexConfig.knowledge_promotion_max_passes` reached (default 1000) |
+| `max_records` | `ApexConfig.knowledge_promotion_max_records` cap reached (default `None`) |
+| `timeout` | `ApexConfig.knowledge_promotion_timeout_seconds` elapsed (default `None`) |
+| `single_pass` | Mode is `"single_pass"` — legacy behaviour; exactly one pass |
+| `disabled` | Mode is `"disabled"` — staging only, no promotion |
+
+**Progress tracking uses un-promoted entry counts.**  `get_staged_knowledge()`
+returns all staging-dict entries including already-promoted ones (which stay for
+auditability).  The loop counts only those where `entry.promoted is False` so
+it correctly detects `no_progress` and `exhausted`.
+
+#### `PromotionSummary` dataclass
+
+Returned by `seed_compiled_knowledge_full()` and included in `seed_all()` under
+the `"_promotion"` key:
+
+| Field | Type | Description |
+|---|---|---|
+| `records_staged_initial` | `int` | Un-promoted entries counted at loop start |
+| `records_promoted` | `int` | Total promoted across all passes |
+| `records_remaining` | `int` | Un-promoted entries when loop ended |
+| `passes_run` | `int` | `run_once()` calls made |
+| `stop_reason` | `str` | See table above |
+| `elapsed_seconds` | `float` | Wall-clock time |
+
+#### Controlling the promotion strategy via `ApexConfig`
+
+| Field | Default | Purpose |
+|---|---|---|
+| `knowledge_promotion_mode` | `"until_stable"` | `"until_stable"`, `"single_pass"`, or `"disabled"` |
+| `knowledge_promotion_max_passes` | `1000` | Hard cap — prevents infinite loops |
+| `knowledge_promotion_max_records` | `None` | Optional promoted-records cap |
+| `knowledge_promotion_timeout_seconds` | `None` | Optional wall-clock timeout |
+
+#### Rules for Claude Code
+
+- **Never modify `reflector_max_promotions_per_run` to fix startup promotion.**
+  The correct fix is the multi-pass loop in `seed_loader.py`.  The per-run cap
+  stays low intentionally to keep normal post-engagement Reflector passes bounded.
+- **Progress must be tracked by un-promoted count, not raw staging-dict size.**
+  `get_staged_knowledge()` includes promoted entries; always filter by
+  `not entry.promoted` before counting to detect real progress.
+- **`mode="disabled"` is for test fixtures only** — just like
+  `policy_enabled=False`.  Do not set it in production configurations.
+- **Tests** go in `tests/apex_host/test_promotion_loop.py`.  Use synthetic
+  JSONL fixtures; never load real `knowledge/` files.
+
+---
+
+## 19. PolicyAdvisor and Scope Enforcement
+
+`apex_host/policy/` is the deterministic scope and policy enforcement layer.
+It is **not legal advice** and must never be called "LegalAdvisor".  It
+enforces engagement scope constraints using configurable, LLM-free rules.
+
+### 19.1 Design invariants (non-negotiable)
+
+1. **No LLM calls.** `PolicyAdvisor` is purely synchronous and deterministic.
+   It never calls `ModelRouter`, never does I/O in `review_task()`, and
+   never touches `MemoryAPI`.
+
+2. **Conservative by default.** A missing or unreadable policy YAML file
+   makes the advisor **more** restrictive, not less.  The conservative
+   default allows only `config.target` and blocks all destructive and
+   brute-force tools regardless of whether a YAML was found.
+
+3. **Blocking rules run first.** The rule evaluation order in `ALL_RULES`
+   (in `rules.py`) is fixed.  Destructive-command and target-scope rules
+   run before any permissive rules so they cannot be bypassed.
+
+4. **All restrictions come from `ApexConfig`.** The policy YAML file (when
+   present) is only used to confirm that an operator-supplied policy exists
+   (`policy_loaded=True`).  The YAML content itself is not parsed for rules —
+   restrictions are set exclusively through `ApexConfig` fields.  This means
+   YAML presence never automatically relaxes anything.
+
+5. **`policy_enabled=False` is for test fixtures only.** Do not set it in
+   production configurations.  Every real engagement must run with policy
+   checking enabled.
+
+6. **Secret material is never evaluated.** Rules inspect tool names and
+   `args` tokens only.  They never read from the EKG, execute tools, or
+   call network services.
+
+### 19.2 Module map
+
+```
+apex_host/policy/
+├── __init__.py          # public exports: PolicyAdvisor, models, load_policy
+├── models.py            # PolicyStatus, PolicyDecision, PolicyRule, ScopePolicy
+├── policy_loader.py     # load_policy(config) → ScopePolicy
+├── rules.py             # deterministic rule functions + ALL_RULES registry
+└── advisor.py           # PolicyAdvisor.review_task()
+```
+
+### 19.3 Public API
+
+```python
+from apex_host.policy import PolicyAdvisor, PolicyDecision, PolicyStatus, load_policy
+
+policy = load_policy(config)                   # loads YAML or conservative default
+advisor = PolicyAdvisor(policy, config)
+
+decision = advisor.review_task(task, phase, evidence, config)
+# decision.status: "approved" | "blocked" | "needs_human_review"
+# decision.rule_name: the name of the rule that fired (or "default_allow")
+# decision.reason: human-readable explanation
+```
+
+`review_task` is synchronous and always returns a `PolicyDecision` — it never
+raises.  Rule exceptions are caught internally, logged, and skipped.
+
+### 19.4 Rule registry and evaluation order
+
+Rules are evaluated in the fixed order defined in `rules.ALL_RULES`.
+The first rule that returns a non-None `PolicyDecision` wins.
+
+| # | Rule function | When it fires |
+|---|---|---|
+| 1 | `check_no_destructive_command` | `task.params["tool"]` in `policy.blocked_tools` |
+| 2 | `check_target_in_scope` | `task.params["target"]` not in `policy.allowed_targets` |
+| 3 | `check_no_attacking_infrastructure` | An arg token contains an IP outside the allowed scope |
+| 4 | `check_no_password_list` | An arg token is a wordlist flag (`-w`, `--wordlist`, …) |
+| 5 | `check_no_sensitive_data` | An arg token contains a known sensitive path fragment |
+| 6 | `check_require_review` | Tool is in `policy.require_review_for` |
+| 7 | `check_safe_recon_allowed` | Safe recon tool against assigned target → explicit `approved` |
+| — | Default allow | All rules returned None → `approved` |
+
+### 19.5 New `ApexConfig` fields
+
+| Field | Type | Default | Purpose |
+|---|---|---|---|
+| `policy_enabled` | `bool` | `True` | Enable scope enforcement; `False` is for test fixtures only |
+| `policy_file` | `str \| None` | `None` | Explicit path to policy YAML; overrides knowledge_root lookup |
+| `allow_sensitive_data_access` | `bool` | `False` | Permit access to sensitive system paths (requires explicit operator approval) |
+| `allow_password_lists` | `bool` | `False` | Permit wordlist/password-list flags (e.g. `ffuf -w`) |
+| `require_policy_approval_for` | `list[str]` | `[]` | Tool names that always require human review |
+
+### 19.6 Policy YAML lookup order
+
+`load_policy` resolves the policy YAML in priority order:
+
+1. `config.policy_file` (explicit operator override — set via `--policy-file` CLI flag)
+2. `<config.knowledge_root>/policy_db/compiled/hackthebox_lab.yaml`
+3. `knowledge/policy_db/compiled/hackthebox_lab.yaml` (local development)
+
+If none exists: `policy_loaded=False`, `policy_source="conservative_default"`.
+**The same restrictions apply regardless of `policy_loaded`.**
+
+#### `--policy-file` CLI flag
+
+Both `main.py` and `eval/run_htb_local.py` expose:
+
+```bash
+--policy-file PATH
+```
+
+This sets `ApexConfig.policy_file` to the supplied path.  The field already
+existed in `ApexConfig`; the flag exposes it on the CLI so operators can supply
+an explicit policy file without relying on the `--knowledge-root` discovery path.
+
+**Precedence (non-negotiable):**
+1. `--policy-file PATH` (wins always, when present)
+2. `--knowledge-root DIR` discovery (`<DIR>/policy_db/compiled/hackthebox_lab.yaml`)
+3. Local dev convention (`knowledge/policy_db/compiled/hackthebox_lab.yaml`)
+4. Conservative built-in default (no file needed; same rules always apply)
+
+**If the explicit path does not exist:** `load_policy` falls back to the
+conservative default and emits a warning log at `DEBUG` level — it does **not**
+crash.  `policy_loaded=False` and `policy_source="conservative_default"`.
+
+**Tests** go in `tests/apex_host/test_policy_file_cli.py`.
+
+### 19.7 Blocked tools (always blocked, independent of allowed_tools)
+
+`_ALWAYS_BLOCKED_TOOLS` in `policy_loader.py` covers:
+
+- Destructive system commands: `rm`, `mkfs`, `dd`, `shutdown`, `reboot`,
+  `halt`, `poweroff`, `fdisk`, `format`, `mkswap`
+- Autonomous brute-force tools: `hydra`, `medusa`, `patator`, `hashcat`, `john`
+- Exploit frameworks: `msfconsole`, `msfvenom`
+
+These are blocked by `check_no_destructive_command` (rule 1) before any other
+rule runs.  Adding one to `ApexConfig.allowed_tools` does **not** unblock it.
+
+### 19.8 Execution-Time Policy Gate (implemented)
+
+`PolicyAdvisor` is wired into every agent node in `apex_host/graph.py` as a
+**mandatory pre-execution gate**.  The gate runs **before** any tool command,
+subprocess, or network connection is initiated — including `TelnetExecutor`,
+`BrowserExecutor`, and `RepairEngine` repaired tasks.
+
+#### How the gate is injected
+
+`build_apex_graph()` accepts an optional `advisor: PolicyAdvisor | None = None`
+parameter.  When `None` (the production default), the advisor is constructed
+from `load_policy(config)` inside the function and captured in a closure shared
+by all agent nodes.  Tests inject a `_FakeAdvisor` through this parameter —
+no monkeypatching of internals is required.
+
+```python
+graph = build_apex_graph(api, registry, config, advisor=_FakeAdvisor(always_blocked=True))
+```
+
+#### Gate placement in each agent node
+
+| Node | Gate fires before |
+|---|---|
+| `recon_agent` / `web_agent` / `priv_esc_agent` | `run_command()` in `_run_tasks()._run_one_cmd()` |
+| `execute_agent` (credential) | `TelnetExecutor.run()` or `run_command()` |
+| `browser_agent` | `BrowserExecutor.run()` |
+| `repair_agent` | `run_command()` for the repaired task |
+
+All gate checks are performed synchronously inside the async node functions —
+no I/O, no LLM calls.
+
+#### Blocked task result structure
+
+When `advisor.review_task()` returns a non-approved decision, the agent node
+returns a synthetic tool result dict immediately (without touching runner.py):
+
+```python
+{
+    "task_id": task.id,
+    "tool": tool,
+    "args": [...],
+    "target": target,
+    "parser": parser_name,
+    "stdout": "",
+    "stderr": "",
+    "returncode": 1,
+    "dry_run": config.dry_run,
+    "error": f"policy_blocked: {reason}",
+    "phase": state["phase"],
+    "policy_blocked": True,
+    "policy_rule": rule_name,
+}
+```
+
+`returncode=1` with `error="policy_blocked: ..."` causes `_outcome_for()` to
+return `Outcome.fundamental`, so `route_after_write` sends the turn to
+`reflect_or_continue` — **blocked tasks are never retried by `repair_agent`**.
+
+#### `policy_decisions` state field
+
+Every task reviewed by `PolicyAdvisor` (approved or blocked) appends one dict
+to `state["policy_decisions"]` via the `operator.add` reducer:
+
+```python
+{
+    "tool": tool,
+    "target": target,
+    "phase": state["phase"],
+    "status": "approved" | "blocked" | "needs_human_review",
+    "rule_name": rule_name,
+    "reason": reason,
+}
+```
+
+`RunReport` derives `policy_approved_count`, `policy_blocked_count`,
+`policy_needs_review_count`, and `last_blocked_reasons` from this list.
+`to_json_dict()` exports `"policy_gate"` (summary dict) and
+`"policy_decisions"` (raw list).
+
+#### Gate for `needs_human_review`
+
+Both `blocked` AND `needs_human_review` decisions prevent execution:
+`if not pd.is_approved` is the gate condition.  The result is the same
+blocked tool result dict — the turn continues without executing the task.
+
+### 19.9 Tests
+
+`tests/apex_host/test_policy_advisor.py` (53 tests) verifies all rule-level
+acceptance criteria:
+
+- `nmap` against `config.target` → `approved` (rule: `safe_recon_allowed`)
+- `nmap` against a different IP → `blocked` (rule: `target_in_scope`)
+- `ffuf -w wordlist.txt` → `blocked` (rule: `no_password_list`)
+- `rm` → `blocked` (rule: `no_destructive_command`)
+- Missing policy YAML → conservative default still blocks off-scope targets
+- `nc` and `curl` against target → `approved`
+- Tool in `require_policy_approval_for` → `needs_human_review`
+- `policy_enabled=False` → `approved` (rule: `policy_disabled`)
+- `/etc/shadow` in args → `blocked` (rule: `no_sensitive_data`)
+- `allow_password_lists=True` → wordlist flag approved
+- `allow_sensitive_data_access=True` → sensitive path approved
+- IP in args outside scope → `blocked` (rule: `no_attacking_infrastructure`)
+- Malformed YAML file → `policy_loaded=False`, conservative default applied
+- All `ApexConfig` policy fields have correct defaults
+
+`tests/apex_host/test_policy_gate.py` (18 tests) verifies the execution-time
+gate wired into `graph.py`:
+
+- Approved task → `run_command` is called; no blocked policy_decisions entry
+- Blocked task → `run_command` is NOT called; blocked entry in `policy_decisions`;
+  `last_tool_result.policy_blocked == True`; `error` contains `"policy_blocked"`
+- Blocked credential task (`telnet_access`) → `TelnetExecutor.run` is NOT called;
+  blocked entry in `policy_decisions` with `tool="telnet_access"`
+- Blocked browser task → `BrowserExecutor.run` is NOT called; blocked entry
+  in `policy_decisions` with `tool="browser"`
+- `build_report` derives correct `policy_approved_count` / `policy_blocked_count` /
+  `policy_needs_review_count` / `last_blocked_reasons` from `state["policy_decisions"]`
+- `format_text` renders a "Policy Gate" section
+- `to_json_dict` includes `"policy_gate"` summary and `"policy_decisions"` raw list
+- `ApexGraphState` has `policy_decisions` field typed as `Annotated[list[dict], operator.add]`
+
+### 19.10 Rules for Claude Code
+
+- **Never call it LegalAdvisor.** It is a scope and policy enforcement tool.
+- **Never add LLM calls to `PolicyAdvisor` or any `rules.py` function.**
+  Determinism is a safety property here, not a limitation.
+- **New rules go in `rules.py`, not in `advisor.py` or planners.**  Add the
+  function to `ALL_RULES` in the correct position (blocking rules before
+  permissive ones).
+- **Tests for new rules** go in `tests/apex_host/test_policy_advisor.py`.
+  Use the `_make_task` / `_make_advisor` helper pattern established there.
+- **Gate wiring tests** go in `tests/apex_host/test_policy_gate.py`.  Use
+  `_FakeAdvisor` and the `advisor=` parameter on `build_apex_graph()`.
+- **Blocked tasks are never retried.** `returncode=1` + `error="policy_blocked:…"`
+  routes to `reflect_or_continue`, not `repair_agent`.  Do not add retry logic
+  for blocked tasks.
+- **`policy_decisions` must appear in every agent return dict.**  When adding a
+  new agent node or tool path, include `"policy_decisions": [pd_entry]` in the
+  return value so the `operator.add` reducer accumulates the decision.  Missing
+  this key means the gate fires but leaves no audit trail.
+- **`policy_enabled=False` is for test fixtures only.**  Never set it in
+  an `ApexConfig` that is used for a real engagement.
+- **The YAML content is not trusted input.** `load_policy` reads the YAML
+  only to verify the file is well-formed (`yaml.safe_load`, not `yaml.load`).
+  It never evaluates YAML keys as policy rules.
+
+---
+
+### 19.11 LLM Policy Checkpoints
+
+`apex_host/policy/llm_guard.py` provides `LLMPolicyGuard` — a synchronous,
+stateless content filter that wraps every LLM call in `PlanningEngine` and
+`RepairEngine`.  No I/O, no network access, no MemoryAPI calls.
+
+#### Three-layer pipeline (in order)
+
+```
+PromptBuilder.build_messages()
+  → LLMPolicyGuard.sanitize_messages()   # strip secrets from prompt
+  → LLMPolicyGuard.check_prompt()        # pre-flight scope/secret check
+  → LLM call (only if not blocked)
+  → LLMPolicyGuard.check_output()        # post-LLM safety check
+  → Validator                            # existing schema/tool gate
+  → TaskSpec list
+```
+
+On any block (`check_prompt` or `check_output` returns `(True, reason)`),
+the engine **immediately** falls back to the deterministic planner — no
+exception, no stall.  The `RepairEngine` returns `None` on block (skipping
+repair for this turn).
+
+#### `sanitize_messages(messages) → (sanitized, count)`
+
+Replaces in all message content (case-sensitive):
+- Every configured password from `ApexConfig.password_candidates` (minimum
+  4 characters to avoid false positives) → `[REDACTED_PASSWORD]`
+- Every configured username from `ApexConfig.username_candidates` (same
+  minimum length) → `[REDACTED_USERNAME]`
+- `sk-<20+ chars>` (OpenAI-style key) → `[REDACTED_API_KEY]`
+- `AKIA<16 chars>` (AWS access key) → `[REDACTED_AWS_KEY]`
+- `Bearer <20+ chars>` → `Bearer [REDACTED_TOKEN]`
+- `ghp_<36 chars>` (GitHub PAT) → `[REDACTED_GITHUB_TOKEN]`
+- `-----BEGIN ... PRIVATE KEY-----` → `[REDACTED_PRIVATE_KEY]`
+
+Returns the sanitized message list and the total substitution count.  The
+original list is never mutated.
+
+#### `check_prompt(messages) → (blocked, reason)`
+
+Blocks when any message content contains:
+- A configured password that survived `sanitize_messages` (defense-in-depth).
+- A `-----BEGIN ... PRIVATE KEY-----` header not caught by pattern redaction.
+- An IPv4 address in a `GOAL:` or `TARGET:` line that is not `config.target`.
+
+Non-GOAL/TARGET lines (evidence content, EKG summaries) are **not** scanned
+for IPs — this prevents false positives from knowledge-base content that
+legitimately references other IP addresses.
+
+#### `check_output(raw_text) → (blocked, reason)`
+
+Blocks when the raw LLM output contains any of:
+
+| Category | Trigger examples |
+|---|---|
+| Persistence/backdoor | `crontab -e`, `authorized_keys`, `.bashrc`, `systemctl enable`, `nc -e` |
+| Brute force | `hydra`, `medusa`, `patator`, `hashcat`, `john … --wordlist` |
+| Data exfiltration | `/etc/shadow`, `base64 … </etc/` |
+| Out-of-scope target | Non-target IP in a `"target":` or `"args":` JSON field |
+
+The check runs on the **raw JSON string** before any parsing, so it catches
+dangerous content in reasoning, args, and rationale fields alike.
+
+#### `PlanDecision` audit fields
+
+Three new fields (with safe defaults) record guard activity per planner
+invocation:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `policy_checkpoint_status` | `str` | `""` = guard not configured; `"clean"` = guard ran, nothing flagged; `"redacted"` = secrets were redacted; `"blocked"` = guard blocked the call |
+| `redaction_count` | `int` | Number of substitutions made by `sanitize_messages` |
+| `policy_block_reason` | `str` | Human-readable block reason, or `""` if not blocked |
+
+These appear in `PlanDecision.to_dict()` and therefore in `RunReport.planner_decisions`.
+
+#### Wiring
+
+`LLMPolicyGuard` is injected into `PlanningEngine` and `RepairEngine` via
+a `guard: LLMPolicyGuard | None = None` constructor parameter — consistent
+with how `PolicyAdvisor` is injected into `build_apex_graph()`.
+
+**`PlanningEngine`** wiring (in `apex_host/planning/engine.py`):
+
+```python
+engine = PlanningEngine(
+    model_router=router,
+    fallback_planner=deterministic_planner,
+    allowed_tools=config.allowed_tools,
+    target=config.target,
+    guard=LLMPolicyGuard(config),   # add this
+)
+```
+
+**`RepairEngine`** wiring (in `apex_host/planning/repair.py`):
+
+```python
+engine = RepairEngine(
+    model_router=model_router,
+    allowed_tools=config.allowed_tools,
+    target=config.target,
+    dry_run=config.dry_run,
+    guard=LLMPolicyGuard(config),   # add this
+)
+```
+
+When `guard=None` (the default), the engine behaves exactly as before —
+no guard checks, no overhead.  `FakeModelRouter` (the default) returns
+`None` for `planner_llm()`, so the engine falls back to deterministic
+before the guard is ever reached.
+
+#### Rules for Claude Code
+
+- **`PlanningEngine` remains the only planner LLM caller.**  `LLMPolicyGuard`
+  sits inside `PlanningEngine.plan()` — it is not called by planners, parsers,
+  or executors directly.
+- **`RepairEngine` must use the same guard.**  Any future repair-like engine
+  must apply the same pre/post checks.
+- **Do not store chain-of-thought.**  `policy_block_reason` records why the
+  guard blocked, not LLM reasoning content.
+- **No real LLM calls in tests.**  Use `_StubRouter(_StubLLM(json_str))` or
+  `_FakeModelRouter()`.  Never construct `OpenAIModelRouter` in a test.
+- **New block categories go in `llm_guard.py`.**  Add to the appropriate
+  pattern list (`_PERSISTENCE_PATTERNS`, `_BRUTE_FORCE_PATTERNS`,
+  `_EXFILTRATION_PATTERNS`).  Add a test in `test_llm_guard.py`.
+- **Tests** go in `tests/apex_host/test_llm_guard.py`.  Use the established
+  `_StubLLM` / `_CapturingLLM` / `_StubRouter` / `_StubFallback` pattern.
+- **`sanitize_messages` never mutates the input list.**  It returns a new list.
+- **`guard=None` is the safe default.**  Do not add `guard=LLMPolicyGuard(config)`
+  to any `PlanningEngine` construction without explicitly deciding to enable it.
+  The default is deterministic behavior with no guard overhead.
+
+---
+
+## 20. Knowledge + Policy Definition of Done
+
+A session of Claude Code that modifies, extends, or verifies knowledge or
+policy components **must** clear every item in this checklist before
+reporting success.  "Compiles" and "tests pass" are necessary but not
+sufficient — real compiled files must exist and verification must pass.
+
+### 20.1 Knowledge compilation
+
+1. **Real `./knowledge` compiles without error:**
+   ```bash
+   python -m apex_host.knowledge.compiler.compile_knowledge \
+       --knowledge-root ./knowledge --strict --verbose
+   ```
+   Exit code must be **0**.  Any `STRICT:` failure line in stderr = not done.
+
+2. **All 9 required compiled outputs exist and are valid:**
+   ```bash
+   python -m apex_host.knowledge.compiler.verify_compiled \
+       --knowledge-root ./knowledge
+   ```
+   Exit code must be **0**.  Any `[FAIL]` line = not done.
+
+3. **Compiled knowledge seeds through MemoryAPI:**
+   `seed_compiled_knowledge(api, config, mf_config)` must stage all families
+   and `ReflectorWorker.run_once()` must promote them so that
+   `api.query(filters=INTEL_FILTER)` returns non-empty `ScoredEntry` objects
+   with `ScoredEntry.text != ""`.
+
+### 20.2 Policy gates
+
+4. **`PolicyAdvisor` gates risky execution:**
+   `advisor.review_task(task, phase, evidence, config)` must return
+   `blocked` for off-scope targets, destructive tools, and brute-force tools,
+   and `approved` for safe recon tools against `config.target`.
+
+5. **`LLMPolicyGuard` checkpoints are active:**
+   When wired into `PlanningEngine` or `RepairEngine`, `sanitize_messages`
+   must redact configured passwords before the LLM call, and `check_output`
+   must return `(True, reason)` for any output containing persistence patterns
+   (e.g. `crontab -e`), brute-force tools (e.g. `hydra`), or exfiltration
+   patterns (e.g. `/etc/shadow`).
+
+### 20.3 Codebase invariants
+
+6. **No host-specific code added to `memfabric`:**
+   `grep -r "CVE\|exploit\|shell\|credential\|hydra\|nmap\|telnet" memfabric/`
+   must find no matches in non-test source files.
+
+7. **All tests pass:**
+   ```bash
+   .venv/bin/python -m pytest tests/ -q
+   ```
+   Exit code **0**.  No failures, no errors.
+
+8. **`verify_compiled` always runs after `compile_knowledge` (unless `--no-verify`):**
+   Modifying the compiler must not break the auto-verify flow.  The
+   `--no-verify` flag is for CI pipelines that run verification separately —
+   never skip it in interactive development.
+
+### 20.4 Quick verification commands (in order)
+
+```bash
+# 1. Compile
+python -m apex_host.knowledge.compiler.compile_knowledge \
+    --knowledge-root ./knowledge --strict --verbose
+
+# 2. Verify
+python -m apex_host.knowledge.compiler.verify_compiled \
+    --knowledge-root ./knowledge
+
+# 3. Test
+.venv/bin/python -m pytest tests/ -q
+```
+
+Or via Make:
+
+```bash
+make compile-knowledge
+make verify-knowledge
+make test
+```
+
+All three must exit **0** before a session is considered complete.

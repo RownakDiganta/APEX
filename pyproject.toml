@@ -25,6 +25,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "mypy>=1.9",
     "types-networkx",
+    "types-PyYAML",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -36,7 +37,7 @@ python_version = "3.11"
 files = ["memfabric", "apex_host"]
 
 [[tool.mypy.overrides]]
-module = ["langgraph.*", "faiss", "playwright.*", "langchain_core.*", "langchain_openai.*", "dotenv"]
+module = ["langgraph.*", "faiss", "playwright.*", "langchain_core.*", "langchain_openai.*", "dotenv", "rank_bm25"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

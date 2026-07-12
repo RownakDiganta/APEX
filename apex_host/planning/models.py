@@ -49,6 +49,16 @@ class PlanDecision:
     ``"deterministic"`` when only the rule-based fallback ran.
     ``fallback_used`` is ``True`` whenever the deterministic planner
     produced the final result, regardless of whether the LLM was tried first.
+
+    LLM policy checkpoint fields (populated when ``LLMPolicyGuard`` is wired
+    into ``PlanningEngine``):
+    - ``policy_checkpoint_status``: ``""`` = guard not configured; ``"clean"``
+      = guard ran, nothing flagged; ``"redacted"`` = guard applied redactions;
+      ``"blocked"`` = guard blocked the prompt or output (fallback used).
+    - ``redaction_count``: number of secret substitutions applied by
+      ``sanitize_messages``.
+    - ``policy_block_reason``: human-readable reason string when status is
+      ``"blocked"``; empty string otherwise.
     """
 
     planner_model: str           # "llm" | "deterministic"
@@ -59,6 +69,27 @@ class PlanDecision:
     fallback_used: bool          # True when deterministic planner produced the result
     timestamp: str               # ISO-8601
     phase: str                   # ApexPhase value at the time of the call
+    # LLM policy checkpoint fields (default to not-checked / no activity)
+    policy_checkpoint_status: str = ""    # "" | "clean" | "redacted" | "blocked"
+    redaction_count: int = 0
+    policy_block_reason: str = ""
+    # Repeated-plan detection — set when the engine skipped an LLM call
+    # because the context (EKG + evidence) was unchanged since the last call
+    # for this phase.  ``repeated_plan_action`` is "skipped_llm" when the
+    # skip happened, "executed" when the plan ran despite matching fingerprint,
+    # or "" when no repeat was detected.
+    repeated_plan_detected: bool = False
+    repeated_plan_fingerprint: str | None = None
+    repeated_plan_count: int = 0
+    repeated_plan_action: str = ""
+    # LLM error classification — populated when an exception was caught during
+    # the LLM call.  ``llm_error_category`` is "permanent" for 4xx errors that
+    # should never be retried (401, 403, 404), "transient" for errors where
+    # retrying is safe (timeout, 429, 5xx), "validation" when the Validator
+    # rejected the output, or "" when no error occurred.
+    llm_error_category: str = ""
+    llm_http_status: int | None = None
+    llm_retry_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable dict (for state and report storage)."""

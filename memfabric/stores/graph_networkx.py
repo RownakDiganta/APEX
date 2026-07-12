@@ -10,9 +10,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
-from typing import Sequence
+from typing import Any, Sequence
 
-import networkx as nx  # type: ignore[import-untyped]
+import networkx as nx
 
 from memfabric.types import Edge, Node, SubgraphView
 
@@ -23,7 +23,7 @@ class NetworkXGraphStore:
     """GraphStore backed by a networkx DiGraph held entirely in memory."""
 
     def __init__(self) -> None:
-        self._g: nx.DiGraph = nx.DiGraph()
+        self._g: nx.DiGraph[str, dict[str, Any], dict[str, Any]] = nx.DiGraph()
         self._edges: dict[str, Edge] = {}   # edge_id → Edge
         self._lock = asyncio.Lock()
 

@@ -220,7 +220,7 @@ class ReflectorWorker:
 
         total = len(knowledge_entries) + len(skill_entries)
         remaining = max(0, total - promoted - skipped)
-        logger.info(
+        logger.debug(
             "reflector promotion pass: promoted=%d skipped=%d remaining=%d",
             promoted, skipped, remaining,
         )

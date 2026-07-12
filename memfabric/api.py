@@ -688,17 +688,14 @@ class MemoryAPI:
             entry.promoted = True
 
         _kt = _knowledge_text(entry)
-        await self._lexical.add(
-            entry.id,
-            _kt,
-            {"tier": Tier.semantic.value, "source": entry.source, "_text": _kt},
-        )
+        # Merge entry.metadata so host-supplied fields (e.g. source_family,
+        # source_type) are available in retrieval results for filtering.
+        # Core keys always win over user metadata to preserve tier integrity.
+        _kmeta: dict[str, Any] = {**entry.metadata, "tier": Tier.semantic.value, "source": entry.source, "_text": _kt}
+        await self._lexical.add(entry.id, _kt, _kmeta)
         if entry.embedding:
-            await self._vector.add(
-                entry.id,
-                entry.embedding,
-                {"tier": Tier.semantic.value, "source": entry.source},
-            )
+            _vmeta: dict[str, Any] = {**entry.metadata, "tier": Tier.semantic.value, "source": entry.source}
+            await self._vector.add(entry.id, entry.embedding, _vmeta)
         logger.debug("promoted knowledge id=%s", entry_id)
         return True
 

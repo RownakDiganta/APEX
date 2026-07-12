@@ -1,0 +1,187 @@
+description: HTB platform rule records compiled by policy_compiler.py
+updated_at: '2026-07-11T09:18:07.051737+00:00'
+record_count: 16
+records:
+- id: 3f0a3655c558bdb388331ea6e272efb4
+  title: Hack The Box Platform Rules
+  text: '# Hack The Box Platform Rules
+
+
+    > **Source:** Hack The Box Help Center
+
+    > **Last Updated:** Approximately 2 weeks ago
+
+    > **Purpose:** Rules and Terms of Service governing the use of the Hack The Box
+    plat'
+  confidence: 0.9
+- id: 709315de201a2a4a6116b53dff4c23e8
+  title: 1. Permitted and Prohibited Hacking Targets
+  text: '# 1. Permitted and Prohibited Hacking Targets'
+  confidence: 0.9
+- id: 44055b7f376e644bc15d5ecf9fb2e8e3
+  title: ✅ Permitted
+  text: '## ✅ Permitted
+
+
+    - Hack **only** the specific target IP address or entry point provided by Hack
+    The Box.
+
+    - Limit all testing strictly to the assigned machine or lab environment.'
+  confidence: 0.9
+- id: abb4bb02cf9b5537c2013b647bb5f110
+  title: ❌ Prohibited
+  text: "## ❌ Prohibited\n\n- Do **not** attack unintended machines on the HTB network.\n\
+    \ - Example:\n - Network gateways\n - Other infrastructure\n - Non-target nodes\
+    \ (e.g. `10.10.10.0/24`)\n- Do **not** attack othe"
+  confidence: 0.9
+- id: cbee7de6ba95f15014cd007b2251564d
+  title: 2. Prohibited Attack Types
+  text: '# 2. Prohibited Attack Types'
+  confidence: 0.9
+- id: 4056730ee5c9bf1f81e4b245c7c89c1a
+  title: ❌ Denial of Service (DoS)
+  text: '## ❌ Denial of Service (DoS)
+
+
+    The following are strictly forbidden:
+
+
+    - DoS attacks
+
+    - Distributed DoS (DDoS)
+
+    - Resource exhaustion attacks
+
+    - Any attack intended to make systems unavailable
+
+
+    If a DoS oc'
+  confidence: 0.9
+- id: d022c08efbfa61bc9e50b31adfe2726f
+  title: 3. System Security Recommendations
+  text: "# 3. System Security Recommendations\n\nHack The Box strongly recommends:\n\
+    \n- Use a dedicated Virtual Machine (VM) for HTB.\n- Avoid connecting from your\
+    \ primary personal computer.\n- Consider using:\n - Ka"
+  confidence: 0.9
+- id: 2ef00967046c25048200435cfe7a77a4
+  title: 4. Content Sharing Policy
+  text: '# 4. Content Sharing Policy'
+  confidence: 0.9
+- id: d06920a090cc180fff961aed050626fb
+  title: Allowed Content
+  text: '## Allowed Content
+
+
+    The following content may be published, streamed, or uploaded:
+
+
+    - Retired Machines
+
+    - Retired Sherlocks
+
+    - Retired Challenges
+
+    - Starting Point Machines
+
+    - Tier 0 Academy Modules
+
+    - Min'
+  confidence: 0.9
+- id: 9631e5c591ff30a9e06ab1b6244c090c
+  title: Prohibited Content
+  text: '## Prohibited Content
+
+
+    Do **not** publish or stream solutions for:
+
+
+    - Active Machines
+
+    - Active Challenges
+
+    - Active Sherlocks
+
+    - Active Pro Labs
+
+    - Mini Pro Labs without official write-ups
+
+
+    ---'
+  confidence: 0.9
+- id: 5cb97dde0ee391f55ff1d042ef095924
+  title: Spoilers
+  text: '## Spoilers
+
+
+    Do not share or disclose solutions for active HTB content with other members.
+
+
+    ---'
+  confidence: 0.9
+- id: cbcacbe20b1ef1af81e5390667abeeee
+  title: Terms of Service Violations
+  text: '## Terms of Service Violations
+
+
+    Publishing prohibited material may result in:
+
+
+    - Account action
+
+    - Removal requests
+
+    - Legal action by Hack The Box
+
+
+    ---'
+  confidence: 0.9
+- id: 4a7b58d8c58328c65401df03f020a7fc
+  title: 5. Artificial Intelligence and Machine Learning Restrictions
+  text: '# 5. Artificial Intelligence and Machine Learning Restrictions
+
+
+    Hack The Box explicitly prohibits using HTB content for AI or machine learning
+    purposes.
+
+
+    The following are **not permitted**:
+
+
+    - Traini'
+  confidence: 0.9
+- id: 33df3b2797a3c833d213b6e205583ae2
+  title: Compliance Checklist
+  text: '# Compliance Checklist'
+  confidence: 0.9
+- id: 05c3e9f76b2564fed7a2106d2e816b98
+  title: Allowed
+  text: '## Allowed
+
+
+    - Hack only assigned HTB targets
+
+    - Use dedicated testing systems
+
+    - Publish retired content only
+
+    - Report accidental compromises
+
+    - Report accidental DoS'
+  confidence: 0.9
+- id: 63a5f091f67bb92a66b233ee12d37432
+  title: Not Allowed
+  text: '## Not Allowed
+
+
+    - Attack unintended HTB systems
+
+    - Attack other HTB users
+
+    - Perform DoS attacks
+
+    - Publish active machine write-ups
+
+    - Share active machine solutions
+
+    - Train or fine-tune AI using HTB con'
+  confidence: 0.9

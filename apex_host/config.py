@@ -67,3 +67,75 @@ class ApexConfig:
     use_llm: bool = False
     llm_provider: str = "fake"
     llm_base_url: str | None = None
+    # External knowledge base root and per-family overrides.
+    # When knowledge_root is set, each family defaults to <knowledge_root>/<family>.
+    # Per-family overrides take precedence over the derived default.
+    # Set these via --knowledge-root / --policy-db-path / etc. CLI flags.
+    # None means the corresponding knowledge family is not loaded at startup.
+    knowledge_root: str | None = None
+    policy_db_path: str | None = None
+    methodology_db_path: str | None = None
+    intel_db_path: str | None = None
+    payload_db_path: str | None = None
+    # PolicyAdvisor scope enforcement.
+    # policy_enabled=True (the default) means every task is reviewed before
+    # execution.  Disable only in integration tests that exercise the task
+    # routing machinery without any policy checking.
+    # policy_file is an optional explicit path to the policy YAML; when None
+    # the loader searches the conventional locations (see policy_loader.py).
+    # allow_password_lists and allow_sensitive_data_access default to False;
+    # the operator must explicitly set them to True (e.g. via CLI flags).
+    # require_policy_approval_for lists tool names that always trigger a
+    # needs_human_review decision regardless of other rules.
+    policy_enabled: bool = True
+    policy_file: str | None = None
+    allow_sensitive_data_access: bool = False
+    allow_password_lists: bool = False
+    require_policy_approval_for: list[str] = field(default_factory=list)
+    # LLM call budget — controls how many real LLM calls are allowed per run.
+    # FakeModelRouter (the default when use_llm=False) returns None for all
+    # roles so these limits are never consulted in deterministic mode.
+    # max_llm_calls_per_run: hard cap on total LLM calls across the entire run.
+    # max_llm_calls_per_phase: hard cap per phase (recon, web, credential, …).
+    # llm_request_timeout_seconds: per-call timeout forwarded to ChatOpenAI.
+    # llm_stop_on_repeated_plan: skip LLM when context is unchanged since last
+    #   call for the same phase (saves one API call per identical turn).
+    max_llm_calls_per_run: int = 5
+    max_llm_calls_per_phase: int = 2
+    llm_request_timeout_seconds: float = 60.0
+    llm_stop_on_repeated_plan: bool = True
+    # Knowledge promotion strategy — controls how many Reflector passes are
+    # run after the compiled knowledge corpus is staged at startup.
+    #
+    # "until_stable" (default): loop run_once() until no staged records remain
+    #     or until safety limits are reached.  Required when the corpus is
+    #     larger than reflector_max_promotions_per_run (100 by default).
+    # "single_pass": one run_once() call only — legacy behaviour; leaves large
+    #     corpora partially promoted.
+    # "disabled": skip promotion entirely (test fixtures that don't need
+    #     retrieval to work).
+    knowledge_promotion_mode: str = "until_stable"
+    # Maximum number of Reflector passes during the startup promotion loop.
+    # At 100 records/pass, 1000 passes → up to 100,000 records.  Increase
+    # only if your corpus is larger than knowledge_promotion_max_passes × 100.
+    knowledge_promotion_max_passes: int = 1000
+    # Optional hard cap on total records promoted during startup.  None = no
+    # cap (promote everything that clears the quality gate).
+    knowledge_promotion_max_records: int | None = None
+    # Optional wall-clock timeout in seconds for the promotion loop.  None =
+    # no timeout (loop until stable or max_passes reached).
+    knowledge_promotion_timeout_seconds: float | None = None
+    # Duplicate action detection — catches repeated identical fallback tasks.
+    # When enabled, any task whose fingerprint (phase+tool+args+target) has been
+    # seen >= duplicate_action_max_repeats times within the most recent
+    # duplicate_action_window executions is skipped and logged to duplicate_actions.
+    # Set duplicate_action_detection_enabled=False to disable entirely.
+    duplicate_action_detection_enabled: bool = True
+    duplicate_action_window: int = 5
+    duplicate_action_max_repeats: int = 1
+    # Promotion logging verbosity for -v runs.
+    # False (default): per-record reflector DEBUG logs are suppressed even with -v;
+    #   only interval progress summaries and the final count are shown.
+    # True (--trace-records): per-record DEBUG logs are visible with -v, showing
+    #   each promoted record ID.
+    trace_knowledge_records: bool = False

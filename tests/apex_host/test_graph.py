@@ -60,6 +60,7 @@ def make_initial_state(target: str, run_id: str = "run-1") -> ApexGraphState:
         "planner_decisions": [],
         "tool_results": None,
         "repair_count": 0,
+        "policy_decisions": [],
     }
 
 

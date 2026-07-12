@@ -18,19 +18,34 @@ Design
 - Any LLM exception or validator rejection triggers an automatic fallback to
   the deterministic planner — the engagement never stalls due to LLM issues.
 
+Budget and observability
+------------------------
+- An optional ``LLMBudgetTracker`` (from ``apex_host.planning.budget``) is
+  consulted before every LLM call.  When either the global run budget or the
+  per-phase budget is exhausted, the engine falls back immediately.
+- Context-hash comparison detects when the EKG + evidence is unchanged since
+  the last call for this phase; the LLM is then skipped to save the budget.
+- Every call is timed and the elapsed time is logged at INFO level:
+    ``LLM call 2/5 phase=recon model=gpt-5 elapsed=14.7s result=success tasks=1``
+- Exceptions are classified as ``"permanent"`` (never retry: 4xx) or
+  ``"transient"`` (retry bounded: timeout, 429, 5xx) before the retry loop.
+
 Invariants preserved
 --------------------
 - MemoryAPI is the sole state source (Invariant 1): the engine reads context
   through the ``EvidenceBundle`` and ``SubgraphView`` passed in, never
   directly from any store.
 - Executors and planners are stateless (Invariant 6): the engine itself holds
-  no mutable turn state.
+  no mutable turn state beyond ``last_decision``.
 - No agent-to-agent calls (Invariant 7): the engine writes nothing; all state
   changes flow through MemoryAPI in the graph's merge node.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from memfabric.ids import new_id
@@ -51,6 +66,8 @@ from apex_host.types import ApexPhase
 
 if TYPE_CHECKING:
     from apex_host.llm.router import ModelRouter
+    from apex_host.planning.budget import LLMBudgetTracker
+    from apex_host.policy.llm_guard import LLMPolicyGuard
 
 
 class _LLMChatModel(Protocol):
@@ -69,6 +86,17 @@ logger = logging.getLogger(__name__)
 # Confidence below this threshold causes the engine to log an advisory, but
 # the plan is still executed if the validator otherwise accepts it.
 _LOW_CONFIDENCE_THRESHOLD = 0.35
+
+# HTTP status codes that should never be retried (permanent auth/route errors).
+_PERMANENT_HTTP_STATUSES: frozenset[int] = frozenset({400, 401, 403, 404})
+
+# Exception type name suffixes that indicate a permanent (non-retriable) error.
+_PERMANENT_EXC_SUFFIXES: frozenset[str] = frozenset({
+    "AuthenticationError",
+    "PermissionDeniedError",
+    "NotFoundError",
+    "BadRequestError",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +136,59 @@ def summarize_subgraph(subgraph: SubgraphView | None) -> str:
         lines.append(f"  {ntype} ({len(items)}): " + ", ".join(items[:5]))
     lines.append(f"  edges: {len(subgraph.edges)}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Context hash — lightweight fingerprint for repeated-context detection
+# ---------------------------------------------------------------------------
+
+def _context_hash(subgraph: SubgraphView, evidence: EvidenceBundle) -> str:
+    """Return a compact hash representing the structural state of the context.
+
+    Uses only counts (not content) so the hash is cheap to compute and
+    stable across equivalent retrieval orderings.
+    """
+    data = (
+        f"{len(subgraph.nodes)}:{len(subgraph.edges)}:{len(evidence.entries)}"
+    )
+    return hashlib.md5(data.encode()).hexdigest()[:8]
+
+
+# ---------------------------------------------------------------------------
+# Error classification
+# ---------------------------------------------------------------------------
+
+def _classify_error(exc: Exception) -> tuple[str, int | None]:
+    """Classify an LLM exception as ``"permanent"`` or ``"transient"``.
+
+    Returns ``(category, http_status)`` where ``category`` is one of:
+    - ``"permanent"`` — should never be retried (401, 403, 404, bad request).
+    - ``"transient"`` — may be retried (timeout, 429, 5xx, connection errors).
+
+    Extracts the HTTP status from the exception's ``status_code`` attribute or
+    nested ``response.status_code`` without importing the openai package.
+    """
+    # Extract HTTP status without requiring openai to be importable.
+    http_status: int | None = None
+    raw_status = getattr(exc, "status_code", None)
+    if isinstance(raw_status, int):
+        http_status = raw_status
+    if http_status is None:
+        response = getattr(exc, "response", None)
+        if response is not None:
+            nested = getattr(response, "status_code", None)
+            if isinstance(nested, int):
+                http_status = nested
+
+    if http_status is not None and http_status in _PERMANENT_HTTP_STATUSES:
+        return "permanent", http_status
+
+    # Classify by exception type name suffix (no openai import required).
+    exc_type = type(exc).__name__
+    if any(exc_type.endswith(suffix) for suffix in _PERMANENT_EXC_SUFFIXES):
+        return "permanent", http_status
+
+    return "transient", http_status
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +244,12 @@ class PlanningEngine:
 
     - Calling ``ModelRouter.planner_llm()`` (the **only** place in
       ``apex_host`` where this call may be made).
+    - Budget checking via an optional ``LLMBudgetTracker``.
+    - Repeated-context detection (skip LLM when context is unchanged).
     - Building the structured prompt via ``PromptBuilder``.
     - Validating the LLM response via ``Validator``.
+    - Error classification: permanent (401/403/404 — never retry) vs
+      transient (timeout/429/5xx — retry bounded).
     - Converting a valid ``PlannerOutput`` into ``TaskSpec`` objects.
     - Falling back to the deterministic ``fallback_planner`` on any error,
       invalid output, or when no LLM is configured.
@@ -187,6 +272,10 @@ class PlanningEngine:
         The primary engagement target (IP / hostname).  Used as the default
         ``target`` field on any ``TaskSpec`` produced by LLM output that
         omits the target.
+    budget:
+        Optional shared ``LLMBudgetTracker``.  When provided, every call is
+        counted against global and per-phase call budgets.  When ``None``
+        (the default), no budget is enforced.
     """
 
     def __init__(
@@ -197,6 +286,8 @@ class PlanningEngine:
         target: str = "",
         confidence_threshold: float = 0.4,
         max_retries: int = 1,
+        guard: "LLMPolicyGuard | None" = None,
+        budget: "LLMBudgetTracker | None" = None,
     ) -> None:
         self._router = model_router
         self._fallback = fallback_planner
@@ -207,6 +298,8 @@ class PlanningEngine:
         self._prompt_builder = PromptBuilder()
         self._validator = Validator()
         self._last_decision: PlanDecision | None = None
+        self._guard = guard
+        self._budget = budget
 
     @property
     def last_decision(self) -> PlanDecision | None:
@@ -218,7 +311,20 @@ class PlanningEngine:
         """
         return self._last_decision
 
-    def _record_fallback(self, phase: ApexPhase) -> None:
+    def _record_fallback(
+        self,
+        phase: ApexPhase,
+        *,
+        policy_checkpoint_status: str = "",
+        redaction_count: int = 0,
+        policy_block_reason: str = "",
+        repeated_plan_detected: bool = False,
+        repeated_plan_count: int = 0,
+        repeated_plan_action: str = "",
+        llm_error_category: str = "",
+        llm_http_status: int | None = None,
+        llm_retry_count: int = 0,
+    ) -> None:
         """Record a deterministic-fallback decision (no LLM output available)."""
         self._last_decision = PlanDecision(
             planner_model="deterministic",
@@ -229,9 +335,33 @@ class PlanningEngine:
             fallback_used=True,
             timestamp=now(),
             phase=phase.value,
+            policy_checkpoint_status=policy_checkpoint_status,
+            redaction_count=redaction_count,
+            policy_block_reason=policy_block_reason,
+            repeated_plan_detected=repeated_plan_detected,
+            repeated_plan_count=repeated_plan_count,
+            repeated_plan_action=repeated_plan_action,
+            llm_error_category=llm_error_category,
+            llm_http_status=llm_http_status,
+            llm_retry_count=llm_retry_count,
         )
 
-    def _record_llm(self, output: PlannerOutput, phase: ApexPhase, *, fallback_used: bool = False) -> None:
+    def _record_llm(
+        self,
+        output: PlannerOutput,
+        phase: ApexPhase,
+        *,
+        fallback_used: bool = False,
+        policy_checkpoint_status: str = "",
+        redaction_count: int = 0,
+        policy_block_reason: str = "",
+        repeated_plan_detected: bool = False,
+        repeated_plan_count: int = 0,
+        repeated_plan_action: str = "",
+        llm_error_category: str = "",
+        llm_http_status: int | None = None,
+        llm_retry_count: int = 0,
+    ) -> None:
         """Record an LLM-backed decision (success or low-confidence fallback)."""
         self._last_decision = PlanDecision(
             planner_model="llm",
@@ -242,6 +372,15 @@ class PlanningEngine:
             fallback_used=fallback_used,
             timestamp=now(),
             phase=phase.value,
+            policy_checkpoint_status=policy_checkpoint_status,
+            redaction_count=redaction_count,
+            policy_block_reason=policy_block_reason,
+            repeated_plan_detected=repeated_plan_detected,
+            repeated_plan_count=repeated_plan_count,
+            repeated_plan_action=repeated_plan_action,
+            llm_error_category=llm_error_category,
+            llm_http_status=llm_http_status,
+            llm_retry_count=llm_retry_count,
         )
 
     async def plan(
@@ -258,40 +397,195 @@ class PlanningEngine:
         a fallback to the deterministic planner.
 
         Retry policy:
-        - On LLM exception or validator rejection: retry up to ``max_retries``
-          times, then fall back to the deterministic planner.
-        - On low confidence (< ``confidence_threshold``): fall back immediately
+        - Permanent errors (401, 403, 404, BadRequest): no retry, immediate
+          fallback.
+        - Transient errors (timeout, 429, 5xx): retry up to ``max_retries``
+          times, then fallback.
+        - Validator rejection: retry up to ``max_retries`` times, then fallback.
+        - Low confidence (< ``confidence_threshold``): fallback immediately
           without retrying — low confidence is a signal, not a transient error.
         """
         llm = self._router.planner_llm()
         if llm is None:
             logger.debug("planning_engine: no LLM configured — using fallback planner")
+            if self._budget is not None:
+                self._budget.record_fallback_only()
             self._record_fallback(phase)
             return await self._fallback.plan(goal, subgraph, evidence)
 
+        # ------------------------------------------------------------------ #
+        # Budget check
+        # ------------------------------------------------------------------ #
+        if self._budget is not None:
+            can_call, budget_reason = self._budget.can_call(phase.value)
+            if not can_call:
+                logger.info(
+                    "planning_engine: budget blocked LLM call (%s) — using fallback",
+                    budget_reason,
+                )
+                self._budget.record_fallback_only()
+                self._record_fallback(phase, llm_error_category="budget_exhausted")
+                return await self._fallback.plan(goal, subgraph, evidence)
+
+        # ------------------------------------------------------------------ #
+        # Repeated-context detection (skip LLM when nothing changed)
+        # ------------------------------------------------------------------ #
+        ctx_hash = _context_hash(subgraph, evidence)
+        if self._budget is not None and self._budget.is_context_repeated(phase.value, ctx_hash):
+            repeated_count = self._budget.record_repeated_skip(phase.value)
+            self._budget.record_fallback_only()
+            self._record_fallback(
+                phase,
+                repeated_plan_detected=True,
+                repeated_plan_count=repeated_count,
+                repeated_plan_action="skipped_llm",
+            )
+            return await self._fallback.plan(goal, subgraph, evidence)
+
+        # ------------------------------------------------------------------ #
+        # Prompt building and guard sanitization
+        # ------------------------------------------------------------------ #
         ekg_summary = summarize_subgraph(subgraph)
         messages = self._prompt_builder.build_messages(
             goal, phase, evidence, ekg_summary, self._allowed_tools
         )
         chat_llm = cast(_LLMChatModel, llm)
 
+        _redaction_count = 0
+        _checkpoint_status = ""
+        if self._guard is not None:
+            messages, _redaction_count = self._guard.sanitize_messages(messages)
+            _checkpoint_status = "redacted" if _redaction_count > 0 else "clean"
+            if _redaction_count > 0:
+                logger.debug(
+                    "planning_engine: %d secret(s) redacted from prompt", _redaction_count
+                )
+            prompt_blocked, prompt_reason = self._guard.check_prompt(messages)
+            if prompt_blocked:
+                logger.warning(
+                    "planning_engine: prompt blocked by LLM guard (%s) — falling back",
+                    prompt_reason,
+                )
+                if self._budget is not None:
+                    self._budget.record_fallback_only()
+                self._record_fallback(
+                    phase,
+                    policy_checkpoint_status="blocked",
+                    redaction_count=_redaction_count,
+                    policy_block_reason=prompt_reason,
+                )
+                return await self._fallback.plan(goal, subgraph, evidence)
+
+        # ------------------------------------------------------------------ #
+        # Consume budget slot — we are committed to attempting the LLM call
+        # ------------------------------------------------------------------ #
+        if self._budget is not None:
+            self._budget.record_call_start(phase.value)
+
+        # Try to derive a model name for logging (best-effort, no import required).
+        _model_name = ""
+        try:
+            _cfg = getattr(self._router, "_config", None)
+            if _cfg is not None:
+                _model_name = str(getattr(_cfg, "planner_model", "")) or ""
+        except Exception:
+            pass
+
         last_output: PlannerOutput | None = None
+        _retry_count = 0
+        t0 = time.monotonic()
+
         for attempt in range(self._max_retries + 1):
             try:
                 response = chat_llm.invoke(messages)
                 raw = str(getattr(response, "content", response))
+
             except Exception as exc:
+                error_category, http_status = _classify_error(exc)
+                elapsed = time.monotonic() - t0
+                _retry_count = attempt
+
+                if error_category == "permanent":
+                    # Never retry permanent errors.
+                    logger.warning(
+                        "planning_engine: permanent LLM error (attempt %d/%d) "
+                        "status=%s exc=%s — falling back immediately",
+                        attempt + 1, self._max_retries + 1,
+                        http_status or "?", exc,
+                    )
+                    if self._budget is not None:
+                        self._budget.record_failure(
+                            phase.value, elapsed, "permanent", http_status, _model_name,
+                        )
+                    self._record_fallback(
+                        phase,
+                        policy_checkpoint_status=_checkpoint_status,
+                        redaction_count=_redaction_count,
+                        llm_error_category="permanent",
+                        llm_http_status=http_status,
+                        llm_retry_count=_retry_count,
+                    )
+                    return await self._fallback.plan(goal, subgraph, evidence)
+
+                # Transient error — retry if attempts remain.
                 logger.warning(
-                    "planning_engine: attempt %d/%d LLM error (%s) — %s",
-                    attempt + 1,
-                    self._max_retries + 1,
-                    exc,
+                    "planning_engine: transient LLM error (attempt %d/%d) "
+                    "exc=%s — %s",
+                    attempt + 1, self._max_retries + 1, exc,
                     "retrying" if attempt < self._max_retries else "falling back",
                 )
                 if attempt < self._max_retries:
+                    if self._budget is not None:
+                        self._budget.record_retry()
+                    _retry_count += 1
                     continue
-                self._record_fallback(phase)
+
+                if self._budget is not None:
+                    self._budget.record_failure(
+                        phase.value, elapsed, "transient", http_status, _model_name,
+                    )
+                self._record_fallback(
+                    phase,
+                    policy_checkpoint_status=_checkpoint_status,
+                    redaction_count=_redaction_count,
+                    llm_error_category="transient",
+                    llm_http_status=http_status,
+                    llm_retry_count=_retry_count,
+                )
                 return await self._fallback.plan(goal, subgraph, evidence)
+
+            # ---------------------------------------------------------------- #
+            # Post-output guard check
+            # ---------------------------------------------------------------- #
+            if self._guard is not None:
+                out_blocked, out_reason = self._guard.check_output(raw)
+                if out_blocked:
+                    logger.warning(
+                        "planning_engine: attempt %d/%d output blocked by LLM guard (%s) — %s",
+                        attempt + 1,
+                        self._max_retries + 1,
+                        out_reason,
+                        "retrying" if attempt < self._max_retries else "falling back",
+                    )
+                    if attempt < self._max_retries:
+                        if self._budget is not None:
+                            self._budget.record_retry()
+                        _retry_count += 1
+                        continue
+                    elapsed = time.monotonic() - t0
+                    if self._budget is not None:
+                        self._budget.record_failure(
+                            phase.value, elapsed, "validation", None, _model_name,
+                        )
+                    self._record_fallback(
+                        phase,
+                        policy_checkpoint_status="blocked",
+                        redaction_count=_redaction_count,
+                        policy_block_reason=out_reason,
+                        llm_error_category="validation",
+                        llm_retry_count=_retry_count,
+                    )
+                    return await self._fallback.plan(goal, subgraph, evidence)
 
             output: PlannerOutput | None = self._validator.validate(
                 raw, self._allowed_tools
@@ -304,8 +598,22 @@ class PlanningEngine:
                     "retrying" if attempt < self._max_retries else "falling back",
                 )
                 if attempt < self._max_retries:
+                    if self._budget is not None:
+                        self._budget.record_retry()
+                    _retry_count += 1
                     continue
-                self._record_fallback(phase)
+                elapsed = time.monotonic() - t0
+                if self._budget is not None:
+                    self._budget.record_failure(
+                        phase.value, elapsed, "validation", None, _model_name,
+                    )
+                self._record_fallback(
+                    phase,
+                    policy_checkpoint_status=_checkpoint_status,
+                    redaction_count=_redaction_count,
+                    llm_error_category="validation",
+                    llm_retry_count=_retry_count,
+                )
                 return await self._fallback.plan(goal, subgraph, evidence)
 
             last_output = output
@@ -313,21 +621,44 @@ class PlanningEngine:
             # Low confidence: advisory log + hard fallback (don't retry — it's
             # epistemic, not transient).
             if output.confidence < self._confidence_threshold:
+                elapsed = time.monotonic() - t0
                 logger.info(
                     "planning_engine: confidence %.2f < threshold %.2f (phase=%s) — falling back",
                     output.confidence,
                     self._confidence_threshold,
                     phase.value,
                 )
-                self._record_llm(output, phase, fallback_used=True)
+                if self._budget is not None:
+                    self._budget.record_failure(
+                        phase.value, elapsed, "low_confidence", None, _model_name,
+                    )
+                self._record_llm(
+                    output,
+                    phase,
+                    fallback_used=True,
+                    policy_checkpoint_status=_checkpoint_status,
+                    redaction_count=_redaction_count,
+                    llm_retry_count=_retry_count,
+                )
                 return await self._fallback.plan(goal, subgraph, evidence)
 
             if output.stop_reason:
+                elapsed = time.monotonic() - t0
                 logger.info(
                     "planning_engine: LLM signalled stop — reason: %s",
                     output.stop_reason,
                 )
-                self._record_llm(output, phase)
+                if self._budget is not None:
+                    self._budget.record_success(
+                        phase.value, elapsed, 0, ctx_hash, _model_name,
+                    )
+                self._record_llm(
+                    output,
+                    phase,
+                    policy_checkpoint_status=_checkpoint_status,
+                    redaction_count=_redaction_count,
+                    llm_retry_count=_retry_count,
+                )
                 return AbandonSignal(reason=output.stop_reason)
 
             if not output.selected_tasks:
@@ -337,24 +668,74 @@ class PlanningEngine:
                     "retrying" if attempt < self._max_retries else "falling back",
                 )
                 if attempt < self._max_retries:
+                    if self._budget is not None:
+                        self._budget.record_retry()
+                    _retry_count += 1
                     continue
-                self._record_fallback(phase)
+                elapsed = time.monotonic() - t0
+                if self._budget is not None:
+                    self._budget.record_failure(
+                        phase.value, elapsed, "validation", None, _model_name,
+                    )
+                self._record_fallback(
+                    phase,
+                    policy_checkpoint_status=_checkpoint_status,
+                    redaction_count=_redaction_count,
+                    llm_error_category="validation",
+                    llm_retry_count=_retry_count,
+                )
                 return await self._fallback.plan(goal, subgraph, evidence)
 
+            # ---------------------------------------------------------------- #
+            # Success path
+            # ---------------------------------------------------------------- #
+            elapsed = time.monotonic() - t0
             task_specs = [
                 _to_task_spec(t, goal, self._target) for t in output.selected_tasks
             ]
-            logger.info(
+            if self._budget is not None:
+                self._budget.record_success(
+                    phase.value, elapsed, len(task_specs), ctx_hash, _model_name,
+                )
+            logger.debug(
                 "planning_engine: LLM produced %d task(s) for phase=%s (attempt %d)",
                 len(task_specs),
                 phase.value,
                 attempt + 1,
             )
-            self._record_llm(output, phase)
+            self._record_llm(
+                output,
+                phase,
+                policy_checkpoint_status=_checkpoint_status,
+                redaction_count=_redaction_count,
+                llm_retry_count=_retry_count,
+            )
             return task_specs
 
+        # Exhausted all retries without a conclusive result.
+        elapsed = time.monotonic() - t0
         if last_output is not None:
-            self._record_llm(last_output, phase, fallback_used=True)
+            if self._budget is not None:
+                self._budget.record_failure(
+                    phase.value, elapsed, "validation", None, _model_name,
+                )
+            self._record_llm(
+                last_output,
+                phase,
+                fallback_used=True,
+                policy_checkpoint_status=_checkpoint_status,
+                redaction_count=_redaction_count,
+                llm_retry_count=_retry_count,
+            )
         else:
-            self._record_fallback(phase)
+            if self._budget is not None:
+                self._budget.record_failure(
+                    phase.value, elapsed, "transient", None, _model_name,
+                )
+            self._record_fallback(
+                phase,
+                policy_checkpoint_status=_checkpoint_status,
+                redaction_count=_redaction_count,
+                llm_retry_count=_retry_count,
+            )
         return await self._fallback.plan(goal, subgraph, evidence)

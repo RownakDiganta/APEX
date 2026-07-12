@@ -60,6 +60,33 @@ class RunReport:
     planner_decisions: list[dict[str, Any]] = field(default_factory=list)
     # Accumulated planner audit log: one PlanDecision.to_dict() per invocation.
 
+    # Policy gate summary — derived from state["policy_decisions"].
+    policy_approved_count: int = 0
+    policy_blocked_count: int = 0
+    policy_needs_review_count: int = 0
+    last_blocked_reasons: list[str] = field(default_factory=list)
+    # Raw per-task policy decision audit log (one entry per reviewed task).
+    policy_decisions: list[dict[str, Any]] = field(default_factory=list)
+
+    # Knowledge seeding summary — populated when seed_all() ran with a
+    # knowledge_root and returned a _promotion key.
+    # seeding_counts: per-family record counts (family → staged count).
+    # seeding_promotion: PromotionSummary.to_dict() fields.
+    # policy_source: string describing which policy file/fallback was used.
+    seeding_counts: dict[str, Any] = field(default_factory=dict)
+    seeding_promotion: dict[str, Any] = field(default_factory=dict)
+    policy_source: str = ""
+
+    # LLM call budget summary — populated from LLMBudgetTracker.to_dict() when
+    # --use-llm is set.  Empty dict when running in deterministic mode.
+    llm_usage: dict[str, Any] = field(default_factory=dict)
+
+    # Duplicate action summary — populated from state["duplicate_actions"].
+    # duplicate_action_count: total tasks skipped by the duplicate gate.
+    # duplicate_action_entries: the raw audit entries (one per skipped task).
+    duplicate_action_count: int = 0
+    duplicate_action_entries: list[dict[str, Any]] = field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # Status helper
@@ -103,6 +130,9 @@ def build_report(
     *,
     episodes_by_outcome: dict[str, int] | None = None,
     evidence_samples: list[str] | None = None,
+    seed_results: dict[str, Any] | None = None,
+    policy_source: str = "",
+    llm_budget: dict[str, Any] | None = None,
 ) -> RunReport:
     """Build a ``RunReport`` from engagement outputs.
 
@@ -160,6 +190,34 @@ def build_report(
 
     planner_decisions = list(final_state.get("planner_decisions") or [])
 
+    # Policy gate summary
+    raw_pd = list(final_state.get("policy_decisions") or [])
+    policy_approved_count = sum(1 for d in raw_pd if d.get("status") == "approved")
+    policy_blocked_count = sum(1 for d in raw_pd if d.get("status") == "blocked")
+    policy_needs_review_count = sum(
+        1 for d in raw_pd if d.get("status") == "needs_human_review"
+    )
+    last_blocked_reasons = [
+        str(d.get("reason", ""))
+        for d in raw_pd
+        if d.get("status") in ("blocked", "needs_human_review") and d.get("reason")
+    ][:3]
+
+    # Extract seeding summary from seed_results (if available).
+    seeding_counts: dict[str, Any] = {}
+    seeding_promotion: dict[str, Any] = {}
+    if seed_results:
+        seeding_counts = {
+            k: v for k, v in seed_results.items()
+            if k not in ("_promotion",) and not k.startswith("_")
+        }
+        promo = seed_results.get("_promotion")
+        if isinstance(promo, dict):
+            seeding_promotion = promo
+
+    # Duplicate action summary
+    raw_dup = list(final_state.get("duplicate_actions") or [])
+
     return RunReport(
         target=config.target,
         mode="dry-run" if config.dry_run else "live",
@@ -183,6 +241,17 @@ def build_report(
         evidence_samples=evidence_samples,
         last_error=final_state["last_error"],
         planner_decisions=planner_decisions,
+        policy_approved_count=policy_approved_count,
+        policy_blocked_count=policy_blocked_count,
+        policy_needs_review_count=policy_needs_review_count,
+        last_blocked_reasons=last_blocked_reasons,
+        policy_decisions=raw_pd,
+        seeding_counts=seeding_counts,
+        seeding_promotion=seeding_promotion,
+        policy_source=policy_source,
+        llm_usage=llm_budget if llm_budget is not None else {},
+        duplicate_action_count=len(raw_dup),
+        duplicate_action_entries=raw_dup,
     )
 
 
@@ -282,6 +351,74 @@ def format_text(report: RunReport) -> str:
             fb = " [fallback]" if d.get("fallback_used") else ""
             lines.append(f"  [{phase:<12}] {model:<16} conf={conf:.2f}{fb}")
 
+    # Knowledge seeding summary (shown when compiled knowledge was loaded)
+    if report.seeding_counts:
+        lines.append("\nKnowledge Seeding")
+        for family, count in sorted(report.seeding_counts.items()):
+            lines.append(f"  {family:<20}: {count:,}")
+        if report.seeding_promotion:
+            p = report.seeding_promotion
+            lines.append(f"  Reflector bootstrap:")
+            lines.append(f"    passes        : {p.get('passes_run', 'n/a')}")
+            lines.append(f"    promoted      : {p.get('records_promoted', 'n/a')}")
+            lines.append(f"    remaining     : {p.get('records_remaining', 'n/a')}")
+            lines.append(f"    stop_reason   : {p.get('stop_reason', 'n/a')}")
+            lines.append(f"    elapsed_s     : {p.get('elapsed_seconds', 'n/a')}")
+
+    # Policy Gate summary (always shown — all-approved is the expected baseline)
+    total_policy = (
+        report.policy_approved_count
+        + report.policy_blocked_count
+        + report.policy_needs_review_count
+    )
+    lines.append("\nPolicy Gate")
+    if report.policy_source:
+        lines.append(f"  Policy source   : {report.policy_source}")
+    lines.append(f"  Total reviewed  : {total_policy}")
+    lines.append(f"  Approved        : {report.policy_approved_count}")
+    lines.append(f"  Blocked         : {report.policy_blocked_count}")
+    lines.append(f"  Needs review    : {report.policy_needs_review_count}")
+    if report.last_blocked_reasons:
+        lines.append("  Last blocked reasons:")
+        for reason in report.last_blocked_reasons:
+            lines.append(f"    {reason[:120]}")
+
+    # LLM Usage (shown only when LLM planning was active this run)
+    if report.llm_usage:
+        u = report.llm_usage
+        lines.append("\nLLM Usage")
+        lines.append(f"  Calls attempted   : {u.get('calls_attempted', 0)}")
+        lines.append(f"  Calls succeeded   : {u.get('calls_succeeded', 0)}")
+        lines.append(f"  Calls failed      : {u.get('calls_failed', 0)}")
+        lines.append(f"  Fallbacks (total) : {u.get('fallbacks', 0)}")
+        lines.append(f"  Retries           : {u.get('retries', 0)}")
+        lines.append(f"  Total elapsed s   : {u.get('total_elapsed_seconds', 0.0):.2f}")
+        if u.get("stop_reason"):
+            lines.append(f"  Stop reason       : {u['stop_reason']}")
+        repeated = sum(v for v in (u.get("repeated_skips") or {}).values())
+        if repeated:
+            lines.append(f"  Repeated skips    : {repeated}")
+        per_phase = u.get("phase_counts") or {}
+        if per_phase:
+            for ph, cnt in sorted(per_phase.items()):
+                lines.append(f"    {ph:<16}: {cnt} call(s)")
+
+    # Duplicate Actions (shown only when any tasks were skipped)
+    if report.duplicate_action_count > 0:
+        lines.append("\nDuplicate Actions Skipped")
+        lines.append(f"  Total skipped     : {report.duplicate_action_count}")
+        phase_dups: dict[str, int] = {}
+        for e in report.duplicate_action_entries:
+            ph = str(e.get("phase", "unknown"))
+            phase_dups[ph] = phase_dups.get(ph, 0) + 1
+        for ph, cnt in sorted(phase_dups.items()):
+            lines.append(f"  {ph:<16}: {cnt}")
+        for e in report.duplicate_action_entries[:3]:
+            lines.append(
+                f"  [{e.get('phase','?'):<12}] fp={e.get('fingerprint','?')} "
+                f"tool={e.get('tool','?')!r} {e.get('reason','')[:60]}"
+            )
+
     lines += ["", _SEP, ""]
     return "\n".join(lines)
 
@@ -319,6 +456,23 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
         "evidence_samples": report.evidence_samples,
         "last_error": report.last_error,
         "planner_decisions": report.planner_decisions,
+        "policy_gate": {
+            "policy_source": report.policy_source,
+            "approved": report.policy_approved_count,
+            "blocked": report.policy_blocked_count,
+            "needs_human_review": report.policy_needs_review_count,
+            "last_blocked_reasons": report.last_blocked_reasons,
+        },
+        "policy_decisions": report.policy_decisions,
+        "knowledge_seeding": {
+            "family_counts": report.seeding_counts,
+            "promotion": report.seeding_promotion,
+        },
+        "llm_usage": report.llm_usage,
+        "duplicate_actions": {
+            "total_skipped": report.duplicate_action_count,
+            "entries": report.duplicate_action_entries,
+        },
     }
 
 

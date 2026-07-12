@@ -1,0 +1,281 @@
+# rules.py
+# Deterministic, stateless rule functions for scope and policy enforcement.
+"""Deterministic policy rule functions.
+
+Each public rule function has the signature:
+
+    check_*(task, policy, config) -> PolicyDecision | None
+
+Return ``None`` to indicate the rule passes (no violation).  Return a
+``PolicyDecision`` to indicate a binding outcome (``blocked`` or
+``needs_human_review``).  Returning ``approved`` from a rule is reserved for
+the explicit safe-recon acknowledgement rule only.
+
+Rules are pure functions with no side-effects.  They never call tools, never
+read from MemoryAPI, and never touch the filesystem.
+
+**Rule evaluation order (enforced in advisor.py):**
+
+1. ``check_no_destructive_command``   — hard block, runs first
+2. ``check_target_in_scope``          — block off-scope targets
+3. ``check_no_attacking_infrastructure`` — block tasks targeting non-target IPs
+4. ``check_no_password_list``         — block wordlist/credential bruteforce
+5. ``check_no_sensitive_data``        — block sensitive file reads
+6. ``check_require_review``           — flag tasks needing human review
+7. ``check_safe_recon_allowed``       — explicit approval for nmap/nc/curl on target
+"""
+from __future__ import annotations
+
+import re
+from typing import TYPE_CHECKING
+
+from apex_host.policy.models import PolicyDecision, PolicyStatus
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from apex_host.config import ApexConfig
+    from apex_host.policy.models import ScopePolicy
+    from memfabric.types import TaskSpec
+
+    # Precise type for every rule function in this module.
+    _RuleFn = Callable[[TaskSpec, ScopePolicy, ApexConfig], PolicyDecision | None]
+
+# ---------------------------------------------------------------------------
+# Internal constants — NOT exported.  Host apps that need to add patterns
+# should use config.require_policy_approval_for or subclass the advisor.
+# ---------------------------------------------------------------------------
+
+# IPv4 address pattern — used to detect when a tool arg contains an IP.
+_IPV4_RE = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
+
+# Args that indicate wordlist / password-list usage.
+_PASSWORD_LIST_FLAGS: frozenset[str] = frozenset({
+    "-w", "--wordlist",
+    "-P", "--passwords", "--passfile",
+    "-C", "--combo-file",
+    "--user-combo",
+})
+
+# Path fragments indicating sensitive system data.
+_SENSITIVE_PATHS: tuple[str, ...] = (
+    "/etc/shadow",
+    "/etc/passwd",
+    "/.ssh/",
+    "/id_rsa",
+    "/id_ed25519",
+    "/id_ecdsa",
+    "/.aws/credentials",
+    "/.aws/config",
+    "/secrets/",
+    "/private_key",
+    "/.gnupg/",
+    "/.netrc",
+)
+
+# Tools considered safe for passive recon against the assigned target.
+_SAFE_RECON_TOOLS: frozenset[str] = frozenset({
+    "nmap", "nc", "netcat", "curl", "python3",
+})
+
+
+# ---------------------------------------------------------------------------
+# Public rule functions
+# ---------------------------------------------------------------------------
+
+def check_no_destructive_command(
+    task: "TaskSpec",
+    policy: "ScopePolicy",
+    config: "ApexConfig",
+) -> PolicyDecision | None:
+    """Block any tool that appears in the policy's blocked-tools set."""
+    tool = str(task.params.get("tool", "")).strip().lower()
+    if tool in policy.blocked_tools:
+        return PolicyDecision(
+            status=PolicyStatus.blocked,
+            rule_name="no_destructive_command",
+            reason=f"tool {tool!r} is in the policy blocked-tools list",
+            task_tool=tool,
+            task_target=str(task.params.get("target", "")),
+        )
+    return None
+
+
+def check_target_in_scope(
+    task: "TaskSpec",
+    policy: "ScopePolicy",
+    config: "ApexConfig",
+) -> PolicyDecision | None:
+    """Block tasks whose explicit target field is not in the allowed targets."""
+    raw_target = str(task.params.get("target", "")).strip()
+    if not raw_target:
+        return None  # no explicit target field; checked by infrastructure rule
+
+    if raw_target not in policy.allowed_targets:
+        return PolicyDecision(
+            status=PolicyStatus.blocked,
+            rule_name="target_in_scope",
+            reason=(
+                f"target {raw_target!r} is not in the allowed scope "
+                f"{sorted(policy.allowed_targets)}"
+            ),
+            task_tool=str(task.params.get("tool", "")),
+            task_target=raw_target,
+        )
+    return None
+
+
+def check_no_attacking_infrastructure(
+    task: "TaskSpec",
+    policy: "ScopePolicy",
+    config: "ApexConfig",
+) -> PolicyDecision | None:
+    """Block tasks whose args contain an IP address outside the allowed scope.
+
+    This catches cases where the IP appears in args rather than (or in addition
+    to) the explicit target field.  Addresses belonging to ``policy.allowed_targets``
+    are permitted.  Non-IP strings are ignored.
+    """
+    args: list[str] = list(task.params.get("args", []))
+    tool = str(task.params.get("tool", ""))
+
+    for token in args:
+        for match in _IPV4_RE.finditer(token):
+            ip = match.group(1)
+            if ip not in policy.allowed_targets:
+                return PolicyDecision(
+                    status=PolicyStatus.blocked,
+                    rule_name="no_attacking_infrastructure",
+                    reason=(
+                        f"arg {token!r} contains IP {ip!r} which is outside "
+                        f"the allowed scope {sorted(policy.allowed_targets)}"
+                    ),
+                    task_tool=tool,
+                    task_target=ip,
+                )
+    return None
+
+
+def check_no_password_list(
+    task: "TaskSpec",
+    policy: "ScopePolicy",
+    config: "ApexConfig",
+) -> PolicyDecision | None:
+    """Block wordlist/password-list use when the policy does not allow it."""
+    if policy.allow_password_lists:
+        return None
+
+    args: list[str] = list(task.params.get("args", []))
+    tool = str(task.params.get("tool", ""))
+
+    for token in args:
+        if token in _PASSWORD_LIST_FLAGS:
+            return PolicyDecision(
+                status=PolicyStatus.blocked,
+                rule_name="no_password_list",
+                reason=(
+                    f"arg {token!r} indicates password/wordlist use; "
+                    "set config.allow_password_lists=True to permit this"
+                ),
+                task_tool=tool,
+                task_target=str(task.params.get("target", "")),
+            )
+    return None
+
+
+def check_no_sensitive_data(
+    task: "TaskSpec",
+    policy: "ScopePolicy",
+    config: "ApexConfig",
+) -> PolicyDecision | None:
+    """Block access to known sensitive system file paths when not permitted."""
+    if policy.allow_sensitive_data_access:
+        return None
+
+    args: list[str] = list(task.params.get("args", []))
+    tool = str(task.params.get("tool", ""))
+
+    for token in args:
+        token_lower = token.lower()
+        for sensitive in _SENSITIVE_PATHS:
+            if sensitive.lower() in token_lower:
+                return PolicyDecision(
+                    status=PolicyStatus.blocked,
+                    rule_name="no_sensitive_data",
+                    reason=(
+                        f"arg {token!r} references a sensitive path "
+                        f"({sensitive!r}); set config.allow_sensitive_data_access=True "
+                        "to permit this (requires explicit operator approval)"
+                    ),
+                    task_tool=tool,
+                    task_target=str(task.params.get("target", "")),
+                )
+    return None
+
+
+def check_require_review(
+    task: "TaskSpec",
+    policy: "ScopePolicy",
+    config: "ApexConfig",
+) -> PolicyDecision | None:
+    """Flag tasks whose tool is in the require-human-review list."""
+    tool = str(task.params.get("tool", "")).strip()
+    if tool in policy.require_review_for:
+        return PolicyDecision(
+            status=PolicyStatus.needs_human_review,
+            rule_name="require_review",
+            reason=(
+                f"tool {tool!r} is in config.require_policy_approval_for; "
+                "a human operator must approve this task before execution"
+            ),
+            task_tool=tool,
+            task_target=str(task.params.get("target", "")),
+        )
+    return None
+
+
+def check_safe_recon_allowed(
+    task: "TaskSpec",
+    policy: "ScopePolicy",
+    config: "ApexConfig",
+) -> PolicyDecision | None:
+    """Explicit approval for safe passive recon tools against the assigned target.
+
+    This rule runs last.  It returns an ``approved`` decision only when the
+    tool is in the safe-recon set AND the target is in scope.  For all other
+    tasks, it returns None and the advisor falls through to the default
+    ``approved`` outcome.
+
+    The explicit approval is useful for callers who want to know *why* a task
+    was approved (rule_name = "safe_recon_allowed"), not just that it wasn't
+    blocked.
+    """
+    tool = str(task.params.get("tool", "")).strip().lower()
+    raw_target = str(task.params.get("target", "")).strip()
+
+    if tool in _SAFE_RECON_TOOLS and raw_target in policy.allowed_targets:
+        return PolicyDecision(
+            status=PolicyStatus.approved,
+            rule_name="safe_recon_allowed",
+            reason=f"tool {tool!r} is a safe recon tool against assigned target {raw_target!r}",
+            task_tool=tool,
+            task_target=raw_target,
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Ordered rule registry used by PolicyAdvisor
+# ---------------------------------------------------------------------------
+
+# Evaluate in this order.  The first non-None result is the policy decision.
+# Blocking rules come first so they cannot be bypassed by later rules.
+ALL_RULES: tuple[_RuleFn, ...] = (
+    check_no_destructive_command,
+    check_target_in_scope,
+    check_no_attacking_infrastructure,
+    check_no_password_list,
+    check_no_sensitive_data,
+    check_require_review,
+    check_safe_recon_allowed,
+)

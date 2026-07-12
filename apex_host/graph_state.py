@@ -65,6 +65,14 @@ class ApexGraphState(TypedDict):
     planner_decisions: Annotated[list[dict[str, Any]], operator.add]
     tool_results: list[dict[str, Any]] | None
     repair_count: int
+    # Policy gate audit log: one entry per task reviewed by PolicyAdvisor.
+    # Fields per entry: tool, target, phase, status, rule_name, reason.
+    # Accumulated with operator.add so every turn's decisions append.
+    policy_decisions: Annotated[list[dict[str, Any]], operator.add]
+    # Duplicate action audit log: one entry per task skipped by the duplicate
+    # action gate.  Fields per entry: fingerprint, tool, target, phase,
+    # disposition, reason, meaningful_state_change.
+    duplicate_actions: Annotated[list[dict[str, Any]], operator.add]
 
 
 CompiledApexGraph = Any

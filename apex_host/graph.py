@@ -59,6 +59,8 @@ from memfabric.types import (
 
 from apex_host.agents.browser_executor import BrowserExecutor
 from apex_host.agents.telnet_executor import TelnetExecutor
+from apex_host.policy import PolicyAdvisor, load_policy
+from apex_host.policy.models import PolicyDecision
 from apex_host.graph_state import ApexGraphState, CompiledApexGraph
 from apex_host.parsers.access_parser import AccessParser
 from apex_host.parsers.banner_parser import BannerParser
@@ -69,6 +71,7 @@ from apex_host.parsers.gobuster_parser import GobusterParser
 from apex_host.parsers.nmap_parser import NmapParser
 from apex_host.planners.capabilities import capabilities_from_subgraph
 from apex_host.planners.credential_planner import CredentialPlanner
+from apex_host.planning.fingerprint import DuplicateActionTracker, task_fingerprint
 from apex_host.planners.global_planner import GlobalPlanner
 from apex_host.planners.priv_esc_planner import PrivEscPlanner
 from apex_host.planners.recon_planner import ReconPlanner
@@ -82,10 +85,24 @@ from apex_host.types import ApexPhase, BrowserObservation, ToolCommand
 if TYPE_CHECKING:
     from apex_host.config import ApexConfig
     from apex_host.llm.router import ModelRouter
+    from apex_host.planning.budget import LLMBudgetTracker
     from memfabric.api import MemoryAPI
     from memfabric.coordination.protocols import Planner
 
 logger = logging.getLogger(__name__)
+
+
+def _make_pd_entry(tool: str, target: str, phase: str, decision: PolicyDecision) -> dict[str, Any]:
+    """Build a policy-decision record for state['policy_decisions']."""
+    return {
+        "tool": tool,
+        "target": target,
+        "phase": phase,
+        "status": decision.status.value,
+        "rule_name": decision.rule_name,
+        "reason": decision.reason,
+    }
+
 
 _NMAP = NmapParser()
 _FFUF = FfufParser()
@@ -206,6 +223,8 @@ def build_apex_graph(
     *,
     checkpointer: Any | None = None,
     model_router: "ModelRouter | None" = None,
+    advisor: "PolicyAdvisor | None" = None,
+    budget_tracker: "LLMBudgetTracker | None" = None,
 ) -> CompiledApexGraph:
     """Compile and return the APEX engagement StateGraph.
 
@@ -218,10 +237,33 @@ def build_apex_graph(
     fallback to the deterministic core on any error or low confidence.
     The default (``None``) preserves the fully-deterministic behaviour so that
     existing tests and dry-run engagements need no changes.
+
+    ``advisor`` is the ``PolicyAdvisor`` instance used to gate every task before
+    execution.  If ``None`` (the default), one is constructed from
+    ``load_policy(config)`` — the engagement target is the sole allowed scope.
+    Tests may inject a custom advisor (e.g. a fake that always blocks) to verify
+    the blocking behaviour in isolation without side-effects.
     """
     _ct = getattr(config, "planning_confidence_threshold", 0.4)
     _mr = getattr(config, "max_planning_retries", 1)
     _max_repair = getattr(config, "max_repair_attempts", 1)
+
+    # Policy gate — constructed once, captured by all agent node closures.
+    # An injected advisor (from tests or callers) is used as-is.
+    if advisor is None:
+        advisor = PolicyAdvisor(load_policy(config), config)
+
+    # Duplicate action tracker — shared across all agent node closures.
+    # Created once per build_apex_graph() call; persists for the full run.
+    # None when detection is disabled so all fast-path checks are branch-free.
+    dup_tracker: DuplicateActionTracker | None = (
+        DuplicateActionTracker(
+            window=getattr(config, "duplicate_action_window", 5),
+            max_repeats=getattr(config, "duplicate_action_max_repeats", 1),
+        )
+        if getattr(config, "duplicate_action_detection_enabled", True)
+        else None
+    )
 
     global_planner = GlobalPlanner(max_turns=config.max_turns)
     phase_planners: dict[str, "Planner"] = {
@@ -232,6 +274,7 @@ def build_apex_graph(
             allowed_tools=config.allowed_tools if model_router else None,
             confidence_threshold=_ct,
             max_retries=_mr,
+            budget_tracker=budget_tracker,
         ),
         ApexPhase.web.value: WebPlanner(
             config.target,
@@ -242,6 +285,7 @@ def build_apex_graph(
             allowed_tools=config.allowed_tools if model_router else None,
             confidence_threshold=_ct,
             max_retries=_mr,
+            budget_tracker=budget_tracker,
         ),
         ApexPhase.credential.value: CredentialPlanner(
             config.target,
@@ -253,6 +297,7 @@ def build_apex_graph(
             allowed_tools=config.allowed_tools if model_router else None,
             confidence_threshold=_ct,
             max_retries=_mr,
+            budget_tracker=budget_tracker,
         ),
         ApexPhase.priv_esc.value: PrivEscPlanner(
             config.target,
@@ -261,6 +306,7 @@ def build_apex_graph(
             allowed_tools=config.allowed_tools if model_router else None,
             confidence_threshold=_ct,
             max_retries=_mr,
+            budget_tracker=budget_tracker,
         ),
     }
     browser_executor = BrowserExecutor(config)
@@ -376,12 +422,87 @@ def build_apex_graph(
         concurrency_cap = max(1, min(config.max_concurrency, len(tasks)))
         sem = asyncio.Semaphore(concurrency_cap)
 
-        async def _run_one_cmd(task: TaskSpec) -> dict[str, Any]:
+        # _run_one_cmd returns (tool_result_dict, pd_entry_dict, dup_entries).
+        # dup_entries is a list of duplicate-action audit dicts (empty when no dup).
+        async def _run_one_cmd(
+            task: TaskSpec,
+        ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
             async with sem:
                 tool = str(task.params.get("tool", ""))
                 args = [str(a) for a in task.params.get("args", [])]
                 target = str(task.params.get("target", config.target))
                 parser_name = str(task.params.get("parser", "command"))
+
+                # Policy gate — runs before any command execution.
+                pd = advisor.review_task(task, state["phase"], evidence, config)
+                pd_entry = _make_pd_entry(tool, target, state["phase"], pd)
+
+                if not pd.is_approved:
+                    logger.info(
+                        "policy gate [%s] blocked task tool=%r target=%r rule=%r",
+                        state["phase"], tool, target, pd.rule_name,
+                    )
+                    blocked: dict[str, Any] = {
+                        "task_id": task.id,
+                        "tool": tool,
+                        "args": args,
+                        "target": target,
+                        "parser": parser_name,
+                        "stdout": "",
+                        "stderr": "",
+                        "returncode": 1,
+                        "dry_run": config.dry_run,
+                        "error": f"policy_blocked: {pd.reason}",
+                        "phase": state["phase"],
+                        "policy_blocked": True,
+                        "policy_rule": pd.rule_name,
+                    }
+                    return blocked, pd_entry, []
+
+                # Duplicate action gate — fires after policy gate, before execution.
+                # is_duplicate() + record() are synchronous with no awaits between
+                # them, so they execute atomically under asyncio cooperative scheduling.
+                _dup_entries: list[dict[str, Any]] = []
+                if dup_tracker is not None:
+                    _executor_domain = str(task.params.get("executor_domain", state["phase"]))
+                    _fp = task_fingerprint(
+                        state["phase"], tool, args, target, parser_name, _executor_domain,
+                    )
+                    if dup_tracker.is_duplicate(_fp):
+                        _dup_entry: dict[str, Any] = {
+                            "fingerprint": _fp,
+                            "tool": tool,
+                            "target": target,
+                            "phase": state["phase"],
+                            "disposition": "skip_task",
+                            "reason": (
+                                f"task repeated within window="
+                                f"{getattr(config, 'duplicate_action_window', 5)}"
+                            ),
+                            "meaningful_state_change": False,
+                        }
+                        logger.info(
+                            "duplicate action [%s] skipped tool=%r target=%r fp=%s",
+                            state["phase"], tool, target, _fp,
+                        )
+                        skipped: dict[str, Any] = {
+                            "task_id": task.id,
+                            "tool": tool,
+                            "args": args,
+                            "target": target,
+                            "parser": parser_name,
+                            "stdout": "",
+                            "stderr": "",
+                            "returncode": 0,
+                            "dry_run": config.dry_run,
+                            "error": None,
+                            "phase": state["phase"],
+                            "skipped_duplicate": True,
+                            "duplicate_fingerprint": _fp,
+                        }
+                        return skipped, pd_entry, [_dup_entry]
+                    dup_tracker.record(_fp)
+
                 cmd = ToolCommand(tool=tool, args=args, timeout_seconds=config.max_command_seconds)
                 try:
                     result = await run_command(cmd, config)
@@ -398,7 +519,7 @@ def build_apex_graph(
                         "dry_run": config.dry_run,
                         "error": str(exc),
                         "phase": state["phase"],
-                    }
+                    }, pd_entry, _dup_entries
                 return {
                     "task_id": task.id,
                     "tool": tool,
@@ -411,13 +532,16 @@ def build_apex_graph(
                     "dry_run": result.dry_run,
                     "error": result.error,
                     "phase": state["phase"],
-                }
+                }, pd_entry, _dup_entries
 
-        results = list(await asyncio.gather(*[_run_one_cmd(t) for t in tasks]))
+        pairs = list(await asyncio.gather(*[_run_one_cmd(t) for t in tasks]))
+        results = [p[0] for p in pairs]
+        pd_list_tasks = [p[1] for p in pairs]
+        dup_entries = [entry for p in pairs for entry in p[2]]
         first_result = results[0] if results else None
         first_task = tasks[0] if tasks else None
 
-        return {
+        rdict: dict[str, Any] = {
             "current_task": {
                 "id": first_task.id,
                 "executor_domain": first_task.executor_domain,
@@ -427,7 +551,11 @@ def build_apex_graph(
             "tool_results": results,
             "last_error": first_result.get("error") if first_result else None,
             "planner_decisions": decision_list,
+            "policy_decisions": pd_list_tasks,
         }
+        if dup_entries:
+            rdict["duplicate_actions"] = dup_entries
+        return rdict
 
     async def recon_agent(state: ApexGraphState) -> dict[str, Any]:
         return await _run_tasks(state, phase_planners[ApexPhase.recon.value])
@@ -483,6 +611,74 @@ def build_apex_graph(
             "params": task.params,
         }
 
+        # Policy gate — runs before TelnetExecutor or run_command.
+        pd = advisor.review_task(task, state["phase"], evidence, config)
+        pd_entry = _make_pd_entry(tool, target, state["phase"], pd)
+        if not pd.is_approved:
+            logger.info(
+                "policy gate [%s] blocked credential task tool=%r target=%r rule=%r",
+                state["phase"], tool, target, pd.rule_name,
+            )
+            blocked_tr: dict[str, Any] = {
+                "task_id": task.id,
+                "tool": tool,
+                "args": [],
+                "target": target,
+                "parser": parser_name,
+                "stdout": "",
+                "stderr": "",
+                "returncode": 1,
+                "dry_run": config.dry_run,
+                "error": f"policy_blocked: {pd.reason}",
+                "phase": state["phase"],
+                "policy_blocked": True,
+                "policy_rule": pd.rule_name,
+            }
+            return {
+                "current_task": current_task_info,
+                "last_tool_result": blocked_tr,
+                "tool_results": [blocked_tr],
+                "last_error": f"policy_blocked: {pd.reason}",
+                "planner_decisions": decision_list,
+                "policy_decisions": [pd_entry],
+            }
+
+        # Duplicate action gate for credential tasks.
+        if dup_tracker is not None:
+            _exec_domain = str(task.params.get("executor_domain", state["phase"]))
+            _exec_fp = task_fingerprint(
+                state["phase"], tool,
+                [str(a) for a in task.params.get("args", [])],
+                target, parser_name, _exec_domain,
+            )
+            if dup_tracker.is_duplicate(_exec_fp):
+                _exec_dup: dict[str, Any] = {
+                    "fingerprint": _exec_fp,
+                    "tool": tool,
+                    "target": target,
+                    "phase": state["phase"],
+                    "disposition": "skip_task",
+                    "reason": (
+                        f"task repeated within window="
+                        f"{getattr(config, 'duplicate_action_window', 5)}"
+                    ),
+                    "meaningful_state_change": False,
+                }
+                logger.info(
+                    "duplicate action [%s] skipped credential tool=%r target=%r fp=%s",
+                    state["phase"], tool, target, _exec_fp,
+                )
+                return {
+                    "current_task": current_task_info,
+                    "last_tool_result": None,
+                    "tool_results": None,
+                    "last_error": None,
+                    "planner_decisions": decision_list,
+                    "policy_decisions": [pd_entry],
+                    "duplicate_actions": [_exec_dup],
+                }
+            dup_tracker.record(_exec_fp)
+
         if tool == "telnet_access":
             result = await telnet_executor.run(task, evidence)
             ep_data = result.episode.data
@@ -514,6 +710,7 @@ def build_apex_graph(
                 "tool_results": [tool_result],
                 "last_error": error_str,
                 "planner_decisions": decision_list,
+                "policy_decisions": [pd_entry],
             }
 
         # Fallback: shell-based tools via safety-gated runner.py
@@ -528,6 +725,7 @@ def build_apex_graph(
                 "tool_results": None,
                 "last_error": str(exc),
                 "planner_decisions": decision_list,
+                "policy_decisions": [pd_entry],
             }
         cmd_tool_result: dict[str, Any] = {
             "task_id": task.id,
@@ -548,6 +746,7 @@ def build_apex_graph(
             "tool_results": [cmd_tool_result],
             "last_error": run_result.error,
             "planner_decisions": decision_list,
+            "policy_decisions": [pd_entry],
         }
 
     async def priv_esc_agent(state: ApexGraphState) -> dict[str, Any]:
@@ -566,11 +765,74 @@ def build_apex_graph(
             id=state["run_id"],
             goal_id=state["run_id"],
             executor_domain="browser",
-            params={"url": url},
+            # Include tool="browser" and target=config.target so policy rules
+            # can evaluate scope (target_in_scope, require_review_for, etc.).
+            params={"url": url, "tool": "browser", "target": config.target, "args": []},
             subgraph_anchor=anchor,
             phase=state["phase"],
         )
         evidence = await api.query(text=state["goal"], subgraph_anchor=anchor)
+
+        # Policy gate — runs before BrowserExecutor.run().
+        pd = advisor.review_task(task, state["phase"], evidence, config)
+        pd_entry = _make_pd_entry("browser", config.target, state["phase"], pd)
+        if not pd.is_approved:
+            logger.info(
+                "policy gate [%s] blocked browser task target=%r rule=%r",
+                state["phase"], config.target, pd.rule_name,
+            )
+            blocked_br: dict[str, Any] = {
+                "kind": "browser",
+                "task_id": task.id,
+                "url": url,
+                "dry_run": config.dry_run,
+                "outcome": Outcome.fundamental.value,
+                "phase": state["phase"],
+                "obs": {},
+                "policy_blocked": True,
+                "policy_rule": pd.rule_name,
+                "error": f"policy_blocked: {pd.reason}",
+            }
+            return {
+                "current_task": {"id": task.id, "executor_domain": "browser", "params": task.params},
+                "last_tool_result": blocked_br,
+                "tool_results": [blocked_br],
+                "last_error": f"policy_blocked: {pd.reason}",
+                "planner_decisions": [],
+                "policy_decisions": [pd_entry],
+            }
+
+        # Duplicate action gate for browser tasks.
+        if dup_tracker is not None:
+            _br_fp = task_fingerprint(state["phase"], "browser", [], config.target, "browser", "browser")
+            if dup_tracker.is_duplicate(_br_fp):
+                _br_dup: dict[str, Any] = {
+                    "fingerprint": _br_fp,
+                    "tool": "browser",
+                    "target": config.target,
+                    "phase": state["phase"],
+                    "disposition": "skip_task",
+                    "reason": (
+                        f"task repeated within window="
+                        f"{getattr(config, 'duplicate_action_window', 5)}"
+                    ),
+                    "meaningful_state_change": False,
+                }
+                logger.info(
+                    "duplicate browser action [%s] skipped target=%r fp=%s",
+                    state["phase"], config.target, _br_fp,
+                )
+                return {
+                    "current_task": {"id": task.id, "executor_domain": "browser", "params": task.params},
+                    "last_tool_result": None,
+                    "tool_results": None,
+                    "last_error": "skipped: duplicate browser action",
+                    "planner_decisions": [],
+                    "policy_decisions": [pd_entry],
+                    "duplicate_actions": [_br_dup],
+                }
+            dup_tracker.record(_br_fp)
+
         result = await browser_executor.run(task, evidence)
 
         ep_data = result.episode.data
@@ -590,6 +852,7 @@ def build_apex_graph(
             "tool_results": [tool_result],
             "last_error": last_error,
             "planner_decisions": [],  # browser_agent has no planner decision
+            "policy_decisions": [pd_entry],
         }
 
     # ------------------------------------------------------------------
@@ -743,6 +1006,20 @@ def build_apex_graph(
         r_args = [str(a) for a in repaired_task.params.get("args", [])]
         r_target = str(repaired_task.params.get("target", config.target))
         r_parser = str(repaired_task.params.get("parser", "command"))
+
+        # Policy gate — repaired tasks must also pass scope enforcement.
+        r_pd = advisor.review_task(repaired_task, state["phase"], evidence, config)
+        r_pd_entry = _make_pd_entry(r_tool, r_target, state["phase"], r_pd)
+        if not r_pd.is_approved:
+            logger.info(
+                "policy gate [%s] blocked repaired task tool=%r target=%r rule=%r",
+                state["phase"], r_tool, r_target, r_pd.rule_name,
+            )
+            return {
+                "repair_count": new_repair_count,
+                "policy_decisions": [r_pd_entry],
+            }
+
         r_cmd = ToolCommand(tool=r_tool, args=r_args, timeout_seconds=config.max_command_seconds)
         try:
             r_result = await run_command(r_cmd, config)
@@ -788,6 +1065,7 @@ def build_apex_graph(
             "repair_count": new_repair_count,
             "last_tool_result": repaired_tool_result,
             "last_error": r_result.error,
+            "policy_decisions": [r_pd_entry],
         }
 
     # ------------------------------------------------------------------

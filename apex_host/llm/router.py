@@ -64,6 +64,12 @@ class OpenAIModelRouter:
         kwargs: dict[str, object] = {"model": model, "api_key": self._api_key}
         if self._base_url:
             kwargs["base_url"] = self._base_url
+        # Propagate the per-call timeout from ApexConfig so that requests
+        # that hang for longer than llm_request_timeout_seconds are
+        # classified as transient errors rather than blocking indefinitely.
+        timeout = getattr(self._config, "llm_request_timeout_seconds", None)
+        if timeout is not None:
+            kwargs["timeout"] = float(timeout)
         return ChatOpenAI(**kwargs)  # type: ignore[arg-type]
 
     def planner_llm(self) -> object:

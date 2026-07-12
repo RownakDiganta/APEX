@@ -722,3 +722,79 @@ python -m apex_host.eval.run_htb_local \
 
 **Never** run `--no-dry-run` against a host you do not own or have explicit
 written authorization to test.
+
+---
+
+## Knowledge Compilation
+
+External threat-intelligence and payload knowledge lives in `knowledge/` and
+must be compiled into compact JSONL before APEX can ingest it via the RAG
+pipeline.  Three commands cover the full workflow.
+
+### 1. Compile all knowledge families
+
+```bash
+python -m apex_host.knowledge.compiler.compile_knowledge \
+    --knowledge-root ./knowledge \
+    --strict --verbose
+```
+
+Reads `knowledge/{intel_db,methodology_db,payload_db,policy_db}/` and writes
+nine JSONL / YAML files under each family's `compiled/` directory.  `--strict`
+exits 1 if any required output is missing or empty.  A post-compilation
+verification pass runs automatically unless `--no-verify` is passed.
+
+Make shortcut:
+
+```bash
+make compile-knowledge
+```
+
+### 2. Verify compiled outputs
+
+Confirm all nine required outputs exist, are non-empty, contain valid JSON per
+line, and include `source_family` + `source_type` in every record:
+
+```bash
+python -m apex_host.knowledge.compiler.verify_compiled \
+    --knowledge-root ./knowledge
+```
+
+Make shortcut:
+
+```bash
+make verify-knowledge
+```
+
+Exit 0 = all checks passed; exit 1 = one or more files failed.
+
+### 3. Run the full test suite
+
+```bash
+.venv/bin/python -m pytest tests/ -q
+```
+
+Make shortcut:
+
+```bash
+make test
+```
+
+All tests run with `dry_run=True` (the default) — no real network traffic,
+no real command execution, no API keys required.
+
+### Required compiled outputs (nine files)
+
+| # | Family | File | Min records |
+|---|---|---|---|
+| 1 | `policy_db` | `compiled/policy_records.jsonl` | 1 |
+| 2 | `policy_db` | `compiled/hackthebox_lab.yaml` | — |
+| 3 | `methodology_db` | `compiled/methodology_chunks.jsonl` | 1 |
+| 4 | `intel_db` | `compiled/attack_techniques.jsonl` | 100 |
+| 5 | `intel_db` | `compiled/cwe_weaknesses.jsonl` | 100 |
+| 6 | `intel_db` | `compiled/capec_patterns.jsonl` | 50 |
+| 7 | `intel_db` | `compiled/cve_slim.jsonl` | 1 000 |
+| 8 | `payload_db` | `compiled/payload_records.jsonl` | 100 |
+| 9 | `payload_db` | `compiled/wordlist_manifest.jsonl` | 10 |
+
+If any file is missing, run `make compile-knowledge` first.
