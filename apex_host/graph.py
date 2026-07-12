@@ -58,6 +58,7 @@ from memfabric.types import (
 )
 
 from apex_host.agents.browser_executor import BrowserExecutor
+from apex_host.agents.factory import AgentFactory, AgentRegistry, dispatch_agent
 from apex_host.agents.telnet_executor import TelnetExecutor
 from apex_host.graph_state import ApexGraphState, CompiledApexGraph
 from apex_host.parsers.access_parser import AccessParser
@@ -206,6 +207,7 @@ def build_apex_graph(
     *,
     checkpointer: Any | None = None,
     model_router: "ModelRouter | None" = None,
+    agent_registry: "AgentRegistry | None" = None,
 ) -> CompiledApexGraph:
     """Compile and return the APEX engagement StateGraph.
 
@@ -275,6 +277,14 @@ def build_apex_graph(
         target=config.target,
         dry_run=config.dry_run,
     )
+
+    # Dynamic-agent factory.  The registry is EMPTY by default, so every
+    # existing phase (recon/web/credential/priv_esc/browser) takes the normal
+    # run_command path unchanged.  Register AgentSpec types into this registry
+    # to make a planner able to target them by name — _run_one_cmd's registry
+    # check below then dispatches those tasks through the factory instead.
+    dyn_registry = agent_registry if agent_registry is not None else AgentRegistry()
+    dyn_factory = AgentFactory(dyn_registry, config)
 
     def _anchor() -> str:
         return f"host:{config.target}"
@@ -376,8 +386,62 @@ def build_apex_graph(
         concurrency_cap = max(1, min(config.max_concurrency, len(tasks)))
         sem = asyncio.Semaphore(concurrency_cap)
 
+        async def _run_dynamic(task: TaskSpec) -> dict[str, Any]:
+            """Dispatch a task targeting a registered AgentSpec type.
+
+            ``dispatch_agent`` runs the agent AND persists its deltas + episode
+            through MemoryAPI, so the result is marked ``handled`` and
+            parse_observation / write_memory skip it (no double-write).
+            Findings are surfaced here instead, from the returned deltas.
+            """
+            result = await dispatch_agent(task, dyn_factory, api, evidence)
+            base: dict[str, Any] = {
+                "task_id": task.id,
+                "tool": str(task.params.get("tool", "")),
+                "target": str(task.params.get("target", config.target)),
+                "parser": str(task.params.get("parser", "command")),
+                "dry_run": config.dry_run,
+                "phase": state["phase"],
+                "handled": True,
+                "executor_domain": task.executor_domain,
+            }
+            if result is None:
+                base.update({
+                    "returncode": 1,
+                    "error": (
+                        f"agent type {task.executor_domain!r} could not be created "
+                        "(unknown or past max_depth)"
+                    ),
+                    "handled_findings": [],
+                })
+                return base
+            ep = result.episode
+            base.update({
+                "tool": str(ep.data.get("tool", task.params.get("tool", ""))),
+                "returncode": int(ep.data.get("returncode", 0) or 0),
+                "error": ep.data.get("error"),
+                "dry_run": bool(ep.data.get("dry_run", config.dry_run)),
+                "handled_findings": [
+                    {
+                        "id": n.id,
+                        "phase": state["phase"],
+                        "title": f"{n.type} discovered",
+                        "detail": str(n.props)[:300],
+                        "confidence": n.confidence,
+                        "source": task.executor_domain,
+                        "timestamp": ep.timestamp,
+                    }
+                    for n in result.node_deltas
+                ],
+            })
+            return base
+
         async def _run_one_cmd(task: TaskSpec) -> dict[str, Any]:
             async with sem:
+                # Registry check: a task whose executor_domain names a
+                # registered dynamic agent type is dispatched via the factory.
+                if dyn_registry.get(task.executor_domain) is not None:
+                    return await _run_dynamic(task)
                 tool = str(task.params.get("tool", ""))
                 args = [str(a) for a in task.params.get("args", [])]
                 target = str(task.params.get("target", config.target))
@@ -417,7 +481,13 @@ def build_apex_graph(
         first_result = results[0] if results else None
         first_task = tasks[0] if tasks else None
 
-        return {
+        # Dynamic-agent results are already parsed+written by dispatch_agent;
+        # surface their findings here since parse_observation skips them.
+        handled_findings = [
+            f for r in results for f in r.get("handled_findings", [])
+        ]
+
+        ret: dict[str, Any] = {
             "current_task": {
                 "id": first_task.id,
                 "executor_domain": first_task.executor_domain,
@@ -428,6 +498,9 @@ def build_apex_graph(
             "last_error": first_result.get("error") if first_result else None,
             "planner_decisions": decision_list,
         }
+        if handled_findings:
+            ret["findings"] = handled_findings
+        return ret
 
     async def recon_agent(state: ApexGraphState) -> dict[str, Any]:
         return await _run_tasks(state, phase_planners[ApexPhase.recon.value])
@@ -609,6 +682,9 @@ def build_apex_graph(
 
         all_findings: list[dict[str, Any]] = []
         for tool_result in results_to_parse:
+            # Dynamic-agent results were already parsed+written by dispatch_agent.
+            if tool_result.get("handled"):
+                continue
             parsed, source = _parse_single_result(tool_result, state)
             await api.apply_deltas(
                 nodes=parsed.node_deltas,
@@ -639,6 +715,9 @@ def build_apex_graph(
 
         error_entries: list[dict[str, Any]] = []
         for tool_result in results_to_write:
+            # Dynamic-agent episodes were already appended by dispatch_agent.
+            if tool_result.get("handled"):
+                continue
             if tool_result.get("kind") == "browser":
                 outcome = (
                     Outcome.success if not state.get("last_error") else Outcome.fundamental
@@ -678,7 +757,11 @@ def build_apex_graph(
     # ------------------------------------------------------------------
     def route_after_write(state: ApexGraphState) -> str:
         tool_result = state.get("last_tool_result")
-        if not tool_result or tool_result.get("kind") == "browser":
+        if (
+            not tool_result
+            or tool_result.get("kind") == "browser"
+            or tool_result.get("handled")
+        ):
             return "reflect_or_continue"
 
         outcome = _outcome_for(

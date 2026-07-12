@@ -484,6 +484,95 @@ Expected: `Success: no issues found in 5 source files`
 
 ---
 
+## Dynamic agent factory
+
+`apex_host/agents/factory.py` lets a planner **create specific agents
+dynamically** — mint new agent *types* at runtime and spawn instances of them —
+without breaking any memfabric invariant.
+
+### Design
+
+- **An agent type is data, not code.** `AgentSpec` is a frozen dataclass
+  (`name`, `allowed_tools`, `parser`, `max_depth`, `may_spawn`). Registering a
+  new type is a validated dict write, never a generated class — so the
+  substrate stays `mypy --strict`-clean and testable.
+- **An agent instance is a stateless `DynamicAgent`** built by `AgentFactory`
+  on demand (memfabric Invariant 6). It implements the existing `Executor`
+  protocol (`domain` + `async run`), routes every command through the
+  safety-gated `tools/runner.py`, and dispatches to the spec's parser.
+- **Spawning goes through the fabric, not agent-to-agent calls** (Invariant 7).
+  A planner/agent *requests* a child by producing a `TaskSpec` via `spawn_task`
+  (fabric data, `depth + 1`); the orchestrator materialises it. `dispatch_agent`
+  is the only thing that writes the result to memory (via `apply_deltas`,
+  Invariant 1).
+- **Two allowlist layers + bounded recursion.** A spec's `allowed_tools` can
+  only *narrow* the global `ApexConfig.allowed_tools`; the runner/`safety.py`
+  gate still applies. `spawn_task` and `AgentFactory.create` both refuse to
+  exceed `max_depth`, so `orchestrator → a → b → …` cannot run away.
+
+| Symbol | Role |
+|---|---|
+| `AgentSpec` | Agent type as data |
+| `AgentRegistry` | `register` / `get` / `names` — the roster of types |
+| `AgentFactory.create(name, depth=)` | Builds a stateless `DynamicAgent`, or `None` if unknown / past `max_depth` |
+| `spawn_task(...)` | Builds a spawn-request `TaskSpec` for a child, or `None` past `max_depth` |
+| `dispatch_agent(task, factory, api, evidence)` | Runs the agent and persists its deltas + episode through `MemoryAPI` |
+
+### Wiring into the engagement graph
+
+`build_apex_graph(api, registry, config, *, agent_registry=None)` takes an
+optional `AgentRegistry`. Inside `_run_tasks`, `_run_one_cmd` performs a
+**registry check** on each task:
+
+```
+task.executor_domain registered in agent_registry?
+   ├── yes → dispatch_agent(...) runs the DynamicAgent and writes to the fabric;
+   │         the result is marked "handled" so parse_observation / write_memory
+   │         skip it (no double-write); findings are surfaced from the deltas.
+   └── no  → normal run_command path (unchanged)
+```
+
+The registry is **empty by default**, so every existing phase
+(recon/web/credential/priv_esc/browser) takes the normal `run_command` path
+with zero behaviour change. Dynamic dispatch activates only once a type is
+registered.
+
+### Usage
+
+```python
+from apex_host.agents.factory import AgentRegistry, AgentSpec, spawn_task
+from apex_host.graph import build_apex_graph
+
+# 1. mint a new agent type at runtime
+registry = AgentRegistry()
+registry.register(AgentSpec(
+    name="banner-specialist",
+    allowed_tools=frozenset({"nc"}),   # narrows the global allowlist
+    parser="banner",
+    max_depth=2,
+))
+
+# 2. build the graph with the shared registry
+graph = build_apex_graph(api, tool_registry, config, agent_registry=registry)
+
+# 3. a planner requests an instance by emitting a spawn TaskSpec (fabric data,
+#    not a call) — its executor_domain names the registered type:
+child = spawn_task(
+    "banner-specialist", tool="nc", args=["-nv", target, "22"],
+    target=target, goal_id=goal.id, parser="banner", parent_depth=0, max_depth=2,
+)
+return [child]   # returned like any other TaskSpec; the registry check dispatches it
+```
+
+### Tests
+
+`tests/apex_host/test_agent_factory.py` covers registration/lookup, factory
+creation, the depth ceiling, the per-agent allowlist gate (allowed tool runs in
+dry-run; a tool outside the spec is rejected as `fundamental`), and
+`spawn_task`'s `max_depth` guard.
+
+---
+
 ## Planner workflow
 
 ### How planners interact with MemoryAPI
