@@ -228,7 +228,19 @@ class TestApprovedReachesRunner:
     async def test_approved_run_command_is_called(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """With an approved advisor, run_command is invoked (gate opens)."""
+        """With an approved advisor, run_command is invoked (gate opens).
+
+        Infra Phase 4: the default backend for a *dry_run=True* config is now
+        DryRunToolBackend, which never imports or calls
+        apex_host.tools.runner.run_command at all (by design — see
+        apex_host.tools.backend.select_runtime_backend). This test uses
+        dry_run=False with the default tool_backend="local" so the generic
+        command path still resolves to LocalToolBackend -> run_command,
+        preserving this test's original intent (spy-proves run_command is
+        the function that ultimately executes an approved task) without
+        making any real subprocess call — the monkeypatched spy replaces
+        run_command entirely.
+        """
         advisor = _FakeAdvisor(always_blocked=False)
         run_calls: list[Any] = []
 
@@ -240,7 +252,7 @@ class TestApprovedReachesRunner:
 
         target = "127.0.0.1"
         api = _make_api()
-        config = ApexConfig(target=target, dry_run=True, max_turns=1)
+        config = ApexConfig(target=target, dry_run=False, max_turns=1)
         registry = ToolRegistry.from_config(config)
         graph = build_apex_graph(api, registry, config, advisor=advisor)
 

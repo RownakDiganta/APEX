@@ -92,6 +92,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "conservative default."
         ),
     )
+    # Infra Phase 4 — tool-execution backend selection.
+    # No --tool-service-token flag exists on purpose: CLI arguments are
+    # visible in shell history and `ps` output. Set the bearer token via the
+    # APEX_TOOL_SERVICE_TOKEN environment variable instead.
+    parser.add_argument(
+        "--tool-backend", dest="tool_backend", default=None,
+        choices=["dry-run", "local", "remote"], metavar="{dry-run,local,remote}",
+        help=(
+            "Tool-execution backend for generic (non-Telnet, non-browser) commands "
+            "(default: local). Ignored whenever --dry-run is in effect. "
+            "See docs/remote-tool-backend.md."
+        ),
+    )
+    parser.add_argument(
+        "--tool-service-url", dest="tool_service_url", default=None, metavar="URL",
+        help="Base URL of a Phase 3 apex_tool_service instance (required when --tool-backend remote).",
+    )
+    parser.add_argument(
+        "--tool-service-timeout", dest="tool_service_timeout", type=float, default=None, metavar="SECS",
+        help="Overall request timeout budget in seconds for the remote tool backend (default: 120.0).",
+    )
     # LLM call budget flags — only relevant when --use-llm is set.
     parser.add_argument(
         "--max-llm-calls", dest="max_llm_calls", type=int, default=None, metavar="N",

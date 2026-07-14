@@ -37,6 +37,7 @@ from apex_host.knowledge.seed_loader import (
     seed_payload_repo,
 )
 from apex_host.planning.budget import LLMBudgetTracker
+from apex_host.tools.backend import select_runtime_backend
 from apex_host.tools.registry import ToolRegistry
 from apex_host.types import ApexPhase
 
@@ -164,10 +165,22 @@ class ApexRuntime:
         )
         self.last_budget = budget
 
+        # Infra Phase 4: construct the tool-execution backend explicitly here
+        # (rather than relying on build_apex_graph()'s own internal default)
+        # specifically so this method — the fully lifecycle-managed
+        # production entrypoint — can close it in the `finally` block below.
+        # select_runtime_backend() enforces dry_run=True → DryRunToolBackend
+        # regardless of config.tool_backend (docs/remote-tool-backend.md).
+        # See build_apex_graph()'s docstring "Lifecycle note" for the
+        # documented limitation that applies to callers who do NOT go
+        # through ApexRuntime.
+        tool_backend = select_runtime_backend(self.config)
+
         graph = build_apex_graph(
             self.api, self.registry, self.config,
             model_router=model_router,
             budget_tracker=budget,
+            tool_backend=tool_backend,
         )
         run_id = new_id()
         initial: ApexGraphState = {
@@ -189,12 +202,18 @@ class ApexRuntime:
             "policy_decisions": [],
             "duplicate_actions": [],
             "completed_fingerprints": [],
+            "execution_backend_log": [],
         }
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": run_id},
             "recursion_limit": max(50, self.config.max_turns * 10),
         }
-        final_state: ApexGraphState = await graph.ainvoke(initial, config=invoke_config)
+        try:
+            final_state: ApexGraphState = await graph.ainvoke(initial, config=invoke_config)
+        finally:
+            aclose = getattr(tool_backend, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
         # Post-engagement Reflector pass — generalise success chains into
         # staged skills, promote entries above the quality gate, apply decay

@@ -478,6 +478,98 @@ class TestStatusAndCompleteness:
         assert report.fixable_count == 1
         assert report.fundamental_count == 0
 
+
+# ---------------------------------------------------------------------------
+# Infra Phase 4 — execution backend summary (backend_usage / timed_out_count)
+# ---------------------------------------------------------------------------
+
+class TestExecutionBackendSummary:
+    def test_backend_usage_counts_by_backend_name(self) -> None:
+        state = _state()
+        state["execution_backend_log"] = [
+            {"tool": "nmap", "backend": "local", "timed_out": False, "phase": "recon"},
+            {"tool": "curl", "backend": "local", "timed_out": False, "phase": "web"},
+            {"tool": "nc", "backend": "dry-run", "timed_out": False, "phase": "recon"},
+        ]
+        report = build_report(state, _subgraph(), _config())
+        assert report.backend_usage == {"local": 2, "dry-run": 1}
+
+    def test_timed_out_count_derived_from_log(self) -> None:
+        state = _state()
+        state["execution_backend_log"] = [
+            {"tool": "nmap", "backend": "remote", "timed_out": True, "phase": "recon"},
+            {"tool": "curl", "backend": "remote", "timed_out": False, "phase": "web"},
+        ]
+        report = build_report(state, _subgraph(), _config())
+        assert report.timed_out_count == 1
+
+    def test_backend_field_identifies_remote_as_kali_service_value(self) -> None:
+        """apex_tool_service self-identifies as "kali-service"; the client-side
+        RemoteToolBackend preserves that literal value in ToolResult.backend
+        and therefore in this log entry (docs/kali-tool-service.md §5)."""
+        state = _state()
+        state["execution_backend_log"] = [
+            {"tool": "nmap", "backend": "kali-service", "timed_out": False, "phase": "recon"},
+        ]
+        report = build_report(state, _subgraph(), _config())
+        assert report.backend_usage == {"kali-service": 1}
+
+    def test_no_backend_log_yields_empty_summary(self) -> None:
+        """Backward compatibility: a state dict built before Infra Phase 4
+        (missing the execution_backend_log key entirely) must not raise."""
+        report = build_report(_state(), _subgraph(), _config())
+        assert report.backend_usage == {}
+        assert report.timed_out_count == 0
+
+    def test_format_text_shows_execution_backend_section_when_present(self) -> None:
+        state = _state()
+        state["execution_backend_log"] = [
+            {"tool": "nmap", "backend": "local", "timed_out": False, "phase": "recon"},
+        ]
+        report = build_report(state, _subgraph(), _config())
+        text = format_text(report)
+        assert "Execution Backend" in text
+        assert "local" in text
+
+    def test_format_text_omits_execution_backend_section_when_empty(self) -> None:
+        report = build_report(_state(), _subgraph(), _config())
+        text = format_text(report)
+        assert "Execution Backend" not in text
+
+    def test_to_json_dict_includes_execution_backend_key(self) -> None:
+        state = _state()
+        state["execution_backend_log"] = [
+            {"tool": "nmap", "backend": "local", "timed_out": True, "phase": "recon"},
+        ]
+        report = build_report(state, _subgraph(), _config())
+        d = to_json_dict(report)
+        assert d["execution_backend"] == {"usage": {"local": 1}, "timed_out_count": 1}
+
+    def test_no_token_appears_in_serialized_report(self) -> None:
+        """ApexConfig.tool_service_token never flows into RunReport at all —
+        build_report() never reads it — so it cannot leak into any report
+        output regardless of what value is configured."""
+        state = _state()
+        state["execution_backend_log"] = [
+            {"tool": "nmap", "backend": "remote", "timed_out": False, "phase": "recon"},
+        ]
+        cfg = ApexConfig(
+            target=_TARGET, dry_run=False, tool_backend="remote",
+            tool_service_url="http://kali:8080",
+            tool_service_token="super-secret-report-test-token",
+        )
+        report = build_report(state, _subgraph(), cfg)
+        assert "super-secret-report-test-token" not in json.dumps(to_json_dict(report), default=str)
+        assert "super-secret-report-test-token" not in format_text(report)
+
+    def test_existing_report_consumers_unaffected_by_new_fields(self) -> None:
+        """A report built the old way (no execution_backend_log at all) still
+        produces every previously-existing field with its previous meaning."""
+        report = build_report(_state(turn_count=2), _subgraph(), _config())
+        assert report.turns_used == 2
+        assert isinstance(report.backend_usage, dict)
+        assert isinstance(report.timed_out_count, int)
+
     def test_fundamental_count(self) -> None:
         errors = [_FUND_ERR]
         report = build_report(_state(error_episodes=errors), _subgraph(), _config())

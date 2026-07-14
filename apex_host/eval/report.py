@@ -89,6 +89,15 @@ class RunReport:
     duplicate_action_count: int = 0
     duplicate_action_entries: list[dict[str, Any]] = field(default_factory=list)
 
+    # Infra Phase 4 — tool-execution backend summary, populated from
+    # state["execution_backend_log"]. backend_usage counts executions per
+    # backend identifier ("dry-run" | "local" | "remote"); timed_out_count
+    # is the number of executions that hit their timeout. Telnet/browser
+    # tool_results carry no "backend" tag and are not represented here (see
+    # apex_host/orchestration/memory_node.py).
+    backend_usage: dict[str, int] = field(default_factory=dict)
+    timed_out_count: int = 0
+
 
 # ---------------------------------------------------------------------------
 # Status helper
@@ -220,6 +229,16 @@ def build_report(
     # Duplicate action summary
     raw_dup = list(final_state.get("duplicate_actions") or [])
 
+    # Infra Phase 4: tool-execution backend summary
+    raw_backend_log = list(final_state.get("execution_backend_log") or [])
+    backend_usage: dict[str, int] = {}
+    timed_out_count = 0
+    for entry in raw_backend_log:
+        name = str(entry.get("backend", "unknown"))
+        backend_usage[name] = backend_usage.get(name, 0) + 1
+        if entry.get("timed_out"):
+            timed_out_count += 1
+
     return RunReport(
         target=config.target,
         mode="dry-run" if config.dry_run else "live",
@@ -254,6 +273,8 @@ def build_report(
         llm_usage=llm_budget if llm_budget is not None else {},
         duplicate_action_count=len(raw_dup),
         duplicate_action_entries=raw_dup,
+        backend_usage=backend_usage,
+        timed_out_count=timed_out_count,
     )
 
 
@@ -405,6 +426,15 @@ def format_text(report: RunReport) -> str:
             for ph, cnt in sorted(per_phase.items()):
                 lines.append(f"    {ph:<16}: {cnt} call(s)")
 
+    # Execution Backend summary (shown only when any backend-tagged
+    # execution occurred — dry-run engagements without any generic command
+    # execution, e.g. all-preflight runs, show nothing here)
+    if report.backend_usage:
+        lines.append("\nExecution Backend")
+        for name, count in sorted(report.backend_usage.items()):
+            lines.append(f"  {name:<20}: {count}")
+        lines.append(f"  {'timed_out':<20}: {report.timed_out_count}")
+
     # Duplicate Actions (shown only when any tasks were skipped)
     if report.duplicate_action_count > 0:
         lines.append("\nDuplicate Actions Skipped")
@@ -474,6 +504,10 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
         "duplicate_actions": {
             "total_skipped": report.duplicate_action_count,
             "entries": report.duplicate_action_entries,
+        },
+        "execution_backend": {
+            "usage": report.backend_usage,
+            "timed_out_count": report.timed_out_count,
         },
     }
 

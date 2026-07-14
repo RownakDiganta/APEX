@@ -37,7 +37,7 @@ def test_local_backend_satisfies_protocol() -> None:
 
 
 def test_remote_backend_satisfies_protocol() -> None:
-    backend = RemoteToolBackend(service_url="http://kali:8080", token="t")
+    backend = RemoteToolBackend(_config(tool_backend="remote", tool_service_url="http://kali:8080", tool_service_token="t"))
     assert isinstance(backend, ToolBackend)
 
 
@@ -183,27 +183,28 @@ async def test_local_backend_enforces_safety_gate() -> None:
 
 
 # ---------------------------------------------------------------------------
-# RemoteToolBackend — contract only
+# RemoteToolBackend — construction-time validation only.
+#
+# Full request/response/transport/lifecycle behavior for RemoteToolBackend
+# (Infra Phase 4) is tested in tests/apex_host/test_remote_backend.py, not
+# here — this file stays focused on the ToolBackend protocol/selection
+# machinery shared by all three backends.
 # ---------------------------------------------------------------------------
 
 def test_remote_backend_requires_service_url() -> None:
     with pytest.raises(ValueError, match="service_url"):
-        RemoteToolBackend(service_url=None)
+        RemoteToolBackend(_config(tool_backend="remote", tool_service_url=None, tool_service_token="t"))
 
 
-def test_remote_backend_construction_is_safe() -> None:
+def test_remote_backend_construction_is_safe_with_valid_config() -> None:
     # Must not raise, must not perform any I/O.
-    RemoteToolBackend(service_url="http://kali:8080", token="secret", timeout_seconds=30.0)
-
-
-async def test_remote_backend_execute_raises_not_implemented() -> None:
-    backend = RemoteToolBackend(service_url="http://kali:8080")
-    with pytest.raises(NotImplementedError):
-        await backend.execute("nmap", ["-T4", "127.0.0.1"])
+    RemoteToolBackend(
+        _config(tool_backend="remote", tool_service_url="http://kali:8080", tool_service_token="secret")
+    )
 
 
 # ---------------------------------------------------------------------------
-# select_tool_backend
+# select_tool_backend / select_runtime_backend
 # ---------------------------------------------------------------------------
 
 def test_select_dry_run_backend() -> None:
@@ -218,9 +219,17 @@ def test_select_local_backend() -> None:
 
 def test_select_remote_backend() -> None:
     backend = select_tool_backend(
-        _config(tool_backend="remote", tool_service_url="http://kali:8080")
+        _config(tool_backend="remote", tool_service_url="http://kali:8080", tool_service_token="t")
     )
     assert isinstance(backend, RemoteToolBackend)
+
+
+def test_select_backend_normalizes_case_and_whitespace() -> None:
+    for raw in (" Remote ", "REMOTE", "ReMoTe"):
+        backend = select_tool_backend(
+            _config(tool_backend=raw, tool_service_url="http://kali:8080", tool_service_token="t")
+        )
+        assert isinstance(backend, RemoteToolBackend)
 
 
 def test_select_backend_rejects_invalid_value() -> None:
@@ -230,7 +239,7 @@ def test_select_backend_rejects_invalid_value() -> None:
 
 def test_valid_tool_backends_matches_selectable_names() -> None:
     for name in VALID_TOOL_BACKENDS:
-        cfg = _config(tool_backend=name, tool_service_url="http://kali:8080")
+        cfg = _config(tool_backend=name, tool_service_url="http://kali:8080", tool_service_token="t")
         select_tool_backend(cfg)  # must not raise for any declared-valid name
 
 
@@ -238,6 +247,27 @@ def test_default_tool_backend_is_local_preserving_current_behavior() -> None:
     """ApexConfig.tool_backend defaults to "local" — the same execution path
     build_apex_graph() has always used (apex_host.tools.runner.run_command)."""
     assert _config().tool_backend == "local"
+
+
+def test_select_runtime_backend_dry_run_overrides_configured_remote() -> None:
+    """The critical safety invariant: dry_run=True always wins, even when
+    tool_backend="remote" is explicitly configured with a valid URL/token."""
+    from apex_host.tools.backend import select_runtime_backend
+
+    cfg = _config(
+        dry_run=True, tool_backend="remote",
+        tool_service_url="http://kali:8080", tool_service_token="t",
+    )
+    backend = select_runtime_backend(cfg)
+    assert isinstance(backend, DryRunToolBackend)
+
+
+def test_select_runtime_backend_dry_run_false_uses_configured_backend() -> None:
+    from apex_host.tools.backend import select_runtime_backend
+
+    cfg = _config(dry_run=False, tool_backend="local")
+    backend = select_runtime_backend(cfg)
+    assert isinstance(backend, LocalToolBackend)
 
 
 # ---------------------------------------------------------------------------

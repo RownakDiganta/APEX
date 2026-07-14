@@ -1,13 +1,14 @@
 # backend.py
-# ToolBackend protocol and its three implementations (dry-run, local, remote-contract-only) — see docs/tool-execution-architecture.md.
-"""Replaceable tool-execution backend abstraction (Infra Phase 2).
+# ToolBackend protocol and its three implementations (dry-run, local, remote) — see docs/tool-execution-architecture.md.
+"""Replaceable tool-execution backend abstraction (Infra Phase 2; Infra
+Phase 4 completed the ``RemoteToolBackend`` transport).
 
 This module formalizes, as an explicit ``typing.Protocol``, a seam that
 already existed implicitly in ``apex_host.execution.dispatcher.TaskDispatcher``
-(the ``run_command_fn`` constructor parameter). It does not change how
-``TaskDispatcher`` is wired by default — see ``docs/tool-execution-architecture.md``
-for the full rationale and the phase-by-phase plan that adopts this
-abstraction more deeply.
+(the ``run_command_fn`` constructor parameter). See
+``docs/tool-execution-architecture.md`` for the full rationale and
+``docs/remote-tool-backend.md`` for the Infra Phase 4 client implementation
+detail.
 
 Three implementations:
 
@@ -18,9 +19,10 @@ Three implementations:
   ``ApexConfig.dry_run`` internally as the primary safety switch (defense in
   depth: even if backend selection is misconfigured, dry-run mode cannot be
   bypassed).
-- ``RemoteToolBackend`` — contract only in this phase. Constructing it is
-  safe; calling ``execute()`` always raises ``NotImplementedError``. No
-  network transport is implemented here.
+- ``RemoteToolBackend`` (``apex_host/tools/remote_backend.py`` — re-exported
+  here for backward compatibility with existing imports) — a real
+  asynchronous HTTP client for a Phase 3 ``apex_tool_service`` instance.
+  Also defense-in-depth-safe against ``dry_run=True``.
 
 All three call ``apex_host.tools.safety.check_command`` before doing
 anything else, exactly as ``run_command`` does today — the safety gate is
@@ -31,6 +33,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Awaitable, Callable, Protocol, runtime_checkable
 
+from apex_host.tools.remote_backend import RemoteToolBackend
 from apex_host.tools.safety import check_command
 from apex_host.types import ToolCommand, ToolResult
 
@@ -39,6 +42,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "ToolBackend",
+    "ToolExecutionResult",
+    "DryRunToolBackend",
+    "LocalToolBackend",
+    "RemoteToolBackend",
+    "VALID_TOOL_BACKENDS",
+    "select_tool_backend",
+    "select_runtime_backend",
+    "to_run_command_fn",
+]
+
 # ToolBackend.execute() returns a ToolResult. The architecture-document
 # pseudocode calls this ``ToolExecutionResult`` — this alias documents that
 # mapping without introducing a duplicate parallel model (CLAUDE.md-style
@@ -46,6 +61,16 @@ logger = logging.getLogger(__name__)
 ToolExecutionResult = ToolResult
 
 VALID_TOOL_BACKENDS: frozenset[str] = frozenset({"dry-run", "local", "remote"})
+
+
+def _normalize_backend_name(name: str) -> str:
+    """Case/whitespace-normalize a ``tool_backend`` value for comparison.
+
+    ``config.tool_backend`` itself is never mutated — normalization happens
+    only at the point of interpretation, so ``" Remote "``, ``"REMOTE"``,
+    and ``"remote"`` all select the same backend.
+    """
+    return name.strip().lower()
 
 
 @runtime_checkable
@@ -173,74 +198,60 @@ class LocalToolBackend:
         return await run_command(cmd, self._config)
 
 
-class RemoteToolBackend:
-    """Contract-only stub for a restricted Kali tool-execution service.
-
-    Constructing this class is always safe (pure data holder, no I/O).
-    Calling ``execute()`` always raises ``NotImplementedError`` — the HTTP
-    transport, request/response contract, and server-side allowlisting are
-    specified in ``docs/tool-execution-architecture.md`` for a later phase to
-    implement. This class exists so callers can already depend on a stable
-    import path and constructor shape ahead of that work.
-    """
-
-    name = "remote"
-
-    def __init__(
-        self,
-        *,
-        service_url: str | None,
-        token: str = "",
-        timeout_seconds: float = 120.0,
-    ) -> None:
-        if not service_url:
-            raise ValueError(
-                "RemoteToolBackend requires a non-empty service_url "
-                "(ApexConfig.tool_service_url)"
-            )
-        self._service_url = service_url
-        self._token = token
-        self._timeout_seconds = timeout_seconds
-
-    async def execute(
-        self,
-        tool: str,
-        arguments: list[str],
-        *,
-        timeout_seconds: float | None = None,
-        stdin: str | None = None,
-    ) -> ToolExecutionResult:
-        raise NotImplementedError(
-            "RemoteToolBackend network transport is not implemented. "
-            "See docs/tool-execution-architecture.md for the request/response "
-            "contract a later phase will implement against a restricted "
-            "Kali tool service at "
-            f"{self._service_url!r}."
-        )
-
-
 def select_tool_backend(config: "ApexConfig") -> ToolBackend:
     """Construct the ``ToolBackend`` named by ``config.tool_backend``.
 
-    Raises ``ValueError`` for any value outside ``VALID_TOOL_BACKENDS`` —
-    fails loudly rather than silently falling back to a default, since a
-    typo here is a configuration bug, not a recoverable condition.
+    ``config.tool_backend`` is normalized (case/whitespace) before matching,
+    but the field on ``config`` itself is left untouched. Raises
+    ``ValueError`` for any value outside ``VALID_TOOL_BACKENDS`` — fails
+    loudly rather than silently falling back to a default, since a typo
+    here is a configuration bug, not a recoverable condition.
+
+    This function does **not** apply the ``dry_run``-overrides-``remote``/
+    ``local`` invariant — it returns exactly the backend named by
+    ``config.tool_backend``, nothing else. Use ``select_runtime_backend()``
+    for the safety-aware selection used by the actual engagement runtime
+    (``apex_host/runtime.py``, ``apex_host/orchestration/builder.py``).
     """
-    name = config.tool_backend
+    name = _normalize_backend_name(config.tool_backend)
     if name == "dry-run":
         return DryRunToolBackend(config)
     if name == "local":
         return LocalToolBackend(config)
     if name == "remote":
-        return RemoteToolBackend(
-            service_url=config.tool_service_url,
-            token=config.tool_service_token,
-            timeout_seconds=config.tool_service_timeout_seconds,
-        )
+        return RemoteToolBackend(config)
     raise ValueError(
-        f"invalid ApexConfig.tool_backend {name!r}; must be one of "
-        f"{sorted(VALID_TOOL_BACKENDS)}"
+        f"invalid ApexConfig.tool_backend {config.tool_backend!r}; must be one of "
+        f"{sorted(VALID_TOOL_BACKENDS)} (case/whitespace-insensitive)"
     )
+
+
+def select_runtime_backend(config: "ApexConfig") -> ToolBackend:
+    """The safety-aware backend selector used by the real engagement runtime.
+
+    Binding invariant (docs/tool-execution-architecture.md;
+    docs/remote-tool-backend.md): **when ``config.dry_run`` is ``True``,
+    execution always uses ``DryRunToolBackend``, regardless of
+    ``config.tool_backend``.** ``dry_run=True`` must never be able to reach
+    ``RemoteToolBackend`` — not even indirectly through a misconfigured
+    ``tool_backend="remote"``. This is the single, centralized place that
+    invariant is enforced for the default (no explicit backend injected)
+    construction path; ``RemoteToolBackend.execute()`` also enforces it a
+    second time internally (defense in depth — see its docstring), so even
+    a caller that bypasses this function and constructs
+    ``RemoteToolBackend`` directly still cannot contact the network while
+    ``dry_run=True``.
+
+    When ``config.dry_run`` is ``False``, delegates to ``select_tool_backend()``
+    — the configured ``local`` or ``remote`` backend is used exactly as
+    named. An explicitly inconsistent configuration (e.g.
+    ``tool_backend="remote"`` with no ``tool_service_url``) fails clearly
+    via ``RemoteToolBackend.__init__``'s own ``ValueError``, the moment this
+    function is called — never silently normalized to something else.
+    """
+    if config.dry_run:
+        return DryRunToolBackend(config)
+    return select_tool_backend(config)
 
 
 def to_run_command_fn(

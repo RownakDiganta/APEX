@@ -34,6 +34,7 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
             return {}
 
         error_entries: list[dict[str, Any]] = []
+        backend_entries: list[dict[str, Any]] = []
         for tr in results_to_write:
             # F13: skipped-duplicate tasks never executed — skip episode creation.
             if tr.get("skipped_duplicate"):
@@ -66,6 +67,24 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
                     "phase": state["phase"],
                 })
 
-        return {"error_episodes": error_entries} if error_entries else {}
+            # Infra Phase 4: only generic-command results carry a "backend"
+            # tag (from ToolBackend.execute()) — telnet/browser tool_results
+            # use TelnetExecutor/BrowserExecutor directly and have no
+            # "backend" key, so they are naturally excluded here.
+            backend = tr.get("backend")
+            if backend:
+                backend_entries.append({
+                    "tool": tr.get("tool", "unknown"),
+                    "backend": backend,
+                    "timed_out": bool(tr.get("timed_out", False)),
+                    "phase": state["phase"],
+                })
+
+        result: dict[str, Any] = {}
+        if error_entries:
+            result["error_episodes"] = error_entries
+        if backend_entries:
+            result["execution_backend_log"] = backend_entries
+        return result
 
     return write_memory

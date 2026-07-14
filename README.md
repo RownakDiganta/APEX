@@ -660,23 +660,38 @@ runs the full engagement end-to-end with **zero real command execution**.
 
 **Tool execution architecture (Infra Phase 2):** `apex_host/tools/backend.py`
 defines a `ToolBackend` protocol — `DryRunToolBackend`, `LocalToolBackend`
-(wraps the `runner.py` pathway above unchanged), and a contract-only
-`RemoteToolBackend` stub for a future restricted Kali tool service. This
-formalizes, but does not change, today's execution behavior — the default
-(`build_apex_graph()` with no `tool_backend` argument) is byte-for-byte the
-same as before. `RemoteToolBackend.execute()` always raises
-`NotImplementedError`; no network transport, container, or Kali service
-exists yet. Full design, trust boundaries, and the phase-by-phase plan for
-implementing the remote backend live in
+(wraps the `runner.py` pathway above unchanged), and `RemoteToolBackend`
+(a real HTTP client as of Infra Phase 4 — see below). Full design and
+trust boundaries live in
 [`docs/tool-execution-architecture.md`](docs/tool-execution-architecture.md).
 
 **Kali tool service (Infra Phase 3):** `apex_tool_service/` is a small,
 independently deployable, independently tested HTTP service — the future
-Kali-container-side execution boundary that `RemoteToolBackend` will
-eventually call. It is not wired to `apex_host` yet and no container image
-exists. Run it locally with `uv run python -m apex_tool_service`; full API
-contract, authentication, allowlist, and validation rules are documented in
+Kali-container-side execution boundary. Run it locally with
+`uv run python -m apex_tool_service`; full API contract, authentication,
+allowlist, and validation rules are documented in
 [`docs/kali-tool-service.md`](docs/kali-tool-service.md).
+
+**Remote backend wiring (Infra Phase 4):** `RemoteToolBackend`
+(`apex_host/tools/remote_backend.py`) now has a real, tested async HTTP
+client that speaks `apex_tool_service`'s contract, and backend selection is
+centralized: `apex_host.tools.backend.select_runtime_backend(config)` picks
+`DryRunToolBackend` / `LocalToolBackend` / `RemoteToolBackend` from
+`ApexConfig`, with the binding invariant that `dry_run=True` always
+overrides `tool_backend` — dry-run engagements never contact the tool
+service. Both `ApexRuntime.run()` and `build_apex_graph()`'s default
+construction use this selector automatically; no manual backend injection
+is needed for ordinary use. New CLI flags: `--tool-backend
+{dry-run,local,remote}`, `--tool-service-url URL`,
+`--tool-service-timeout SECS` (on both `apex_host.main` and
+`apex_host.eval.run_htb_local`). The bearer token has **no CLI flag** —
+set it via `export APEX_TOOL_SERVICE_TOKEN=...` instead (CLI args leak
+into shell history and `ps`). **What's still missing:** the Docker/Compose
+deployment that would actually run `apex_tool_service` inside a Kali
+container reachable over a network — today `RemoteToolBackend` has only
+been exercised in-process and against a locally started service on the
+same machine. Full detail:
+[`docs/remote-tool-backend.md`](docs/remote-tool-backend.md).
 
 ---
 

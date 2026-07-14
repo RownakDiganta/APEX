@@ -4435,10 +4435,148 @@ phase table renumbered).
 | Real HTTP smoke test (`python -m apex_tool_service` as a subprocess, real TCP socket, `curl` against `127.0.0.1:18080`) | `/health` 200 with accurate tool map; unauthenticated `/v1/execute` 401; authenticated `/v1/execute` 200 with real `curl --version` output |
 | `git diff --check` | exit 0 |
 
-**Deferred to Infra Phase 4+ (unchanged from `docs/kali-tool-service.md`
-§17–§18):** `RemoteToolBackend` HTTP client transport in `apex_host`;
-wiring `config.tool_backend` into `build_apex_graph()`'s default
-construction; threading `timed_out`/`backend` into `RunReport`; Kali
-Dockerfile; APEX Dockerfile; Docker Compose; `.env.example`; VPN
-networking; CI publishing; any Meow-specific change. **None of these were
-started in this phase.**
+**Deferred at the time this Phase 3 record was written; RemoteToolBackend/
+config-wiring/report-threading items were completed in Infra Phase 4 (see
+that record below — this paragraph is left as the historical Phase 3
+snapshot per this document's append-only convention for phase records):**
+`RemoteToolBackend` HTTP client transport in `apex_host`; wiring
+`config.tool_backend` into `build_apex_graph()`'s default construction;
+threading `timed_out`/`backend` into `RunReport`; Kali Dockerfile; APEX
+Dockerfile; Docker Compose; `.env.example`; VPN networking; CI publishing;
+any Meow-specific change. **Still entirely unstarted after Infra Phase 4:**
+Kali Dockerfile; APEX Dockerfile; Docker Compose; `.env.example`; VPN
+networking; CI publishing; any Meow-specific change.
+
+---
+
+### Infra Phase 4 — `RemoteToolBackend` HTTP transport and runtime wiring ✓ COMPLETE
+
+**Completion date:** 2026-07-14
+
+**Full client implementation, error mapping, configuration, lifecycle, and
+routing detail:** [`docs/remote-tool-backend.md`](docs/remote-tool-backend.md)
+(new document, per this phase's own instruction). This entry is a summary
+and progress record.
+
+**Scope:** implement the real HTTP transport for `RemoteToolBackend`
+(previously a Phase 2 contract-only stub) and wire centralized backend
+selection into the actual engagement runtime, so normal construction paths
+(`apex_host.runtime.ApexRuntime.run()`, `apex_host.eval.run_htb_local`)
+select the correct backend from `ApexConfig` automatically, with no manual
+`tool_backend=` injection required for ordinary use. **Not in scope and NOT
+done:** Dockerfiles, Docker Compose, VPN containers, GitHub Actions,
+`.env.example`, or any Meow-specific exploitation change — none of these
+were started.
+
+**Key decisions:**
+
+- **`RemoteToolBackend`** moved to its own module,
+  `apex_host/tools/remote_backend.py` (re-exported from
+  `apex_host/tools/backend.py` for backward compatibility with existing
+  imports) — justified by size (a real `httpx` client with 9+ distinct
+  failure-mode mappings is substantially larger than the other two
+  backends). Constructed from `ApexConfig` (never bare kwargs); the bearer
+  token resolves as `config.tool_service_token or
+  os.environ.get("APEX_TOOL_SERVICE_TOKEN") or ""`, mirroring
+  `apex_host/llm/router.py::OpenAIModelRouter`'s existing
+  `OPENAI_API_KEY`/`OPENAI_BASE_URL` precedent exactly.
+- **`select_runtime_backend(config)`** (`apex_host/tools/backend.py`) —
+  the new, centralized, safety-aware selector. Binding invariant:
+  `config.dry_run=True` always yields `DryRunToolBackend`, regardless of
+  `config.tool_backend`. Enforced twice — once at selection time (this
+  function), once again inside `RemoteToolBackend.execute()` itself
+  (defense in depth, in case the class is ever constructed and injected
+  directly, bypassing this selector).
+- **`build_apex_graph()`'s default** (`tool_backend=None`, no explicit
+  injection) now calls `select_runtime_backend(config)` instead of the
+  literal `apex_host.tools.runner.run_command` function. For the unchanged
+  default configuration (`dry_run=True`, or `dry_run=False` with
+  `tool_backend="local"`) the resulting behavior is unchanged — both route
+  to the same underlying `run_command` call, just through
+  `LocalToolBackend`'s thin wrapper instead of directly.
+- **`apex_host.runtime.ApexRuntime.run()`** constructs the backend
+  explicitly (rather than relying on `build_apex_graph`'s internal
+  default) specifically so it can close it in a `finally` block after the
+  graph completes — the fully lifecycle-managed production entry point.
+  `build_apex_graph()`'s own internal default fallback has a documented
+  lifecycle limitation for direct callers who don't go through
+  `ApexRuntime` (see its docstring and `docs/remote-tool-backend.md` §2.2).
+- **`select_tool_backend()`** now normalizes `tool_backend` values
+  (case/whitespace) at the point of interpretation, without mutating
+  `config.tool_backend` itself.
+- **CLI:** `--tool-backend`, `--tool-service-url`, `--tool-service-timeout`
+  added to both `apex_host/main.py` and `apex_host/eval/run_htb_local.py`,
+  wired through `ApexConfig.from_cli_args()`. **Deliberately no
+  `--tool-service-token` flag** — CLI arguments are visible in shell
+  history and `ps`; the token must come from the `APEX_TOOL_SERVICE_TOKEN`
+  environment variable.
+- **Report/EKG threading:** `TaskDispatcher._run_command()`'s result dict
+  now includes `timed_out`/`backend` (already present on `ToolResult`
+  since Phase 2, never consumed until now). A new accumulated
+  `ApexGraphState.execution_backend_log` field (populated in
+  `orchestration/memory_node.py::write_memory`, excluding Telnet/Browser
+  results which carry no `"backend"` key) feeds two new, additive
+  `RunReport` fields: `backend_usage: dict[str, int]` and
+  `timed_out_count: int`, surfaced in both `format_text()` and
+  `to_json_dict()`.
+- **Routing preserved exactly:** `TelnetExecutor` and `BrowserExecutor`
+  remain wired into `TaskDispatcher` through their own dedicated
+  constructor parameters, completely independent of `run_command_fn` /
+  `tool_backend`. Setting `tool_backend="remote"` has zero effect on
+  Telnet or Browser task routing — proven by
+  `tests/apex_host/test_runtime_backend_wiring.py::test_telnet_and_browser_bypass_even_with_remote_backend_configured`.
+  No Telnet login behavior was reimplemented through the generic backend;
+  no Meow-specific change was made.
+
+**New files:**
+
+| File | Purpose |
+|---|---|
+| `apex_host/tools/remote_backend.py` | Real `RemoteToolBackend` HTTP client implementation |
+| `docs/remote-tool-backend.md` | Full Infra Phase 4 client documentation |
+| `tests/apex_host/test_remote_backend.py` | 57 tests: request construction, response mapping, HTTP/transport failures, configuration, lifecycle, 3 contract-integration tests against the real `apex_tool_service` app |
+| `tests/apex_host/test_runtime_backend_wiring.py` | 14 tests: default/explicit backend selection, policy-blocked-zero-requests, approved-exactly-one-request, Telnet/Browser routing preservation, CLI flag wiring |
+
+**Modified files:** `apex_host/tools/backend.py` (re-exports
+`RemoteToolBackend`, adds `_normalize_backend_name`/`select_runtime_backend`,
+removes the old stub class), `apex_host/orchestration/builder.py` (default
+`tool_backend=None` path), `apex_host/runtime.py` (explicit backend
+construction + `finally`-block `aclose()`), `apex_host/config.py` (CLI
+wiring in `from_cli_args`; refined field docstrings), `apex_host/main.py`
++ `apex_host/eval/run_htb_local.py` (3 new CLI flags each),
+`apex_host/execution/dispatcher.py` (`timed_out`/`backend` in the result
+dict), `apex_host/graph_state.py` (new `execution_backend_log` field),
+`apex_host/orchestration/memory_node.py` (populates the new field),
+`apex_host/eval/report.py` (`backend_usage`/`timed_out_count` fields +
+text/JSON surfacing), `apex_host/eval/run_synthetic_machine.py` (new state
+field in its literal), `pyproject.toml` (`httpx` moved from dev to
+runtime dependency — production code in `remote_backend.py` now imports
+it directly), `tests/apex_host/test_tool_backend.py` (stale stub-era
+`RemoteToolBackend` tests updated for the real constructor signature),
+`tests/apex_host/test_phase6_dispatcher.py` (`_FakeToolResult` gained
+`timed_out`/`backend` fields), `tests/apex_host/test_policy_gate.py` (one
+test's `dry_run` flipped — see rationale in that test's updated docstring),
+`tests/apex_host/test_report.py` (8 new tests),
+`docs/tool-execution-architecture.md` + `docs/kali-tool-service.md`
+(cross-references updated to point at the now-real implementation).
+
+**Validation (all against a clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest tests/apex_host/test_remote_backend.py -q` | **57 passed** |
+| `uv run pytest tests/apex_host/test_runtime_backend_wiring.py -q` | **14 passed** |
+| `uv run pytest tests/apex_host/test_report.py -q` | **77 passed** (8 new) |
+| `uv run pytest -q` (full) | **2911 passed**, 53 warnings — no regressions |
+| `uv run ruff check .` | `All checks passed!` |
+| `uv run mypy` | Success — 137 source files |
+| `uv run python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `uv run python -m apex_tool_service --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Deferred to Infra Phase 5+ (unchanged):** Kali Dockerfile; APEX
+Dockerfile; Docker Compose; VPN networking; CI publishing; `.env.example`;
+any Meow-specific diagnosis, deterministic Meow test, or authorized live
+Meow validation. **None of these were started in this phase.**
