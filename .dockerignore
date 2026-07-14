@@ -50,13 +50,25 @@ build
 dist
 
 # ---------------------------------------------------------------------------
-# Secrets and environment files — none exist in this repository yet
-# (.env.example is a later phase), but excluded defensively so a locally
-# created .env (or any VPN credential bundle) can never be baked into an
-# image by accident.
+# Secrets and environment files — excluded so a locally created .env (or any
+# VPN credential bundle) can never be baked into an image by accident.
+#
+# `.env.*` matches `.env.example` too (it is a glob, not an exact-name
+# match like Git's `.env` entry can be) — the explicit `!.env.example`
+# negation below restores it. Neither Dockerfile actually COPies
+# `.env.example` into an image today (both use selective, explicit COPY
+# instructions — see each Dockerfile's own comments), so this negation is
+# not currently load-bearing for image contents, but it keeps the build
+# *context* itself from silently excluding a file a future test, doc
+# build, or Dockerfile change might reasonably expect to find (Infra
+# Phase 8's own explicit requirement: "Do not use a broad `.env*` rule
+# that accidentally excludes `.env.example`, unless explicitly negated").
 # ---------------------------------------------------------------------------
 .env
+.env.local
+.env.*.local
 .env.*
+!.env.example
 *.ovpn
 secrets/
 *.pem

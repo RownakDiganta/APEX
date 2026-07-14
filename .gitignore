@@ -34,7 +34,18 @@ Thumbs.db
 # ==========================================================
 # Environment Variables
 # ==========================================================
+# Exact-name matches only (never a broad `.env*` glob) so .env.example
+# — committed, secret-free, and required for the Docker Compose workflow
+# (see docs/environment-configuration.md) — is never accidentally ignored.
 .env
+.env.local
+.env.*.local
+
+# ==========================================================
+# Secrets
+# ==========================================================
+secrets/
+*.ovpn
 
 # ==========================================================
 # Logs
