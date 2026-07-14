@@ -4831,3 +4831,120 @@ container/networking; `.env.example`; Linux capability grants for
 default/SYN-scan nmap support; CI image publishing; Meow-specific
 diagnosis/tests/live validation. **None of these were started in this
 phase.**
+
+### Infra Phase 7 — Docker Compose integration (APEX ↔ Kali) ✓ COMPLETE
+
+**Date:** 2026-07-15
+**Files:** `compose.yaml`, `apex_host/eval/compose_smoke.py`,
+`tests/docker/test_compose.py` (33 static tests),
+`docs/docker-compose.md` (full design/evidence record)
+
+Wired the Infra Phase 5 APEX application image and the Infra Phase 6 Kali
+tool-service image into a runnable two-service Docker Compose environment,
+validated against a real `docker compose` daemon (v2.34.0-desktop.1),
+including a real `RemoteToolBackend` call from the `apex` container to the
+`kali` container over Compose's internal network. Neither
+`docker/apex/Dockerfile` nor `docker/kali/Dockerfile` was modified.
+
+**Topology:** `compose.yaml` at the repo root, modern Compose Specification
+(no top-level `version:` key), two services (`apex`, `kali`) joined to one
+dedicated network (`apex-internal`). `kali` has no `ports:` mapping — only
+`expose: ["8080"]` — so it is never published to the host; verified live
+via `docker compose port kali 8080` (returns `:0`, unbound) and a direct
+`curl http://127.0.0.1:8080/health` from the host (connection refused,
+curl exit code 7). `apex` reaches `kali` at `http://kali:8080` via
+Compose's built-in service-name DNS — verified live
+(`socket.gethostbyname("kali")` → the container's real `apex-internal`
+address). `apex.depends_on.kali.condition: service_healthy` relies on
+`kali`'s own image-baked `HEALTHCHECK` (Infra Phase 6, not duplicated in
+`compose.yaml`) — verified live: `apex`'s command does not start until
+`kali`'s health check has already passed.
+
+**Token handling:** both services require `APEX_TOOL_SERVICE_TOKEN` via
+Compose's fail-fast `${APEX_TOOL_SERVICE_TOKEN:?...}` interpolation — no
+reusable default token is baked in anywhere. Verified live: `docker
+compose config` with the variable unset fails immediately (exit code 1,
+clear error message); with it set, both services receive the identical
+interpolated value. No `.env.example` was created (explicitly deferred,
+per this phase's own task brief).
+
+**Safe default behavior:** `apex`'s default Compose `command:` is
+`apex_host.eval.compose_smoke` (new module, `apex_host/eval/`) with no
+flags — which defaults to `--dry-run`, exactly like every other APEX
+entry point (CLAUDE.md §13.5 — never violated). `docker compose up
+--abort-on-container-exit` therefore starts `kali`, waits for it to become
+healthy, runs a bounded connectivity check that never contacts `kali` for
+real (`backend_used="dry-run"`), and exits `0` — verified live end to end,
+including a log scan confirming no secret ever appears in either
+container's output. `--abort-on-container-exit` was chosen (and is used
+consistently throughout `docs/docker-compose.md`) because `apex`'s command
+finishes in under a second while `kali` is a long-running server with no
+natural exit.
+
+**Real remote execution (completion criterion):** `docker compose run
+--rm apex python -m apex_host.eval.compose_smoke --no-dry-run` performs a
+real `RemoteToolBackend` → `kali` → `curl --version` round trip through
+Compose's internal network. Verified live:
+`ToolResult(backend="kali-service", returncode=0, dry_run=False,
+elapsed_seconds=0.128)`.
+
+**Dry-run isolation (completion criterion):** with `kali` running and a
+deliberately invalid/unreachable `APEX_TOOL_SERVICE_URL` substituted,
+`--dry-run` still completes in `elapsed_seconds=0.000` — proving
+`RemoteToolBackend`'s own internal dry-run short-circuit fires before any
+socket is opened, even inside the real container network with a real
+(healthy) `kali` service available.
+
+**Report persistence:** `./run_reports:/app/run_reports` bind mount
+(plain bind, not a named volume, so an operator can inspect JSON output
+directly from the host). macOS Docker Desktop bind-mount / non-root UID
+behavior was evaluated empirically (not assumed): a file written by the
+container's UID 1000 `apex` user was immediately readable on the host,
+owned by the invoking host user, with no permission errors — verified via
+a real `compose_smoke.json` artifact written, inspected, and then removed
+(pre-existing, legitimate reports under `run_reports/` were left
+untouched). `kali` has no `volumes:` entry at all — it cannot read or
+write any APEX report.
+
+**Compiled knowledge:** available exactly once — baked into the `apex`
+image (unchanged from Infra Phase 5); `compose.yaml` does not additionally
+mount `./Knowledge`/`./knowledge`, avoiding a duplicate, differently-cased
+copy.
+
+**Security properties verified live via `docker inspect` on the running
+containers** (not just the static Compose file): `Privileged=false`,
+`CapAdd=[]` (in particular, **no `NET_ADMIN`, no `NET_RAW`** — this
+phase's task brief explicitly forbade adding `NET_RAW` merely to enable
+default/SYN-scan Nmap; the Infra Phase 6 finding that only `nmap -sT` and
+`ping` work unprivileged therefore still holds unchanged inside this
+Compose environment), `NetworkMode=apex-internal` (not `host`), no
+`docker.sock` reference anywhere, `kali`'s `Mounts` is `[]`, both
+containers run as their pre-existing non-root users
+(`uid=1000(apex)`/`uid=1000(apextool)`), and a grep of both images'
+`docker history --no-trunc` output plus every container log line produced
+during validation for the disposable test token used this phase
+(`phase7-test-token`) found zero matches.
+
+**Real end-to-end validation performed (all items from this phase's
+runtime-validation checklist, recorded with full command transcripts in
+`docs/docker-compose.md`):** missing-token failure; rendered
+`docker compose config`; `docker compose build --no-cache` (one transient
+PyPI network timeout on the first attempt, resolved by a plain retry);
+default safe startup with `--abort-on-container-exit`; `docker compose ps`
+health/state; internal DNS resolution; real remote execution; dry-run
+isolation with an invalid URL; report persistence with the macOS
+UID/bind-mount finding; no-host-port-mapping proof (two independent
+methods); non-root identity for both services; full security inspection;
+and `docker compose down --remove-orphans` cleanup with test-artifact
+removal. All temporary containers and the `apex-internal` network were
+removed after validation.
+
+**Deferred to Infra Phase 8+ (as of Infra Phase 7):** `.env.example` for
+either `apex_host` or `apex_tool_service`; HTB VPN container/tunnel
+routing (nothing in `apex-internal` can reach an HTB target); Linux
+capability grants (`NET_RAW`/`NET_ADMIN`) for unprivileged default/SYN-scan
+nmap support; wiring a full multi-turn engagement
+(`apex_host.eval.run_htb_local`) into Compose; GitHub Actions/CI image
+publishing; Meow-specific diagnosis, deterministic Meow tests, or
+authorized live Meow validation. **None of these were started in this
+phase.**

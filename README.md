@@ -739,21 +739,54 @@ curl -s -X POST http://127.0.0.1:8080/v1/execute \
 docker rm -f apex-kali   # stop and remove
 ```
 
-No Docker Compose wiring exists yet between this image and the APEX
-application container, and no live HTB/VPN target is contacted by any of
-the commands above — every one of them talks only to the container's own
-loopback interface. A real `apex_host.tools.remote_backend.RemoteToolBackend`
-client was verified against a real running instance of this image during
-Infra Phase 6 (`ToolResult(backend="kali-service", returncode=0, ...)` for
-a real `curl --version` execution), closing the "still missing" gap noted
-above for Infra Phase 4 — `RemoteToolBackend` has now been exercised
-against a real Dockerized service, not just in-process. One notable,
+No live HTB/VPN target is contacted by any of the commands above — every
+one of them talks only to the container's own loopback interface. A real
+`apex_host.tools.remote_backend.RemoteToolBackend` client was verified
+against a real running instance of this image during Infra Phase 6
+(`ToolResult(backend="kali-service", returncode=0, ...)` for a real
+`curl --version` execution), closing the "still missing" gap noted above
+for Infra Phase 4 — `RemoteToolBackend` has now been exercised against a
+real Dockerized service, not just in-process. One notable,
 empirically-verified finding: `nmap`'s default/SYN-scan mode does **not**
 work unprivileged inside this container (`-sT` is required) — see
 [`docs/kali-container.md`](docs/kali-container.md) §5 for the full
 capability investigation. Full detail on every installed/excluded tool,
 the build design, and all nine parts of this phase's runtime validation:
 [`docs/kali-container.md`](docs/kali-container.md).
+
+**Docker Compose integration (Infra Phase 7):** `compose.yaml` wires the
+APEX application and Kali tool-service images together on a dedicated,
+non-host-published internal network (`apex-internal`) — `apex` reaches
+`kali` at `http://kali:8080` by Compose's built-in service-name DNS, and
+`kali`'s port 8080 is never published to the host. Start a safe,
+target-free connectivity check (builds both images, waits for `kali` to
+report healthy, then runs a bounded dry-run smoke check that exits
+cleanly):
+
+```bash
+APEX_TOOL_SERVICE_TOKEN=replace-with-a-disposable-test-token \
+  docker compose up --build --abort-on-container-exit
+```
+
+This starts a **safe connectivity smoke test only** — it does not contact
+HTB or any real target, requires no credentials beyond the disposable
+token above, and does not run a live engagement. To actually exercise the
+real `apex`-to-`kali` HTTP call (still no real target — `curl --version`
+only), pass `--no-dry-run` explicitly to the same smoke module:
+
+```bash
+docker compose run --rm apex python -m apex_host.eval.compose_smoke --no-dry-run
+```
+
+The token shown above is a **temporary, disposable value** — never a real
+credential, never committed anywhere. **`.env.example` does not exist yet**
+(deferred to a later phase — every example in this README and
+[`docs/docker-compose.md`](docs/docker-compose.md) sets the token inline
+on the command line instead), and **HTB VPN is not yet integrated** —
+nothing in this Compose environment can reach an authorized HTB target;
+`docker compose up` here is not a complete, ready-to-engage setup by
+itself. Full design, every verified runtime-validation command, and the
+non-root/capability/security properties: [`docs/docker-compose.md`](docs/docker-compose.md).
 
 ---
 
