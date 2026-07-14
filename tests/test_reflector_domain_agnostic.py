@@ -12,7 +12,6 @@ Invariants verified:
 """
 from __future__ import annotations
 
-import ast
 import pathlib
 import re
 import uuid
@@ -281,7 +280,6 @@ def test_no_cybersecurity_terms_in_memfabric_reflector(src_file: pathlib.Path) -
     # Strip string literals and comments before checking to avoid false positives
     # from docstrings/comments that explain WHY something was removed.
     # We check the AST for actual Name/Attribute nodes in comments separately.
-    matches = _CYBER_TERMS.findall(source)
     # Allow the term "port" in comments explaining the pattern was REMOVED
     # (the fix documentation itself may mention what was removed).
     # Filter out matches that only appear inside # comment lines.

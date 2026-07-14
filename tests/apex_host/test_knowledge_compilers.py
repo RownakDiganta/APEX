@@ -10,11 +10,9 @@ from __future__ import annotations
 import json
 import pathlib
 import textwrap
-import xml.etree.ElementTree as ET
 
 import pytest
 
-from apex_host.knowledge.compiler.schemas import CompiledKnowledgeRecord
 
 
 # ---------------------------------------------------------------------------

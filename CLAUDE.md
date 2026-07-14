@@ -1460,10 +1460,25 @@ After each run the runner prints:
 
 ## 13. Development commands
 
+### Environment setup (uv)
+
+`uv` is the authoritative dependency and environment manager (see §22 for the
+full migration record). One-time setup from a clean checkout:
+
+```bash
+uv sync --all-groups
+```
+
+All commands below assume this has been run. Every command is either
+prefixed with `uv run` (recommended — no activation step needed) or assumes
+an activated `uv`-managed `.venv` (`source .venv/bin/activate`). Do not use
+`pip install`, a manually created `venv`, or any Python interpreter outside
+the `uv`-managed `.venv` for this project.
+
 ### Run the test suite
 
 ```bash
-.venv/bin/python -m pytest tests/ -q
+uv run pytest tests/ -q
 ```
 
 ### Dry-run engagement (default — safe, no real commands)
@@ -1704,7 +1719,7 @@ convention is `test_<module>.py`.
 - If you touch an existing module, run the existing tests before and after
   your change to confirm no regression. Run with:
   ```bash
-  .venv/bin/python -m pytest tests/ -q
+  uv run pytest tests/ -q
   ```
 
 ### 13.5 The dry-run default must never change
@@ -3287,7 +3302,7 @@ sufficient — real compiled files must exist and verification must pass.
 
 7. **All tests pass:**
    ```bash
-   .venv/bin/python -m pytest tests/ -q
+   uv run pytest tests/ -q
    ```
    Exit code **0**.  No failures, no errors.
 
@@ -3308,7 +3323,7 @@ python -m apex_host.knowledge.compiler.verify_compiled \
     --knowledge-root ./knowledge
 
 # 3. Test
-.venv/bin/python -m pytest tests/ -q
+uv run pytest tests/ -q
 ```
 
 Or via Make:
@@ -3983,3 +3998,183 @@ When a phase's fixes are committed, update the table row to include the
 commit hash and mark the finding as `[FIXED]`. Do not delete rows — keep
 the audit trail visible. Increment the test count in the baseline line at
 the top of this section to reflect the new passing count.
+
+---
+
+## 22. Infrastructure Migration Roadmap (Packaging & Environment)
+
+This is a separate migration track from the Reviewer Remediation Program in
+§21 — it governs **how the project is packaged and how contributors get a
+working environment**, not application-level correctness. Its own phase
+numbering ("Infra Phase 1", "Infra Phase 2", …) is independent of the
+Reviewer Remediation "Phase 1"–"Phase 11" in §21; do not conflate the two.
+
+### Infra Phase 1 — `uv` dependency and environment management ✓ COMPLETE
+
+**Completion date:** 2026-07-14 (dependency/environment migration); corrected
+and genuinely completed 2026-07-14 (Ruff remediation pass — see below).
+
+> **Correction note:** an earlier version of this record marked Infra Phase 1
+> complete while `uv run ruff check .` still reported 134 pre-existing errors.
+> That was wrong — a `pyproject.toml`/`uv.lock` migration that ships with a
+> failing lint command is not "complete." This entry has been corrected in
+> place (not appended as a new phase, since the Ruff failures were pre-existing
+> repository state exposed by this same migration's own validation step, not
+> a separate follow-on concern) once `uv run ruff check .` genuinely passed.
+
+**Scope:** make `uv` the sole, authoritative dependency and Python
+environment manager for the repository, **and** ensure the resulting
+`uv run ruff check .` command actually exits successfully for all first-party
+code. No Docker, Docker Compose, Kali integration, GitHub Actions/CI, HTB VPN
+validation, or Meow debugging was in scope for this phase, and none of it was
+touched.
+
+**Authoritative sources (binding going forward):**
+
+- **`pyproject.toml`** is the authoritative dependency declaration.
+  Runtime dependencies live in `[project].dependencies`; development
+  dependencies live in `[dependency-groups].dev` (PEP 735 / uv dependency
+  groups — not `[project.optional-dependencies]`).
+- **`uv.lock`** is the required, committed lock file. It must stay in sync
+  with `pyproject.toml` (`uv lock --check` must pass) and must be
+  regenerated (`uv lock`) and committed whenever a dependency or version
+  constraint changes.
+- **`.python-version`** pins the interpreter to `3.11` so `uv sync` /
+  `uv run` always provision Python 3.11.14 rather than whatever `python3`
+  resolves to on a given machine. This matters: on a clean host, `uv`
+  otherwise defaults to the newest available interpreter (3.14 was observed
+  during this migration), and mypy's `python_version = "3.11"` setting then
+  rejects PEP 695 syntax present in newer numpy's bundled `.pyi` stubs —
+  a real, reproducible failure mode this pin exists specifically to prevent.
+- **No legacy dependency files existed** (`requirements*.txt`, `setup.py`,
+  `setup.cfg`, `Pipfile`, `poetry.lock`, `tox.ini` were all absent before
+  this migration) — nothing to remove or reconcile.
+
+**Standard development commands (see README.md "Development environment
+(uv)" for the full contributor-facing version):**
+
+```bash
+uv sync --all-groups          # clean environment setup
+uv run pytest -q              # test suite
+uv run ruff check .           # lint
+uv run mypy                   # type check — bare, uses [tool.mypy] files scope
+uv run python -m apex_host.eval.run_htb_local --help   # CLI
+uv lock                       # regenerate uv.lock after a dependency change
+uv lock --check                # verify uv.lock is up to date, no changes
+```
+
+**`mypy` invocation is intentionally scoped, not `mypy .`.** The repository
+has long documented `mypy --strict` (relying on `[tool.mypy] files =
+["memfabric", "apex_host"]`) as its type-check target — this predates the
+`uv` migration and is preserved unchanged. Literally running `mypy .` (or
+`uv run mypy .`) overrides that `files` config with the CLI argument and
+walks the entire repository tree, including the vendored, gitignored
+`Knowledge/` reference corpus (GTFOBins, LOLBAS, PayloadsAllTheThings,
+SecLists), which contains a file with an intentionally broken relative
+import (`Knowledge/payload_db/GTFOBins/linter/__main__.py`) that is not part
+of this project's source. This was reproduced identically against both the
+pre-migration `.venv` and the post-migration `uv`-managed one — it is
+pre-existing repository structure, not something introduced by this
+migration. `uv run mypy` (no path argument) is therefore the correct,
+scope-preserving invocation and is what CI or contributors should run.
+
+**Dependency corrections made during migration (not scope creep — these are
+gaps between declared and actual dependencies, found by diffing real
+imports against `pyproject.toml`):**
+
+| Change | Reason |
+|---|---|
+| Added `PyYAML>=6.0` to `[project].dependencies` | `apex_host/knowledge/compiler/payload_compiler.py` and `policy_compiler.py` both `import yaml` directly at module level — this was previously an undeclared transitive dependency that happened to be pulled in by something else. It is now a direct, correctly-declared runtime dependency. |
+| Added `ruff>=0.6` to `[dependency-groups].dev` | Ruff is documented and used extensively throughout this file and the remediation roadmap (§21, R07) but was never declared as a project dependency; it was only present in the old `.venv` because someone installed it manually. |
+| Migrated `[project.optional-dependencies].dev` → `[dependency-groups].dev` | Matches the `uv`-preferred PEP 735 dependency-group mechanism referenced in this section; functionally equivalent set of packages (pytest, pytest-asyncio, mypy, ruff, types-networkx, types-PyYAML). |
+
+No existing version constraint was tightened, loosened, or upgraded to a
+newer major version as part of this migration. `uv lock` resolved slightly
+newer patch/minor versions than were previously installed for several
+transitive dependencies (e.g. `langgraph`, `langchain-core`); this is
+`uv lock` doing what any fresh resolution against the existing `>=` bounds
+does, not a deliberate upgrade decision.
+
+**Ruff remediation (correction pass — brings `uv run ruff check .` to a
+genuine, unconditional pass):**
+
+The `uv`/`pyproject.toml` migration surfaced 134 pre-existing Ruff findings
+across first-party `apex_host/`, `memfabric/`, `tests/`, and `examples/`
+code (`ruff` had never been declared as a project dependency before this
+migration, so it had never been run through a reproducible, lockfile-pinned
+environment). All 134 were fixed — none suppressed, none ignored, no rule
+family disabled, no vendored-path exclusion added (see the "Repository
+boundary" note below — no vendored file ever appeared in the failure list,
+so no exclusion was needed or added).
+
+| Code | Count | Nature | Resolution |
+|---|---|---|---|
+| `F401` (unused import) | 107 | Dead imports accumulated across test files and a handful of `apex_host` modules; none were `__all__`-re-exported or side-effect imports (verified by grep before fixing) | `ruff check . --select F401 --fix` (safe, auto-fixable) |
+| `F841` (unused local variable) | 17 | Mix of genuinely dead setup code (e.g. a `verbose` variable in `apex_host/knowledge/compiler/compile_knowledge.py` that duplicated logic already handled via `args.verbose` two lines above), vestigial test scaffolding from earlier test-refactors (unused `graph`/`initial`/`disp` objects, unused mock-instrumentation variables), and `result = await x()` assignments whose return value was never asserted on (only a mock's `call_count` was checked) | Manually reviewed and fixed individually — each case traced to confirm no side-effect-bearing expression was silently dropped and no assertion was weakened; see git diff for the 17 individual edits |
+| `F541` (f-string, no placeholders) | 4 | Plain string content mistakenly marked with an `f` prefix | `ruff check . --select F541 --fix` (safe, auto-fixable — removes the `f` prefix only) |
+| `E741` (ambiguous variable name `l`) | 2 | Generator-expression loop variable named `l` in `methodology_compiler.py` and `payload_compiler.py` | Manually renamed `l` → `line` in both files (no name collisions in scope) |
+| `F811` (redefinition of unused name) | 2 | `tests/apex_host/test_knowledge_schemas.py` imported `SourceFamily`/`SourceType` at module level but never used them there — the only use was a local re-import inside `test_compiler_package_imports_cleanly` (deliberately verifying the package's public re-export surface, already marked `# noqa: F401`) | Removed the dead, never-used module-level imports of `SourceFamily`/`SourceType` (auto-fixed as part of the `F401` pass above — same root cause, F811 disappeared once the shadowed module-level import was gone); the intentional local re-import and its `noqa` were left untouched |
+| `E401` (multiple imports, one line) | 1 | `import io, contextlib` in a test | `ruff check . --select E401 --fix` (safe, auto-fixable — splits into two `import` statements) |
+| `F821` (undefined name) | 1 | `tests/test_graph_atomicity.py:553` annotated a variable as `_DictKVStore`, a name that does not exist anywhere in the codebase — a real typo/bug (should be `InMemoryKVStore`, which is imported and is the actual concrete type of `api._kv` in that test). Went undetected by `mypy` because `tests/` is outside `[tool.mypy] files` scope. | Manually corrected `_DictKVStore` → `InMemoryKVStore` |
+
+**Repository-boundary analysis — no exclusions needed or added.** Every one
+of the 134 findings above was in `apex_host/`, `tests/`, or `examples/` —
+first-party code. The vendored, gitignored corpus at `Knowledge/` (containing
+`GTFOBins`, `LOLBAS`, `PayloadsAllTheThings`, `SecLists`, plus downloaded
+`intel_db`/`methodology_db`/`policy_db` raw sources) produced **zero**
+findings, because Ruff's default `respect-gitignore = true` already keeps it
+out of scope — confirmed empirically by running `uv run ruff check Knowledge
+--no-cache`, which reports `No Python files found under the given path(s)`.
+No `[tool.ruff]` `exclude`/`extend-exclude` entries were added, because none
+were needed: adding one would have been an unjustified, undocumented
+exclusion of the exact kind this correction pass was told to avoid. The only
+`[tool.ruff]` addition is `target-version = "py311"` (explicit, matches
+`[project].requires-python`; ruff already inferred the same value implicitly,
+so this changes no enforcement behavior). Default lint rule selection
+(`E4`, `E7`, `E9`, `F`) is untouched — no rule family was disabled.
+First-party knowledge-management code (`apex_host/knowledge/compiler/*.py`,
+`apex_host/knowledge/seed_loader.py` — note: distinct from the root-level
+vendored `Knowledge/` data directory) remains fully linted; several of the
+fixes above (the `E741` renames, the `compile_knowledge.py` dead-variable
+removal) are in that exact package.
+
+**Validation performed (final, clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Pre-migration baseline | Before this correction pass | After this correction pass |
+|---|---|---|---|
+| `pytest` | 2668 passed | 2668 passed | **2668 passed** (unchanged — all fixes behavior-preserving) |
+| `ruff check .` | 134 errors (pre-existing; §21 baseline of "130" is stale by 4 — drift unrelated to either migration pass) | 134 errors | **0 errors — `All checks passed!`** |
+| `mypy` (scoped) | Success — 125 source files | Success — 125 source files | **Success — 125 source files** (unchanged) |
+| CLI `--help` | n/a | exit 0 | **exit 0** (both `apex_host.main` and `apex_host.eval.run_htb_local`) |
+
+**Deferred to later infra phases (explicitly out of scope for this phase,
+per this task's own instructions — do not start these without a new,
+explicit go-ahead):**
+
+- Docker / Dockerfile
+- Docker Compose
+- Kali Linux toolchain integration
+- GitHub Actions / CI publishing (no `.github/workflows` exists for this
+  project today — only vendored copies inside gitignored `Knowledge/`
+  third-party corpora, which are not this project's CI and were left
+  untouched)
+- HTB VPN live-run validation
+- Meow (or any other machine) exploitation/debugging
+
+**Known pre-existing issues, still present, intentionally not touched by
+this correction pass** (out of scope — not Ruff, not dependency/environment
+management):
+
+- §21's remediation-program Ruff-error-ceiling reference ("130 errors") in
+  the historical, append-only Phase-11 report is stale (actual was 134 before
+  this pass, 0 after). That historical record is preserved as-is per §21 R12
+  (findings/records are status-updated, never rewritten) — it describes what
+  was true when Phase 11 of the *Reviewer Remediation Program* completed, a
+  separate track from this infrastructure migration. No new "Infra Phase 2"
+  correction was opened for it; if §21 is revisited in its own remediation
+  track, that reference should be updated there.
+- `docs/*.md` phase-audit reports (e.g. `docs/final_validation_report.md`)
+  still reference `.venv/bin/python` invocations. These are dated,
+  append-only historical records of what was actually run at the time
+  (§21 R12 — findings/records are never rewritten) and were deliberately
+  left untouched; they are not living developer instructions.

@@ -24,7 +24,6 @@ from memfabric.types import (
     TaskSpec,
 )
 
-from apex_host.planners.capabilities import Capability
 from apex_host.planners.credential_planner import CredentialPlanner, _CredentialDeterministic
 from apex_host.planners.global_planner import GlobalPlanner
 from apex_host.planners.priv_esc_planner import PrivEscPlanner, _PrivEscDeterministic
@@ -222,7 +221,7 @@ class TestPlanningEngineEnhanced:
     async def test_validator_rejection_retries_then_fallback(self, fallback: _FallbackCounter) -> None:
         llm = _StubLLM("NOT VALID JSON {{{{")
         engine = self._engine(llm, fallback, confidence_threshold=0.4, max_retries=1)
-        result = await engine.plan(_goal(), ApexPhase.recon, _empty_subgraph(), _empty_evidence())
+        await engine.plan(_goal(), ApexPhase.recon, _empty_subgraph(), _empty_evidence())
         assert fallback.call_count == 1
         assert llm.call_count == 2  # initial + 1 retry
 
@@ -276,7 +275,7 @@ class TestPlanningEngineEnhanced:
     async def test_confidence_just_below_threshold_fallback(self, fallback: _FallbackCounter) -> None:
         llm = _StubLLM(_good_json(confidence=0.39))
         engine = self._engine(llm, fallback, confidence_threshold=0.4, max_retries=0)
-        result = await engine.plan(_goal(), ApexPhase.recon, _empty_subgraph(), _empty_evidence())
+        await engine.plan(_goal(), ApexPhase.recon, _empty_subgraph(), _empty_evidence())
         assert fallback.call_count == 1
 
 
@@ -311,8 +310,6 @@ class TestReconPlannerWithEngine:
     async def test_with_low_confidence_falls_back(self) -> None:
         reg = _registry("nmap")
         llm = _StubLLM(_good_json(confidence=0.1))
-        fallback_count = [0]
-        original_core_plan = _ReconDeterministic(target=_TARGET, registry=reg).plan
 
         planner = ReconPlanner(
             _TARGET, reg,

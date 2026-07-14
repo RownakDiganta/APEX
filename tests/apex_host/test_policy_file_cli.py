@@ -13,10 +13,8 @@ from __future__ import annotations
 
 import logging
 import pathlib
-import tempfile
 
 import pytest
-import yaml
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +67,7 @@ class TestRunHtbLocalPolicyFilePrecedence:
         self, tmp_path: pathlib.Path,
     ) -> None:
         from apex_host.config import ApexConfig
-        from apex_host.policy.policy_loader import load_policy, _resolve_policy_path
+        from apex_host.policy.policy_loader import _resolve_policy_path
 
         # Create a well-formed YAML at the explicit path.
         explicit = tmp_path / "my_policy.yaml"

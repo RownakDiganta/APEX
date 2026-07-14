@@ -21,7 +21,6 @@ import pathlib
 from typing import Any
 
 import pytest
-import pytest_asyncio
 
 from memfabric.api import MemoryAPI
 from memfabric.config import Config
@@ -35,7 +34,7 @@ from memfabric.retrieval.engine import HybridRetriever
 from memfabric.retrieval.protocols import PassthroughReranker, StubEmbedder, TextGraphMatcher
 
 from apex_host.config import ApexConfig
-from apex_host.knowledge.seed_loader import PromotionSummary, promote_staged_knowledge_until_stable
+from apex_host.knowledge.seed_loader import promote_staged_knowledge_until_stable
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +317,6 @@ async def test_source_family_filter_after_multipass(tmp_path: pathlib.Path) -> N
 @pytest.mark.asyncio
 async def test_no_direct_store_writes() -> None:
     """promote_staged_knowledge_until_stable never touches the store directly."""
-    import unittest.mock as mock
 
     mf_config = Config()
     api = _make_api(mf_config)
@@ -387,7 +385,6 @@ async def test_seed_all_returns_promotion_summary(tmp_path: pathlib.Path) -> Non
 
 def test_policy_source_in_report(tmp_path: pathlib.Path) -> None:
     """build_report populates policy_source when passed; to_json_dict includes it."""
-    import asyncio
     from memfabric.types import SubgraphView
     from apex_host.eval.report import build_report, to_json_dict
     from apex_host.graph_state import ApexGraphState

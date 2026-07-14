@@ -19,9 +19,8 @@ Covers:
 """
 from __future__ import annotations
 
-import json
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -242,7 +241,6 @@ class TestConfigFromCLIArgs:
         """--llm-model sets planner_model, executor_model, and parser_model."""
         from apex_host.main import parse_args
 
-        import types
         args = parse_args(["--target", "10.0.0.1", "--llm-model", "openai/gpt-5.5"])
         config_kwargs: dict[str, object] = dict(
             target=args.target,

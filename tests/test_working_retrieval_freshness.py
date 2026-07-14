@@ -17,11 +17,10 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-import pytest
 
-from memfabric.api import MemoryAPI, _edge_text, _node_text
+from memfabric.api import MemoryAPI, _edge_text
 from memfabric.config import Config
-from memfabric.ids import new_id, now
+from memfabric.ids import now
 from memfabric.stores.episodic_jsonl import JSONLEpisodicStore
 from memfabric.stores.graph_networkx import NetworkXGraphStore
 from memfabric.stores.kv_memory import InMemoryKVStore

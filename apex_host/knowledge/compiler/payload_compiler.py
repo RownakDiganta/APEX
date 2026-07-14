@@ -153,7 +153,7 @@ def _compile_markdown(path: pathlib.Path) -> list[CompiledKnowledgeRecord]:
         if not chunk:
             continue
         rec_id = stable_record_id("payload_db", "payload", str(path), idx)
-        first_line = next((l.lstrip("#").strip() for l in chunk.splitlines() if l.strip()), path.stem)
+        first_line = next((line.lstrip("#").strip() for line in chunk.splitlines() if line.strip()), path.stem)
         records.append(CompiledKnowledgeRecord(
             id=rec_id,
             source_family="payload_db",

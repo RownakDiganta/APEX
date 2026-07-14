@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from memfabric.types import EvidenceBundle, Goal, ScoredEntry, SubgraphView
+from memfabric.types import EvidenceBundle, Goal, ScoredEntry
 
 from apex_host.types import ApexPhase
 

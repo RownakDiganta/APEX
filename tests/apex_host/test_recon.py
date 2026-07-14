@@ -13,7 +13,6 @@ from memfabric.types import (
     Goal,
     Node,
     Outcome,
-    ScoredEntry,
     SubgraphView,
     TaskSpec,
 )
@@ -292,8 +291,6 @@ class TestReconExecutorDryRun:
     async def test_nc_dry_run_does_not_append_target(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """nc args are already complete; target must NOT be appended again."""
         import asyncio
-
-        seen_args: list[list[str]] = []
 
         async def _fake_proc(*args: object, **kwargs: object) -> object:
             raise AssertionError("dry_run must not spawn a subprocess")

@@ -17,7 +17,6 @@ loading hundreds of megabytes of raw JSON or PDF into memory.
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 

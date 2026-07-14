@@ -10,14 +10,12 @@ Acceptance criteria:
 """
 from __future__ import annotations
 
-import pytest
 
-from memfabric.ids import new_id, now
+from memfabric.ids import new_id
 from memfabric.types import (
     AbandonSignal,
     EvidenceBundle,
     Goal,
-    Node,
     RawObservation,
     SubgraphView,
 )

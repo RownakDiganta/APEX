@@ -30,7 +30,7 @@ from memfabric.stores.graph_networkx import NetworkXGraphStore
 from memfabric.stores.kv_memory import InMemoryKVStore
 from memfabric.stores.lexical_bm25 import BM25LexicalIndex
 from memfabric.stores.vector_faiss import FaissVectorIndex
-from memfabric.types import Conflict, ConflictStatus, Node
+from memfabric.types import ConflictStatus, Node
 
 
 # ---------------------------------------------------------------------------

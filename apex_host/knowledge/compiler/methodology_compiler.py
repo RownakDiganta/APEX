@@ -95,7 +95,7 @@ def _compile_text_file(path: pathlib.Path) -> list[CompiledKnowledgeRecord]:
             continue
         rec_id = stable_record_id("methodology_db", "methodology", str(path), idx)
         # Use first non-empty line of chunk as title
-        first_line = next((l.strip().lstrip("#").strip() for l in chunk.splitlines() if l.strip()), path.stem)
+        first_line = next((line.strip().lstrip("#").strip() for line in chunk.splitlines() if line.strip()), path.stem)
         records.append(CompiledKnowledgeRecord(
             id=rec_id,
             source_family="methodology_db",

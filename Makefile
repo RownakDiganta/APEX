@@ -1,25 +1,31 @@
 # Makefile — convenience targets for the APEX knowledge pipeline and test suite.
 #
-# All commands assume a virtual environment at .venv/ (created by `python -m venv .venv`).
-# The PYTHON variable may be overridden: make test PYTHON=python3.12
+# Dependencies and the Python environment are managed by `uv` (see README.md).
+# All commands run through `uv run`, which uses the project's .venv (created by
+# `uv sync --all-groups`) and the interpreter pinned in .python-version.
 
-PYTHON   := .venv/bin/python
 KNOWLEDGE_ROOT := ./knowledge
 
-.PHONY: compile-knowledge verify-knowledge test help
+.PHONY: compile-knowledge verify-knowledge test lint typecheck help
 
 help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-25s %s\n", $$1, $$2}'
 
 compile-knowledge:  ## Compile all knowledge families into compact JSONL outputs
-	$(PYTHON) -m apex_host.knowledge.compiler.compile_knowledge \
+	uv run python -m apex_host.knowledge.compiler.compile_knowledge \
 	    --knowledge-root $(KNOWLEDGE_ROOT) \
 	    --strict --verbose
 
 verify-knowledge:  ## Verify all 9 required compiled outputs are valid
-	$(PYTHON) -m apex_host.knowledge.compiler.verify_compiled \
+	uv run python -m apex_host.knowledge.compiler.verify_compiled \
 	    --knowledge-root $(KNOWLEDGE_ROOT)
 
 test:  ## Run the full test suite
-	$(PYTHON) -m pytest tests/ -q
+	uv run pytest -q
+
+lint:  ## Run Ruff
+	uv run ruff check .
+
+typecheck:  ## Run mypy over memfabric + apex_host
+	uv run mypy

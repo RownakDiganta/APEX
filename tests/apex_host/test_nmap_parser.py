@@ -16,18 +16,16 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
 
 from memfabric.api import MemoryAPI
 from memfabric.config import Config
-from memfabric.ids import new_id, now
+from memfabric.ids import new_id
 from memfabric.stores.episodic_jsonl import JSONLEpisodicStore
 from memfabric.stores.graph_networkx import NetworkXGraphStore
 from memfabric.stores.kv_memory import InMemoryKVStore
 from memfabric.stores.lexical_bm25 import BM25LexicalIndex
 from memfabric.stores.vector_faiss import FaissVectorIndex
 from memfabric.types import (
-    AbandonSignal,
     EvidenceBundle,
     Goal,
     SubgraphView,
@@ -496,42 +494,8 @@ class TestGraphMergesParserDeltas:
     async def test_real_nmap_output_writes_service_nodes(self) -> None:
         """Simulate what parse_observation does when it receives real nmap output."""
         api = _make_api()
-        config = ApexConfig(target=_TARGET, dry_run=True, max_turns=1)
-        registry = ToolRegistry.from_config(config)
-        graph = build_apex_graph(api, registry, config)
 
-        # Manually pre-populate tool_result as if nmap ran live and returned
-        # multi-service output.  The graph's parse_observation node processes it.
-        initial: ApexGraphState = {
-            "run_id": "test-live-merge",
-            "target": _TARGET,
-            "phase": ApexPhase.recon.value,
-            "goal": f"recon {_TARGET}",
-            "current_task": {"id": "t1", "executor_domain": "recon",
-                             "params": {"tool": "nmap", "parser": "nmap"}},
-            "evidence_summary": "",
-            "findings": [],
-            "error_episodes": [],
-            "last_tool_result": {
-                "task_id": "t1",
-                "tool": "nmap",
-                "args": ["-sV", "-T4", "-Pn", _TARGET],
-                "target": _TARGET,
-                "parser": "nmap",
-                "stdout": _NMAP_MULTI,
-                "stderr": "",
-                "returncode": 0,
-                "dry_run": False,
-                "error": None,
-                "phase": ApexPhase.recon.value,
-            },
-            "last_error": None,
-            "completed": False,
-            "turn_count": 0,
-        }
-        # Run only the parse_observation → write_memory → reflect_or_continue subpath
-        # by running the graph from reflect state; easier: call parse directly via api.
-        # Instead, write the nmap deltas via the parser and upsert manually — this
+        # Write the nmap deltas via the parser and upsert manually — this
         # directly tests that the parser + API integration works.
         parsed = _PARSER.parse_text(_NMAP_MULTI, target=_TARGET)
         for node in parsed.node_deltas:

@@ -19,7 +19,7 @@ import re
 from typing import Any
 
 from memfabric.ids import new_id, now
-from memfabric.types import Episode, Outcome, Skill
+from memfabric.types import Episode, Skill
 
 # Built-in pattern: UUID v4 — universally opaque in any domain.
 # This is the ONLY pattern shipped in the substrate.  All domain-specific

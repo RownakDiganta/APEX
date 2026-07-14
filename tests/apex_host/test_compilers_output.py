@@ -182,7 +182,7 @@ class TestSyntheticIntelCompiler:
 
         out = tmp_path / "compiled"
         # No cwe/ directory — compiler should produce empty cwe_weaknesses.jsonl
-        count = compile_intel(tmp_path, out)
+        compile_intel(tmp_path, out)
         # Overall count may be 0; the file still exists and can be queried
         cwe_path = out / "cwe_weaknesses.jsonl"
         assert cwe_path.exists()

@@ -26,8 +26,6 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
-from unittest.mock import patch
 
 import pytest
 
@@ -75,7 +73,7 @@ def _subgraph(n_nodes: int = 0, n_edges: int = 0) -> SubgraphView:
     edges = [
         Edge(
             id=f"edge-{i}",
-            source=f"node-0",
+            source="node-0",
             target=f"node-{i}",
             type="exposes",
             props={},
@@ -530,7 +528,6 @@ class TestJsonExportLlmUsage:
     """Scenario 15: JSON export contains "llm_usage" key with correct fields."""
 
     def test_json_dict_contains_llm_usage(self) -> None:
-        import collections
         from memfabric.types import SubgraphView
         from apex_host.config import ApexConfig
         from apex_host.eval.report import build_report, to_json_dict
@@ -572,7 +569,6 @@ class TestPlanDecisionExport7Fields:
     """Scenario 16: PlanDecision.to_dict() includes all 7 new budget/error fields."""
 
     def test_plan_decision_has_all_new_fields(self) -> None:
-        from dataclasses import asdict
         from memfabric.ids import now
 
         d = PlanDecision(

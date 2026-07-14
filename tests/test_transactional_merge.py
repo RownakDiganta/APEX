@@ -7,7 +7,6 @@ in exactly the state it was before the call — no partial writes visible.
 """
 from __future__ import annotations
 
-import asyncio
 import pytest
 
 from memfabric.api import MemoryAPI

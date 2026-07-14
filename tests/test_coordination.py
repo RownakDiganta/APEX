@@ -13,8 +13,6 @@ Section 8 invariants tested here:
 from __future__ import annotations
 
 import asyncio
-import time
-from typing import Any
 
 import pytest
 
@@ -36,14 +34,12 @@ from memfabric.stores.kv_memory import InMemoryKVStore
 from memfabric.stores.lexical_bm25 import BM25LexicalIndex
 from memfabric.stores.vector_faiss import FaissVectorIndex
 from memfabric.types import (
-    AbandonSignal,
     Episode,
     EvidenceBundle,
     ExecutorResult,
     Goal,
     Node,
     Outcome,
-    SubgraphView,
     TaskSpec,
 )
 

@@ -13,7 +13,6 @@ Dispatch logic inside ``parse()``:
 from __future__ import annotations
 
 import re
-from typing import Any
 
 from memfabric.ids import now
 from memfabric.types import Edge, KnowledgeEntry, Node, ParsedObservation, RawObservation

@@ -21,7 +21,6 @@ real tool execution. They verify:
 """
 from __future__ import annotations
 
-import pytest
 
 from memfabric.api import MemoryAPI
 from memfabric.config import Config

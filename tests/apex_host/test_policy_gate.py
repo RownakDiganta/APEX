@@ -648,7 +648,7 @@ class TestBlockedBrowserNeverReachesExecutor:
                                  "id": "ep1", "confidence": 0.9,
                                  "source": "test", "detail": ""}]
 
-        final_state = await graph.ainvoke(initial)
+        await graph.ainvoke(initial)
 
         assert len(browser_calls) == 0, (
             "BrowserExecutor.run must not be called for a blocked browser task"

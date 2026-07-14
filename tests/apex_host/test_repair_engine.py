@@ -27,7 +27,6 @@ from memfabric.stores.kv_memory import InMemoryKVStore
 from memfabric.stores.lexical_bm25 import BM25LexicalIndex
 from memfabric.stores.vector_faiss import FaissVectorIndex
 from memfabric.types import (
-    AbandonSignal,
     EvidenceBundle,
     Goal,
     SubgraphView,
@@ -37,7 +36,7 @@ from memfabric.types import (
 from apex_host.config import ApexConfig
 from apex_host.graph import build_apex_graph
 from apex_host.graph_state import ApexGraphState
-from apex_host.planning.models import PlanDecision, PlannerOutput, PlannedTask
+from apex_host.planning.models import PlanDecision
 from apex_host.planning.prompt_builder import PromptBuilder
 from apex_host.planning.repair import RepairEngine, RepairRequest
 from apex_host.planners.recon_planner import ReconPlanner

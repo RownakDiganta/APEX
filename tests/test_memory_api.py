@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
 
 from memfabric.api import MemoryAPI
 from memfabric.config import Config
