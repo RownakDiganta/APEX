@@ -36,6 +36,16 @@ _APPROVED_ENV_READERS = {
     # own CLI-flag defaults (a narrow, purpose-built connectivity smoke
     # module, not apex_host/config.py).
     "apex_host/eval/compose_smoke.py",
+    # Infra Phase 9: the container entrypoint builds the {file, **os.environ}
+    # mapping for --env-file (same load_env_file contract as main.py/
+    # run_htb_local.py above) and reads token/OPENAI_API_KEY *presence* only
+    # for its redacted configuration summary — never prints either value.
+    "apex_host/container_entrypoint.py",
+    # Infra Phase 9: apex_host/eval/preflight.py::check_llm_readiness reads
+    # OPENAI_API_KEY *presence* only (never its value) to validate LLM
+    # credential readiness before a live run — same discipline as
+    # check_config.py above.
+    "apex_host/eval/preflight.py",
 }
 
 

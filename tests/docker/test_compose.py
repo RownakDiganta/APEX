@@ -312,14 +312,20 @@ def test_no_duplicate_knowledge_volume_mount() -> None:
 # Safe default command; no live target; no API key hardcoded
 # ---------------------------------------------------------------------------
 
-def test_apex_default_command_is_the_smoke_module() -> None:
+def test_apex_default_command_is_smoke_mode() -> None:
+    """Infra Phase 9: the default command is now the container ENTRYPOINT's
+    'smoke' subcommand (apex_host.container_entrypoint, set as
+    docker/apex/Dockerfile's ENTRYPOINT) — not the standalone
+    apex_host.eval.compose_smoke module directly (still available, unused
+    as the Compose default as of this phase)."""
     data = _compose_dict()
     command = data["services"]["apex"].get("command")
     assert command is not None
     joined = " ".join(command) if isinstance(command, list) else str(command)
-    assert "apex_host.eval.compose_smoke" in joined
+    assert command[0] == "smoke"
     assert "run_htb_local" not in joined, "the default command must not launch a live-engagement entry point"
-    assert "--no-dry-run" not in joined, "the default command must not force real backend contact"
+    assert "--confirm-live" not in joined, "the default command must never confirm live mode"
+    assert "--target" not in joined, "the default command must not hardcode a target"
 
 
 def test_no_hardcoded_target_ip_anywhere() -> None:

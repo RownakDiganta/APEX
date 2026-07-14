@@ -167,16 +167,20 @@ services:
     # already applies. No Docker socket, no host networking, no
     # `privileged:`, no added capabilities.
     #
-    # Safe default command: a bounded, dry-run-by-default connectivity
-    # smoke check (apex_host/eval/compose_smoke.py) — NOT a live
-    # engagement, NOT `run_htb_local`, and NOT `--no-dry-run`. It proves
-    # configuration validity (backend selection, service discovery once
-    # `kali` is healthy) and exits 0 without contacting `kali` for real.
-    # See docs/docker-compose.md "Safe default behavior" and
-    # "Connectivity smoke test" for the explicit, real-contact invocation
-    # (`docker compose run --rm apex python -m apex_host.eval.compose_smoke
-    # --no-dry-run`) used during this phase's runtime validation.
-    command: ["python", "-m", "apex_host.eval.compose_smoke"]
+    # Safe default command (Infra Phase 9): the container's own ENTRYPOINT
+    # (docker/apex/Dockerfile, apex_host.container_entrypoint) 'smoke' mode
+    # — NOT a live engagement, NOT `run_htb_local`, no target anywhere.
+    # Unlike Phase 7/8's default (apex_host.eval.compose_smoke, dry-run by
+    # default), 'smoke' mode DOES make a real, but harmless and bounded,
+    # connectivity check: it validates local configuration/report-directory/
+    # compiled-knowledge/policy, then calls Kali's own unauthenticated
+    # GET /health, then runs exactly one hardcoded, non-configurable
+    # `curl --version` through the real RemoteToolBackend. See
+    # docs/container-entrypoint.md "Smoke mode" for why this does not weaken
+    # the dry-run safety invariant (no target, no user-controllable command).
+    # --knowledge-root points at this image's own baked-in compiled
+    # knowledge, matching docker/apex/Dockerfile's own default CMD.
+    command: ["smoke", "--knowledge-root", "/app/knowledge"]
 
 networks:
   # A single, dedicated, internal-by-convention network — Compose does not

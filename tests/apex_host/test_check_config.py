@@ -15,7 +15,7 @@ from contextlib import redirect_stderr, redirect_stdout
 
 import pytest
 
-from apex_host.eval.check_config import _async_main, _parse_args, _validate_combinations
+from apex_host.eval.check_config import _async_main, _parse_args, validate_combinations
 from apex_host.config_env import load_apex_config_from_env
 
 
@@ -122,7 +122,7 @@ class TestValidationRules:
         """An env-sourced malformed URL fails even earlier and more clearly
         than a combination-level problem — apex_host.config_env.validate_url
         raises EnvConfigError immediately during the merge, before
-        _validate_combinations ever runs."""
+        validate_combinations ever runs."""
         monkeypatch.setenv("APEX_TOOL_SERVICE_TOKEN", "x")
         code, _, err = await _run(["--tool-backend", "remote", "--no-dry-run"])
         # No malformed URL yet — sanity check this specific combination is
@@ -141,11 +141,11 @@ class TestValidationRules:
     ) -> None:
         """A CLI-supplied --tool-service-url is not shape-validated by
         argparse itself, so the combination-level check in
-        _validate_combinations is what catches it."""
+        validate_combinations is what catches it."""
         monkeypatch.setenv("APEX_TOOL_SERVICE_TOKEN", "x")
         ns = _parse_args(["--tool-backend", "remote", "--tool-service-url", "not-a-url", "--no-dry-run"])
         config = load_apex_config_from_env(ns, {}, require_target=False)
-        problems = _validate_combinations(config)
+        problems = validate_combinations(config)
         assert any("not a valid http(s) URL" in p for p in problems)
 
     @pytest.mark.asyncio

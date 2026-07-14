@@ -5095,3 +5095,172 @@ container/tunnel routing; GitHub Actions/CI image publishing; wiring a full
 multi-turn engagement (`apex_host.eval.run_htb_local`) into Compose;
 Meow-specific diagnosis, deterministic Meow tests, or authorized live Meow
 validation. **None of these were started in this phase.**
+
+---
+
+### Infra Phase 9 — Container entrypoint and automated preflight orchestration ✓ COMPLETE
+
+**Date:** 2026-07-15
+**Files:** `apex_host/eval/preflight.py` (new), `apex_host/container_entrypoint.py`
+(new), `apex_host/eval/check_config.py` (renamed `_validate_combinations` →
+public `validate_combinations`), `docker/apex/Dockerfile` (updated),
+`compose.yaml` (updated), `docs/container-entrypoint.md` (new),
+`tests/apex_host/test_eval_preflight.py` (new, 65 tests),
+`tests/apex_host/test_container_entrypoint.py` (new, 28 tests),
+`tests/apex_host/test_phase8_env_architecture.py` (allowlist updated),
+`tests/docker/test_apex_dockerfile.py` / `tests/docker/test_compose.py`
+(updated for the new entrypoint/command contract)
+
+Built the final safe container entrypoint and automated preflight
+orchestration described in this phase's own task brief.
+`apex_host/container_entrypoint.py` is now `docker/apex/Dockerfile`'s
+`ENTRYPOINT` — every mode runs a structured preflight pass (configuration →
+report directory → compiled knowledge → policy → [smoke/run only] Kali
+health → [smoke/run only] one harmless remote-tool command) before
+dispatching to any operational command. `docker compose up --build`
+remains safe, deterministic, and target-free — it now performs a genuinely
+real (not synthetic) connectivity verification by default, closing the gap
+Infra Phase 7/8's `compose_smoke` module left open.
+
+**`apex_host/eval/preflight.py`** — reusable, independently-testable
+preflight checks, never embedded directly in the entrypoint. Two frozen
+dataclasses: `PreflightCheck` (`name`, `passed`, `detail`,
+`required: bool = True`) and `PreflightResult` (aggregate; `.passed`,
+`.failed_required`, `.warnings`, `.required_count`, `.to_dict()`,
+`.format_text()`). Eight check functions, none of which import or start
+the engagement graph: `check_configuration` (reuses `check_config.py`'s
+newly-public `validate_combinations` — one implementation, two callers),
+`check_remote_backend_selected` (smoke mode's own explicit "tool_backend
+must be remote" requirement), `check_report_directory` (writability proven
+via a uniquely-named, immediately-removed marker file — never overwrites a
+real report, never recursively changes permissions), `check_compiled_knowledge`
+(delegates entirely to the existing `verify_compiled()` — never
+duplicates the nine-file spec; a soft pass when no root is configured, a
+hard failure when a configured root is missing/corrupt),
+`check_policy` (reuses `policy_loader._resolve_policy_path`'s exact
+three-tier resolution so it validates precisely what `load_policy()` would
+actually load; required only for `run` mode, a soft informational pass
+elsewhere), `check_tool_service_health` (bounded, unauthenticated
+`GET /health`; `client:` param injectable for `httpx.MockTransport`-based
+tests), `check_remote_smoke` (executes one real, harmless, hardcoded
+`curl --version` through the real `select_runtime_backend(config)`),
+`check_llm_readiness` (trivial pass when `use_llm=False`), and
+`check_live_confirmation` (`run` mode's own safeguard — see below).
+
+**`apex_host/container_entrypoint.py`** — the container `ENTRYPOINT`. Five
+modes: `check` (local-only, no target, no network — the Dockerfile's safe
+default), `smoke` (adds Kali health + one harmless remote command; forces
+`dry_run=False` unconditionally since its command is hardcoded and
+non-configurable — the same safety profile already accepted for Infra
+Phase 7/8's `compose_smoke --no-dry-run`), `dry-run` (requires a target;
+forces `dry_run=True` unconditionally — no CLI flag on this subcommand can
+override it; dispatches to the existing, unmodified
+`apex_host.eval.run_htb_local.run_engagement()` pipeline on preflight
+success), `run` (the live-run path: requires `--target`, `--no-dry-run`
+resolved through the normal, unmodified `resolve_dry_run` precedence, and
+an explicit `--confirm-live` CLI flag with **no environment-variable
+substitute anywhere** — this phase's own task brief preferred an explicit
+CLI flag over `APEX_LIVE_CONFIRM` because environment values can go stale;
+also runs the full preflight with `policy_required=True`, unlike every
+other mode), and `exec` (bypasses the entire workflow via argv-list
+`os.execvp` — process replacement, never a shell, so no signal-forwarding
+logic is needed once it succeeds). `_run_with_signal_handling()` wraps
+every async mode's dispatch in an `asyncio.Task` with a `SIGTERM` handler
+that cancels it cleanly (exit code `143`) rather than leaving the
+interpreter's default disposition to kill it mid-await.
+
+**`run` mode never dispatches to the engagement pipeline when refused** —
+proven by dedicated tests that inject an `AssertionError`-raising fake in
+place of `_run_engagement_and_report` for every refusal path (missing
+`--confirm-live`; missing `--no-dry-run`; a stale `$APEX_LIVE_CONFIRM`-style
+env var, which has zero effect by design; a failing required preflight
+check such as a missing policy file).
+
+**Bug found and fixed during this phase:** `check_remote_smoke`'s first
+implementation did not catch the `ValueError` that
+`select_runtime_backend()`/`RemoteToolBackend.__init__` raises fail-fast
+(an established Infra Phase 4 behavior) for a missing bearer token —
+direct manual testing surfaced an unhandled traceback instead of a clean,
+structured failure. Fixed by wrapping the call in `try/except ValueError`
+and returning an ordinary failed `PreflightCheck` — no request is ever
+sent when the backend cannot be constructed. This satisfies the "missing
+service token: smoke fails before execution, never sends a request"
+runtime-validation requirement.
+
+**`docker/apex/Dockerfile`:** `ENTRYPOINT ["python", "-m",
+"apex_host.container_entrypoint"]` / `CMD ["check", "--knowledge-root",
+"/app/knowledge"]` — both exec-form JSON arrays, no shell, so signals are
+delivered directly to the Python interpreter and `CMD`'s arguments are
+appended to `ENTRYPOINT`'s argv rather than shell-reinterpreted. The prior
+bare `--help` invocation now has a documented equivalent via `exec` mode
+(`docker run --rm apex-image exec -- python -m apex_host.main --help`) or
+`--entrypoint python`.
+
+**`compose.yaml`:** the `apex` service's default `command:` changed from
+`["python", "-m", "apex_host.eval.compose_smoke"]` to `["smoke",
+"--knowledge-root", "/app/knowledge"]`. Unlike Phase 7/8's dry-run-by-default
+smoke module, this performs a *real* connectivity check by design (§ above)
+— `docker compose up --build --abort-on-container-exit` now exercises the
+genuine Kali health + harmless-command path on every run, not a synthetic
+placeholder. Compose's default `restart: "no"` policy already produces the
+desired "`kali` stays running after `apex` exits cleanly" behavior with no
+added configuration — both `--abort-on-container-exit` (auto-stopping,
+recommended for a single verification pass) and a bare `docker compose up
+--build` (leaves `kali` running for a follow-up `docker compose run apex
+dry-run ...`) remain valid, documented workflows.
+
+**`.env.example` — unchanged.** No new variable was required; the
+live-confirmation safeguard is deliberately CLI-only with no environment
+equivalent (see `run` mode above); no default target, no VPN variable, and
+no way to enable live mode by default was added.
+
+**Tests (93 new, across 2 new files + 2 updated):**
+`tests/apex_host/test_eval_preflight.py` (65 — every check function's
+pass/fail/warning paths, using `tmp_path`/`stat` for platform-safe
+report-directory permission tests, synthetic fixtures matching the real
+9-file compiled-knowledge spec, `httpx.MockTransport` for health checks,
+and a fake backend plus one real `LocalToolBackend` execution for the
+remote-smoke check), `tests/apex_host/test_container_entrypoint.py` (28 —
+every mode, `--json` output, exit-code propagation, token redaction
+(a real distinctive token value asserted absent from all captured
+output), `exec` mode's `os.execvp` argv-list call (mocked — never actually
+replaces the test process) and its "no shell" static source-text guard,
+and `SIGTERM` cancellation of a running coroutine via a genuine
+`os.kill(os.getpid(), signal.SIGTERM)` in an async test). Every `dry-run`/
+`run` dispatch test mocks `_run_engagement_and_report` — no real engagement
+work occurs in any test. `tests/apex_host/test_phase8_env_architecture.py`'s
+`_APPROVED_ENV_READERS` allowlist was extended for the two new files (both
+read only token/API-key *presence*, matching the pre-existing redaction
+discipline; the architecture test caught this correctly on first run and
+was fixed, not weakened). `tests/docker/test_apex_dockerfile.py` and
+`tests/docker/test_compose.py` were updated for the new `ENTRYPOINT`/`CMD`
+and `smoke`-mode default command contracts.
+
+**Real end-to-end validation performed:** host-side `check` mode (pass and
+report-directory-failure paths); host-side `smoke` mode against a running
+`apex_tool_service` (real health check, real `curl --version`); missing
+compiled knowledge (clear, actionable, non-zero failure); missing/malformed
+policy file (both failure shapes); missing service token (fails before any
+request is sent — see the bug fix above); Kali unavailable (bounded
+timeout, never hangs); a real `docker compose up --build` two-container
+startup with a disposable test token (Kali healthy, `smoke` preflight
+visible in `docker compose logs apex`, harmless smoke succeeds, no target
+contacted, no secret printed, `apex` exits `0`, `kali` remains healthy
+afterward); container `check` mode via direct `docker run`; container
+`smoke` mode via `docker compose run`; a full `dry-run` engagement against
+a placeholder target with report export, confirmed to never contact Kali;
+`run` mode's refusal paths (missing `--confirm-live` alone; missing
+`--no-dry-run` alone even with `--confirm-live` present) — live execution
+against a real target was never attempted, since no HTB VPN routing exists
+yet; `SIGTERM` signal propagation; full strict-validation suite (lock
+check, sync, 3283 tests passing, ruff clean, mypy clean across 142 source
+files, both CLI `--help` commands, diff check, git status); cleanup of all
+temporary containers/networks/env files/smoke artifacts. Full detail:
+[`docs/container-entrypoint.md`](docs/container-entrypoint.md).
+
+**Deferred to Infra Phase 10+ (as of Infra Phase 9):** HTB VPN
+container/tunnel routing (`run` mode's live path remains unexercised
+against a real target); GitHub Actions/CI image publishing; Meow-specific
+diagnosis, deterministic Meow tests, or authorized live Meow validation.
+**None of these were started in this phase.** No git branch was created;
+no commit or push was made as part of this phase's work.

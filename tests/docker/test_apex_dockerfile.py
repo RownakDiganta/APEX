@@ -217,12 +217,34 @@ def test_does_not_start_the_tool_service() -> None:
 # ---------------------------------------------------------------------------
 
 def test_cmd_present_and_safe() -> None:
+    """Infra Phase 9: the default CMD is now the container ENTRYPOINT's
+    'check' subcommand (apex_host.container_entrypoint) — local-only
+    configuration/knowledge/policy validation, no target, no network call.
+    ('--help' was Phase 5's own safe default before the entrypoint existed;
+    'check' is a stricter, more thorough safe default — see
+    docs/container-entrypoint.md.)"""
     cmd_lines = [ln for ln in _non_comment_lines() if re.match(r"^CMD\b", ln)]
     assert cmd_lines, "expected a default CMD"
     cmd = cmd_lines[-1]
     assert "--no-dry-run" not in cmd, f"default CMD must not disable dry-run: {cmd!r}"
     assert "--target" not in cmd, f"default CMD must not hardcode a target: {cmd!r}"
-    assert re.search(r"--help\b", cmd), f"expected the safe default CMD to request --help: {cmd!r}"
+    assert "--confirm-live" not in cmd, f"default CMD must never confirm live mode: {cmd!r}"
+    assert re.search(r'"check"', cmd), f"expected the safe default CMD to use 'check' mode: {cmd!r}"
+
+
+def test_entrypoint_present_and_uses_container_entrypoint_module() -> None:
+    entrypoint_lines = [ln for ln in _non_comment_lines() if re.match(r"^ENTRYPOINT\b", ln)]
+    assert entrypoint_lines, "expected an ENTRYPOINT directive (Infra Phase 9)"
+    entrypoint = entrypoint_lines[-1]
+    assert "apex_host.container_entrypoint" in entrypoint
+    assert entrypoint.strip().startswith("ENTRYPOINT ["), "must be exec-form JSON array, not shell form"
+
+
+def test_entrypoint_and_cmd_use_no_shell_json_array_form() -> None:
+    for ln in _non_comment_lines():
+        if re.match(r"^(ENTRYPOINT|CMD)\b", ln):
+            assert ln.strip().endswith("]"), f"must be exec-form (JSON array): {ln!r}"
+            assert " && " not in ln and " || " not in ln and ";" not in ln, f"no shell operators allowed: {ln!r}"
 
 
 def test_no_hardcoded_target_ip_anywhere() -> None:
