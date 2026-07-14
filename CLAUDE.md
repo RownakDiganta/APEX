@@ -4301,10 +4301,144 @@ list and rationale):**
 | `uv run python -m apex_host.eval.run_htb_local --help` | exit 0 |
 | `git diff --check` | exit 0 |
 
-**Phase-by-phase implementation map** (full version in the linked doc §17):
-Infra Phase 3 implements `RemoteToolBackend`'s transport and wires
-`config.tool_backend` into the default path; Phase 4 builds the restricted
-Kali service; Phase 5 adds the APEX Dockerfile; Phase 6 adds Compose; Phase
-7 wires `ToolCommand.stdin`; Phase 8 adds `.env.example` + CLI flags; Phase
-9+ covers VPN validation, CI publishing, and Meow-specific live-run work.
-**None of Phases 3–9 have been started.**
+**Phase-by-phase implementation map** (full version in the linked doc §17;
+**renumbered by Infra Phase 3** — see that phase's record below): Infra
+Phase 3 builds the restricted Kali tool service (`apex_tool_service/`);
+Phase 4 implements `RemoteToolBackend`'s transport and wires
+`config.tool_backend` into the default path; Phase 5 adds Dockerfiles;
+Phase 6 adds Compose; Phase 7 wires `ToolCommand.stdin`; Phase 8 adds
+`.env.example` + CLI flags; Phase 9+ covers VPN validation, CI publishing,
+and Meow-specific live-run work.
+
+---
+
+### Infra Phase 3 — Restricted Kali-compatible tool-execution service ✓ COMPLETE
+
+**Completion date:** 2026-07-14
+
+**Full design, trust boundary, API contract, and deferred work:**
+[`docs/kali-tool-service.md`](docs/kali-tool-service.md). This entry is a
+summary and progress record; that doc is authoritative.
+
+> **Renumbering note:** `docs/tool-execution-architecture.md` (written in
+> Infra Phase 2) originally proposed "Phase 3 = client transport, Phase 4 =
+> server." This phase built the *server* first (the client needs a
+> finalized contract to implement against), so Phase 3 and Phase 4 are
+> swapped from that original proposal. Both documents have been updated to
+> reflect this — see `docs/tool-execution-architecture.md` §10 and §17.
+
+**Scope:** build `apex_tool_service/`, a small, independently deployable
+HTTP service — the future Kali-container-side execution boundary — that
+accepts structured tool-execution requests, authenticates them, validates
+them mechanically, executes only an explicit allowlist of binaries with
+`shell=False` and no command-string concatenation, and returns a
+structured result. **Not in scope and NOT done:** `RemoteToolBackend`'s
+HTTP client in `apex_host` (still `NotImplementedError` — Phase 4), any
+Kali or APEX Dockerfile, Docker Compose, `.env.example`, VPN networking,
+CI publishing, or any Meow-specific change. All remain entirely
+unimplemented after this phase.
+
+**Package location:** `apex_tool_service/` (repo root, parallel to
+`apex_host/` and `memfabric/`; registered in `[tool.hatch.build.targets.wheel]`
+and `[tool.mypy] files` in `pyproject.toml`). Deliberately does not import
+`apex_host` or `memfabric` anywhere — proven by
+`tests/apex_tool_service/test_separation_from_apex_policy.py`. Run with
+`uv run python -m apex_tool_service` (primary) or
+`uv run uvicorn apex_tool_service.app:app` (alternative).
+
+**Authentication decision:** `POST /v1/execute` requires
+`Authorization: Bearer <token>`, compared with `hmac.compare_digest`
+(timing-safe). No default token exists anywhere in source. Missing
+server-side token configuration (`ServiceSettings.token is None`) makes
+`/v1/execute` fail closed with `503` for **every** request regardless of
+client credentials — distinct from `401` (bad/missing client credential).
+`GET /health` is intentionally unauthenticated (documented rationale:
+exposes only a fixed service name, status, and `{tool: bool}` availability
+map — no secrets, no paths, no env vars). The token is never logged
+(success or failure path) and never appears in any response body.
+
+**Allowlist decision:** `apex_tool_service/allowlist.py::ALLOWED_TOOLS` =
+`nmap`, `curl`, `nc`, `netcat`, `ping`, `telnet` — each mapped to an exact
+binary name, never shell-resolved. `nmap`/`curl`/`nc`/`netcat` have direct
+APEX usage evidence (`apex_host/tools/registry.py`); `ping`/`telnet` were
+included per this phase's own task brief despite thin/no direct APEX
+evidence (documented explicitly in `docs/kali-tool-service.md` §6).
+Deliberately excluded despite evidence: `ffuf`/`gobuster` (wordlist
+fuzzers, already policy-gated opt-in on the APEX side), `searchsploit`
+(different risk shape — local DB search, not network execution),
+`python3` (explicitly forbidden by this phase's task brief as a
+general-purpose interpreter, overriding local usage evidence). A second,
+independent `NEVER_ALLOWED` constant (shells, other interpreters, `env`,
+`sudo`/`su`, container control planes, destructive commands) is checked in
+addition to `ALLOWED_TOOLS` membership, so a careless future edit to the
+allowlist cannot silently reintroduce a shell.
+
+**Validation decision:** request structure via Pydantic v2
+(`model_config = ConfigDict(extra="forbid")` — a raw `"command"` field is
+rejected by schema alone). Mechanical checks in `apex_tool_service/validation.py`:
+argument count/length/total-byte-size limits, shell-metacharacter rejection
+(`;`, `&&`, `\|\|`, `\|`, `>>`, `>`, `<`, `` $( ``, `` ` ``, duplicated —
+not imported — from `apex_host/tools/safety.py`'s list), control-character
+rejection (newline, carriage return, null byte), stdin byte-size limit,
+and timeout-bounds validation (an out-of-bounds explicit `timeout_seconds`
+is rejected, never silently clamped). All limits are `ServiceSettings`
+fields, not scattered magic numbers.
+
+**Execution:** `apex_tool_service/executor.py` — the sole
+`asyncio.create_subprocess_exec` call site in the package (enforced by a
+static scan test), always `shell=False`, always argv-list. SIGTERM → 5s
+grace → SIGKILL on timeout (mirrors `apex_host/tools/runner.py`'s Phase 7
+hardening, reimplemented independently — no import). Output is
+byte-truncated before UTF-8 decoding (`errors="replace"`) so truncation
+never raises. Ordinary failures (non-zero exit, timeout, missing binary,
+launch `OSError`) are represented in the response, never raised as
+exceptions to the HTTP layer.
+
+**New files:**
+
+| File | Purpose |
+|---|---|
+| `apex_tool_service/__init__.py` | Package marker + module docstring (trust-boundary summary) |
+| `apex_tool_service/__main__.py` | `python -m apex_tool_service` CLI entrypoint (uvicorn runner) |
+| `apex_tool_service/app.py` | FastAPI app factory; `/health`, `/v1/execute`; auth-before-body-parsing ordering |
+| `apex_tool_service/settings.py` | `ServiceSettings` — sole env-var-reading module in the package |
+| `apex_tool_service/allowlist.py` | `ALLOWED_TOOLS`, `NEVER_ALLOWED`, `tool_availability()` |
+| `apex_tool_service/validation.py` | `RequestValidationError` + all mechanical checks |
+| `apex_tool_service/auth.py` | Bearer-token check, timing-safe, fail-closed |
+| `apex_tool_service/executor.py` | The sole subprocess call site |
+| `apex_tool_service/audit.py` | Structured audit logging, bounded argument previews |
+| `apex_tool_service/models.py` | `ExecuteRequest`/`ExecuteResponse`/`HealthResponse` (Pydantic v2) |
+| `docs/kali-tool-service.md` | Full architecture document (18 required sections) |
+| `tests/apex_tool_service/*.py` (8 files) | 124 focused tests — health, auth, validation, execution, security invariants, settings, audit, policy separation |
+
+**Modified files:** `pyproject.toml` (added `fastapi`, `uvicorn` runtime
+deps; `httpx` dev dep for ASGI testing; registered `apex_tool_service` in
+hatch packages and mypy files), `uv.lock` (regenerated — 5 new packages:
+fastapi, starlette, uvicorn, click, annotated-doc — no `fastapi[all]`, no
+Kali toolset installed as a Python dependency),
+`docs/tool-execution-architecture.md` (§10 marked finalized-elsewhere, §17
+phase table renumbered).
+
+**Validation (all against a clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass — 5 new packages, no Kali tools installed |
+| `uv run pytest tests/apex_tool_service -q` | **124 passed** |
+| `uv run pytest tests/apex_tool_service/test_security_invariants.py -q` | **13 passed** |
+| `uv run pytest -q` (full) | **2828 passed** (2704 baseline + 124 new), 53 warnings — no regressions |
+| `uv run ruff check .` | `All checks passed!` |
+| `uv run mypy` | Success — 136 source files (was 126; `+10` for `apex_tool_service`) |
+| `uv run python -m apex_tool_service --help` | exit 0 |
+| `uv run python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| Real HTTP smoke test (`python -m apex_tool_service` as a subprocess, real TCP socket, `curl` against `127.0.0.1:18080`) | `/health` 200 with accurate tool map; unauthenticated `/v1/execute` 401; authenticated `/v1/execute` 200 with real `curl --version` output |
+| `git diff --check` | exit 0 |
+
+**Deferred to Infra Phase 4+ (unchanged from `docs/kali-tool-service.md`
+§17–§18):** `RemoteToolBackend` HTTP client transport in `apex_host`;
+wiring `config.tool_backend` into `build_apex_graph()`'s default
+construction; threading `timed_out`/`backend` into `RunReport`; Kali
+Dockerfile; APEX Dockerfile; Docker Compose; `.env.example`; VPN
+networking; CI publishing; any Meow-specific change. **None of these were
+started in this phase.**
