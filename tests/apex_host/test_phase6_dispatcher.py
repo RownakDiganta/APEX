@@ -1274,3 +1274,164 @@ class TestBugFixRegressions:
         ))
         assert results[0] == "ok"
         assert isinstance(results[1], RuntimeError)
+
+
+# ── Infra Phase 2: ToolBackend seam — policy gate is never bypassed ──────────
+#
+# These tests prove the abstraction introduced in apex_host/tools/backend.py
+# does not weaken the policy invariant TaskDispatcher.dispatch() already
+# enforces: policy approval happens before ANY backend is called, blocked
+# tasks never reach the backend, and the default (no backend override) wiring
+# is byte-for-byte the same code path as before this phase.
+
+def _dispatcher_seam_initial_state() -> dict[str, Any]:
+    return {
+        "run_id": "run-backend-seam-test",
+        "target": "10.10.10.10",
+        "phase": "recon",
+        "goal": "Begin engagement against 10.10.10.10",
+        "current_task": None,
+        "evidence_summary": "",
+        "findings": [],
+        "error_episodes": [],
+        "last_tool_result": None,
+        "last_error": None,
+        "completed": False,
+        "turn_count": 0,
+        "planner_decisions": [],
+        "tool_results": None,
+        "repair_count": 0,
+        "policy_decisions": [],
+    }
+
+
+class TestToolBackendSeam:
+    @pytest.mark.asyncio
+    async def test_policy_blocked_task_never_reaches_backend_adapter(self) -> None:
+        from apex_host.tools.backend import DryRunToolBackend, to_run_command_fn
+
+        calls: list[Any] = []
+
+        class _SpyBackend(DryRunToolBackend):
+            async def execute(self, tool: Any, arguments: Any, **kwargs: Any) -> Any:
+                calls.append((tool, arguments))
+                return await super().execute(tool, arguments, **kwargs)
+
+        cfg = _FakeConfig()
+        cfg.allowed_tools = ["nmap"]  # type: ignore[attr-defined]
+        backend = _SpyBackend(cfg)  # type: ignore[arg-type]
+        disp = _make_dispatcher(
+            advisor=_BlockedAdvisor(), run_command_fn=to_run_command_fn(backend),
+        )
+        task = _make_task(tool="nmap")
+        ctx = _make_exec_context()
+
+        result = await disp.dispatch(task, ctx)
+
+        assert result.disposition is ExecutionDisposition.BLOCKED_POLICY
+        assert calls == [], "backend.execute must never be called for a policy-blocked task"
+
+    @pytest.mark.asyncio
+    async def test_approved_task_reaches_backend_adapter_exactly_once(self) -> None:
+        from apex_host.tools.backend import DryRunToolBackend, to_run_command_fn
+
+        calls: list[Any] = []
+
+        class _SpyBackend(DryRunToolBackend):
+            async def execute(self, tool: Any, arguments: Any, **kwargs: Any) -> Any:
+                calls.append((tool, arguments))
+                return await super().execute(tool, arguments, **kwargs)
+
+        cfg = _FakeConfig()
+        cfg.allowed_tools = ["nmap"]  # type: ignore[attr-defined]
+        backend = _SpyBackend(cfg)  # type: ignore[arg-type]
+        disp = _make_dispatcher(
+            advisor=_ApprovedAdvisor(), run_command_fn=to_run_command_fn(backend),
+        )
+        task = _make_task(tool="nmap", args=["-T4"])
+        ctx = _make_exec_context()
+
+        result = await disp.dispatch(task, ctx)
+
+        assert result.disposition is ExecutionDisposition.EXECUTED_SUCCESS
+        assert calls == [("nmap", ["-T4"])]
+
+    @pytest.mark.asyncio
+    async def test_build_apex_graph_default_omits_tool_backend_and_completes(self) -> None:
+        """No tool_backend argument → build_apex_graph behaves exactly as it did
+        before this phase (existing default-behavior evidence; the full 2668-test
+        suite passing unchanged is the primary proof — this exercises one
+        concrete turn end-to-end as a smoke check)."""
+        from apex_host.graph import build_apex_graph
+        from apex_host.config import ApexConfig
+        from apex_host.tools.registry import ToolRegistry
+        from memfabric.api import MemoryAPI
+        from memfabric.config import Config as MFConfig
+        from memfabric.stores.episodic_jsonl import JSONLEpisodicStore
+        from memfabric.stores.graph_networkx import NetworkXGraphStore
+        from memfabric.stores.kv_memory import InMemoryKVStore
+        from memfabric.stores.lexical_bm25 import BM25LexicalIndex
+        from memfabric.stores.vector_faiss import FaissVectorIndex
+
+        mf_cfg = MFConfig()
+        api = MemoryAPI(
+            graph=NetworkXGraphStore(), episodic=JSONLEpisodicStore(path=None),
+            lexical=BM25LexicalIndex(), vector=FaissVectorIndex(dim=mf_cfg.vector_dim),
+            kv=InMemoryKVStore(), config=mf_cfg,
+        )
+        cfg = ApexConfig(target="10.10.10.10", dry_run=True, max_turns=1)
+        registry = ToolRegistry.from_config(cfg)
+        graph = build_apex_graph(api, registry, cfg)  # no tool_backend kwarg
+        final = await graph.ainvoke(_dispatcher_seam_initial_state())
+        assert final["turn_count"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_build_apex_graph_with_explicit_tool_backend_completes(self) -> None:
+        """An explicit ToolBackend (DryRunToolBackend) drives a full engagement
+        turn end-to-end through build_apex_graph's new opt-in seam."""
+        from apex_host.graph import build_apex_graph
+        from apex_host.config import ApexConfig
+        from apex_host.tools.backend import DryRunToolBackend
+        from apex_host.tools.registry import ToolRegistry
+        from memfabric.api import MemoryAPI
+        from memfabric.config import Config as MFConfig
+        from memfabric.stores.episodic_jsonl import JSONLEpisodicStore
+        from memfabric.stores.graph_networkx import NetworkXGraphStore
+        from memfabric.stores.kv_memory import InMemoryKVStore
+        from memfabric.stores.lexical_bm25 import BM25LexicalIndex
+        from memfabric.stores.vector_faiss import FaissVectorIndex
+
+        mf_cfg = MFConfig()
+        api = MemoryAPI(
+            graph=NetworkXGraphStore(), episodic=JSONLEpisodicStore(path=None),
+            lexical=BM25LexicalIndex(), vector=FaissVectorIndex(dim=mf_cfg.vector_dim),
+            kv=InMemoryKVStore(), config=mf_cfg,
+        )
+        cfg = ApexConfig(target="10.10.10.10", dry_run=True, max_turns=1)
+        registry = ToolRegistry.from_config(cfg)
+        graph = build_apex_graph(api, registry, cfg, tool_backend=DryRunToolBackend(cfg))
+        final = await graph.ainvoke(_dispatcher_seam_initial_state())
+        assert final["turn_count"] >= 1
+        assert final["last_error"] is None or "policy_blocked" not in str(final["last_error"])
+
+    @pytest.mark.asyncio
+    async def test_dispatcher_accepts_explicit_tool_backend_via_adapter(self) -> None:
+        """A caller-supplied ToolBackend fully replaces execution without touching
+        the policy/conflict/duplicate gates in TaskDispatcher.dispatch()."""
+        from apex_host.tools.backend import LocalToolBackend, to_run_command_fn
+
+        cfg = _FakeConfig()
+        cfg.allowed_tools = ["python3"]  # type: ignore[attr-defined]
+        cfg.dry_run = False  # type: ignore[attr-defined]
+        backend = LocalToolBackend(cfg)  # type: ignore[arg-type]
+        disp = _make_dispatcher(
+            config=cfg, advisor=_ApprovedAdvisor(),
+            run_command_fn=to_run_command_fn(backend),
+        )
+        task = _make_task(tool="python3", args=["-c", "print('via-backend-seam')"])
+        ctx = _make_exec_context(dry_run=False)
+
+        result = await disp.dispatch(task, ctx)
+
+        assert result.disposition is ExecutionDisposition.EXECUTED_SUCCESS
+        assert "via-backend-seam" in result.tool_result_dict["stdout"]

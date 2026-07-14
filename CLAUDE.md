@@ -4001,13 +4001,15 @@ the top of this section to reflect the new passing count.
 
 ---
 
-## 22. Infrastructure Migration Roadmap (Packaging & Environment)
+## 22. Infrastructure Migration Roadmap
 
 This is a separate migration track from the Reviewer Remediation Program in
-§21 — it governs **how the project is packaged and how contributors get a
-working environment**, not application-level correctness. Its own phase
+§21 — it governs **packaging, environment management, and the tool-execution
+runtime architecture**, not application-level correctness. Its own phase
 numbering ("Infra Phase 1", "Infra Phase 2", …) is independent of the
 Reviewer Remediation "Phase 1"–"Phase 11" in §21; do not conflate the two.
+(Earlier revisions of this section were titled "Packaging & Environment" —
+broadened here to cover Infra Phase 2, which is architecture, not packaging.)
 
 ### Infra Phase 1 — `uv` dependency and environment management ✓ COMPLETE
 
@@ -4178,3 +4180,131 @@ management):
   append-only historical records of what was actually run at the time
   (§21 R12 — findings/records are never rewritten) and were deliberately
   left untouched; they are not living developer instructions.
+
+---
+
+### Infra Phase 2 — Tool-execution backend architecture and contracts ✓ COMPLETE
+
+**Completion date:** 2026-07-14
+
+**Full design rationale, current-state analysis, and phase-by-phase plan:**
+[`docs/tool-execution-architecture.md`](docs/tool-execution-architecture.md).
+This CLAUDE.md entry is a summary and progress record; the doc is
+authoritative for architecture detail.
+
+**Scope:** define a replaceable `ToolBackend` abstraction (dry-run / local /
+remote-contract-only) that formalizes a seam that already existed implicitly
+in `TaskDispatcher`, without changing default runtime behavior and without
+implementing the actual Kali HTTP service. **Not in scope and NOT done:**
+Dockerfiles, Docker Compose, a Kali container image, VPN container/tunnel
+work, GitHub Actions/CI, or any live Meow-specific fix. Those all remain
+entirely unimplemented after this phase — see
+`docs/tool-execution-architecture.md` §16–§17 for what each still requires.
+
+**Architecture decisions (see the linked doc for full detail):**
+
+- **`ToolBackend`** (`apex_host/tools/backend.py`) — a `typing.Protocol`
+  with `async def execute(tool, arguments, *, timeout_seconds=None,
+  stdin=None) -> ToolExecutionResult`. `ToolExecutionResult` is a type
+  alias for the existing `apex_host.types.ToolResult` — no duplicate
+  result model was created.
+- **`DryRunToolBackend`** — standalone, never spawns a process or opens a
+  network connection (proven by monkeypatch-based tests), still enforces
+  `apex_host/tools/safety.py::check_command` first.
+- **`LocalToolBackend`** — thin wrapper delegating entirely to the
+  existing, Phase-7-hardened `apex_host.tools.runner.run_command`; no
+  subprocess logic duplicated. Still honors `ApexConfig.dry_run`
+  internally as defense in depth — explicitly documented as intentional,
+  not a bug (see the doc's §7 "important nuance" note).
+- **`RemoteToolBackend`** — contract only. Constructing it is safe;
+  `execute()` unconditionally raises `NotImplementedError`. No HTTP
+  client, no FastAPI/Flask, no network I/O anywhere in this phase.
+- **`ToolResult`** (`apex_host/types.py`) gained two additive fields:
+  `timed_out: bool = False` and `backend: str = ""`. `ToolCommand` gained
+  one additive field: `stdin: str | None = None`. All five existing
+  `ToolResult(...)` construction sites in `runner.py` were updated to
+  populate the two new fields; no other field's value changed.
+- **`ApexConfig`** (`apex_host/config.py`) gained four additive fields:
+  `tool_backend: str = "local"` (the default preserves current behavior —
+  `"local"` is what `build_apex_graph()` has always used),
+  `tool_service_url: str | None = None`, `tool_service_token: str = ""`
+  (no secret default; redacted by `to_safe_dict()` when non-empty),
+  `tool_service_timeout_seconds: float = 120.0`. No environment-variable
+  reading was added anywhere — `config.py`'s own
+  `test_arch_08_config_py_has_no_env_access` architecture test forbids it,
+  and no other module reads these vars either. `.env.example` and CLI flag
+  wiring remain explicitly deferred (per this phase's own instructions).
+- **`build_apex_graph()`** (`apex_host/orchestration/builder.py`) gained
+  one additive, keyword-only parameter: `tool_backend: ToolBackend | None
+  = None`. When `None` (the default — every existing call site), behavior
+  is byte-for-byte unchanged: `run_command_fn=run_command`, exactly as
+  before this phase. When a `ToolBackend` is supplied, `TaskDispatcher`
+  receives `apex_host.tools.backend.to_run_command_fn(tool_backend)`
+  instead — `TaskDispatcher` itself was not modified.
+- **Policy invariant unchanged and re-proven through the new seam:**
+  `TaskDispatcher.dispatch()`'s policy gate (step 1) still runs before any
+  backend is ever called, for both fresh tasks and `RepairEngine`-repaired
+  tasks (same `dispatch()` call site). Proven by
+  `test_policy_blocked_task_never_reaches_backend_adapter` (a spy-wrapped
+  backend records zero calls for a policy-blocked task).
+
+**Deliberately NOT done in this phase (see doc §17 and §19 for the full
+list and rationale):**
+
+- `config.tool_backend` is not consumed by `build_apex_graph()`'s *default*
+  construction — only the explicit `tool_backend=` keyword argument is
+  honored. Auto-wiring the config value into the default path is deferred
+  to Phase 3, validated together with a real `RemoteToolBackend`.
+- `ToolCommand.stdin` is defined but not piped into `runner.py`'s
+  subprocess call; `LocalToolBackend.execute(..., stdin=...)` raises
+  `NotImplementedError` rather than silently dropping it.
+- `ToolResult.timed_out` / `.backend` are not yet threaded through
+  `TaskDispatcher._run_command()`'s dict-building code into
+  `RunReport`/EKG episodes.
+- `apex_host/agents/recon_executor.py` / `execute_executor.py` (a second,
+  orphaned local-execution path used only by their own tests, never by the
+  live graph) were left as-is — flagged as a consolidation opportunity,
+  not touched (removing them was judged out of this phase's narrow scope).
+- `RemoteToolBackend`'s HTTP transport, the restricted Kali tool service
+  itself, its server-side allowlist/timeout/audit/health enforcement (doc
+  §11), Dockerfiles, Docker Compose, VPN container work, CI, and any
+  Meow-specific live-run change — **all remain entirely unimplemented.**
+
+**New files:**
+
+| File | Purpose |
+|---|---|
+| `apex_host/tools/backend.py` | `ToolBackend` protocol, `DryRunToolBackend`, `LocalToolBackend`, `RemoteToolBackend`, `select_tool_backend()`, `to_run_command_fn()` |
+| `docs/tool-execution-architecture.md` | Full architecture document (19 required sections) |
+| `tests/apex_host/test_tool_backend.py` | 30 focused tests: protocol conformance, dry-run isolation, local-backend parity with `run_command`, remote-backend contract-only behavior, backend selection |
+
+**Modified files:**
+
+| File | Change |
+|---|---|
+| `apex_host/types.py` | `ToolResult.timed_out`, `ToolResult.backend`, `ToolCommand.stdin` — all additive |
+| `apex_host/tools/runner.py` | Five `ToolResult(...)` sites now populate `backend`/`timed_out`; no other behavior change |
+| `apex_host/config.py` | Four additive `ApexConfig` fields; `to_safe_dict()` redacts `tool_service_token` when set |
+| `apex_host/orchestration/builder.py` | `build_apex_graph(..., tool_backend=None)` opt-in seam |
+| `tests/apex_host/test_phase6_dispatcher.py` | 5 new tests in `TestToolBackendSeam`: policy-block-never-reaches-backend, approved-task-reaches-backend-once, default-path end-to-end smoke test, explicit-backend end-to-end smoke test, dispatcher-level backend-adapter parity |
+
+**Validation (all against a clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest -q` | **2704 passed** (2668 baseline + 30 new backend tests + 5 new dispatcher-seam tests + 1 net from collection ordering), 53 warnings — no regressions |
+| `uv run pytest tests/apex_host/test_tool_backend.py tests/apex_host/test_phase6_dispatcher.py -q` | 161 passed (30 + 131) |
+| `uv run ruff check .` | `All checks passed!` |
+| `uv run mypy` | Success — 126 source files (was 125; `+1` for `apex_host/tools/backend.py`) |
+| `uv run python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Phase-by-phase implementation map** (full version in the linked doc §17):
+Infra Phase 3 implements `RemoteToolBackend`'s transport and wires
+`config.tool_backend` into the default path; Phase 4 builds the restricted
+Kali service; Phase 5 adds the APEX Dockerfile; Phase 6 adds Compose; Phase
+7 wires `ToolCommand.stdin`; Phase 8 adds `.env.example` + CLI flags; Phase
+9+ covers VPN validation, CI publishing, and Meow-specific live-run work.
+**None of Phases 3–9 have been started.**

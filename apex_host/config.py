@@ -159,6 +159,36 @@ class ApexConfig:
     retrieval_channel_timeout_seconds: float = 5.0
     # parser_timeout_seconds: maximum wall-clock time for a parser call.
     parser_timeout_seconds: float = 10.0
+    # ---------------------------------------------------------------------------
+    # Infra Phase 2 — tool-execution backend selection
+    # (docs/tool-execution-architecture.md; apex_host/tools/backend.py)
+    # ---------------------------------------------------------------------------
+    # tool_backend selects which ToolBackend apex_host.tools.backend.select_tool_backend()
+    # constructs.  This field is NOT yet consumed by build_apex_graph()'s default
+    # wiring — build_apex_graph(tool_backend=...) accepts an explicit ToolBackend
+    # instance instead (see that function's docstring).  Wiring config.tool_backend
+    # into the default construction path is deferred to a later phase, once
+    # RemoteToolBackend's transport exists and a live selection matrix can be
+    # validated end-to-end.
+    #   "dry-run": DryRunToolBackend — never executes a process.
+    #   "local":   LocalToolBackend — the existing trusted-subprocess pathway
+    #              (apex_host/tools/runner.py); still honors dry_run internally.
+    #   "remote":  RemoteToolBackend — CONTRACT ONLY in this phase; execute()
+    #              raises NotImplementedError.
+    # "local" is the default because it is what build_apex_graph() already uses
+    # today (via apex_host.tools.runner.run_command) — this field does not change
+    # default runtime behavior.
+    tool_backend: str = "local"
+    # tool_service_url / tool_service_token / tool_service_timeout_seconds
+    # configure RemoteToolBackend (contract only — no request is ever sent in
+    # this phase).  No default secret: tool_service_token defaults to the
+    # empty string, never a real credential.  Do not read these from
+    # environment variables inside this module — see CLAUDE.md's config
+    # centralization rule; env-var wiring (e.g. APEX_TOOL_SERVICE_TOKEN) is
+    # deferred to the phase that adds .env support.
+    tool_service_url: str | None = None
+    tool_service_token: str = ""
+    tool_service_timeout_seconds: float = 120.0
     # Configuration schema version — increment when the config format changes in a
     # backward-incompatible way (new required fields, renamed fields, type changes).
     # Exposed via to_safe_dict() so consumers can detect incompatible changes.
@@ -172,11 +202,16 @@ class ApexConfig:
         """Return all fields as a JSON-serialisable dict with sensitive values redacted.
 
         ``password_candidates`` entries are replaced with ``"[redacted]"``.
+        ``tool_service_token`` is replaced with ``"[redacted]"`` when non-empty
+        (RemoteToolBackend authentication token — contract only in this phase,
+        but redacted defensively since it is credential-shaped).
         All other fields are returned verbatim — no other field stores a plaintext secret.
         """
         d: dict[str, object] = {f.name: getattr(self, f.name) for f in _dc_fields(self)}
         if self.password_candidates:
             d["password_candidates"] = [_REDACTED] * len(self.password_candidates)
+        if self.tool_service_token:
+            d["tool_service_token"] = _REDACTED
         return d
 
     @classmethod

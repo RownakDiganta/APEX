@@ -83,6 +83,7 @@ async def run_command(cmd: ToolCommand, config: "ApexConfig") -> ToolResult:
             returncode=0,
             duration_seconds=0.0,
             dry_run=True,
+            backend="dry-run",
         )
 
     if shutil.which(cmd.tool) is None:
@@ -94,6 +95,7 @@ async def run_command(cmd: ToolCommand, config: "ApexConfig") -> ToolResult:
             duration_seconds=0.0,
             dry_run=False,
             error=f"tool '{cmd.tool}' not found in PATH",
+            backend="local",
         )
 
     grace = float(getattr(config, "subprocess_sigterm_grace_seconds", _DEFAULT_SIGTERM_GRACE))
@@ -122,6 +124,8 @@ async def run_command(cmd: ToolCommand, config: "ApexConfig") -> ToolResult:
                 duration_seconds=time.monotonic() - start,
                 dry_run=False,
                 error=f"command timed out after {timeout}s",
+                timed_out=True,
+                backend="local",
             )
         except asyncio.CancelledError:
             # P7-I04 / A08: terminate child before propagating cancellation.
@@ -135,6 +139,7 @@ async def run_command(cmd: ToolCommand, config: "ApexConfig") -> ToolResult:
             returncode=proc.returncode if proc.returncode is not None else -1,
             duration_seconds=time.monotonic() - start,
             dry_run=False,
+            backend="local",
         )
     except asyncio.CancelledError:
         # CancelledError raised during proc creation (before communicate).
@@ -150,4 +155,5 @@ async def run_command(cmd: ToolCommand, config: "ApexConfig") -> ToolResult:
             duration_seconds=time.monotonic() - start,
             dry_run=False,
             error=str(exc),
+            backend="local",
         )
