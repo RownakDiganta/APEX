@@ -670,6 +670,14 @@ exists yet. Full design, trust boundaries, and the phase-by-phase plan for
 implementing the remote backend live in
 [`docs/tool-execution-architecture.md`](docs/tool-execution-architecture.md).
 
+**Kali tool service (Infra Phase 3):** `apex_tool_service/` is a small,
+independently deployable, independently tested HTTP service — the future
+Kali-container-side execution boundary that `RemoteToolBackend` will
+eventually call. It is not wired to `apex_host` yet and no container image
+exists. Run it locally with `uv run python -m apex_tool_service`; full API
+contract, authentication, allowlist, and validation rules are documented in
+[`docs/kali-tool-service.md`](docs/kali-tool-service.md).
+
 ---
 
 ## APEX Host Quickstart

@@ -18,6 +18,8 @@ dependencies = [
     "langchain-openai>=0.2",
     "python-dotenv>=1.0",
     "PyYAML>=6.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
 ]
 
 [dependency-groups]
@@ -28,15 +30,16 @@ dev = [
     "ruff>=0.6",
     "types-networkx",
     "types-PyYAML",
+    "httpx>=0.27",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["memfabric", "apex_host"]
+packages = ["memfabric", "apex_host", "apex_tool_service"]
 
 [tool.mypy]
 strict = true
 python_version = "3.11"
-files = ["memfabric", "apex_host"]
+files = ["memfabric", "apex_host", "apex_tool_service"]
 
 [[tool.mypy.overrides]]
 module = ["langgraph.*", "faiss", "playwright.*", "langchain_core.*", "langchain_openai.*", "dotenv", "rank_bm25"]

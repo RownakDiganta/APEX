@@ -425,7 +425,16 @@ phase must do to close that gap.
 
 ## 10. Remote request/response contract
 
-Not implemented. Specified here for Phase 3+:
+> **Update (Infra Phase 3):** the server side of this contract is now
+> implemented and finalized — see [`docs/kali-tool-service.md`](kali-tool-service.md)
+> for the authoritative, tested request/response schema
+> (`apex_tool_service/models.py::ExecuteRequest`/`ExecuteResponse`), which
+> matches the sketch below with one addition: the response also always
+> includes `backend: "kali-service"` and `error: string | null`. The
+> *client* side (`RemoteToolBackend`'s HTTP transport, in `apex_host`) is
+> still not implemented — that remains Phase 4. The sketch below is kept
+> for historical context; treat `docs/kali-tool-service.md` as
+> authoritative where the two differ.
 
 **Request** (JSON body, `POST` to the restricted Kali tool service):
 
@@ -660,13 +669,20 @@ of this phase (per the task brief's explicit prohibition).
 |---|---|---|
 | Infra Phase 1 | `uv` dependency/environment management | ✓ Complete (see CLAUDE.md §22) |
 | **Infra Phase 2 (this document)** | `ToolBackend` protocol, `DryRunToolBackend`, `LocalToolBackend`, `RemoteToolBackend` (contract only), `ApexConfig` fields, `build_apex_graph(tool_backend=...)` opt-in seam, this document, focused tests | ✓ Complete |
-| Infra Phase 3 (proposed) | Implement `RemoteToolBackend`'s HTTP transport against the contract in §10; wire `config.tool_backend` into `build_apex_graph()`'s *default* construction (today it requires an explicit `tool_backend=` argument); thread `ToolResult.timed_out`/`backend` into `dispatcher.py`'s dict and `RunReport` (§7, §15) | Not started |
-| Infra Phase 4 (proposed) | Build and containerize the restricted Kali tool service implementing §11's server-side allowlist/timeout/audit/health requirements | Not started |
-| Infra Phase 5 (proposed) | Dockerfile(s) for the APEX application container | Not started |
+| **Infra Phase 3** | Build and containerize-*ready* (not yet containerized) the restricted Kali tool service (`apex_tool_service/`) implementing §11's server-side allowlist/timeout/audit/health requirements — see [`docs/kali-tool-service.md`](kali-tool-service.md) | ✓ Complete |
+| Infra Phase 4 (proposed) | Implement `RemoteToolBackend`'s HTTP transport in `apex_host` against the now-finalized contract (§10, `docs/kali-tool-service.md` §5); wire `config.tool_backend` into `build_apex_graph()`'s *default* construction (today it requires an explicit `tool_backend=` argument); thread `ToolResult.timed_out`/`backend` into `dispatcher.py`'s dict and `RunReport` (§7, §15) | Not started |
+| Infra Phase 5 (proposed) | Kali-based Dockerfile running `apex_tool_service` as its entrypoint; APEX application Dockerfile | Not started |
 | Infra Phase 6 (proposed) | Docker Compose wiring APEX + Kali service on an isolated network | Not started |
 | Infra Phase 7 (proposed) | Wire `ToolCommand.stdin` into `runner.py`'s subprocess call for local interactive use cases that need it (§8, §12, §19) | Not started |
 | Infra Phase 8 (proposed) | `.env.example`, CLI flags (`--tool-backend`, `--tool-service-url`, `--tool-service-token`, `--tool-timeout-seconds`) wired via `ApexConfig.from_cli_args()` | Not started |
 | Infra Phase 9+ | VPN validation, CI publishing, Meow-specific live-run debugging over the new architecture | Not started |
+
+> **Note (Infra Phase 3):** this renumbers Phases 3–4 from how they were
+> originally proposed when this document was written (Phase 2): the
+> service was built *before* the client transport, not after, since the
+> client needs a finalized contract to implement against. Phases 5+ are
+> otherwise unchanged. See `docs/kali-tool-service.md` §17–§18 for what
+> Phase 4 and Phase 5 still require.
 
 This numbering is independent of, and must not be confused with, the
 Reviewer Remediation Program's "Phase 1"–"Phase 11" in CLAUDE.md §21 (see
