@@ -18,7 +18,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-import pytest
 
 from memfabric.ids import new_id, now
 from memfabric.types import Edge, Node, SubgraphView

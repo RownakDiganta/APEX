@@ -73,6 +73,107 @@ These are hard constraints, not suggestions.
 
 ---
 
+## Development environment (uv)
+
+[`uv`](https://docs.astral.sh/uv/) is the required dependency and
+Python-environment manager for this repository. `pyproject.toml` is the
+authoritative dependency declaration; `uv.lock` is the committed, reproducible
+lock file. Do not use `pip install`, `venv`, or `poetry` directly — all
+environment setup goes through `uv`.
+
+**Supported Python version:** 3.11 (`requires-python = ">=3.11"` in
+`pyproject.toml`, pinned to `3.11` via `.python-version` so `uv` always
+selects a 3.11 interpreter rather than whatever `python3` happens to resolve
+to on `PATH`). `mypy` is likewise configured for `python_version = "3.11"`.
+
+### Installing uv
+
+```bash
+# macOS (Homebrew)
+brew install uv
+
+# Or via the official installer (macOS/Linux)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+See the [uv installation docs](https://docs.astral.sh/uv/getting-started/installation/)
+for Windows and other options.
+
+### Clean environment setup
+
+```bash
+git clone <repo-url>
+cd apex   # or wherever the repo lives
+uv sync --all-groups
+```
+
+`uv sync --all-groups` reads `uv.lock`, downloads Python 3.11.14 automatically
+if it isn't already installed, creates `.venv/`, and installs the runtime
+dependencies plus every group under `[dependency-groups]` (currently just
+`dev`: pytest, pytest-asyncio, mypy, ruff, and type stubs). The package itself
+(`memfabric`, which also ships `apex_host`) is installed editable, so local
+source edits are picked up immediately with no reinstall step.
+
+To install only runtime dependencies (no dev tooling):
+
+```bash
+uv sync --no-dev
+```
+
+### Running commands
+
+Prefix any command with `uv run` to execute it inside the managed
+environment — no manual `source .venv/bin/activate` required (though that
+still works if you prefer it):
+
+```bash
+# Tests
+uv run pytest -q
+
+# Ruff (lint)
+uv run ruff check .
+
+# mypy (type check — scoped to memfabric + apex_host via [tool.mypy] files)
+uv run mypy
+
+# Main APEX CLI
+uv run python -m apex_host.eval.run_htb_local --help
+uv run python -m apex_host.main --help
+```
+
+> **Note on `mypy` scope:** run `uv run mypy` (no path argument) rather than
+> `uv run mypy .`. The bare form uses the `files = ["memfabric", "apex_host"]`
+> scope already declared in `[tool.mypy]` in `pyproject.toml` — the project's
+> long-standing, documented type-check target. Passing `.` explicitly
+> overrides that config and makes mypy walk the entire repository tree,
+> including the vendored, gitignored `Knowledge/` reference corpus (GTFOBins,
+> LOLBAS, PayloadsAllTheThings, SecLists), which is not part of this
+> project's source and is not type-checkable (`mypy .` fails immediately with
+> `Knowledge/payload_db/GTFOBins/linter/__main__.py:1: error: No parent
+> module`). This is pre-existing repository content, not a defect introduced
+> by dependency migration.
+
+### Refreshing the lock file
+
+After intentionally adding, removing, or changing the version constraint of a
+dependency in `pyproject.toml`:
+
+```bash
+uv lock            # recompute uv.lock
+uv sync --all-groups   # apply it to .venv/
+```
+
+To verify the committed lock file is still up to date with `pyproject.toml`
+(e.g. in a pre-commit check or CI step) without modifying anything:
+
+```bash
+uv lock --check
+```
+
+Commit the updated `uv.lock` alongside the `pyproject.toml` change.
+
+---
+
 ## Memory API surface
 
 ```python
@@ -176,7 +277,7 @@ See `examples/smoke_run.py` for a complete end-to-end demonstration.
 ## Running tests
 
 ```bash
-python -m pytest tests/ -v
+uv run pytest -v
 ```
 
 2668 tests total (as of 2026-07-14 Phase 11 final verification): the `tests/` directory
@@ -263,7 +364,7 @@ planners, executors, knowledge seeding, policy enforcement, LLM wiring, and
 the complete engagement graph.
 
 > **Note for contributors:** the count grows as new findings are remediated.
-> Run `python -m pytest tests/ --collect-only -q | tail -1` for the current count.
+> Run `uv run pytest --collect-only -q | tail -1` for the current count.
 
 ---
 
@@ -563,11 +664,20 @@ runs the full engagement end-to-end with **zero real command execution**.
 
 ### 1. Install dependencies
 
+This project uses [`uv`](https://docs.astral.sh/uv/) as the sole dependency and
+environment manager. See [Development environment (uv)](#development-environment-uv)
+below for the full setup reference; the short version:
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
+uv sync --all-groups
 ```
+
+This creates `.venv/` (Python 3.11, pinned by `.python-version`) and installs
+both the runtime dependencies and the `dev` dependency group (pytest, mypy,
+ruff, type stubs) from `uv.lock`. Prefix all commands below with `uv run`
+(e.g. `uv run python -m apex_host.main ...`), or activate the environment
+first with `source .venv/bin/activate` if you prefer not to type `uv run`
+every time.
 
 Install local tools (macOS with Homebrew):
 
@@ -652,7 +762,7 @@ python -m apex_host.eval.run_htb_local \
 ### 6. Run the test suite
 
 ```bash
-.venv/bin/python -m pytest tests/ -q
+uv run pytest tests/ -q
 ```
 
 All tests run in dry-run mode with no network access.
@@ -784,16 +894,16 @@ environment — API keys are never hardcoded.
 ### Running the tests
 
 ```bash
-.venv/bin/python -m pytest tests/apex_host/test_planning_engine.py -v
+uv run pytest tests/apex_host/test_planning_engine.py -v
 ```
 
 ### Type checking
 
 ```bash
-.venv/bin/python -m mypy apex_host/planning/ --strict
+uv run mypy apex_host/planning/ --strict
 ```
 
-Expected: `Success: no issues found in 5 source files`
+Expected: `Success: no issues found in 8 source files`
 
 ---
 
@@ -886,7 +996,7 @@ node type yet.
 ### Running planner + engine tests
 
 ```bash
-.venv/bin/python -m pytest tests/apex_host/test_planners_with_engine.py -v
+uv run pytest tests/apex_host/test_planners_with_engine.py -v
 ```
 
 ### Test count
@@ -947,13 +1057,13 @@ START → load_context → global_plan ─────────────�
 
 ```bash
 # All tests (851 total)
-.venv/bin/python -m pytest tests/ -q
+uv run pytest tests/ -q
 
 # LLM wiring tests only
-.venv/bin/python -m pytest tests/apex_host/test_llm_wiring.py -v
+uv run pytest tests/apex_host/test_llm_wiring.py -v
 
 # Repair engine + complete loop tests
-.venv/bin/python -m pytest tests/apex_host/test_repair_engine.py -v
+uv run pytest tests/apex_host/test_repair_engine.py -v
 ```
 
 ### Enabling the LLM planning layer
@@ -1084,7 +1194,7 @@ Exit 0 = all checks passed; exit 1 = one or more files failed.
 ### 3. Run the full test suite
 
 ```bash
-.venv/bin/python -m pytest tests/ -q
+uv run pytest tests/ -q
 ```
 
 Make shortcut:

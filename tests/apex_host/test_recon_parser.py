@@ -2,7 +2,6 @@
 # Tests for NmapParser, FfufParser, GobusterParser, CommandParser (curl), and BannerParser verifying correct EKG node/edge extraction from representative stdout samples.
 from __future__ import annotations
 
-import pytest
 
 from apex_host.parsers.banner_parser import BannerParser
 from apex_host.parsers.command_parser import CommandParser

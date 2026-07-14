@@ -50,9 +50,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from memfabric.ids import new_id, now
 from memfabric.types import (
-    AbandonSignal,
     ClaimDependency,
     EvidenceBundle,
     Goal,
@@ -64,7 +62,7 @@ from apex_host.planning.engine import _to_task_spec, summarize_subgraph
 from apex_host.planning.validator import Validator
 
 if TYPE_CHECKING:
-    from apex_host.llm.gateway import LLMCallContext, LLMCallPurpose, LLMGateway
+    from apex_host.llm.gateway import LLMGateway
     from apex_host.llm.router import ModelRouter
     from apex_host.planning.budget import LLMBudgetTracker
     from apex_host.policy.llm_guard import LLMPolicyGuard

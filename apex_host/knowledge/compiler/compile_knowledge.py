@@ -134,7 +134,6 @@ def _run(args: argparse.Namespace) -> int:
         return _run_inspect(args)
 
     strict = getattr(args, "strict", False)
-    verbose = getattr(args, "verbose", False)
     paths = _resolve_paths(args)
     any_found = False
     exit_code = 0

@@ -14,7 +14,6 @@ Key invariants (CLAUDE.md §1.3 and §4):
 """
 from __future__ import annotations
 
-import pytest
 
 from memfabric.api import MemoryAPI
 from memfabric.config import Config

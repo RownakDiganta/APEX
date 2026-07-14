@@ -12,8 +12,6 @@ import textwrap
 import pytest
 
 from apex_host.knowledge.compiler.layout import (
-    KnowledgeLayout,
-    FamilyLayout,
     detect_layout,
     format_inspect_report,
 )
@@ -369,7 +367,7 @@ class TestFormatInspectReport:
         _make_methodology_db(root)
         _make_intel_db(root)
         _make_payload_db(root)
-        report = format_inspect_report(layout := detect_layout(root))
+        report = format_inspect_report(detect_layout(root))
         for family in ["policy_db", "methodology_db", "intel_db", "payload_db"]:
             assert family in report
 
@@ -454,7 +452,8 @@ class TestInspectCLI:
 
     def test_inspect_reports_gtfobins_extensionless_entries(self, tmp_path: pathlib.Path) -> None:
         from apex_host.knowledge.compiler.compile_knowledge import main
-        import io, contextlib
+        import io
+        import contextlib
         root = tmp_path / "knowledge"
         root.mkdir()
         _make_payload_db(root)

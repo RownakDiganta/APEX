@@ -15,10 +15,8 @@ Section 8 invariants tested here:
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
-import pytest
 
 from memfabric.api import MemoryAPI
 from memfabric.config import Config
@@ -35,14 +33,12 @@ from memfabric.stores.kv_memory import InMemoryKVStore
 from memfabric.stores.lexical_bm25 import BM25LexicalIndex
 from memfabric.stores.vector_faiss import FaissVectorIndex
 from memfabric.types import (
-    AbandonSignal,
     Episode,
     EvidenceBundle,
     ExecutorResult,
     Goal,
     Node,
     Outcome,
-    SubgraphView,
     TaskSpec,
 )
 
@@ -123,7 +119,6 @@ class TestTurnStateStructure:
 
         def _flatten(hint: object) -> set[object]:
             """Recursively collect all type arguments."""
-            import typing
             args = getattr(hint, "__args__", None) or ()
             result: set[object] = {hint}
             for a in args:

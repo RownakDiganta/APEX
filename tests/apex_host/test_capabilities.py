@@ -2,8 +2,8 @@
 # Tests for capabilities_from_subgraph verifying the mapping from EKG service and endpoint nodes to planner capability names.
 from __future__ import annotations
 
-from memfabric.ids import new_id, now
-from memfabric.types import Edge, Node, SubgraphView
+from memfabric.ids import now
+from memfabric.types import Node, SubgraphView
 
 from apex_host.planners.capabilities import Capability, capabilities_from_subgraph
 

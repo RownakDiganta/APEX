@@ -28,7 +28,6 @@ from memfabric.types import (
 from apex_host.agents.telnet_executor import TelnetExecutor
 from apex_host.config import ApexConfig
 from apex_host.parsers.access_parser import AccessParser
-from apex_host.planners.capabilities import Capability
 from apex_host.planners.credential_planner import CredentialPlanner
 from apex_host.tools.registry import ToolRegistry
 
@@ -207,7 +206,7 @@ class TestAccessParser:
         assert cred_nodes[0].props["username"] == "root"
 
     def test_success_credential_node_has_redacted_secret(self) -> None:
-        stdout = f"login: root\r\nPassword:\r\nroot@host:~$ "
+        stdout = "login: root\r\nPassword:\r\nroot@host:~$ "
         obs = self._PARSER.parse_text(stdout, target=_TARGET, username="root")
         cred_nodes = [n for n in obs.node_deltas if n.type == "credential"]
         assert cred_nodes[0].props["secret_hint"] == "[redacted]"

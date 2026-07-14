@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import shutil
 
-import pytest
 
 from apex_host.config import ApexConfig
 from apex_host.tools.preflight import check_local_tools

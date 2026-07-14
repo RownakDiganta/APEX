@@ -119,7 +119,6 @@ def read_jsonl(path: str | pathlib.Path) -> list[dict[str, Any]]:
     Skips blank lines and logs (but does not raise on) malformed lines.
     Returns an empty list if the file does not exist.
     """
-    from apex_host.knowledge.compiler.schemas import CompiledKnowledgeRecord  # local import to avoid cycles
 
     p = pathlib.Path(path)
     if not p.exists():

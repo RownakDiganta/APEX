@@ -29,7 +29,6 @@ import tempfile
 from typing import Any
 from unittest.mock import patch
 
-import pytest
 
 from apex_host.config import ApexConfig
 from apex_host.policy import (
@@ -40,7 +39,7 @@ from apex_host.policy import (
     ScopePolicy,
     load_policy,
 )
-from apex_host.policy.policy_loader import _ALWAYS_BLOCKED_TOOLS, _DEFAULT_POLICY_YAML
+from apex_host.policy.policy_loader import _ALWAYS_BLOCKED_TOOLS
 
 
 # ---------------------------------------------------------------------------

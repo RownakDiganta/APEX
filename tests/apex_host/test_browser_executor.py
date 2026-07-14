@@ -13,7 +13,6 @@ Acceptance criteria verified here:
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import pytest
@@ -42,7 +41,6 @@ from apex_host.config import ApexConfig
 from apex_host.graph import build_apex_graph
 from apex_host.graph_state import ApexGraphState
 from apex_host.parsers.browser_parser import BrowserParser
-from apex_host.planners.capabilities import capabilities_from_subgraph
 from apex_host.planners.web_planner import WebPlanner
 from apex_host.tools.registry import ToolRegistry
 from apex_host.types import BrowserObservation

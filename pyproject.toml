@@ -17,13 +17,15 @@ dependencies = [
     "langchain-core>=0.3",
     "langchain-openai>=0.2",
     "python-dotenv>=1.0",
+    "PyYAML>=6.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "mypy>=1.9",
+    "ruff>=0.6",
     "types-networkx",
     "types-PyYAML",
 ]
@@ -43,3 +45,15 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+# Matches [project].requires-python; explicit rather than left to inference.
+target-version = "py311"
+# No path exclusions: ruff's default respect-gitignore=true already keeps the
+# vendored, gitignored `Knowledge/` corpus (GTFOBins/LOLBAS/PayloadsAllTheThings/
+# SecLists third-party sources, plus downloaded intel_db/methodology_db raw data)
+# out of scope. Confirmed empirically — zero lint findings ever originated under
+# `Knowledge/` — so no [tool.ruff] exclude entries were added. First-party code
+# under apex_host/knowledge/ (the compiler/loader package, distinct from the
+# root-level vendored `Knowledge/` data directory) remains fully linted.
+# Default lint rule selection (E4, E7, E9, F) is unchanged — no rules disabled.

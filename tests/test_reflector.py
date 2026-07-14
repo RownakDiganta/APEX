@@ -12,7 +12,6 @@ Section 8 invariants tested here:
 """
 from __future__ import annotations
 
-import pytest
 
 from memfabric.api import MemoryAPI
 from memfabric.config import Config

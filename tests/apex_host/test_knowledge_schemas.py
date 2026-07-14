@@ -18,8 +18,6 @@ from apex_host.knowledge.compiler.common import (
 )
 from apex_host.knowledge.compiler.schemas import (
     CompiledKnowledgeRecord,
-    SourceFamily,
-    SourceType,
 )
 
 

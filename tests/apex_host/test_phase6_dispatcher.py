@@ -22,21 +22,17 @@ import pytest
 from apex_host.execution.context import DispatchResult, ExecutionContext
 from apex_host.execution.dispatcher import (
     TaskDispatcher,
-    _CONFLICT_CRITICAL_FIELDS,
-    _CONFLICT_SENSITIVE_TOOLS,
 )
 from apex_host.execution.dispositions import (
     ExecutionDisposition,
-    RetryDecision,
     classify_retry,
 )
-from apex_host.execution.errors import ErrorCategory, ExecutionError
+from apex_host.execution.errors import ErrorCategory
 from apex_host.execution.registry import TaskRecord, TaskRegistry, TaskStatus
 from apex_host.planning.fingerprint import task_fingerprint
 from memfabric.ids import new_id, now
 from memfabric.types import (
     BlockedClaim,
-    ClaimDependency,
     EvidenceBundle,
     Goal,
     Node,
@@ -1058,9 +1054,6 @@ class TestFingerprintUpgrade:
                task_fingerprint("recon", "nmap", ["-T4", "-sV"], "x")
 
     def test_dispatcher_uses_16_char_fingerprint(self) -> None:
-        reg = TaskRegistry()
-        disp = _make_dispatcher(registry=reg)
-        # Synchronous check via event loop
         fp = task_fingerprint("recon", "nmap", [], "10.10.10.10", "nmap", "recon")
         assert len(fp) == 16
 
@@ -1150,7 +1143,6 @@ class TestCredentialPlannerCapabilitiesOnce:
 
         call_count = 0
 
-        import apex_host.planners.credential_planner as cred_mod
         import apex_host.planners.capabilities as caps_mod
 
         original = caps_mod.capabilities_from_subgraph

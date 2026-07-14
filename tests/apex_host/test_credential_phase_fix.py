@@ -11,7 +11,6 @@ Covers:
 """
 from __future__ import annotations
 
-import pytest
 
 from memfabric.ids import new_id, now
 from memfabric.types import (
@@ -20,11 +19,9 @@ from memfabric.types import (
     Goal,
     Node,
     SubgraphView,
-    TaskSpec,
 )
 
 from apex_host.parsers.access_parser import AccessParser
-from apex_host.planners.capabilities import Capability
 from apex_host.planners.credential_planner import CredentialPlanner
 from apex_host.planners.global_planner import GlobalPlanner
 from apex_host.tools.registry import ToolRegistry
@@ -228,7 +225,6 @@ class TestLLMBypassForTelnet:
 
     async def test_bypass_emits_telnet_access_not_nc(self) -> None:
         """Even when the LLM would return nc probes, telnet+creds forces telnet_access."""
-        from apex_host.config import ApexConfig
         registry = ToolRegistry(allowed_tools=["nmap", "nc", "curl"])
         router = self._stub_llm_planner_that_would_emit_nc()
         planner = CredentialPlanner(
@@ -245,7 +241,6 @@ class TestLLMBypassForTelnet:
 
     async def test_bypass_records_deterministic_decision(self) -> None:
         """Bypass path records a deterministic PlanDecision, not an LLM decision."""
-        from apex_host.config import ApexConfig
         registry = ToolRegistry(allowed_tools=["nmap", "nc", "curl"])
         router = self._stub_llm_planner_that_would_emit_nc()
         planner = CredentialPlanner(

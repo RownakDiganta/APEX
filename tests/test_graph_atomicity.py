@@ -33,7 +33,7 @@ import pytest
 
 from memfabric.api import MemoryAPI
 from memfabric.config import Config
-from memfabric.ids import new_id, now
+from memfabric.ids import now
 from memfabric.retrieval.engine import _cache_key
 from memfabric.retrieval.engine import HybridRetriever
 from memfabric.retrieval.protocols import PassthroughReranker, StubEmbedder, TextGraphMatcher
@@ -550,7 +550,7 @@ def test_t15_cache_key_includes_k() -> None:
 async def test_t16_different_k_causes_cache_miss() -> None:
     """After a k=4 query is cached, a k=8 query is NOT served from that cache."""
     api = _make_api()
-    kv: _DictKVStore = api._kv  # type: ignore[assignment]
+    kv: InMemoryKVStore = api._kv  # type: ignore[assignment]
 
     # Manually plant a fake cache entry for k=4
     tiers = [Tier.working]

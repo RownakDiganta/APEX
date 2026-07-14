@@ -37,10 +37,8 @@ from memfabric.types import SubgraphView
 from apex_host.config import ApexConfig
 from apex_host.eval.export_graph import export_ekg
 from apex_host.eval.report import (
-    RunReport,
     build_report,
     format_text,
-    to_json_dict,
     write_report_json,
 )
 from apex_host.graph_state import ApexGraphState

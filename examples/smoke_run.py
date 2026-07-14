@@ -16,7 +16,6 @@ All data is synthetic and domain-neutral.
 from __future__ import annotations
 
 import asyncio
-import pprint
 
 from memfabric.api import MemoryAPI
 from memfabric.config import Config
@@ -34,7 +33,6 @@ from memfabric.stores.lexical_bm25 import BM25LexicalIndex
 from memfabric.stores.vector_faiss import FaissVectorIndex
 from memfabric.types import (
     Edge,
-    Episode,
     Goal,
     KnowledgeEntry,
     Node,
@@ -131,7 +129,7 @@ async def main() -> None:
 
     merged = await api._graph.get_node("node-alpha")
     assert merged is not None
-    print(f"  After 2-writer merge:")
+    print("  After 2-writer merge:")
     print(f"    props       = {merged.props}")
     print(f"    provenance  = {merged._provenance}")
     assert merged.props["description"] == "analyse target"  # agent-A wrote, kept
@@ -219,7 +217,7 @@ async def main() -> None:
     await api._lexical.add("ke-2", "unrelated entry about weather patterns", {"tier": "semantic"})
 
     bundle = await api.query(text="synthetic knowledge task", k=5, tiers=[Tier.semantic])
-    print(f"  Query: 'synthetic knowledge task'")
+    print("  Query: 'synthetic knowledge task'")
     print(f"  Results ({len(bundle.entries)}):")
     for e in bundle.entries[:3]:
         print(f"    [{e.id[:8]}] score={e.score:.4f} tier={e.tier}")

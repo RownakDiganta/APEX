@@ -14,10 +14,7 @@ Coverage:
 from __future__ import annotations
 
 import json
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 
 from memfabric.ids import new_id, now
 from memfabric.types import (
@@ -33,7 +30,6 @@ from memfabric.types import (
 
 from apex_host.llm.router import FakeModelRouter
 from apex_host.planning.engine import PlanningEngine, summarize_subgraph
-from apex_host.planning.models import PlannedTask, PlannerOutput
 from apex_host.planning.prompt_builder import PromptBuilder
 from apex_host.planning.validator import Validator
 from apex_host.types import ApexPhase
@@ -525,14 +521,14 @@ class TestPlanningEngineWithStubLLM:
 
     async def test_unsafe_tool_in_llm_output_falls_back(self) -> None:
         engine, fb, _ = self._engine(_valid_output_json(tool="rm"))
-        result = await engine.plan(
+        await engine.plan(
             _goal(), ApexPhase.recon, _subgraph(_subgraph().nodes), _empty_evidence()
         )
         assert fb.call_count == 1
 
     async def test_unknown_tool_in_llm_output_falls_back(self) -> None:
         engine, fb, _ = self._engine(_valid_output_json(tool="gobuster"))
-        result = await engine.plan(
+        await engine.plan(
             _goal(), ApexPhase.recon, _subgraph(), _empty_evidence()
         )
         assert fb.call_count == 1
@@ -546,7 +542,7 @@ class TestPlanningEngineWithStubLLM:
             allowed_tools=_ALLOWED_TOOLS,
             target=_TARGET,
         )
-        result = await engine.plan(
+        await engine.plan(
             _goal(), ApexPhase.recon, _subgraph(), _empty_evidence()
         )
         assert fb.call_count == 1
@@ -567,7 +563,7 @@ class TestPlanningEngineWithStubLLM:
         data["selected_tasks"] = []
         data["stop_reason"] = None
         engine, fb, _ = self._engine(json.dumps(data))
-        result = await engine.plan(
+        await engine.plan(
             _goal(), ApexPhase.recon, _subgraph(), _empty_evidence()
         )
         assert fb.call_count == 1
