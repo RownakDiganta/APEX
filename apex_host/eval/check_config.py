@@ -106,7 +106,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _validate_combinations(config: ApexConfig) -> list[str]:
+def validate_combinations(config: ApexConfig) -> list[str]:
     """Return a list of human-readable problems with *config* as a whole.
     Empty list means the configuration is valid. Never raises."""
     problems: list[str] = []
@@ -201,7 +201,7 @@ async def _async_main(argv: list[str] | None) -> int:
     if log_level_name:
         logging.basicConfig(level=getattr(logging, log_level_name))
 
-    problems = _validate_combinations(config)
+    problems = validate_combinations(config)
     _print_summary(config, problems)
 
     if args.check_connectivity and config.tool_backend == "remote" and config.tool_service_url:

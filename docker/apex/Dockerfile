@@ -1,13 +1,14 @@
 # Dockerfile
-# Multi-stage build for the APEX application image (Infra Phase 5) — locked, non-root, dependency-only runtime. Does NOT build or start the Kali tool service (Infra Phase 6+).
+# Multi-stage build for the APEX application image (Infra Phase 5; entrypoint added Infra Phase 9) — locked, non-root, dependency-only runtime. Does NOT build or start the Kali tool service (Infra Phase 6+).
 #
 # Build from the REPOSITORY ROOT (not this directory), so the build context
 # includes pyproject.toml, uv.lock, and the first-party packages:
 #
 #   docker build -f docker/apex/Dockerfile -t apex:phase5 .
 #
-# See docs/apex-container.md for the full design rationale, what this image
-# contains/excludes, and what remains deferred to later phases.
+# See docs/apex-container.md for the Phase 5 image design rationale (what
+# this image contains/excludes) and docs/container-entrypoint.md for the
+# Phase 9 ENTRYPOINT/CMD (apex_host.container_entrypoint) design.
 
 # ---------------------------------------------------------------------------
 # Pinned tool image: uv's own official static-binary distribution, used only
@@ -173,14 +174,44 @@ USER apex
 # Python interpreter starts" would be theater, not a real signal. See
 # docs/apex-container.md "Health check decision".
 
-# Safe default: prints CLI usage and exits 0. Requires no API key, no HTB
-# VPN, no remote tool service, and does not start an engagement merely
-# because the container starts. `--target` is a required argument on both
-# apex_host.main and apex_host.eval.run_htb_local, so even an operator who
-# drops this default command entirely and runs the module bare (without
-# --help) gets a fast, safe argparse usage error — never an accidental live
-# run. Override at `docker run` time for actual use, e.g.:
-#   docker run --rm -v "$(pwd)/run_reports:/app/run_reports" apex:phase5 \
-#     python -m apex_host.eval.run_htb_local --target <IP> --dry-run \
-#     --export-json /app/run_reports/run.json
-CMD ["python", "-m", "apex_host.main", "--help"]
+# ---------------------------------------------------------------------------
+# Entrypoint (Infra Phase 9): apex_host.container_entrypoint — parses
+# configuration, prints a redacted summary, runs local preflight (report
+# directory, compiled knowledge, policy) and, for `smoke`/`run`, connectivity
+# checks — before dispatching to any operational command. Exec-form JSON
+# array (no shell), so `docker run`/Compose deliver signals directly to the
+# Python interpreter, and CMD's arguments are appended to ENTRYPOINT's argv
+# rather than being shell-interpreted. See docs/container-entrypoint.md for
+# the full mode reference (check/smoke/dry-run/run/exec).
+#
+# Safe default mode: `check` — local-only configuration/report-directory/
+# knowledge/policy validation. Requires no target, contacts no network, and
+# does not start an engagement merely because the container starts. This is
+# a stricter, more thorough safe default than Phase 5's bare `--help`: it
+# actually exercises the image's own configuration and knowledge/report
+# paths, not just argparse usage text.
+# --knowledge-root points at this image's own baked-in compiled knowledge
+# (§ "Runtime-required compiled knowledge only" above) so the default
+# `check` actually validates the real artifact this image ships, not a
+# skipped/optional check — knowledge validation is otherwise a soft-pass
+# when no root is configured (apex_host/eval/preflight.py::check_compiled_knowledge).
+ENTRYPOINT ["python", "-m", "apex_host.container_entrypoint"]
+CMD ["check", "--knowledge-root", "/app/knowledge"]
+
+# Equivalents for prior bare-module invocations, now that ENTRYPOINT is set
+# (docs/container-entrypoint.md "Troubleshooting" has the full reference):
+#
+#   Old (Infra Phase 5):
+#     docker run --rm apex:phase5 python -m apex_host.main --help
+#
+#   New, via the `exec` mode (argv-list os.execvp, no shell, no preflight —
+#   documented as intentionally bypassing the engagement workflow but not
+#   container OS permissions):
+#     docker run --rm apex-image exec -- python -m apex_host.main --help
+#
+#   New, bypassing the entrypoint entirely (also always available):
+#     docker run --rm --entrypoint python apex-image -m apex_host.main --help
+#
+#   Full dry-run engagement with report export:
+#     docker run --rm -v "$(pwd)/run_reports:/app/run_reports" apex-image \
+#       dry-run --target <IP> --export-json /app/run_reports/run.json
