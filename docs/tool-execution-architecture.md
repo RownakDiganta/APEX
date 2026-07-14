@@ -214,7 +214,7 @@ shape, plus an explicit, optional way to supply it
 | Approved action → normalized command | `TaskDispatcher._run_command()` / `_run_telnet()` / `_run_browser()` build the `ToolCommand`/task params from already-approved `task.params` only | Nothing else constructs commands after approval |
 | Normalized command → argv list | `ToolCommand.tool` + `ToolCommand.args` (a `list[str]`) — never a shell string | `apex_host/tools/safety.py::check_command` rejects shell metacharacters in every token as defense in depth even though `shell=True` is never used |
 | APEX process → child process (local) | `asyncio.create_subprocess_exec` (argv list, no shell) inside `runner.py` only | Enforced by the static architecture scan in `test_phase7_async.py` |
-| APEX process → remote Kali service (future) | Not yet built. Will be: HTTPS + bearer/token auth + JSON request/response, no shell string ever sent (§10) | `RemoteToolBackend.execute()` — currently raises `NotImplementedError` |
+| APEX process → remote Kali service | Implemented (Infra Phase 4): HTTP(S) + bearer/token auth + JSON request/response, no shell string ever sent (§10) | `RemoteToolBackend.execute()` — see `docs/remote-tool-backend.md`; container deployment itself still not built |
 | Secret material → logs/reports | `apex_host.security.redaction` (existing, CLAUDE.md §"Sensitive Data Handling") | Applies equally regardless of backend; `ApexConfig.tool_service_token` is redacted by `to_safe_dict()` |
 
 ---
@@ -378,17 +378,34 @@ out of this phase's narrow scope.
   than silently dropping it — `runner.py`'s subprocess call has no stdin
   pipe wired up yet (§19).
 
-### `RemoteToolBackend` (`apex_host/tools/backend.py`)
+### `RemoteToolBackend` (`apex_host/tools/remote_backend.py`; re-exported from `apex_host/tools/backend.py`)
 
-- **Contract only.** Constructing it is always safe (pure data holder — no
-  I/O in `__init__`). Calling `execute()` unconditionally raises
-  `NotImplementedError` naming the docs section a later phase must
-  implement against.
-- Requires a non-empty `service_url`; raises `ValueError` immediately in
-  `__init__` if one is not supplied — this is deliberately a fail-fast
-  constructor check, not a runtime surprise inside `execute()`.
-- No HTTP client, no `httpx`/`requests` import, no FastAPI/Flask — none of
-  that exists anywhere in this phase's changes.
+> **Update (Infra Phase 4):** this is no longer a contract-only stub — the
+> HTTP transport described below is fully implemented. See
+> [`docs/remote-tool-backend.md`](remote-tool-backend.md) for the complete
+> client-implementation detail (request/response mapping, error handling,
+> lifecycle, routing). The summary below is kept current but that document
+> is authoritative.
+
+- A real, asynchronous `httpx`-based HTTP client for a Phase 3
+  `apex_tool_service` instance, constructed from `ApexConfig`.
+- Requires a non-empty, `http`/`https`-scheme `service_url` and a
+  non-empty bearer token (from `config.tool_service_token` or the
+  `APEX_TOOL_SERVICE_TOKEN` environment variable); raises `ValueError`
+  immediately in `__init__` if either is missing — a fail-fast constructor
+  check, not a runtime surprise inside `execute()`.
+- Refuses to contact the network when `config.dry_run` is `True`, even if
+  explicitly constructed and injected — delegates to `DryRunToolBackend`
+  instead (defense in depth on top of `select_runtime_backend()`'s own
+  dry-run override).
+- Every ordinary failure (HTTP error status, malformed/missing/wrong-typed
+  response fields, connection/DNS/timeout transport errors) is mapped to a
+  structured `ToolResult` with `error` set — none of them propagate as a
+  raised `httpx` exception.
+- Owns a lazily-created `httpx.AsyncClient` (created on first real call,
+  not in `__init__`) with an `aclose()` method for managed lifecycle;
+  `apex_host.runtime.ApexRuntime.run()` is the fully lifecycle-managed
+  entry point.
 
 ---
 
@@ -481,10 +498,11 @@ and for handling, without raising an unhandled exception up through
   client's own timeout fires) → `timed_out=True`, mirroring
   `LocalToolBackend`'s contract.
 
-`RemoteToolBackend.execute()` must never raise for any of the above — only
-for the two documented "this is a genuine defect" cases: safety-gate
-rejection (`ValueError`, same as every other backend) and "transport not
-implemented yet" (`NotImplementedError`, this phase only).
+`RemoteToolBackend.execute()` never raises for any of the above — only for
+safety-gate rejection (`ValueError`, same as every other backend). This
+was the Phase 3 specification; Infra Phase 4 implemented it exactly as
+specified — see `docs/remote-tool-backend.md` §2.5 for the final,
+tested error-mapping table.
 
 ---
 
@@ -583,8 +601,9 @@ was not touched.
 | Tool not found in PATH (local) | `ToolResult(error="tool '...' not found in PATH", returncode=-1)` | `runner.py`, unchanged |
 | Local process timeout | `ToolResult(timed_out=True, error="command timed out after Ns", returncode=-1)` | `runner.py`, `timed_out` is new in this phase |
 | Local `OSError` on launch | `ToolResult(error=str(exc), returncode=-1)` | `runner.py`, unchanged |
-| Remote transport not implemented | `NotImplementedError` (this phase only — deliberately loud, not swallowed) | `RemoteToolBackend.execute()` |
-| Remote connection/HTTP/parse errors (future) | `ToolResult(error=..., returncode=-1)`, never an unhandled exception | Specified in §10; not yet built |
+| Remote HTTP error status (400/401/403/404/422/500/503) | `ToolResult(error="tool service returned HTTP {status}: ...", returncode=-1, backend="remote")` | `apex_host/tools/remote_backend.py`, Infra Phase 4 |
+| Remote connection/DNS/timeout/malformed-response errors | `ToolResult(error=..., returncode=-1, backend="remote")`, never an unhandled exception | `apex_host/tools/remote_backend.py`, Infra Phase 4 — full table in `docs/remote-tool-backend.md` §2.5 |
+| Remote backend construction error (bad URL/missing token) | `ValueError`, raised immediately in `__init__` — a configuration bug, not a runtime condition | `RemoteToolBackend.__init__` |
 | Policy block | `DispatchResult(disposition=BLOCKED_POLICY, ...)`, backend never called | `TaskDispatcher.dispatch()`, unchanged |
 | Conflict block | `DispatchResult(disposition=BLOCKED_CONFLICT, ...)`, backend never called | `TaskDispatcher.dispatch()`, unchanged |
 | Duplicate task | `DispatchResult(disposition=SKIPPED_DUPLICATE, ...)`, backend never called | `TaskDispatcher.dispatch()`, unchanged |
@@ -592,9 +611,10 @@ was not touched.
 The design principle carried into `ToolBackend`: **ordinary command
 failure is data (a `ToolResult` with a non-zero `returncode` or a
 populated `error`), never an exception.** The only exceptions any
-implementation is expected to raise are `ValueError` (safety-gate
-rejection — a caller bug, not a runtime condition) and, for
-`RemoteToolBackend` only in this phase, `NotImplementedError`.
+implementation raises are `ValueError` — either safety-gate rejection (a
+caller bug, not a runtime condition) or, for `RemoteToolBackend`
+specifically, a configuration error detected at construction time (bad
+URL, missing token) that makes continuing unsafe.
 
 ---
 
@@ -670,7 +690,7 @@ of this phase (per the task brief's explicit prohibition).
 | Infra Phase 1 | `uv` dependency/environment management | ✓ Complete (see CLAUDE.md §22) |
 | **Infra Phase 2 (this document)** | `ToolBackend` protocol, `DryRunToolBackend`, `LocalToolBackend`, `RemoteToolBackend` (contract only), `ApexConfig` fields, `build_apex_graph(tool_backend=...)` opt-in seam, this document, focused tests | ✓ Complete |
 | **Infra Phase 3** | Build and containerize-*ready* (not yet containerized) the restricted Kali tool service (`apex_tool_service/`) implementing §11's server-side allowlist/timeout/audit/health requirements — see [`docs/kali-tool-service.md`](kali-tool-service.md) | ✓ Complete |
-| Infra Phase 4 (proposed) | Implement `RemoteToolBackend`'s HTTP transport in `apex_host` against the now-finalized contract (§10, `docs/kali-tool-service.md` §5); wire `config.tool_backend` into `build_apex_graph()`'s *default* construction (today it requires an explicit `tool_backend=` argument); thread `ToolResult.timed_out`/`backend` into `dispatcher.py`'s dict and `RunReport` (§7, §15) | Not started |
+| **Infra Phase 4** | Implemented `RemoteToolBackend`'s HTTP transport in `apex_host` against the finalized contract (§10, `docs/kali-tool-service.md` §5); centralized default backend selection (`select_runtime_backend()`) wired into `build_apex_graph()` and `ApexRuntime.run()`; threaded `ToolResult.timed_out`/`backend` into `dispatcher.py`'s dict and `RunReport` (§7, §15) — see [`docs/remote-tool-backend.md`](remote-tool-backend.md) | ✓ Complete |
 | Infra Phase 5 (proposed) | Kali-based Dockerfile running `apex_tool_service` as its entrypoint; APEX application Dockerfile | Not started |
 | Infra Phase 6 (proposed) | Docker Compose wiring APEX + Kali service on an isolated network | Not started |
 | Infra Phase 7 (proposed) | Wire `ToolCommand.stdin` into `runner.py`'s subprocess call for local interactive use cases that need it (§8, §12, §19) | Not started |
@@ -750,29 +770,25 @@ new type (§6).
    currently has no real caller (no local interactive use case needs it
    yet — `TelnetExecutor` uses its own transport). Deferred to Infra
    Phase 7 rather than done speculatively here.
-2. **`config.tool_backend` is defined but not consumed by
-   `build_apex_graph()`'s default construction.** Only the explicit
-   `tool_backend=` keyword argument is honored. This was a deliberate,
-   conservative choice: auto-wiring `config.tool_backend` into the default
-   path would mean the *value read from configuration*, not just an
-   explicit test/caller argument, decides which backend runs in
-   production — worth validating end-to-end against a real
-   `RemoteToolBackend` (Phase 3) rather than wiring blind.
-3. **`ToolResult.timed_out`/`backend` are not yet visible in
-   `RunReport`/EKG episodes.** See §7, §15. Anyone building tooling that
-   needs to distinguish "this result came from the remote Kali service" at
-   the report layer will need Phase 3's dict/report threading first.
+2. **RESOLVED (Infra Phase 4).** `config.tool_backend` is now consumed by
+   `build_apex_graph()`'s default construction via
+   `select_runtime_backend()`, and `apex_host.runtime.ApexRuntime.run()`
+   uses the same centralized selector with managed backend lifecycle. See
+   `docs/remote-tool-backend.md` §1.
+3. **RESOLVED (Infra Phase 4).** `ToolResult.timed_out`/`backend` now flow
+   into `RunReport.backend_usage`/`.timed_out_count` (and were already
+   present in EKG episode data since Phase 2, once the fields existed on
+   `ToolResult`). See `docs/remote-tool-backend.md` §6.
 4. **`ReconExecutor`/`ExecuteExecutor` (§1.3) remain unconsolidated.**
    They are dead code from the live graph's perspective but are still
    exercised by their own tests. Deleting or merging them was judged out
-   of scope ("narrowly scoped... without changing runtime behavior") but
-   is flagged here so a future cleanup phase does not have to rediscover
-   it.
-5. **The exact remote response schema (§10) is a sketch, not a contract
-   frozen by a server implementation.** Field names/types may need to
-   change once Phase 3 builds against a real service and discovers what
-   the service can actually report (e.g. process exit signal vs. exit
-   code, partial-output-on-timeout semantics).
+   of scope ("narrowly scoped... without changing runtime behavior") in
+   both Phase 2 and Phase 4 — still flagged here so a future cleanup phase
+   does not have to rediscover it.
+5. **RESOLVED (Infra Phase 4).** The remote response schema is now frozen
+   by the real Phase 3 `apex_tool_service` implementation and validated
+   field-by-field (name and Python type) by `RemoteToolBackend._map_response()`.
+   See `docs/kali-tool-service.md` §5 for the authoritative schema.
 6. **Output-size bounding for local execution is still unbounded** (§14).
    This is pre-existing behavior, not introduced by this phase, but it is
    a real deferred risk worth fixing before any local tool execution is

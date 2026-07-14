@@ -160,34 +160,47 @@ class ApexConfig:
     # parser_timeout_seconds: maximum wall-clock time for a parser call.
     parser_timeout_seconds: float = 10.0
     # ---------------------------------------------------------------------------
-    # Infra Phase 2 — tool-execution backend selection
-    # (docs/tool-execution-architecture.md; apex_host/tools/backend.py)
+    # Infra Phase 2/4 — tool-execution backend selection
+    # (docs/tool-execution-architecture.md; docs/remote-tool-backend.md;
+    #  apex_host/tools/backend.py; apex_host/tools/remote_backend.py)
     # ---------------------------------------------------------------------------
     # tool_backend selects which ToolBackend apex_host.tools.backend.select_tool_backend()
-    # constructs.  This field is NOT yet consumed by build_apex_graph()'s default
-    # wiring — build_apex_graph(tool_backend=...) accepts an explicit ToolBackend
-    # instance instead (see that function's docstring).  Wiring config.tool_backend
-    # into the default construction path is deferred to a later phase, once
-    # RemoteToolBackend's transport exists and a live selection matrix can be
-    # validated end-to-end.
-    #   "dry-run": DryRunToolBackend — never executes a process.
-    #   "local":   LocalToolBackend — the existing trusted-subprocess pathway
-    #              (apex_host/tools/runner.py); still honors dry_run internally.
-    #   "remote":  RemoteToolBackend — CONTRACT ONLY in this phase; execute()
-    #              raises NotImplementedError.
-    # "local" is the default because it is what build_apex_graph() already uses
-    # today (via apex_host.tools.runner.run_command) — this field does not change
-    # default runtime behavior.
+    # constructs; values are normalized (case/whitespace) at the point of
+    # interpretation, not here.  As of Infra Phase 4, this field IS consumed
+    # by the default construction path: apex_host.runtime.ApexRuntime.run()
+    # and apex_host.orchestration.builder.build_apex_graph() (when no
+    # explicit tool_backend= is injected) both call
+    # apex_host.tools.backend.select_runtime_backend(config), which applies
+    # one binding safety invariant on top of this field:
+    #   dry_run=True  → ALWAYS DryRunToolBackend, regardless of this field.
+    #   dry_run=False → the backend named by this field, exactly:
+    #     "dry-run": DryRunToolBackend — never executes a process.
+    #     "local":   LocalToolBackend — the trusted local-subprocess pathway
+    #                (apex_host/tools/runner.py); still honors dry_run
+    #                internally as a second, redundant safety layer.
+    #     "remote":  RemoteToolBackend — a real async HTTP client for a
+    #                Phase 3 apex_tool_service instance. Also refuses to
+    #                contact the network if dry_run=True (defense in depth,
+    #                in case this class is ever constructed and injected
+    #                directly, bypassing select_runtime_backend).
+    # "local" remains the default because it is what build_apex_graph() has
+    # always used — this field's default does not change default runtime
+    # behavior.  CLI: --tool-backend (apex_host/main.py, eval/run_htb_local.py).
     tool_backend: str = "local"
-    # tool_service_url / tool_service_token / tool_service_timeout_seconds
-    # configure RemoteToolBackend (contract only — no request is ever sent in
-    # this phase).  No default secret: tool_service_token defaults to the
-    # empty string, never a real credential.  Do not read these from
-    # environment variables inside this module — see CLAUDE.md's config
-    # centralization rule; env-var wiring (e.g. APEX_TOOL_SERVICE_TOKEN) is
-    # deferred to the phase that adds .env support.
+    # tool_service_url configures RemoteToolBackend's target. CLI:
+    # --tool-service-url. No default (None) — RemoteToolBackend.__init__
+    # raises ValueError if tool_backend="remote" is selected without one.
     tool_service_url: str | None = None
+    # tool_service_token: NO CLI flag exists for this on purpose (CLI args
+    # are visible in shell history and `ps`).  RemoteToolBackend reads this
+    # field first, falling back to the APEX_TOOL_SERVICE_TOKEN environment
+    # variable if empty — mirrors apex_host/llm/router.py::OpenAIModelRouter's
+    # OPENAI_API_KEY precedent.  This field's own default ("") is never a
+    # real credential.  This module (config.py) never reads environment
+    # variables itself — enforced by test_arch_08_config_py_has_no_env_access.
     tool_service_token: str = ""
+    # tool_service_timeout_seconds: overall request timeout budget for
+    # RemoteToolBackend. CLI: --tool-service-timeout.
     tool_service_timeout_seconds: float = 120.0
     # Configuration schema version — increment when the config format changes in a
     # backward-incompatible way (new required fields, renamed fields, type changes).
@@ -248,6 +261,16 @@ class ApexConfig:
             "knowledge_root": _g("knowledge_root", None),
             "policy_file": _g("policy_file", None),
             "llm_stop_on_repeated_plan": bool(_g("llm_stop_on_repeated_plan", True)),
+            # Infra Phase 4 — tool-execution backend selection. Note there is
+            # deliberately NO --tool-service-token CLI flag: the bearer token
+            # is read from the APEX_TOOL_SERVICE_TOKEN environment variable
+            # at the point RemoteToolBackend is constructed (never here —
+            # this file has no environment-variable access, enforced by
+            # test_arch_08_config_py_has_no_env_access), because CLI
+            # arguments are visible in shell history and process listings
+            # (`ps`) while environment variables set via `export` are not.
+            "tool_backend": _g("tool_backend", "local"),
+            "tool_service_url": _g("tool_service_url", None),
         }
         if getattr(args, "max_llm_calls", None) is not None:
             kwargs["max_llm_calls_per_run"] = int(getattr(args, "max_llm_calls"))
@@ -255,6 +278,8 @@ class ApexConfig:
             kwargs["max_llm_calls_per_phase"] = int(getattr(args, "max_llm_calls_per_phase"))
         if getattr(args, "llm_timeout", None) is not None:
             kwargs["llm_request_timeout_seconds"] = float(getattr(args, "llm_timeout"))
+        if getattr(args, "tool_service_timeout", None) is not None:
+            kwargs["tool_service_timeout_seconds"] = float(getattr(args, "tool_service_timeout"))
         llm_model = getattr(args, "llm_model", None)
         if llm_model:
             kwargs["planner_model"] = str(llm_model)

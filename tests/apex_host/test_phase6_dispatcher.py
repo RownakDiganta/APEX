@@ -151,6 +151,8 @@ class _FakeToolResult:
     returncode: int = 0
     dry_run: bool = True
     error: str | None = None
+    timed_out: bool = False
+    backend: str = "local"
 
 
 def _make_dispatcher(

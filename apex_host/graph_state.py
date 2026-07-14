@@ -78,6 +78,15 @@ class ApexGraphState(TypedDict):
     # turns; ``TaskRegistry.restore_from_snapshot()`` uses this to skip
     # already-completed tasks after a resume from checkpoint.
     completed_fingerprints: Annotated[list[dict[str, Any]], operator.add]
+    # Infra Phase 4: lightweight per-execution backend/timeout audit log.
+    # One entry per non-skipped tool_result written in write_memory, with
+    # fields {tool, backend, timed_out, phase}. Distinct from the full
+    # tool_result (stored verbatim in episode.data) — this accumulated list
+    # exists so apex_host/eval/report.py can summarize which backend
+    # ("dry-run" | "local" | "remote") executed each task and how many
+    # timed out, across the whole run, without re-querying the episodic
+    # store. See docs/remote-tool-backend.md "Report fields".
+    execution_backend_log: Annotated[list[dict[str, Any]], operator.add]
 
 
 CompiledApexGraph = Any

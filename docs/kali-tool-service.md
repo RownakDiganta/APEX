@@ -1,9 +1,12 @@
 # Kali Tool Service
 
 **Status:** Infra Phase 3 — implemented, independently runnable, independently
-tested. **Not yet deployed inside any Kali container. Not yet callable from
-`apex_host`.**
-**Date:** 2026-07-14
+tested. **Infra Phase 4** wired a real `RemoteToolBackend` HTTP client into
+`apex_host` that speaks the contract described here (see
+[`docs/remote-tool-backend.md`](remote-tool-backend.md)). **Still not yet
+deployed inside any Kali container — no Dockerfile, Compose, or VPN
+networking exists.**
+**Date:** 2026-07-14 (Phase 3); updated 2026-07-14 (Phase 4 cross-references)
 **Package:** `apex_tool_service/` (repo root, parallel to `apex_host/` and
 `memfabric/`)
 
@@ -12,12 +15,13 @@ Infra Phase 3, implementing the contract specified in
 [`docs/tool-execution-architecture.md`](tool-execution-architecture.md) §10.
 Every claim below refers to code that exists in this repository today.
 
-**What this phase did NOT do** (see §17–§18): no Kali container image, no
-APEX Dockerfile, no Docker Compose, no `RemoteToolBackend` HTTP client in
-`apex_host`, no `.env.example`, no VPN networking, no CI publishing, no
-Meow-specific change. This service currently only runs as a local process
-on the developer's own machine or in a future CI job — nothing calls it
-over a network from APEX yet.
+**What remains undone** (see §17–§18): no Kali container image, no APEX
+Dockerfile, no Docker Compose, no `.env.example`, no VPN networking, no CI
+publishing, no Meow-specific change. The `RemoteToolBackend` HTTP client in
+`apex_host` (§17) is now implemented and tested end-to-end in-process, but
+it has never been run against a real network-deployed instance of this
+service — only in-process (`httpx.ASGITransport`) and against a locally
+started process on the same machine.
 
 ---
 
@@ -417,24 +421,29 @@ the current macOS development environment and a future Linux CI runner.
 
 ## 14. Expected future Kali-container integration
 
-**Not built in this phase.** The intended shape (Infra Phase 4+, per
-`docs/tool-execution-architecture.md` §17):
+**Container deployment not built yet.** What Infra Phase 4 completed and
+what remains, per `docs/tool-execution-architecture.md` §17 and
+`docs/remote-tool-backend.md`:
 
-1. A Kali-based container image installs the real `nmap`/`curl`/`nc`/etc.
-   binaries and runs `apex_tool_service` (this package, unchanged) as its
-   entrypoint (`python -m apex_tool_service`).
-2. The container is reachable only from the APEX application's own
-   container/network segment — never exposed publicly — consistent with
-   `APEX_TOOL_SERVICE_HOST` defaulting to `127.0.0.1` (an operator
-   deploying this into a container must explicitly bind `0.0.0.0` or the
-   container's interface).
-3. `apex_host`'s `RemoteToolBackend.execute()` (currently a contract-only
-   stub — `docs/tool-execution-architecture.md` §8) gains an actual HTTP
-   client implementation that calls this service's `POST /v1/execute`
-   using the exact request/response shapes in §5 above.
+1. **Still not built:** a Kali-based container image that installs the
+   real `nmap`/`curl`/`nc`/etc. binaries and runs `apex_tool_service` (this
+   package, unchanged) as its entrypoint (`python -m apex_tool_service`).
+2. **Still not built:** container-network isolation (the container reachable
+   only from the APEX application's own container/network segment, never
+   exposed publicly) — consistent with `APEX_TOOL_SERVICE_HOST` defaulting
+   to `127.0.0.1` (an operator deploying this into a container must
+   explicitly bind `0.0.0.0` or the container's interface), but no actual
+   container or network policy exists yet.
+3. **Done in Infra Phase 4:** `apex_host`'s `RemoteToolBackend.execute()`
+   (previously a contract-only stub) now has a real, tested HTTP client
+   implementation (`apex_host/tools/remote_backend.py`) that calls this
+   service's `POST /v1/execute` using the exact request/response shapes in
+   §5 above — validated end-to-end in-process (no container needed) by the
+   contract-integration tests in `tests/apex_host/test_remote_backend.py`.
+   Full detail: `docs/remote-tool-backend.md`.
 
 No Dockerfile for this service, no base-image selection, and no
-container-networking decision were made in this phase.
+container-networking decision have been made as of Infra Phase 4.
 
 ---
 
@@ -491,22 +500,27 @@ task brief.
 
 ---
 
-## 17. Deferred Phase 4 client work
+## 17. Phase 4 client work — now complete
 
-- Implement `apex_host.tools.backend.RemoteToolBackend.execute()`'s actual
-  HTTP transport (currently `NotImplementedError` —
-  `docs/tool-execution-architecture.md` §8) against this service's
-  `POST /v1/execute` contract (§5).
-- Wire `ApexConfig.tool_backend` into `build_apex_graph()`'s *default*
-  backend construction (today only the explicit `tool_backend=` keyword
-  argument is honored — `docs/tool-execution-architecture.md` §19).
-- Thread `ExecuteResponse`'s `timed_out`/`backend` fields (already present
-  on `apex_host.types.ToolResult` since Infra Phase 2) through
-  `TaskDispatcher`'s dict-building code and `RunReport`/EKG episodes.
-- Client-side connection-error/non-2xx/malformed-response/remote-timeout
-  handling exactly as specified in `docs/tool-execution-architecture.md`
-  §10 — none of that client logic exists yet; only the server side
-  (this document) is built.
+All four items originally deferred here were completed in Infra Phase 4.
+Full detail lives in [`docs/remote-tool-backend.md`](remote-tool-backend.md):
+
+- ✓ `apex_host.tools.remote_backend.RemoteToolBackend.execute()`'s HTTP
+  transport is implemented against this service's `POST /v1/execute`
+  contract (§5).
+- ✓ `ApexConfig.tool_backend` is wired into `build_apex_graph()`'s
+  *default* backend construction (and `apex_host.runtime.ApexRuntime.run()`)
+  via `apex_host.tools.backend.select_runtime_backend()`.
+- ✓ `ExecuteResponse`'s `timed_out`/`backend` fields are threaded through
+  `TaskDispatcher`'s dict-building code into `RunReport.backend_usage`/
+  `.timed_out_count` and EKG episode data.
+- ✓ Client-side connection-error/non-2xx/malformed-response/remote-timeout
+  handling is implemented exactly as specified in
+  `docs/tool-execution-architecture.md` §10 (finalized in §5 above).
+
+**Still not started (unchanged by Infra Phase 4):** the actual Kali
+container, APEX container, Docker Compose, VPN networking, CI publishing —
+see §18 below and `docs/remote-tool-backend.md` §8.
 
 ---
 

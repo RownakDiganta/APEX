@@ -88,40 +88,67 @@ def build_apex_graph(
     """Compile and return the APEX engagement StateGraph.
 
     Public signature is backward compatible with ``apex_host/graph.py``: all
-    prior parameters are unchanged, and the new ``tool_backend`` parameter is
-    optional and defaults to ``None``, which preserves the exact prior
-    behavior (subprocess execution via ``apex_host.tools.runner.run_command``).
-    The implementation delegates to node factories in the orchestration package.
+    prior parameters are unchanged. The implementation delegates to node
+    factories in the orchestration package.
 
-    ``tool_backend`` (Infra Phase 2 — see ``docs/tool-execution-architecture.md``):
-    when provided, ``TaskDispatcher`` calls this ``ToolBackend`` (via
-    ``apex_host.tools.backend.to_run_command_fn``) instead of the default
-    ``run_command``. This is a narrow, opt-in seam — it does not change
-    default behavior and does not itself read ``config.tool_backend``
-    (callers construct the backend explicitly, e.g. via
-    ``apex_host.tools.backend.select_tool_backend(config)``, and pass it
-    here). Policy approval in ``TaskDispatcher.dispatch()`` runs identically
+    ``tool_backend`` (Infra Phase 2 seam; Infra Phase 4 centralized default
+    selection — see ``docs/tool-execution-architecture.md`` and
+    ``docs/remote-tool-backend.md``):
+
+    - When provided explicitly, ``TaskDispatcher`` calls this ``ToolBackend``
+      (via ``apex_host.tools.backend.to_run_command_fn``) instead of any
+      config-derived default. Tests and other direct callers that need a
+      specific backend (e.g. a spy, or a real ``LocalToolBackend`` under a
+      dry-run config) should keep injecting it this way.
+    - When ``None`` (the default), the backend is derived centrally from
+      *config* via ``apex_host.tools.backend.select_runtime_backend(config)``
+      — this is what makes normal engagement construction (``apex_host.runtime.
+      ApexRuntime.run()``, ``apex_host.eval.run_htb_local``) select the
+      correct backend automatically without manual injection.
+      ``select_runtime_backend`` enforces the binding safety invariant that
+      ``config.dry_run=True`` always yields ``DryRunToolBackend`` regardless
+      of ``config.tool_backend`` — see that function's docstring.
+    - For the *unchanged* default configuration (``dry_run=True`` or
+      ``dry_run=False`` with ``tool_backend="local"``, both true of a
+      default-constructed ``ApexConfig``), the resulting behavior is
+      identical to calling ``apex_host.tools.runner.run_command`` directly, as it always
+      was — ``LocalToolBackend``/``DryRunToolBackend`` are thin wrappers
+      around exactly that function.
+    - **Lifecycle note:** when this function constructs the backend
+      internally (``tool_backend=None`` and ``config.tool_backend="remote"``
+      with ``dry_run=False``), the resulting ``RemoteToolBackend`` owns an
+      ``httpx.AsyncClient`` that this function does not close — callers who
+      want managed lifecycle (client construction *and* ``aclose()`` after
+      the run) should use ``apex_host.runtime.ApexRuntime.run()``, which
+      constructs the backend explicitly and closes it in a ``finally``
+      block. Direct ``build_apex_graph()`` callers that end up with a
+      lazily-constructed remote backend and care about clean shutdown
+      should inject ``tool_backend=`` explicitly instead and manage its
+      ``aclose()`` themselves.
+
+    Policy approval in ``TaskDispatcher.dispatch()`` runs identically
     regardless of which backend is supplied — this parameter only replaces
-    *how* an already-approved command is executed, never whether it is
-    approved.
+    *how* an already-approved generic command executes, never whether it is
+    approved. ``TelnetExecutor`` and ``BrowserExecutor`` are unaffected by
+    ``tool_backend`` entirely — they are wired into ``TaskDispatcher``
+    through their own dedicated constructor parameters and are never routed
+    through ``run_command_fn`` (see ``docs/remote-tool-backend.md``
+    "Generic versus interactive routing").
     """
     from apex_host.agents.browser_executor import BrowserExecutor
     from apex_host.agents.telnet_executor import TelnetExecutor
     from apex_host.execution.dispatcher import TaskDispatcher
     from apex_host.execution.registry import TaskRegistry
     from apex_host.planning.repair import RepairEngine
+    from apex_host.tools.backend import select_runtime_backend, to_run_command_fn
 
     if advisor is None:
         advisor = PolicyAdvisor(load_policy(config), config)
 
     if tool_backend is not None:
-        from apex_host.tools.backend import to_run_command_fn
-
         run_command_fn = to_run_command_fn(tool_backend)
     else:
-        from apex_host.tools.runner import run_command
-
-        run_command_fn = run_command
+        run_command_fn = to_run_command_fn(select_runtime_backend(config))
 
     llm_guard, llm_gateway = _build_llm_components(model_router, config, budget_tracker)
     phase_planners = build_planners(

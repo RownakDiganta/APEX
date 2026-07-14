@@ -403,12 +403,14 @@ class TaskDispatcher:
         try:
             result = await self._run_command_fn(cmd, self._config)
         except ValueError as exc:
-            # Safety gate in runner.py rejected the command.
+            # Safety gate in runner.py (or a ToolBackend's own check_command
+            # call) rejected the command before any backend was reached.
             tr: dict[str, Any] = {
                 "task_id": task.id, "tool": tool, "args": args,
                 "target": target, "parser": parser, "stdout": "",
                 "stderr": "", "returncode": 1, "dry_run": self._config.dry_run,
                 "error": str(exc), "phase": phase,
+                "timed_out": False, "backend": "",
             }
             return tr, ExecutionDisposition.INVALID_TASK
 
@@ -424,6 +426,11 @@ class TaskDispatcher:
             "stdout": result.stdout, "stderr": result.stderr,
             "returncode": result.returncode, "dry_run": result.dry_run,
             "error": error, "phase": phase,
+            # Infra Phase 4: identifies which ToolBackend actually produced
+            # this result ("dry-run" | "local" | "remote") and whether
+            # execution was terminated by its own timeout. See
+            # docs/remote-tool-backend.md "Report fields".
+            "timed_out": result.timed_out, "backend": result.backend,
         }
         return tr, disposition
 
