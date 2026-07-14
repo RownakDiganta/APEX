@@ -658,6 +658,18 @@ python -m apex_host.main --target 127.0.0.1 --payload-repo ./payloads --dry-run
 
 runs the full engagement end-to-end with **zero real command execution**.
 
+**Tool execution architecture (Infra Phase 2):** `apex_host/tools/backend.py`
+defines a `ToolBackend` protocol — `DryRunToolBackend`, `LocalToolBackend`
+(wraps the `runner.py` pathway above unchanged), and a contract-only
+`RemoteToolBackend` stub for a future restricted Kali tool service. This
+formalizes, but does not change, today's execution behavior — the default
+(`build_apex_graph()` with no `tool_backend` argument) is byte-for-byte the
+same as before. `RemoteToolBackend.execute()` always raises
+`NotImplementedError`; no network transport, container, or Kali service
+exists yet. Full design, trust boundaries, and the phase-by-phase plan for
+implementing the remote backend live in
+[`docs/tool-execution-architecture.md`](docs/tool-execution-architecture.md).
+
 ---
 
 ## APEX Host Quickstart

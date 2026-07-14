@@ -44,6 +44,11 @@ class ToolCommand:
     args: list[str]
     timeout_seconds: int = 30
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Optional stdin payload for controlled interactive adapters (e.g. a future
+    # ToolBackend that pipes input to a tool expecting stdin). Not yet wired
+    # into apex_host/tools/runner.py's subprocess invocation — see
+    # docs/tool-execution-architecture.md ("Open risks and deferred questions").
+    stdin: str | None = None
 
 
 @dataclass(slots=True)
@@ -56,6 +61,18 @@ class ToolResult:
     duration_seconds: float
     dry_run: bool = False
     error: str | None = None
+    # Backend-abstraction fields (Infra Phase 2 — docs/tool-execution-architecture.md).
+    # timed_out: True only when the command was terminated because it exceeded
+    #   its timeout (as opposed to a normal non-zero exit or an OSError).
+    timed_out: bool = False
+    # backend: identifies which execution mode actually produced this result —
+    #   "dry-run" (no process was spawned) or "local" (a real local subprocess
+    #   ran). A future "remote" value will identify results produced by
+    #   RemoteToolBackend once its transport is implemented. Note this reflects
+    #   the *execution mode*, not necessarily which ToolBackend class was
+    #   invoked: LocalToolBackend still honors ApexConfig.dry_run internally
+    #   (defense in depth) and will itself report backend="dry-run" when it does.
+    backend: str = ""
 
 
 @dataclass(slots=True)

@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from apex_host.config import ApexConfig
     from apex_host.llm.router import ModelRouter
     from apex_host.planning.budget import LLMBudgetTracker
+    from apex_host.tools.backend import ToolBackend
     from memfabric.api import MemoryAPI
 
 logger = logging.getLogger(__name__)
@@ -82,21 +83,45 @@ def build_apex_graph(
     model_router: "ModelRouter | None" = None,
     advisor: "PolicyAdvisor | None" = None,
     budget_tracker: "LLMBudgetTracker | None" = None,
+    tool_backend: "ToolBackend | None" = None,
 ) -> CompiledApexGraph:
     """Compile and return the APEX engagement StateGraph.
 
-    Public signature is unchanged from ``apex_host/graph.py``.  The
-    implementation delegates to node factories in the orchestration package.
+    Public signature is backward compatible with ``apex_host/graph.py``: all
+    prior parameters are unchanged, and the new ``tool_backend`` parameter is
+    optional and defaults to ``None``, which preserves the exact prior
+    behavior (subprocess execution via ``apex_host.tools.runner.run_command``).
+    The implementation delegates to node factories in the orchestration package.
+
+    ``tool_backend`` (Infra Phase 2 — see ``docs/tool-execution-architecture.md``):
+    when provided, ``TaskDispatcher`` calls this ``ToolBackend`` (via
+    ``apex_host.tools.backend.to_run_command_fn``) instead of the default
+    ``run_command``. This is a narrow, opt-in seam — it does not change
+    default behavior and does not itself read ``config.tool_backend``
+    (callers construct the backend explicitly, e.g. via
+    ``apex_host.tools.backend.select_tool_backend(config)``, and pass it
+    here). Policy approval in ``TaskDispatcher.dispatch()`` runs identically
+    regardless of which backend is supplied — this parameter only replaces
+    *how* an already-approved command is executed, never whether it is
+    approved.
     """
     from apex_host.agents.browser_executor import BrowserExecutor
     from apex_host.agents.telnet_executor import TelnetExecutor
     from apex_host.execution.dispatcher import TaskDispatcher
     from apex_host.execution.registry import TaskRegistry
     from apex_host.planning.repair import RepairEngine
-    from apex_host.tools.runner import run_command
 
     if advisor is None:
         advisor = PolicyAdvisor(load_policy(config), config)
+
+    if tool_backend is not None:
+        from apex_host.tools.backend import to_run_command_fn
+
+        run_command_fn = to_run_command_fn(tool_backend)
+    else:
+        from apex_host.tools.runner import run_command
+
+        run_command_fn = run_command
 
     llm_guard, llm_gateway = _build_llm_components(model_router, config, budget_tracker)
     phase_planners = build_planners(
@@ -114,7 +139,7 @@ def build_apex_graph(
     task_registry = TaskRegistry()
     dispatcher = TaskDispatcher(
         advisor=advisor, task_registry=task_registry, config=config,
-        run_command_fn=run_command,
+        run_command_fn=run_command_fn,
         telnet_executor=telnet_executor, browser_executor=browser_executor,
     )
     _max_repair = getattr(config, "max_repair_attempts", 1)
