@@ -67,6 +67,29 @@ class Outcome(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# Skill outcome disposition (for lifecycle tracking)
+# ---------------------------------------------------------------------------
+
+class SkillOutcomeDisposition(str, Enum):
+    """Disposition of a skill following task execution.
+
+    Used by ``MemoryAPI.record_skill_execution()`` to update wins/losses.
+
+    ``WIN``: the task succeeded (``Outcome.success``).
+    ``LOSS``: the task failed with a fundamental error (``Outcome.fundamental``).
+    ``NEUTRAL``: the task failed transiently (``script_error``, ``fixable``); the
+      outcome does not count against the skill.
+    ``NOT_EXECUTED``: the task was blocked before execution (policy block, conflict
+      block, or duplicate skip); wins/losses are not updated.
+    """
+
+    WIN = "win"
+    LOSS = "loss"
+    NEUTRAL = "neutral"
+    NOT_EXECUTED = "not_executed"
+
+
+# ---------------------------------------------------------------------------
 # Working-memory graph types
 # ---------------------------------------------------------------------------
 
@@ -146,6 +169,9 @@ class Skill:
     confidence: float
     wins: int = 0
     losses: int = 0
+    # Legacy run-counter for decay (kept for backward compatibility).
+    # New code should prefer last_used_run_number (set by MemoryAPI lifecycle
+    # methods).  should_decay() uses last_used_run_number when set.
     last_used_run: int = 0
     quarantined: bool = False
     promoted: bool = False
@@ -153,6 +179,31 @@ class Skill:
     timestamp: str = ""
     embedding: list[float] | None = None
     evidence_count: int = 0
+    # --- Phase 3 lifecycle fields (all optional for backward compatibility) ---
+    # Monotonic run-number fields — set by MemoryAPI lifecycle methods.
+    # These use the global _completed_run_number from MemoryAPI, not local counters.
+    created_run_number: int = 0
+    promoted_run_number: int | None = None
+    last_retrieved_run_number: int | None = None
+    last_selected_run_number: int | None = None
+    last_executed_run_number: int | None = None
+    # Primary "last used" field for decay logic (set on any retrieve/select/execute).
+    # When set, should_decay() uses this instead of last_used_run.
+    last_used_run_number: int | None = None
+    # Tracks idempotence: decay_skill() skips if last_decay_run_number == current_run.
+    last_decay_run_number: int | None = None
+    quarantined_run_number: int | None = None
+    # Wall-clock timestamps for each lifecycle event (ISO-8601 UTC)
+    last_retrieved_at: str | None = None
+    last_selected_at: str | None = None
+    last_executed_at: str | None = None
+    # Event counters (separate from wins/losses which track outcomes)
+    retrieval_count: int = 0
+    selection_count: int = 0
+    execution_count: int = 0
+    # Quarantine metadata
+    quarantine_reason: str | None = None
+    quarantined_at: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -171,12 +222,97 @@ class ScoredEntry:
 
 
 @dataclass(slots=True)
+class RetrievalDiagnostics:
+    """Observable diagnostics attached to every HybridRetriever result bundle.
+
+    Serializable and testable.  All numeric counts are 0 when the corresponding
+    channel did not run.  ``channels_attempted`` lists the channels that were
+    invoked; ``channels_skipped`` lists channels that were configured but not
+    invoked (e.g. dense skipped because StubEmbedder and gate closed).
+    """
+    cache_hit: bool
+    channels_attempted: list[str]
+    channels_skipped: list[str]
+    lexical_top_score: float         # max raw BM25 score before tier filter (0.0 if none)
+    lexical_candidate_count: int     # BM25 results after tier filter
+    dense_candidate_count: int
+    graph_candidate_count: int
+    regex_candidate_count: int
+    fused_candidate_count: int       # after RRF
+    reranked_candidate_count: int    # after reranker (may equal fused if reranker is no-op)
+    gate_open: bool                  # True if the BM25-score gate opened (for StubEmbedder path)
+    gate_reasons: list[str]          # human-readable reasons the gate opened or closed
+    index_generation: int            # MemoryAPI._index_generation at query time
+    channel_weights: dict[str, float]  # {"bm25": 1.0, "regex": 0.5, "dense": 1.0, "graph": 0.5}
+
+
+class RetrievalError(Exception):
+    """Raised when a required retrieval channel (BM25) fails hard.
+
+    Soft channel failures (dense, graph, regex) degrade gracefully and are
+    recorded in ``RetrievalDiagnostics`` without raising.  BM25 failure is a
+    hard error because it is the baseline channel and there is no fallback.
+    """
+
+
+@dataclass(slots=True)
+class BlockedClaim:
+    """A specific node field contested by an open Conflict.
+
+    When ``SubgraphView.open_conflicts`` or ``EvidenceBundle.blocked_fields``
+    contains a ``BlockedClaim``, any component that would derive an action from
+    the contested field MUST treat that field as absent until the conflict is
+    resolved.
+
+    Produced centrally by ``MemoryAPI.get_subgraph()`` and ``MemoryAPI.query()``
+    so that planners and executors receive pre-annotated context.  They never
+    need to call ``dependents_blocked_by()`` directly — the annotation travels
+    in the bundle.
+    """
+    node_id: str
+    field_name: str
+    conflict_id: str
+    node_type: str
+
+
+@dataclass(slots=True, frozen=True)
+class ClaimDependency:
+    """A specific node field that a TaskSpec depends on being undisputed.
+
+    When a planner creates a task that reads a node field — target IP, port,
+    service name, URL, protocol, version, credential, access level — it records
+    that dependency here.
+
+    The central conflict guard in ``MemoryAPI``/``apex_host/graph.py`` compares
+    these dependencies against ``EvidenceBundle.blocked_fields`` and
+    ``EvidenceBundle.quarantined_fields`` **before** any executor is invoked.
+    A task is blocked only when one of its declared dependencies is contested;
+    unrelated conflicts on other nodes do NOT block this task.
+
+    ``expected_value`` is optional.  When set, the guard may additionally verify
+    the field holds the expected value before permitting execution.
+    """
+    node_id: str
+    field_name: str
+    expected_value: object | None = None
+
+
+@dataclass(slots=True)
 class SubgraphView:
     """A bounded neighbourhood of the EKG."""
     anchor: str
     nodes: list[Node]
     edges: list[Edge]
     depth: int
+    # Open conflicts on nodes in this subgraph — set by MemoryAPI.get_subgraph().
+    # Components that derive actions from node field values must skip any field
+    # that appears here.  Empty list means no contested fields in this subgraph.
+    open_conflicts: list[BlockedClaim] = field(default_factory=list)
+    # Quarantined fields on nodes in this subgraph — these are NOT open conflicts
+    # (they do not block as "contested") but must be treated as ABSENT, not
+    # trusted.  A capability that depends on a quarantined field must not be
+    # emitted until the field is reestablished by a verified write.
+    quarantined_fields: list[BlockedClaim] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -186,6 +322,17 @@ class EvidenceBundle:
     entries: list[ScoredEntry]
     subgraph: SubgraphView | None
     tiers_queried: list[str]
+    # Contested fields from the subgraph — propagated from SubgraphView.open_conflicts
+    # by MemoryAPI.query().  Any action that reads a blocked field must not proceed
+    # until the conflict is resolved.
+    blocked_fields: list[BlockedClaim] = field(default_factory=list)
+    # Quarantined fields — contested fields whose conflict was quarantined.
+    # Not blocking (not "open"), but also not trusted — treat as absent.
+    quarantined_fields: list[BlockedClaim] = field(default_factory=list)
+    # Retrieval diagnostics — populated by HybridRetriever.search() and forwarded
+    # here so callers can observe which channels fired, cache state, and gate decisions.
+    # None when the retriever was not invoked (e.g. text=None query, or no retriever set).
+    diagnostics: RetrievalDiagnostics | None = field(default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +405,23 @@ class TaskSpec:
     subgraph_anchor: str | None = None
     phase: str | None = None
     retries: int = 0
+    # Fields this task reads and therefore requires to be undisputed.
+    # Populated by the planner at task-creation time so the central conflict
+    # guard can perform dependency-specific blocking rather than tool-name
+    # blocking.  An empty tuple means "no declared dependencies" — the task
+    # either has none, or was created by a planner that has not yet been
+    # updated.  The guard falls through to the legacy tool-name check when
+    # this is empty.
+    claim_dependencies: tuple[ClaimDependency, ...] = ()
+    # Optional semantic purpose tag.  "conflict_verification" marks a task
+    # whose goal is to re-probe an undisputed view of a contested field.
+    # Verification tasks must declare only undisputed fields as dependencies
+    # so the guard allows them through even when a conflict is open.
+    purpose: str | None = None
+    # Skill that was selected to produce this task.  Set by the planner when
+    # a procedural skill is retrieved and chosen as the execution template.
+    # Used by MemoryAPI.record_skill_execution() to attribute the outcome.
+    origin_skill_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -311,3 +475,92 @@ class OpenTask:
     node_type: str
     props: dict[str, Any]
     created: str
+
+
+# ---------------------------------------------------------------------------
+# Transaction exceptions
+# ---------------------------------------------------------------------------
+
+class TransactionCapabilityError(Exception):
+    """Raised when a batch operation requires a store capability that is absent.
+
+    Example: ``apply_deltas(episodes=[...])`` requires the episodic store to
+    expose ``_pop_episodes`` for rollback support.  If the store lacks this
+    method, the batch is rejected *before* any writes begin so the all-or-nothing
+    invariant is preserved.
+
+    Attributes
+    ----------
+    store_type:  The class name of the store that lacks the capability.
+    missing_cap: The name of the missing method or capability.
+    reason:      Human-readable explanation.
+    """
+
+    def __init__(self, store_type: str, missing_cap: str, reason: str) -> None:
+        super().__init__(reason)
+        self.store_type = store_type
+        self.missing_cap = missing_cap
+        self.reason = reason
+
+    def __str__(self) -> str:
+        return (
+            f"TransactionCapabilityError: store '{self.store_type}' lacks "
+            f"'{self.missing_cap}': {self.reason}"
+        )
+
+
+class TransactionIntegrityError(Exception):
+    """Raised when a transaction rollback itself fails, leaving state undefined.
+
+    If ``apply_deltas`` or ``_apply_conflict_resolution_locked`` encounters an
+    error during the write phase AND the subsequent rollback also encounters one
+    or more errors, the system is in an **undefined** state.  The caller must
+    treat all data written in the failed batch as suspect and either reinitialise
+    the store or replay from the last known-good checkpoint.
+
+    Attributes
+    ----------
+    original_error:   The exception that triggered the rollback attempt.
+    rollback_errors:  List of exceptions raised during rollback.
+    affected_ids:     IDs of nodes, edges, episodes, etc. written before failure.
+    stage:            Name of the stage where the primary write failed.
+    conflict_id:      The conflict ID when this error arose from resolution rollback.
+    node_id:          The node ID of the contested field (conflict resolution context).
+    field_name:       The field name of the contested field (conflict resolution context).
+    """
+
+    def __init__(
+        self,
+        original_error: Exception,
+        rollback_errors: list[Exception],
+        affected_ids: list[str],
+        stage: str,
+        conflict_id: str | None = None,
+        node_id: str | None = None,
+        field_name: str | None = None,
+    ) -> None:
+        super().__init__(
+            f"Rollback failed after transaction error; store state is undefined. "
+            f"Original: {original_error!r}; rollback errors: {rollback_errors!r}"
+        )
+        self.original_error = original_error
+        self.rollback_errors = rollback_errors
+        self.affected_ids = affected_ids
+        self.stage = stage
+        self.conflict_id = conflict_id
+        self.node_id = node_id
+        self.field_name = field_name
+
+    def __str__(self) -> str:
+        ctx = (
+            f", conflict_id={self.conflict_id!r}"
+            f", node_id={self.node_id!r}"
+            f", field_name={self.field_name!r}"
+            if self.conflict_id else ""
+        )
+        return (
+            f"TransactionIntegrityError(stage={self.stage!r}{ctx}, "
+            f"original={self.original_error!r}, "
+            f"rollback_errors={self.rollback_errors!r}, "
+            f"affected_ids={self.affected_ids!r})"
+        )

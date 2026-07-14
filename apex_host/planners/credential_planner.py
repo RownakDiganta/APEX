@@ -23,10 +23,17 @@ it delegates directly to ``_CredentialDeterministic``.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from memfabric.ids import new_id, now
-from memfabric.types import AbandonSignal, EvidenceBundle, Goal, SubgraphView, TaskSpec
+from memfabric.types import (
+    AbandonSignal,
+    ClaimDependency,
+    EvidenceBundle,
+    Goal,
+    SubgraphView,
+    TaskSpec,
+)
 
 from apex_host.planners.capabilities import capabilities_from_subgraph
 from apex_host.planning.models import PlanDecision
@@ -34,9 +41,11 @@ from apex_host.tools.registry import ToolRegistry
 from apex_host.types import ApexPhase
 
 if TYPE_CHECKING:
+    from apex_host.llm.gateway import LLMGateway
     from apex_host.llm.router import ModelRouter
     from apex_host.planning.budget import LLMBudgetTracker
     from apex_host.planning.engine import PlanningEngine
+    from apex_host.policy.llm_guard import LLMPolicyGuard
 
 
 class _CredentialDeterministic:
@@ -114,6 +123,15 @@ class _CredentialDeterministic:
                     },
                     subgraph_anchor=goal.anchor_node,
                     phase=goal.phase,
+                    # Telnet login reads port and service from the capability node.
+                    claim_dependencies=(
+                        ClaimDependency(
+                            node_id=cap.source_node_id, field_name="port"
+                        ),
+                        ClaimDependency(
+                            node_id=cap.source_node_id, field_name="service"
+                        ),
+                    ),
                 )
             ]
 
@@ -129,7 +147,8 @@ class _CredentialDeterministic:
                 reason="no access_validate_telnet capability and no known auth_flow endpoints"
             )
 
-        target_url = str(auth_nodes[0].props.get("url", self._target))
+        auth_node = auth_nodes[0]
+        target_url = str(auth_node.props.get("url", self._target))
         return [
             TaskSpec(
                 id=new_id(),
@@ -143,6 +162,10 @@ class _CredentialDeterministic:
                 },
                 subgraph_anchor=goal.anchor_node,
                 phase=goal.phase,
+                # curl uses the auth_flow node's URL.
+                claim_dependencies=(
+                    ClaimDependency(node_id=auth_node.id, field_name="url"),
+                ),
             )
         ]
 
@@ -164,6 +187,8 @@ class CredentialPlanner:
         confidence_threshold: float = 0.4,
         max_retries: int = 1,
         budget_tracker: "LLMBudgetTracker | None" = None,
+        guard: "LLMPolicyGuard | None" = None,
+        gateway: "LLMGateway | None" = None,
     ) -> None:
         self._core = _CredentialDeterministic(
             target, registry,
@@ -184,6 +209,8 @@ class CredentialPlanner:
                 confidence_threshold=confidence_threshold,
                 max_retries=max_retries,
                 budget=budget_tracker,
+                guard=guard,
+                gateway=gateway,
             )
 
     @property
@@ -200,9 +227,10 @@ class CredentialPlanner:
             return self._engine.last_decision
         return None
 
-    def _telnet_credentials_available(self, subgraph: SubgraphView) -> bool:
-        """True when the subgraph has a telnet capability AND credentials are configured."""
-        caps = capabilities_from_subgraph(subgraph)
+    def _telnet_credentials_available_from_caps(
+        self, caps: list[Any]
+    ) -> bool:
+        """True when pre-computed caps include telnet AND credentials are configured."""
         has_telnet = any(c.name == "access_validate_telnet" for c in caps)
         return has_telnet and self._core.has_credentials()
 
@@ -210,7 +238,9 @@ class CredentialPlanner:
         self, goal: Goal, subgraph: SubgraphView, evidence: EvidenceBundle
     ) -> list[TaskSpec] | AbandonSignal:
         if self._engine is not None:
-            if self._telnet_credentials_available(subgraph):
+            # Compute capabilities exactly ONCE per plan() call (F12).
+            caps = capabilities_from_subgraph(subgraph)
+            if self._telnet_credentials_available_from_caps(caps):
                 # Safety bypass: telnet login must use the bounded deterministic
                 # path.  Never let the LLM substitute nc/python3 probes for the
                 # telnet_access executor — that would loop indefinitely.

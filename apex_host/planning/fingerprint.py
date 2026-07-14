@@ -26,7 +26,7 @@ def task_fingerprint(
     parser: str = "",
     executor_domain: str = "",
 ) -> str:
-    """Return a stable 8-char hex fingerprint for a task action.
+    """Return a stable 16-char hex fingerprint for a task action (SHA-256).
 
     All fields are lower-cased and stripped; args are sorted so that
     argument order does not affect the fingerprint.
@@ -40,7 +40,7 @@ def task_fingerprint(
         parser.strip().lower(),
         executor_domain.strip().lower(),
     ])
-    return hashlib.md5(key.encode(), usedforsecurity=False).hexdigest()[:8]
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
 class DuplicateActionTracker:

@@ -25,6 +25,13 @@ from memfabric.types import Edge, Node
 from apex_host.config import ApexConfig
 from apex_host.eval.metrics import EngagementMetrics, summarize
 from apex_host.graph import build_apex_graph
+from apex_host.graph_ids import (
+    auth_flow_id as _auth_flow_id,
+    endpoint_id as _endpoint_id,
+    exposes_edge_id as _exposes_edge_id,
+    host_id as _host_id,
+    service_id as _service_id,
+)
 from apex_host.graph_state import ApexGraphState
 from apex_host.tools.registry import ToolRegistry
 
@@ -47,21 +54,22 @@ async def seed_synthetic_machine(api: MemoryAPI, target: str = SYNTHETIC_TARGET)
     """Populate the EKG with a deterministic synthetic surface: one host
     exposing one HTTP service, one discovered endpoint, and one auth_flow."""
     timestamp = now()
-    host_id = f"host:{target}"
-    service_id = f"service:{target}:80/tcp"
-    endpoint_id = f"endpoint:{target}:seed"
-    auth_id = f"auth_flow:{target}:seed"
+    login_url = f"http://{target}/login"
+    nid_host = _host_id(target)
+    nid_service = _service_id(target, "80", "tcp")
+    nid_endpoint = _endpoint_id(login_url)
+    nid_auth = _auth_flow_id(login_url)
 
-    await api.upsert_node(Node(id=host_id, type="host", props={"ip": target}, confidence=0.9, source="synthetic", first_seen=timestamp, last_seen=timestamp))
-    await api.upsert_node(Node(id=service_id, type="service", props={"port": "80", "service": "http"}, confidence=0.85, source="synthetic", first_seen=timestamp, last_seen=timestamp))
-    await api.upsert_node(Node(id=endpoint_id, type="endpoint", props={"url": f"http://{target}/login"}, confidence=0.7, source="synthetic", first_seen=timestamp, last_seen=timestamp))
-    await api.upsert_node(Node(id=auth_id, type="auth_flow", props={"url": f"http://{target}/login"}, confidence=0.75, source="synthetic", first_seen=timestamp, last_seen=timestamp))
+    await api.upsert_node(Node(id=nid_host, type="host", props={"ip": target}, confidence=0.9, source="synthetic", first_seen=timestamp, last_seen=timestamp))
+    await api.upsert_node(Node(id=nid_service, type="service", props={"port": "80", "service": "http"}, confidence=0.85, source="synthetic", first_seen=timestamp, last_seen=timestamp))
+    await api.upsert_node(Node(id=nid_endpoint, type="endpoint", props={"url": login_url}, confidence=0.7, source="synthetic", first_seen=timestamp, last_seen=timestamp))
+    await api.upsert_node(Node(id=nid_auth, type="auth_flow", props={"url": login_url}, confidence=0.75, source="synthetic", first_seen=timestamp, last_seen=timestamp))
 
-    for to_id in (service_id, endpoint_id, auth_id):
+    for to_id in (nid_service, nid_endpoint, nid_auth):
         await api.upsert_edge(
             Edge(
-                id=f"edge:{host_id}:{to_id}",
-                from_id=host_id,
+                id=_exposes_edge_id(nid_host, to_id),
+                from_id=nid_host,
                 to_id=to_id,
                 type="exposes",
                 props={},
@@ -101,6 +109,7 @@ async def run_synthetic_machine(*, max_turns: int = 5) -> EngagementMetrics:
         "repair_count": 0,
         "policy_decisions": [],
         "duplicate_actions": [],
+        "completed_fingerprints": [],
     }
     final_state: ApexGraphState = await graph.ainvoke(initial)
     return summarize(final_state)

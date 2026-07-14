@@ -30,6 +30,20 @@ if TYPE_CHECKING:
     from memfabric.types import SubgraphView
 
 # ---------------------------------------------------------------------------
+# Critical fields — contestation on any of these blocks capability derivation
+# ---------------------------------------------------------------------------
+
+# If a service node has an open conflict on any of these fields, no capability
+# is emitted for that node.  A contested field could cause a task to probe the
+# wrong port, wrong protocol, wrong state, or wrong service name.
+_CRITICAL_SERVICE_FIELDS: frozenset[str] = frozenset({
+    "port", "service", "proto", "state",
+})
+
+# Endpoint nodes: if url is contested, web-phase tasks would target the wrong URL.
+_CRITICAL_ENDPOINT_FIELDS: frozenset[str] = frozenset({"url"})
+
+# ---------------------------------------------------------------------------
 # Service / port classification sets
 # ---------------------------------------------------------------------------
 
@@ -187,20 +201,44 @@ def capabilities_from_subgraph(subgraph: "SubgraphView") -> list[Capability]:
     capabilities are ordered in node-traversal order — planners should sort
     by confidence if priority matters.
 
+    Conflict filtering (Phase 2):
+        Any node with an open ``Conflict`` on a critical field is skipped
+        entirely — no capability is produced from it.  Critical fields for
+        ``service`` nodes are ``port``, ``service``, ``proto``, and ``state``.
+        Critical fields for ``endpoint`` nodes are ``url``.
+
+        The ``SubgraphView.open_conflicts`` list is populated centrally by
+        ``MemoryAPI.get_subgraph()`` before the subgraph is passed to planners.
+        Conflict blocking is enforced here by skipping contested nodes — callers
+        never need to inspect the conflict registry directly.
+
     Args:
         subgraph: A ``SubgraphView`` as retrieved from ``MemoryAPI``.
 
     Returns:
         A list of ``Capability`` records (may be empty if the subgraph
-        contains no classified service or endpoint nodes).
+        contains no classified service or endpoint nodes, or all such nodes
+        have contested critical fields).
     """
     target = _anchor_to_target(subgraph.anchor)
-    caps: list[Capability] = []
 
+    # Build lookup: (node_id, field_name) → True for all absent critical fields.
+    # "absent" = either open-conflict (contested) OR quarantined (untrusted).
+    # Both must suppress capability derivation from that field.
+    absent: frozenset[tuple[str, str]] = frozenset(
+        (bc.node_id, bc.field_name)
+        for bc in (*subgraph.open_conflicts, *subgraph.quarantined_fields)
+    )
+
+    caps: list[Capability] = []
     for node in subgraph.nodes:
         if node.type == "service":
+            if any((node.id, f) in absent for f in _CRITICAL_SERVICE_FIELDS):
+                continue
             caps.extend(_map_service_node(node.id, node.props, node.confidence, target))
         elif node.type == "endpoint":
+            if any((node.id, f) in absent for f in _CRITICAL_ENDPOINT_FIELDS):
+                continue
             caps.extend(_map_endpoint_node(node.id, node.props, node.confidence, target))
 
     return caps

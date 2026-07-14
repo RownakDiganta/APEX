@@ -8,8 +8,15 @@ from __future__ import annotations
 
 import re
 
-from memfabric.ids import new_id, now
+from memfabric.ids import now
 from memfabric.types import Edge, Node, ParsedObservation
+from apex_host.graph_ids import (
+    host_id as _host_id,
+    service_id as _service_id,
+    tech_id as _tech_id_fn,
+    exposes_edge_id,
+    runs_edge_id,
+)
 
 _HOST_RE = re.compile(r"^Nmap scan report for (?:(?P<name>\S+) \()?(?P<addr>[\w.:]+)\)?$")
 _PORT_RE = re.compile(
@@ -44,11 +51,6 @@ def _extract_tech(version_str: str) -> tuple[str, str] | None:
     return (name, ver) if name else None
 
 
-def _tech_id(host_addr: str, tech_name: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", tech_name.lower()).strip("_")
-    return f"tech:{host_addr}:{slug}"
-
-
 class NmapParser:
     """Stateless parser: nmap stdout text -> ParsedObservation."""
 
@@ -64,10 +66,10 @@ class NmapParser:
                 host_addr = m.group("addr")
                 break
 
-        host_id = f"host:{host_addr}"
+        h_id = _host_id(host_addr)
         nodes.append(
             Node(
-                id=host_id,
+                id=h_id,
                 type="host",
                 props={"ip": host_addr, "target": target},
                 confidence=0.9,
@@ -85,23 +87,18 @@ class NmapParser:
             proto = pm.group("proto")
             state = pm.group("state")
             service = pm.group("service")
-            # raw_version: the full nmap version banner as-is (may be empty)
             raw_version = (pm.group("version") or "").strip()
 
-            # Only create EKG nodes for ports that are reachable.
-            # Closed/filtered ports carry no actionable service info.
             if state not in _OPEN_STATES:
                 continue
 
-            # Extract product/short-version from the raw banner for the tech node
-            # and for the service node's version field.
             tech = _extract_tech(raw_version)
             short_version = tech[1] if tech else ""
 
-            service_id = f"service:{host_addr}:{port}/{proto}"
+            svc_id = _service_id(host_addr, port, proto)
             nodes.append(
                 Node(
-                    id=service_id,
+                    id=svc_id,
                     type="service",
                     props={
                         "port": port,
@@ -109,9 +106,7 @@ class NmapParser:
                         "state": state,
                         "service": service,
                         "target": host_addr,
-                        # raw_version: full nmap version banner (may include OS/extra info)
                         "raw_version": raw_version,
-                        # version: short product-version string extracted from banner
                         "version": short_version,
                     },
                     confidence=0.85,
@@ -122,9 +117,9 @@ class NmapParser:
             )
             edges.append(
                 Edge(
-                    id=new_id(),
-                    from_id=host_id,
-                    to_id=service_id,
+                    id=exposes_edge_id(h_id, svc_id),
+                    from_id=h_id,
+                    to_id=svc_id,
                     type="exposes",
                     props={},
                     confidence=0.85,
@@ -134,10 +129,9 @@ class NmapParser:
                 )
             )
 
-            # Tech node: only when version banner is non-empty and parseable
             if tech:
                 tech_name, tech_ver = tech
-                tid = _tech_id(host_addr, tech_name)
+                tid = _tech_id_fn(host_addr, tech_name)
                 nodes.append(
                     Node(
                         id=tid,
@@ -151,8 +145,8 @@ class NmapParser:
                 )
                 edges.append(
                     Edge(
-                        id=new_id(),
-                        from_id=service_id,
+                        id=runs_edge_id(svc_id, tid),
+                        from_id=svc_id,
                         to_id=tid,
                         type="runs",
                         props={},

@@ -43,7 +43,6 @@ Invariants preserved
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import time
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -65,6 +64,7 @@ from apex_host.planning.validator import Validator
 from apex_host.types import ApexPhase
 
 if TYPE_CHECKING:
+    from apex_host.llm.gateway import LLMGateway
     from apex_host.llm.router import ModelRouter
     from apex_host.planning.budget import LLMBudgetTracker
     from apex_host.policy.llm_guard import LLMPolicyGuard
@@ -143,14 +143,16 @@ def summarize_subgraph(subgraph: SubgraphView | None) -> str:
 # ---------------------------------------------------------------------------
 
 def _context_hash(subgraph: SubgraphView, evidence: EvidenceBundle) -> str:
-    """Return a compact hash representing the structural state of the context.
+    """Return a content-sensitive hash representing the structural state of the context.
 
-    Uses only counts (not content) so the hash is cheap to compute and
-    stable across equivalent retrieval orderings.
+    Hashes the sorted set of node IDs, edge IDs, and evidence entry IDs so that
+    two calls with the same count but different IDs (e.g. one node replaced by
+    another) produce different hashes — preventing stale-context false positives.
     """
-    data = (
-        f"{len(subgraph.nodes)}:{len(subgraph.edges)}:{len(evidence.entries)}"
-    )
+    node_ids = sorted(n.id for n in subgraph.nodes)
+    edge_ids = sorted(e.id for e in subgraph.edges)
+    entry_ids = sorted(e.id for e in evidence.entries)
+    data = f"n:{','.join(node_ids)}|e:{','.join(edge_ids)}|ev:{','.join(entry_ids)}"
     return hashlib.md5(data.encode()).hexdigest()[:8]
 
 
@@ -288,6 +290,7 @@ class PlanningEngine:
         max_retries: int = 1,
         guard: "LLMPolicyGuard | None" = None,
         budget: "LLMBudgetTracker | None" = None,
+        gateway: "LLMGateway | None" = None,
     ) -> None:
         self._router = model_router
         self._fallback = fallback_planner
@@ -300,6 +303,10 @@ class PlanningEngine:
         self._last_decision: PlanDecision | None = None
         self._guard = guard
         self._budget = budget
+        # When a pre-constructed LLMGateway is injected, all LLM invocations
+        # route through it (atomic budget, guard, audit).  No direct model call
+        # occurs in this file when _gateway is not None.
+        self._gateway: "LLMGateway | None" = gateway
 
     @property
     def last_decision(self) -> PlanDecision | None:
@@ -383,6 +390,171 @@ class PlanningEngine:
             llm_retry_count=llm_retry_count,
         )
 
+    async def _plan_via_gateway(
+        self,
+        goal: Goal,
+        phase: ApexPhase,
+        subgraph: SubgraphView,
+        evidence: EvidenceBundle,
+    ) -> "list[TaskSpec] | AbandonSignal":
+        """Route all LLM invocations through the injected ``LLMGateway``.
+
+        This path is taken when ``self._gateway is not None``.  The gateway
+        handles atomic budget reservation, prompt sanitization, pre/post guard
+        checks, timeout, and audit logging.  This method only handles
+        validation retries and TaskSpec conversion.
+
+        Retry policy (simplified — provider errors handled by gateway):
+        - Validator rejection: retry up to ``max_retries`` times, then fallback.
+        - No tasks in output: retry up to ``max_retries`` times, then fallback.
+        - Low confidence: fallback immediately (no retry — epistemic signal).
+        - Non-success gateway status: fallback immediately (no retry).
+        """
+        from apex_host.llm.gateway import LLMCallContext, LLMCallPurpose
+
+        # Repeated-context detection — same logic as direct path.
+        ctx_hash = _context_hash(subgraph, evidence)
+        if self._budget is not None and self._budget.is_context_repeated(phase.value, ctx_hash):
+            repeated_count = self._budget.record_repeated_skip(phase.value)
+            self._budget.record_fallback_only()
+            self._record_fallback(
+                phase,
+                repeated_plan_detected=True,
+                repeated_plan_count=repeated_count,
+                repeated_plan_action="skipped_llm",
+            )
+            return await self._fallback.plan(goal, subgraph, evidence)
+
+        # Build prompt messages.
+        ekg_summary = summarize_subgraph(subgraph)
+        messages = self._prompt_builder.build_messages(
+            goal, phase, evidence, ekg_summary, self._allowed_tools
+        )
+
+        ctx = LLMCallContext(
+            purpose=LLMCallPurpose.planning,
+            phase=phase.value,
+            messages=messages,
+            allowed_tools=self._allowed_tools,
+        )
+
+        _retry_count = 0
+
+        for attempt in range(self._max_retries + 1):
+            assert self._gateway is not None  # type narrowing
+            result = await self._gateway.invoke(ctx)
+
+            if not result.status.is_success:
+                # Gateway returned non-success (budget exhausted, blocked, error, etc.)
+                # Do not retry — the gateway already handles provider retries internally.
+                _checkpoint = "blocked" if result.status.is_blocked else ""
+                logger.info(
+                    "planning_engine[gateway]: status=%s phase=%s — falling back",
+                    result.status.value, phase.value,
+                )
+                if self._budget is not None:
+                    self._budget.record_fallback_only()
+                self._record_fallback(
+                    phase,
+                    policy_checkpoint_status=_checkpoint,
+                    redaction_count=result.redaction_count,
+                    policy_block_reason=result.blocked_reason,
+                    llm_error_category=result.status.value,
+                    llm_retry_count=_retry_count,
+                )
+                return await self._fallback.plan(goal, subgraph, evidence)
+
+            raw = result.raw_text
+            _redaction_count = result.redaction_count
+            _checkpoint_status = "redacted" if _redaction_count > 0 else "clean"
+
+            # Validate the raw output (gateway's post-call guard already ran).
+            output = self._validator.validate(raw, self._allowed_tools)
+            if output is None:
+                logger.info(
+                    "planning_engine[gateway]: validator rejected (attempt %d/%d) — %s",
+                    attempt + 1, self._max_retries + 1,
+                    "retrying" if attempt < self._max_retries else "falling back",
+                )
+                if attempt < self._max_retries:
+                    _retry_count += 1
+                    continue
+                self._record_fallback(
+                    phase,
+                    policy_checkpoint_status=_checkpoint_status,
+                    redaction_count=_redaction_count,
+                    llm_error_category="validation",
+                    llm_retry_count=_retry_count,
+                )
+                return await self._fallback.plan(goal, subgraph, evidence)
+
+            # Low confidence — epistemic signal, not transient; fallback immediately.
+            if output.confidence < self._confidence_threshold:
+                logger.info(
+                    "planning_engine[gateway]: confidence %.2f < threshold %.2f phase=%s — falling back",
+                    output.confidence, self._confidence_threshold, phase.value,
+                )
+                self._record_llm(
+                    output, phase,
+                    fallback_used=True,
+                    policy_checkpoint_status=_checkpoint_status,
+                    redaction_count=_redaction_count,
+                    llm_retry_count=_retry_count,
+                )
+                return await self._fallback.plan(goal, subgraph, evidence)
+
+            # Stop signal from LLM.
+            if output.stop_reason:
+                logger.info(
+                    "planning_engine[gateway]: stop_reason=%s phase=%s",
+                    output.stop_reason, phase.value,
+                )
+                self._record_llm(
+                    output, phase,
+                    policy_checkpoint_status=_checkpoint_status,
+                    redaction_count=_redaction_count,
+                    llm_retry_count=_retry_count,
+                )
+                return AbandonSignal(reason=output.stop_reason)
+
+            # No tasks — retry.
+            if not output.selected_tasks:
+                logger.info(
+                    "planning_engine[gateway]: no tasks (attempt %d/%d) — %s",
+                    attempt + 1, self._max_retries + 1,
+                    "retrying" if attempt < self._max_retries else "falling back",
+                )
+                if attempt < self._max_retries:
+                    _retry_count += 1
+                    continue
+                self._record_fallback(
+                    phase,
+                    policy_checkpoint_status=_checkpoint_status,
+                    redaction_count=_redaction_count,
+                    llm_error_category="validation",
+                    llm_retry_count=_retry_count,
+                )
+                return await self._fallback.plan(goal, subgraph, evidence)
+
+            # Success — convert to TaskSpecs.
+            task_specs = [
+                _to_task_spec(t, goal, self._target) for t in output.selected_tasks
+            ]
+            # Update context hash so repeated-context detection works next call.
+            if self._budget is not None:
+                self._budget.record_context(phase.value, ctx_hash)
+            self._record_llm(
+                output, phase,
+                policy_checkpoint_status=_checkpoint_status,
+                redaction_count=_redaction_count,
+                llm_retry_count=_retry_count,
+            )
+            return task_specs
+
+        # Exhausted retries.
+        self._record_fallback(phase, llm_retry_count=_retry_count)
+        return await self._fallback.plan(goal, subgraph, evidence)
+
     async def plan(
         self,
         goal: Goal,
@@ -392,11 +564,15 @@ class PlanningEngine:
     ) -> list[TaskSpec] | AbandonSignal:
         """Produce a plan for *goal* in *phase*.
 
+        Routes through ``LLMGateway`` when one was injected at construction;
+        otherwise uses the direct provider path (backward-compatible fallback
+        for tests and contexts where no gateway is available).
+
         Returns a list of ``TaskSpec`` objects (possibly empty) or an
         ``AbandonSignal``.  Never raises — any internal failure results in
         a fallback to the deterministic planner.
 
-        Retry policy:
+        Retry policy (direct path only — gateway path delegates retries):
         - Permanent errors (401, 403, 404, BadRequest): no retry, immediate
           fallback.
         - Transient errors (timeout, 429, 5xx): retry up to ``max_retries``
@@ -405,6 +581,9 @@ class PlanningEngine:
         - Low confidence (< ``confidence_threshold``): fallback immediately
           without retrying — low confidence is a signal, not a transient error.
         """
+        if self._gateway is not None:
+            return await self._plan_via_gateway(goal, phase, subgraph, evidence)
+
         llm = self._router.planner_llm()
         if llm is None:
             logger.debug("planning_engine: no LLM configured — using fallback planner")

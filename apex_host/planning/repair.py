@@ -1,43 +1,72 @@
 # repair.py
-# RepairEngine: generates a corrected TaskSpec when a planner task fails with script_error or fixable outcome.
+# RepairEngine: generates a RepairRequest (containing a corrected TaskSpec) when a task fails.
 """Repair planner for failed task correction.
 
 ``RepairEngine`` is called by the ``repair_agent`` graph node when a task
-fails with a ``script_error`` or ``fixable`` ``Outcome``.  It builds a
-focused repair prompt describing the failure and asks the LLM to propose
-a corrected ``TaskSpec``.
+fails with a ``script_error`` or ``fixable`` ``Outcome``.
+
+Architecture
+------------
+``repair()`` returns a **``RepairRequest``** (not a ``TaskSpec`` directly).
+``repair_agent`` in ``graph.py`` extracts the contained ``TaskSpec`` and
+routes it through the normal pre-execution safeguards:
+
+  1. Conflict guard — ``dependents_blocked_by()`` for any claim dependencies.
+  2. Duplicate guard — same action-deduplication logic as main execution.
+  3. Policy gate  — ``PolicyAdvisor.review_task()`` (already in repair_agent).
+
+Only after all three checks pass does ``repair_agent`` execute the repaired
+task via ``runner.py``.
+
+``RepairEngine`` itself NEVER executes a task.  It produces a request and
+returns.  Execution is strictly the graph's responsibility.
+
+LLM invocation path
+--------------------
+All model calls go through ``LLMGateway.invoke()``:
+
+  1. Atomic budget reservation.
+  2. Prompt sanitization and pre-call guard check.
+  3. Provider invocation in a thread pool (never blocks event loop).
+  4. Post-call guard check.
+  5. Reservation commit or fail.
+
+No direct ``chat_llm.invoke()`` call exists in this file.
 
 Safety invariants (non-negotiable)
 ------------------------------------
-- Returns ``None`` immediately when ``config.dry_run is True`` — no repair
-  attempts in dry-run mode (the failure was synthetic).
-- Returns ``None`` when ``ModelRouter.planner_llm()`` returns ``None``
-  (``FakeModelRouter`` path) — no LLM call, no stall.
+- Returns ``None`` immediately when ``config.dry_run is True``.
+- Returns ``None`` when no gateway/router is available.
 - All proposed args go through the same ``Validator`` used by
-  ``PlanningEngine`` — destructive tools and shell metacharacters are blocked.
-- Only one corrected ``TaskSpec`` is produced per call; no loops, no
-  autonomous retry chains.
+  ``PlanningEngine``.
+- Only one corrected ``TaskSpec`` is produced per call.
+- Secret material is redacted from prompts by the gateway before any
+  provider I/O.
 """
 from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, cast
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from memfabric.ids import new_id, now
 from memfabric.types import (
     AbandonSignal,
+    ClaimDependency,
     EvidenceBundle,
     Goal,
     SubgraphView,
     TaskSpec,
 )
 
-from apex_host.planning.engine import _LLMChatModel, _to_task_spec, summarize_subgraph
+from apex_host.planning.engine import _to_task_spec, summarize_subgraph
 from apex_host.planning.validator import Validator
 
 if TYPE_CHECKING:
+    from apex_host.llm.gateway import LLMCallContext, LLMCallPurpose, LLMGateway
     from apex_host.llm.router import ModelRouter
+    from apex_host.planning.budget import LLMBudgetTracker
     from apex_host.policy.llm_guard import LLMPolicyGuard
 
 logger = logging.getLogger(__name__)
@@ -117,26 +146,82 @@ def _build_repair_messages(
     ]
 
 
+# ---------------------------------------------------------------------------
+# RepairRequest — typed result returned by RepairEngine.repair()
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RepairRequest:
+    """A validated corrected task produced by ``RepairEngine``.
+
+    ``repair_agent`` in ``graph.py`` extracts ``repaired_task`` and routes it
+    through the conflict guard, duplicate guard, and policy gate before
+    execution.  ``RepairEngine`` itself does NOT execute.
+
+    Fields
+    ------
+    original_task_id:
+        ID of the ``TaskSpec`` that failed.
+    repaired_task:
+        The corrected ``TaskSpec`` ready for pre-execution safeguard checks.
+    repair_attempt:
+        0-based repair count for this turn (from ``state["repair_count"]``).
+    failure_reason:
+        The error string from the failing tool result.
+    phase:
+        Phase during which the failure occurred.
+    target:
+        Primary engagement target (IP or URL).
+    origin_skill_id:
+        ID of the ``Skill`` that suggested the original task, if known.
+    claim_dependencies:
+        Copied from the original ``TaskSpec``.
+    """
+
+    original_task_id: str
+    repaired_task: TaskSpec
+    repair_attempt: int
+    failure_reason: str
+    phase: str
+    target: str
+    origin_skill_id: str | None = None
+    claim_dependencies: tuple[ClaimDependency, ...] = field(default_factory=tuple)
+
+
+# ---------------------------------------------------------------------------
+# RepairEngine
+# ---------------------------------------------------------------------------
+
+
 class RepairEngine:
-    """Produces a corrected ``TaskSpec`` when a planner task fails.
+    """Produces a ``RepairRequest`` when a planner task fails.
 
     ``repair()`` is the only public entry point.  It returns ``None``
-    immediately when no LLM is available or when ``dry_run=True`` — the
-    caller (``repair_agent`` in ``graph.py``) treats ``None`` as "skip
-    repair, continue to ``reflect_or_continue``".
+    immediately when no LLM is available or when ``dry_run=True``.
 
     Parameters
     ----------
     model_router:
-        A ``ModelRouter`` instance.  ``FakeModelRouter`` returns ``None``
-        for all roles, making this a no-op in tests and dry-run runs.
+        A ``ModelRouter`` instance (used to create an internal gateway when
+        no explicit gateway is injected).  ``FakeModelRouter`` returns ``None``
+        for all roles — repair becomes a no-op.
     allowed_tools:
         Tool names permitted in the current engagement.
     target:
-        Primary engagement target; used as default if the LLM omits it.
+        Primary engagement target.
     dry_run:
-        When ``True``, ``repair()`` returns ``None`` without any LLM call —
-        the failure was synthetic and requires no real correction.
+        When ``True``, ``repair()`` returns ``None`` without any LLM call.
+    guard:
+        ``LLMPolicyGuard`` for prompt/output content checks.  Passed to the
+        internal gateway.
+    budget_tracker:
+        Shared budget tracker.  Passed to the internal gateway so repair calls
+        compete for the same run-level budget as planning calls.
+    gateway:
+        Pre-constructed ``LLMGateway`` (injected by ``build_apex_graph``).
+        When provided, ``model_router``, ``guard``, and ``budget_tracker`` are
+        ignored for invocation purposes (the gateway owns them).
     """
 
     def __init__(
@@ -146,6 +231,8 @@ class RepairEngine:
         target: str = "",
         dry_run: bool = True,
         guard: "LLMPolicyGuard | None" = None,
+        budget_tracker: "LLMBudgetTracker | None" = None,
+        gateway: "LLMGateway | None" = None,
     ) -> None:
         self._router = model_router
         self._allowed_tools = allowed_tools
@@ -153,6 +240,21 @@ class RepairEngine:
         self._dry_run = dry_run
         self._validator = Validator()
         self._guard = guard
+        self._budget = budget_tracker
+
+        # Use injected gateway if provided; else create one from router.
+        # Lazy import breaks circular dependency between planning.repair and llm.gateway.
+        from apex_host.llm.gateway import LLMGateway as _LLMGateway
+        if gateway is not None:
+            self._gateway: "_LLMGateway | None" = gateway
+        elif model_router is not None:
+            self._gateway = _LLMGateway(
+                model_router=model_router,
+                budget=budget_tracker,
+                guard=guard,
+            )
+        else:
+            self._gateway = None
 
     async def repair(
         self,
@@ -161,33 +263,31 @@ class RepairEngine:
         phase: str,
         evidence: EvidenceBundle,
         subgraph: SubgraphView,
-    ) -> TaskSpec | None:
-        """Return a corrected ``TaskSpec`` or ``None`` if repair is unavailable.
+        repair_attempt: int = 0,
+    ) -> RepairRequest | None:
+        """Return a ``RepairRequest`` or ``None`` if repair is unavailable.
 
         Parameters
         ----------
         failed_task:
             The ``TaskSpec`` that produced the failing tool result.
         error:
-            The error string from the failing ``ToolResult``.
+            The error string from the failing tool result.
         phase:
             The current engagement phase (``ApexPhase.value``).
         evidence:
-            The ``EvidenceBundle`` from the current turn (for context).
+            The ``EvidenceBundle`` from the current turn.
         subgraph:
-            The current EKG subgraph (for context).
+            The current EKG subgraph.
+        repair_attempt:
+            Current repair count (0-based) for provenance in ``RepairRequest``.
         """
         if self._dry_run:
             logger.debug("repair_engine: dry_run=True — skipping repair")
             return None
 
-        if self._router is None:
-            logger.debug("repair_engine: no router configured — skipping repair")
-            return None
-
-        llm = self._router.planner_llm()
-        if llm is None:
-            logger.debug("repair_engine: no LLM configured — skipping repair")
+        if self._gateway is None:
+            logger.debug("repair_engine: no gateway/router configured — skipping repair")
             return None
 
         ekg_summary = summarize_subgraph(subgraph)
@@ -195,38 +295,23 @@ class RepairEngine:
             failed_task, error, phase, ekg_summary, self._allowed_tools
         )
 
-        # --- LLM policy checkpoint: sanitize + pre-flight prompt check ---
-        if self._guard is not None:
-            messages, n = self._guard.sanitize_messages(messages)
-            if n > 0:
-                logger.debug("repair_engine: %d secret(s) redacted from repair prompt", n)
-            prompt_blocked, prompt_reason = self._guard.check_prompt(messages)
-            if prompt_blocked:
-                logger.warning(
-                    "repair_engine: repair prompt blocked by LLM guard (%s) — repair skipped",
-                    prompt_reason,
-                )
-                return None
+        from apex_host.llm.gateway import LLMCallContext as _LLMCallCtx, LLMCallPurpose as _LLMCallPurp
+        ctx = _LLMCallCtx(
+            purpose=_LLMCallPurp.repair,
+            phase=phase,
+            messages=messages,
+            allowed_tools=self._allowed_tools,
+        )
+        result = await self._gateway.invoke(ctx)
 
-        chat_llm = cast(_LLMChatModel, llm)
-
-        try:
-            response = chat_llm.invoke(messages)
-            raw = str(getattr(response, "content", response))
-        except Exception as exc:
-            logger.warning("repair_engine: LLM error (%s) — repair skipped", exc)
+        if not result.status.is_success:
+            logger.debug(
+                "repair_engine: gateway returned %s (phase=%s) — skipping repair",
+                result.status.value, phase,
+            )
             return None
 
-        # --- LLM policy checkpoint: post-output check ---
-        if self._guard is not None:
-            out_blocked, out_reason = self._guard.check_output(raw)
-            if out_blocked:
-                logger.warning(
-                    "repair_engine: repair output blocked by LLM guard (%s) — repair skipped",
-                    out_reason,
-                )
-                return None
-
+        raw = result.raw_text
         output = self._validator.validate(raw, self._allowed_tools)
         if output is None:
             logger.info("repair_engine: validator rejected repair output — skipping")
@@ -248,8 +333,18 @@ class RepairEngine:
         )
         task_spec = _to_task_spec(output.selected_tasks[0], goal, self._target)
         logger.info(
-            "repair_engine: produced corrected task tool=%s phase=%s",
+            "repair_engine: produced RepairRequest tool=%s phase=%s attempt=%d",
             task_spec.params.get("tool"),
             phase,
+            repair_attempt,
         )
-        return task_spec
+        return RepairRequest(
+            original_task_id=failed_task.id,
+            repaired_task=task_spec,
+            repair_attempt=repair_attempt,
+            failure_reason=error,
+            phase=phase,
+            target=self._target,
+            origin_skill_id=None,
+            claim_dependencies=tuple(failed_task.claim_dependencies or ()),
+        )

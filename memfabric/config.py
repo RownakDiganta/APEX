@@ -56,6 +56,14 @@ class Config:
     winrate_floor: float = 0.3
     """Skill win-rate below this → quarantine."""
 
+    skill_confidence_floor: float = 0.0
+    """Confidence never decays below this floor.  Default 0.0 (no floor)."""
+
+    skill_grace_runs: int = 0
+    """Number of Reflector runs after promotion during which decay is suppressed.
+    Prevents a freshly promoted skill from decaying before it has had a chance
+    to be selected and executed.  Default 0 (no grace period)."""
+
     # --- orchestrator / scheduler ---
     max_concurrency: int = 4
     """Maximum parallel executor slots."""
@@ -108,6 +116,13 @@ class Config:
     Individual promotion logs are always at DEBUG; only the end-of-pass
     summary (promoted=N skipped=M remaining=K) is at INFO.
     """
+
+    # --- retrieval reranking ---
+    rerank_top_n: int = 20
+    """Number of candidates passed to the reranker.  The RRF step produces
+    max(k, rerank_top_n) candidates so the reranker can consider more options
+    than the final top-k.  Default 20 prevents the reranker from seeing fewer
+    candidates than k when k > 20."""
 
     # --- vector index ---
     vector_dim: int = 384

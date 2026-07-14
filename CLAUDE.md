@@ -3320,3 +3320,666 @@ make test
 ```
 
 All three must exit **0** before a session is considered complete.
+
+---
+
+## 21. Reviewer Remediation Roadmap
+
+This section records the known defects and the order in which they will be
+fixed. It is generated from the full per-finding audit in
+`docs/reviewer_findings_audit.md` (Phase 0 baseline, 2026-07-13).
+
+**Baseline:** 1311 tests passing, `mypy --strict` clean (101 source files).  
+**Post-Phase 1 (initial):** 1386 tests passing, `mypy --strict` clean, 135 pre-existing ruff errors.  
+**Post-Phase 1 (re-open corrections, 2026-07-13):** 1426 tests passing, `mypy --strict` clean, 135 ruff errors (exit code 1). 40 new tests in `tests/test_graph_phase1_extended.py` covering: deep copy isolation at all nesting depths (I01–I09), query snapshot Option C contract (J01–J04), pre-batch snapshot completeness (K01–K02), episode transaction capability (L01–L05), rollback-failure handling (M01–M05), repository-wide architecture scan (N01–N05), and `_graph_lock` holders table (O01–O10).  
+**Post-Phase 10 (2026-07-14):** 2618 tests passing, `mypy --strict` clean (125 source files), 130 ruff errors (at Phase 8 ceiling, exit code 1).  
+**Post-Phase 11 (2026-07-14):** 2668 tests passing, `mypy --strict` clean (125 source files), 130 ruff errors (at Phase 10 ceiling, exit code 1). All 21 findings independently re-verified; F16 and F21 confirmed fixed; F15 confirmed NOT A DEFECT.
+
+Do **not** implement fixes from later phases before earlier phases are
+complete — later phases depend on substrate-level invariants restored in
+Phase 1 and 2.
+
+**12-Phase Remediation Sequence:**
+
+| Phase | Area | Status |
+|---|---|---|
+| Phase 1 | Graph transaction, isolation, rollback (`memfabric`) | ✓ COMPLETE |
+| Phase 2 | Conflict enforcement and winner persistence | OPEN |
+| Phase 3 | Skill lifecycle, decay, quarantine | OPEN |
+| Phase 4 | Hybrid retrieval and cache correctness | OPEN |
+| Phase 5 | Centralized LLM gateway and repair budgets | OPEN |
+| Phase 6 | Unified execution, policy, deduplication, errors | OPEN |
+| Phase 7 | Async responsiveness and cancellation | ✓ COMPLETE |
+| Phase 8 | Secret redaction and graph representation | ✓ COMPLETE |
+| Phase 9 | State boundaries and configuration consistency | ✓ COMPLETE |
+| Phase 10 | Orchestration refactor | ✓ COMPLETE |
+| Phase 11 | Independent final verification | ✓ COMPLETE |
+
+---
+
+### Strict Reviewer Remediation Program — 12 Binding Rules
+
+The following rules govern ALL future remediation sessions. Treat them as
+hard constraints, equivalent in authority to the design invariants in §1.
+
+**R01 — Phase 0 (audit) must be complete before any fix is written.**
+No fix may be written while audit findings are still being gathered. The audit
+is complete when `docs/reviewer_findings_audit.md`, `docs/remediation_traceability_matrix.md`,
+and `docs/remediation_validation_baseline.md` all exist and are current.
+
+**R02 — Every finding must be independently reproduced before marked CONFIRMED.**
+A finding is CONFIRMED only when the reviewer has observed the failure scenario
+described in `docs/reviewer_findings_audit.md` — either through a failing test,
+a code trace, or a repo-wide search that corroborates the claim. PLAUSIBLE is
+used when the failure path is theoretically valid but not yet observed in practice.
+
+**R03 — Write the failing test first (red), then fix (green).**
+The missing test for a finding must be written and confirmed to fail before the
+fix is applied. A fix whose test was written after the code is not trusted.
+
+**R04 — No phase may combine findings from different severity tiers without justification.**
+Phase groupings in §21 are by dependency and severity, not by convenience.
+Mixing a Medium finding from Phase 2 into Phase 4 to ship it faster is prohibited.
+
+**R05 — Every phase ends with a full `pytest -q` run.**
+All previously-passing tests must still pass. The test count must be ≥ the
+prior phase's count. Zero failures is a hard requirement, not a target.
+
+**R06 — `mypy --strict` must be clean after every phase.**
+No type errors may be introduced. If a fix requires a type annotation change,
+that change is in scope for the phase. If it requires a new Protocol, add it.
+
+**R07 — The ruff error count must not increase.**
+The baseline ruff count (135 at Phase 1) is a ceiling. Fixing a ruff error is
+welcome. Adding a new one (even a fixable one) is not acceptable.
+
+**R08 — No architectural changes during remediation phases.**
+Do not add new top-level modules, change Protocol signatures, or restructure
+package boundaries during Phases 2–5. The remediation program fixes
+implementation defects; it does not redesign the architecture.
+
+**R09 — `docs/remediation_traceability_matrix.md` must be updated at phase end.**
+The Phase Completion Checklist table in the matrix must be updated with the
+actual test count, mypy result, and ruff count for the completed phase.
+
+**R10 — Substantive fixes during audit (Phase 0) are prohibited.**
+Phase 0 is read-only. If a defect is found during Phase 0 that is tempting to
+fix immediately (e.g., a one-line change), it must be logged as a finding and
+fixed in the appropriate numbered phase. The audit must remain unpolluted by
+interleaved fixes.
+
+**R11 — Never mark a phase complete without running the full validation suite.**
+The three commands in `docs/remediation_validation_baseline.md` (pytest, mypy,
+ruff) must all produce outputs that satisfy the acceptance criteria. "It should
+pass" is not sufficient.
+
+**R12 — Findings are never deleted; they are only status-updated.**
+`docs/reviewer_findings_audit.md` is append-only for findings. A fixed finding
+is marked `FIXED (date)` with a fix description. A finding found to be invalid
+is marked `NOT REPRODUCED` with the evidence. Rows are never deleted.
+
+---
+
+### Phase 1 — Substrate Correctness (`memfabric`) ✓ COMPLETE
+
+**Initial completion:** 2026-07-13  
+**Re-open corrections completed:** 2026-07-13  
+**Final test count after all Phase 1 corrections:** 1426 passed  
+**mypy after Phase 1:** Success — no issues found in 101 source files  
+**Ruff after Phase 1:** 135 errors (baseline unchanged, exit code 1)
+
+Fixes to `memfabric/` only. No `apex_host` changes.
+
+**Phase 1 re-open — 12 issues resolved:**
+
+| Issue | Description | Resolution |
+|---|---|---|
+| I1 | Shallow defensive copies (one-level-deep) | Fixed: `copy.deepcopy` for `props` and `_provenance` (T13 updated) |
+| I2 | Query snapshot consistency undocumented | Fixed: Option C documented in `query()` docstring; tests J01–J04 |
+| I3 | Pre-batch snapshot completeness unproven | Fixed: tests K01–K02 verify Phase 1 snapshot before Phase 2 writes |
+| I4 | Episode transaction not all-or-nothing | Fixed: capability pre-check raises `TransactionCapabilityError` before any writes |
+| I5 | Rollback failures swallowed silently | Fixed: per-step try/except; `TransactionIntegrityError` if rollback fails |
+| I6 | Architecture scan limited to `memfabric/` | Fixed: tests N01–N05 scan both `memfabric/` and `apex_host/` |
+| I7 | `_graph_lock` users table unverified | Fixed: tests O01–O10 prove each method's locking behaviour |
+| I8 | Ruff reported as "passes" (incorrect) | Fixed: "Ruff baseline unchanged at 135 errors (exit code 1)" |
+| I9 | Test functions listed as ranges not names | Fixed: all tests named explicitly in this section |
+| I10 | Incorrect finding status for F01 | Fixed: F01 specific k-omission FIXED; broader retrieval cache OPEN (Phase 4) |
+| I11 | Phase ordering was 5-phase (incorrect) | Fixed: replaced with 12-phase sequence above |
+| I12 | "No architectural changes" (inaccurate wording) | Fixed: MemoryAPI internal transaction architecture changed; top-level boundaries unchanged |
+
+| Finding | Description | File(s) | Status |
+|---|---|---|---|
+| F01 | Add `k` to `_cache_key` payload to prevent stale truncated retrieval results | `memfabric/retrieval/engine.py` | FIXED |
+| F02 | Snapshot `_write_clock` before `apply_deltas` batch; restore on rollback | `memfabric/api.py` | FIXED |
+| F19 | (Same fix as F02 — different symptom, same root) | `memfabric/api.py` | FIXED |
+
+**Additional substrate hardening delivered in Phase 1:**
+
+1. **`_graph_lock` (new)** — `asyncio.Lock` added to `MemoryAPI.__init__`. Every
+   `upsert_node`, `upsert_edge`, and `apply_deltas` acquires this lock for the
+   full read-modify-write cycle, eliminating the TOCTOU race where a concurrent
+   writer could interleave between a graph read and its paired write. Two callers
+   updating disjoint fields on the same node now both survive.
+
+2. **`_upsert_node_locked` / `_upsert_edge_locked`** — internal helpers that
+   contain the merge / LWW logic and require the caller to hold `_graph_lock`.
+   Public `upsert_node` / `upsert_edge` acquire the lock and delegate. `apply_deltas`
+   acquires the lock once for the entire batch and calls the locked helpers.
+
+3. **Defensive copies in `NetworkXGraphStore`** — `get_node`, `get_edge`,
+   `get_subgraph`, `all_nodes`, `all_edges` now return copies of stored objects
+   (`_copy_node`, `_copy_edge` helpers). Callers can no longer corrupt stored state
+   by mutating the returned `props` dict.
+
+**Transaction invariants guaranteed after Phase 1:**
+- `_graph_lock` is the single exclusive boundary for all graph mutations.
+- Lock nesting order (always outer→inner): `_graph_lock` → `_staging_lock` →
+  `GraphStore._lock`. Never acquired in reverse order.
+- Do not hold `_graph_lock` while executing tools, calling LLMs, running browser
+  automation, embedding large batches, reranking, or doing unrelated filesystem I/O.
+- This is a single-process guarantee (Python asyncio, cooperative multitasking).
+  Multi-process deployments must replace `asyncio.Lock` with a distributed
+  advisory lock (e.g. Redis SETNX) backed by the same durable graph store.
+
+**Acceptance criteria (all passed):**
+
+*Initial Phase 1 tests (`tests/test_graph_atomicity.py` — 17 tests):*
+- `test_t07_write_clock_restored_after_rollback` — covers F02/F19
+- `test_t15_cache_key_includes_k`, `test_t16_different_k_causes_cache_miss` — covers F01
+- `test_t01` through `test_t14`, `test_t17` — concurrent write, defensive copy, batch atomicity
+- All 1311 pre-existing tests still pass (1328 total)
+
+*Phase 1 Comprehensive (`tests/test_graph_transaction_complete.py` et al. — 58 new tests):*
+- Reader isolation (Design A), public deletion API, complete rollback coverage
+- Test count after Phase 1 Comprehensive: **1386 passed**
+
+*Phase 1 Re-open corrections (`tests/test_graph_phase1_extended.py` — 40 new tests):*
+- `test_i01`–`test_i09` — deep copy isolation at all nesting depths, all 5 public read paths
+- `test_j01`–`test_j04` — query snapshot Option C contract; subgraph under `_graph_lock`
+- `test_k01`–`test_k02` — pre-batch snapshot complete before first write; rollback restores
+- `test_l01`–`test_l05` — episode capability pre-check; `TransactionCapabilityError` attributes
+- `test_m01`–`test_m05` — rollback-failure injection; `TransactionIntegrityError` attributes
+- `test_n01`–`test_n05` — architecture scan: `apex_host/` + `memfabric/` + synthetic violations
+- `test_o01`–`test_o10` — exact `_graph_lock` acquisition for every public method
+- **Final test count: 1426 passed**
+
+### Phase 1 — Comprehensive Transaction Model (16 binding rules)
+
+The following rules govern all future work on `memfabric/api.py` and any code that
+touches graph state.  They are derived from the Phase 1 comprehensive implementation
+and are as binding as the invariants in §1.
+
+**T01 — `_graph_lock` is the SOLE transaction boundary for all graph mutations.**  
+Every call that reads and then writes graph state must hold `_graph_lock` for the
+entire read-modify-write cycle.  This includes `upsert_node`, `upsert_edge`, and
+`apply_deltas`.  No graph mutation may occur without this lock.
+
+**T02 — `_graph_lock` is NOT reentrant.**  
+`asyncio.Lock` is not reentrant.  Any method that already holds `_graph_lock` must call
+`self._graph.*` methods directly (store methods) rather than public `MemoryAPI` methods
+to avoid deadlock.  Document "requires `_graph_lock` to be held" on every internal
+locked helper.
+
+**T03 — Reader paths acquire `_graph_lock`.**  
+`get_subgraph()`, `open_tasks()`, and the subgraph-attachment path inside `query()`
+each acquire `_graph_lock` for the duration of their graph reads.  This prevents any
+reader from observing a partial batch state between `await` points.
+
+**T04 — Lock nesting order is fixed and inviolable.**  
+Outer to inner: `_graph_lock` → `_staging_lock` → `GraphStore._lock`.  Never acquire
+in a different order.  `_staging_lock` is never acquired while waiting for `_graph_lock`.
+
+**T05 — `_write_clock` is always restored after rollback.**  
+`_rollback_locked` restores `self._write_clock = pre_clock` as its FIRST action before
+restoring any nodes or edges.  No other code may decrement or reset `_write_clock`
+except during rollback.  This prevents version-sequence gaps from accumulating.
+
+**T06 — Rollback removes newly-created entries from all indexes.**  
+For each entry created in a failed batch: `_delete_node_locked` / `_delete_edge_locked`
+removes the entry from the graph, lexical index, and optional vector index.  A final
+`kv.delete_prefix("retrieval:")` is called at the end of rollback to bust the cache.
+
+**T07 — Rollback restores updated entries in all indexes.**  
+For each entry updated in a failed batch: `put_node` / `put_edge` restores the pre-batch
+snapshot, and `lexical.add` (with old text and metadata) restores the old lexical entry.
+
+**T08 — `_delete_node_locked` and `_delete_edge_locked` are the canonical deletion helpers.**  
+All deletion code paths (rollback, public `delete_node`, public `delete_edge`) must use
+these locked helpers.  No code path may call `self._graph.delete_node()` directly except
+inside one of these helpers.
+
+**T09 — Public `delete_node` and `delete_edge` acquire `_graph_lock`.**  
+These are the only public deletion methods on `MemoryAPI`.  Callers that need to delete
+must go through these methods, not through store methods directly.
+
+**T10 — Episode rollback uses `_pop_episodes` via `getattr`.**  
+`apply_deltas` rolls back episodes by calling `getattr(self._episodic, "_pop_episodes")`.
+Stores without this method log a warning — they do not crash.  The Protocol does not
+expose `_pop_episodes`; it is an implementation detail of in-memory stores only.
+
+**T11 — Proposal rollback removes only the batch's own proposals.**  
+`_rollback_locked` removes only IDs that were staged during the failed batch.
+Pre-existing proposals (staged before the batch) must survive unchanged.
+
+**T12 — The retrieval cache is always busted at the end of rollback.**  
+`kv.delete_prefix("retrieval:")` is called after all per-entry index operations complete,
+whether the batch succeeded or failed.  This is the canonical cache-bust point.
+
+**T13 — Defensive copies are fully isolated deep copies (`copy.deepcopy`).**  
+`_copy_node` / `_copy_edge` use `copy.deepcopy` for both `props` and `_provenance`.
+This guarantees isolation at every nesting depth — callers cannot corrupt stored state
+by mutating nested dicts, nested lists, or nested provenance values in returned objects.
+The earlier "one-level-deep" description was incorrect and has been corrected.  Tests
+I01–I09 in `tests/test_graph_phase1_extended.py` verify isolation for all nesting depths
+and all five public read paths.
+
+**T14 — `apply_deltas` snapshot is taken before ANY write, not lazily.**  
+All `pre_nodes` and `pre_edges` lookups happen in the Phase 1 snapshot loop before
+the Phase 2 write loop begins.  No snapshot may be taken after a write has started.
+
+**T15 — Reader isolation guarantee scope is single-process asyncio.**  
+The lock is `asyncio.Lock`, which is a single-process guarantee.  Multi-process
+deployments require a distributed advisory lock (e.g. Redis SETNX) backed by the
+same durable store.  Do not claim cross-process isolation without explicit wiring.
+
+**T16 — Architecture scan test `test_g01_no_production_graph_mutation_bypasses_memory_api`
+is the authoritative bypass detector.**  
+If you add new graph-mutation code, run this test.  It fails if any file outside
+`api.py` and `graph_networkx.py` calls `put_node`, `put_edge`, `delete_node`, or
+`delete_edge` on a graph store.  Passing this test is a necessary (but not sufficient)
+condition for Invariant 1 compliance.
+
+---
+
+### Phase 2 — Conflict Enforcement and Winner Persistence
+
+Enforce documented conflict lifecycle invariants in `memfabric/`. Requires Phase 1 complete.
+
+| Finding | Description | File(s) |
+|---|---|---|
+| F20 | Wire `dependents_blocked_by()` check into `read_context` (substrate) and `load_context` (apex) before subgraph is passed to planners | `memfabric/coordination/graph_loop.py`, `apex_host/graph.py` |
+
+**Acceptance criteria:** `test_conflict_blocks_planner_when_field_contested` passes; no regressions.
+
+---
+
+### Phase 3 — Skill Lifecycle, Decay, Quarantine
+
+Enforce documented but unenforced Reflector invariants. Requires Phase 2 complete.
+
+| Finding | Description | File(s) |
+|---|---|---|
+| F21 | Replace direct `best_match.wins += 1 / confidence = ...` mutations in Reflector with `await api.update_skill_result(id, won=True)` | `memfabric/reflector/worker.py:133-138` |
+
+**Acceptance criteria:** `test_reflector_skill_update_goes_through_api` passes; no regressions.
+
+---
+
+### Phase 4 — Hybrid Retrieval and Cache Correctness
+
+Fixes to `memfabric/retrieval/`. Requires Phase 1 complete. Can run parallel to Phase 3.
+
+| Finding | Description | File(s) |
+|---|---|---|
+| F01-broader | Broader retrieval cache correctness beyond `k` — query hash coverage | `memfabric/retrieval/engine.py` |
+| F05 | Replace count-only `_context_hash` with content-sensitive hash (node/edge ID sets) | `apex_host/planning/engine.py:145-154` |
+
+**Acceptance criteria:** Cache correctness tests pass; no regressions.
+
+---
+
+### Phase 5 — Centralized LLM Gateway and Repair Budgets
+
+Fixes to the LLM planning layer. Requires Phase 4 complete.
+
+| Finding | Description | File(s) |
+|---|---|---|
+| F03 | Add `budget_tracker` param to `RepairEngine`; gate LLM calls through `can_call()` | `apex_host/planning/repair.py` |
+| F04 | Pass `budget_tracker=budget_tracker` to `RepairEngine` in `build_apex_graph` | `apex_host/graph.py:318-323` |
+| F08 | Pass `current_phase=state.get("phase")` to `decide_phase` in `reflect_or_continue` peek | `apex_host/graph.py:1108-1112` |
+| F14 | Wire `LLMPolicyGuard(config)` into `PlanningEngine` and `RepairEngine` when `use_llm=True` | `apex_host/graph.py` |
+
+**Acceptance criteria:** Missing tests from F03, F04, F08, F14 pass; no regressions.
+
+---
+
+### Phase 6 — Unified Execution, Policy, Deduplication, Error Handling
+
+Fixes to `apex_host/graph.py` and parsers. Requires Phase 5 complete.
+
+| Finding | Description | File(s) |
+|---|---|---|
+| F06 | `route_after_write`: check all `tool_results` for failures, not only `last_tool_result` | `apex_host/graph.py:942-957` |
+| F07 | Browser episode outcome: derive from own `tool_result["error"]`, not `state["last_error"]` | `apex_host/graph.py:905-908` |
+| F09 | Add `return_exceptions=True` to `asyncio.gather` in `_run_tasks`; handle exception entries | `apex_host/graph.py:537` |
+| F10 | Derive `NmapParser` edge IDs deterministically (host+port+proto+tech slug) | `apex_host/parsers/nmap_parser.py` |
+| F11 | Derive `AccessParser` `grants` edge ID deterministically (credential ID + access_state ID) | `apex_host/parsers/access_parser.py` |
+| F12 | Refactor `CredentialPlanner` to call `capabilities_from_subgraph` once per `plan()` | `apex_host/planners/credential_planner.py` |
+| F13 | Mark duplicate-skip episodes with a distinct outcome/flag so Reflector ignores them | `apex_host/graph.py:488-503` + `write_memory` |
+| F15 | Add test; verify `GlobalPlanner.record_turn` doesn't double-charge on phase transitions | `apex_host/graph.py:344-358` + test |
+| F16 | Add accumulation test for `duplicate_actions` across turns | `tests/apex_host/test_duplicate_actions.py` |
+
+**Acceptance criteria:** Missing tests from F06–F16 pass; no regressions.
+
+---
+
+### Phase 7 — Async Responsiveness and Cancellation ✓ COMPLETE
+
+**Completion date:** 2026-07-14  
+**Tests after Phase 7:** 2218 passed  
+**mypy after Phase 7:** Success — 109 source files  
+**Ruff after Phase 7:** 130 errors (below 133 baseline)
+
+Implemented fixes A01–A09 and created `tests/apex_host/test_phase7_async.py` (131 tests).
+
+#### Async reliability invariants (binding — added 2026-07-14)
+
+**P7-I01** — CPU-bound BM25 work runs in a thread pool via `asyncio.to_thread`,
+never blocking the event loop.  `BM25LexicalIndex.search()` and `_rebuild_async()`
+both use this pattern.
+
+**P7-I02** — Holding `asyncio.Lock` while `await asyncio.to_thread(...)` runs is
+**correct**.  The lock maintains mutual exclusion but the event loop is free to
+schedule other coroutines that do not need the same lock.
+
+**P7-I03** — Subprocess timeout sends SIGTERM first, waits
+`config.subprocess_sigterm_grace_seconds` (default 5 s), then SIGKILL.  Never
+immediate SIGKILL on timeout.
+
+**P7-I04** — `asyncio.CancelledError` in any subprocess path triggers child
+cleanup (SIGTERM → wait) before re-raising.  No zombie/orphan processes.
+
+**P7-I05** — `playwright.chromium.launch()` is wrapped in `asyncio.wait_for`
+with `config.browser_launch_timeout_seconds` (default 30 s).  No indefinite hang.
+
+**P7-I06** — Report and EKG export writes are atomic: temp-file write in same
+directory + `os.fsync` + POSIX rename.  A crash mid-write cannot leave a
+truncated file at the destination path.
+
+**P7-I07** — File reads during knowledge seeding (`compiled_loader.py`) use
+`asyncio.to_thread(path.read_text, ...)` to avoid blocking the event loop.
+
+**P7-I08** — `IO_SEMAPHORE` and `CPU_SEMAPHORE` in `apex_host/async_utils.py`
+bound concurrent thread-pool submissions.  Limits: `max(4, cpu_count * 2)` for
+I/O, `max(2, cpu_count)` for CPU.
+
+**P7-I09** — `ApexRuntime.aclose()` is idempotent (safe to call multiple times).
+It cancels all background asyncio tasks and awaits `asyncio.gather(...,
+return_exceptions=True)` to suppress individual cancellation exceptions.
+
+**P7-I10** — All five Phase 7 timeout config fields have safe, non-zero defaults:
+`subprocess_sigterm_grace_seconds=5.0`, `browser_launch_timeout_seconds=30.0`,
+`telnet_read_timeout_seconds=10.0`, `retrieval_channel_timeout_seconds=5.0`,
+`parser_timeout_seconds=10.0`.
+
+#### New files
+
+| File | Purpose |
+|---|---|
+| `apex_host/async_utils.py` | `run_io`, `run_cpu`, `write_atomic_async`, `write_json_atomic`, semaphore constants |
+| `tests/apex_host/test_phase7_async.py` | 131 tests across 19 groups (G01–G19) |
+| `docs/phase7_end_report.md` | Full Phase 7 end report |
+
+#### Modified files
+
+| File | Change |
+|---|---|
+| `memfabric/stores/lexical_bm25.py` | A01 (scoring) + A02 (rebuild) via `asyncio.to_thread` |
+| `memfabric/stores/episodic_jsonl.py` | A03: file append via `asyncio.to_thread` |
+| `apex_host/knowledge/compiled_loader.py` | A04: file read via `asyncio.to_thread` |
+| `apex_host/eval/report.py` | A05: atomic temp-file write |
+| `apex_host/eval/export_graph.py` | A06: atomic temp-file write |
+| `apex_host/tools/runner.py` | A07 (SIGTERM grace) + A08 (CancelledError cleanup) |
+| `apex_host/agents/browser_executor.py` | A09: `asyncio.wait_for` on launch |
+| `apex_host/config.py` | 5 new timeout fields |
+| `apex_host/runtime.py` | `aclose()` shutdown method |
+
+---
+
+### Phase 8 — Secret Redaction and Graph Representation ✓ COMPLETE
+
+**Completion date:** 2026-07-14  
+**Tests after Phase 8:** 2298 passed  
+**mypy after Phase 8:** Success — 112 source files  
+**Ruff after Phase 8:** 130 errors (at Phase 7 ceiling)
+
+#### Binding invariants (P8 series)
+
+**P8-I01 — `apex_host.security.redaction` is the sole source of redaction logic.**  
+No `apex_host` source file (other than `redaction.py` itself) may contain the
+string literals `"[redacted]"` or `"[session_redacted]"` as code constants.
+Import `REDACTED_PLACEHOLDER` / `SESSION_REDACTED_PLACEHOLDER` from that module.
+
+**P8-I02 — Live session transcripts are never stored.**  
+`TelnetExecutor` (and any future network session executor) writes
+`SESSION_REDACTED_PLACEHOLDER` to `episode.data["stdout"]` — never the raw
+session bytes.  Metadata fields (`stdout_length`, `shell_found`) may be stored
+alongside for debugging without leaking credential material.
+
+**P8-I03 — `secret_hint` is always `REDACTED_PLACEHOLDER`.**  
+Every `credential` node written to the EKG must have
+`props["secret_hint"] = REDACTED_PLACEHOLDER`.  The plaintext credential must
+never appear in graph state, episodic log, or any proposal.
+
+**P8-I04 — `apex_host.graph_ids` is the sole source of EKG ID construction.**  
+All parsers and graph-writing components call the builder functions in
+`graph_ids.py`.  Inline f-strings like `f"host:{ip}"` in parsers are a
+violation caught by the ARCH test suite in `test_phase8_redaction.py`.
+
+**P8-I05 — `put_edge` must validate both endpoint nodes exist.**  
+`NetworkXGraphStore.put_edge()` raises `ValueError` with a message containing
+`"from_id"` or `"to_id"` when the referenced node does not exist.
+`MemoryAPI.upsert_edge()` propagates this exception.  Dangling edges are
+prevented at the store boundary.
+
+**P8-I06 — `export_ekg` always includes schema_version.**  
+Every call to `export_ekg()` includes `"schema_version": EKG_SCHEMA_VERSION`
+as the first key in the returned dict so consumers can detect incompatible
+schema changes.
+
+#### New files
+
+| File | Purpose |
+|---|---|
+| `apex_host/security/__init__.py` | Package; re-exports `redact_dict`, `redact_session_text`, `redact_value` |
+| `apex_host/security/redaction.py` | Central recursive redaction; `REDACTED_PLACEHOLDER`, `SESSION_REDACTED_PLACEHOLDER` |
+| `apex_host/graph_ids.py` | Canonical EKG ID builders + `normalize_url()` + `EKG_SCHEMA_VERSION = "1"` |
+| `tests/apex_host/test_phase8_redaction.py` | 80 acceptance tests (REDACT, CANARY, BOUND, GRAPH_ID, URL, PAR, DANGLE, SCHEMA, ARCH, INT) |
+
+#### Modified files
+
+`apex_host/agents/telnet_executor.py`, `apex_host/parsers/access_parser.py`,
+all six parser files (nmap, banner, browser, command, ffuf, gobuster),
+`memfabric/stores/graph_networkx.py` (parallel-edge + dangling-edge fixes),
+`apex_host/graph.py` (canonical anchor node), `apex_host/eval/export_graph.py`
+(schema_version key).
+
+---
+
+### Phase 9 — Shared-State Boundaries, Canonical Configuration, and Safe Default Consistency ✓ COMPLETE
+
+**Completion date:** 2026-07-14  
+**Tests added (Phase 9):** 80 (`tests/apex_host/test_phase9_config.py`)  
+**Total tests after Phase 9:** 2378 passed  
+**mypy after Phase 9:** Success — 112 source files  
+**Ruff after Phase 9:** 130 errors (at Phase 8 ceiling, exit code 1)
+
+#### Binding invariants (P9 series)
+
+**P9-I01 — `ApexConfig.from_cli_args()` is the canonical CLI→config factory.**  
+Both `main.py` and `eval/run_htb_local.py` call `ApexConfig.from_cli_args(args)` to
+construct `ApexConfig`.  No other production file (except `config.py` itself and
+`eval/run_synthetic_machine.py`) may call `ApexConfig(...)` directly.  Adding a new
+CLI flag means adding its mapping in `from_cli_args()` only — not in two separate files.
+
+**P9-I02 — `llm_provider` defaults to `"fake"` end-to-end.**  
+`ApexConfig.llm_provider = "fake"` is the field default.  Both CLI entry points register
+`--llm-provider` with `default=None` so that when the flag is absent, `from_cli_args()`
+propagates `None` → field default `"fake"`.  Setting `"openai"` requires an explicit
+`--llm-provider openai` flag on every invocation.
+
+**P9-I03 — `to_safe_dict()` is the approved serialisation path.**  
+`to_safe_dict()` returns all `ApexConfig` fields as a JSON-serialisable dict with
+`password_candidates` replaced by `[REDACTED_PLACEHOLDER]` entries.  It uses
+`REDACTED_PLACEHOLDER` (imported from `apex_host.security.redaction`) — never a
+hardcoded `"[redacted]"` string literal (which would violate P8-I01).
+
+**P9-I04 — `run_synthetic_machine.py` uses only canonical graph_ids builders.**  
+The five inline EKG ID f-strings have been replaced with calls to `_host_id`,
+`_service_id`, `_endpoint_id`, `_auth_flow_id`, and `_exposes_edge_id` from
+`apex_host.graph_ids`.  ARCH tests 01–03 verify no f-strings remain.
+
+#### New files
+
+| File | Purpose |
+|---|---|
+| `tests/apex_host/test_phase9_config.py` | 80 acceptance tests across 7 groups (CFG, CLI, ENV, STATE, SERIAL, ARCH, E2E) |
+
+#### Modified files
+
+| File | Change |
+|---|---|
+| `apex_host/config.py` | Added `config_schema_version: str = "1"` field; `to_safe_dict()` method; `from_cli_args()` classmethod; `fields as _dc_fields` and `REDACTED_PLACEHOLDER as _REDACTED` imports |
+| `apex_host/main.py` | Changed `--llm-provider default="openai"` → `default=None`; replaced 20-line `config_kwargs` block with `config = ApexConfig.from_cli_args(args)` |
+| `apex_host/eval/run_htb_local.py` | Same two changes as `main.py` |
+| `apex_host/eval/run_synthetic_machine.py` | Replaced inline EKG ID f-strings with canonical `graph_ids` builders |
+
+#### Defects fixed
+
+| # | Description |
+|---|---|
+| D1 | `--llm-provider` CLI default was `"openai"` — overrode ApexConfig's safe `"fake"` default even when user did not pass the flag |
+| D2 | Both `main.py` and `run_htb_local.py` had separate 20-line `config_kwargs` blocks with no divergence detection |
+| D3 | `run_synthetic_machine.py` built EKG IDs with inline f-strings — P8-I04 violation |
+| D4 | No `config_schema_version` field |
+| D5 | No `to_safe_dict()` method — no safe serialisation path that redacts credentials |
+| D6 | No `from_cli_args()` factory — duplicated mapping logic across two entry points |
+
+---
+
+### Phase 10 — Orchestration Refactor ✓ COMPLETE
+
+**Completion date:** 2026-07-14  
+**Tests after Phase 10:** 2618 passed  
+**mypy after Phase 10:** Success — 125 source files  
+**Ruff after Phase 10:** 130 errors (at Phase 8 ceiling, exit code 1)
+
+Decomposed monolithic `apex_host/graph.py` (1056 lines, `build_apex_graph` ~830 lines)
+into a 13-module `apex_host/orchestration/` package.  Fixed F17 and F18.
+Verified all prior-phase fixes (F04/F06/F07/F08/F09/F13/F14) are correctly placed
+in the decomposed architecture.
+
+| Finding | Description | File(s) | Status |
+|---|---|---|---|
+| F17 | Update README test count | `README.md` | FIXED (2026-07-14) |
+| F18 | Add `tests/test_file_headers.py` — two-line file-header convention | `tests/test_file_headers.py` | FIXED (2026-07-14) |
+
+#### Binding invariants (P10 series)
+
+**P10-I01 — `build_apex_graph()` public signature is unchanged.**
+All parameters preserved. Thin wrapper `apex_host/graph.py` re-exports from
+`apex_host/orchestration/builder.py`.
+
+**P10-I02 — Node factory pattern: `make_<name>_node(deps)` returns async node function.**
+No graph node defined inline in `build_apex_graph`. Each factory receives
+`OrchestrationDeps` and returns an independently testable async function.
+
+**P10-I03 — `OrchestrationDeps` is a frozen dataclass — immutable after construction.**
+All node closures share one `OrchestrationDeps`. Mutation would create race conditions.
+
+**P10-I04 — `OrchestrationDeps` never appears in `ApexGraphState`.**
+Infrastructure objects captured by node closures only (memfabric Invariant 1).
+
+**P10-I05 — Node names in the compiled graph are stable.**
+`load_context`, `global_plan`, `recon_agent`, `web_agent`, `browser_agent`,
+`execute_agent`, `priv_esc_agent`, `parse_observation`, `write_memory`,
+`repair_agent`, `reflect_or_continue` must never be renamed (checkpoint replay).
+
+**P10-I06 — `routing.py` is the sole location for routing function definitions.**
+All conditional edge logic lives in `orchestration/routing.py`.
+
+**P10-I07 — `completion.py` functions are pure (no I/O, no state, no async).**
+`outcome_for`, `is_repairable`, `should_complete` are synchronous pure functions.
+
+**P10-I08 — `run_command` is imported inside `build_apex_graph()`, not at module level.**
+Tests that monkeypatch `run_command` must target `apex_host.tools.runner.run_command`
+and apply the patch BEFORE calling `build_apex_graph()`.
+
+**P10-I09 — No `check_conflict_dependencies` call in orchestration/ modules.**
+The conflict gate is owned by `TaskDispatcher.dispatch()` in `execution/dispatcher.py`.
+
+**P10-I10 — All orchestration files follow the §12.6 two-line file-header convention.**
+Enforced by `tests/test_file_headers.py` (F18).
+
+**P10-I11 — `build_planners()` in `dependencies.py` is the single planner factory.**
+All domain planners are created in `build_planners`; no planner is constructed
+elsewhere in the orchestration package.
+
+#### New files
+
+| File | Purpose |
+|---|---|
+| `apex_host/orchestration/__init__.py` | Package re-exports |
+| `apex_host/orchestration/builder.py` | `build_apex_graph()` entry point |
+| `apex_host/orchestration/completion.py` | Pure completion/outcome functions |
+| `apex_host/orchestration/models.py` | Record builder helpers |
+| `apex_host/orchestration/dependencies.py` | `OrchestrationDeps`; `build_planners` |
+| `apex_host/orchestration/routing.py` | Routing functions and `PHASE_NODE` |
+| `apex_host/orchestration/context_node.py` | `load_context` node |
+| `apex_host/orchestration/global_plan_node.py` | `global_plan` node |
+| `apex_host/orchestration/dispatch_node.py` | All agent dispatch nodes |
+| `apex_host/orchestration/parsing_node.py` | `parse_observation` node |
+| `apex_host/orchestration/memory_node.py` | `write_memory` node |
+| `apex_host/orchestration/repair_node.py` | `repair_agent` node |
+| `apex_host/orchestration/continuation_node.py` | `reflect_or_continue` node |
+| `tests/apex_host/test_phase10_orchestration.py` | 120 acceptance tests |
+| `tests/test_file_headers.py` | 5 F18 enforcement tests |
+
+#### Acceptance criteria (all met)
+
+- ✓ `README.md` count matches `pytest --collect-only -q | tail -1` (2618)
+- ✓ `test_file_headers.py` passes (5/5)
+- ✓ 2618 tests pass (120 new in Phase 10 + all prior)
+- ✓ mypy --strict: Success (125 source files)
+- ✓ ruff: 130 errors (at ceiling)
+- ✓ No dry_run default changed
+- ✓ No memfabric changes
+
+---
+
+### Phase 11 — Independent Final Verification ✓ COMPLETE
+
+**Completion date:** 2026-07-14  
+**Tests after Phase 11:** 2668 passed  
+**mypy after Phase 11:** Success — 125 source files  
+**Ruff after Phase 11:** 130 errors (at Phase 10 ceiling, exit code 1)
+
+50 new tests in `tests/test_final_verification.py` across 10 groups (GRAPH,
+CONFLICT, SKILL, RETRIEVAL, LLM, EXEC, ASYNC, SECRET, CONFIG, INTEG — 5 tests
+each). All 21 original findings (F01–F21) and async findings (A01–A09) independently
+re-verified without trusting prior phase labels.
+
+**Final finding statuses:**
+- F01–F14, F17–F21, A01–A09: FIXED (independently verified)
+- F15: NOT A DEFECT (`record_turn` is called exactly once per non-done phase;
+  `reflect_or_continue` only peeks — no budget double-charge)
+- F16: FIXED (Phase 7 — 7 accumulation tests in `test_phase7_async.py::TestDuplicateActionsAccumulation`)
+- F21: FIXED (Phase 3 — `worker.py` uses `api.merge_skill_candidate()`, no direct mutation)
+
+**Known limitations (acknowledged, not blocking):**
+- 130 pre-existing ruff errors (predominantly F401 unused imports, auto-fixable)
+- 53 pre-existing PytestWarnings in `test_retrieval_phase4.py`
+- `asyncio.Lock` is single-process only; multi-process deployments need a distributed lock
+- `write_json_atomic` requires sequential calls per path — not safe for concurrent writes to same path
+
+Validation outputs recorded in `docs/final_validation_report.md`.
+All findings documented in `docs/reviewer_remediation_report.md`.
+
+---
+
+### How to update this roadmap
+
+When a phase's fixes are committed, update the table row to include the
+commit hash and mark the finding as `[FIXED]`. Do not delete rows — keep
+the audit trail visible. Increment the test count in the baseline line at
+the top of this section to reflect the new passing count.

@@ -22,6 +22,7 @@ with every other executor/parser pair in this codebase (memfabric Invariant 1).
 """
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 from memfabric.types import EvidenceBundle, Episode, ExecutorResult, Outcome, TaskSpec
@@ -137,8 +138,16 @@ class BrowserExecutor:
         from playwright.async_api import async_playwright  # lazy import: optional dep
 
         timeout_ms = self._config.max_command_seconds * 1000
+        # P7-I05 / A09: browser.launch() needs an explicit timeout; without one
+        # a hung browser process stalls the event loop indefinitely.
+        launch_timeout = float(
+            getattr(self._config, "browser_launch_timeout_seconds", 30.0)
+        )
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch()
+            browser = await asyncio.wait_for(
+                playwright.chromium.launch(),
+                timeout=launch_timeout,
+            )
             try:
                 page = await browser.new_page()
                 await page.goto(url, timeout=timeout_ms)

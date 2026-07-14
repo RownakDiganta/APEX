@@ -39,7 +39,7 @@ from apex_host.graph import build_apex_graph
 from apex_host.graph_state import ApexGraphState
 from apex_host.planning.models import PlanDecision, PlannerOutput, PlannedTask
 from apex_host.planning.prompt_builder import PromptBuilder
-from apex_host.planning.repair import RepairEngine
+from apex_host.planning.repair import RepairEngine, RepairRequest
 from apex_host.planners.recon_planner import ReconPlanner
 from apex_host.tools.registry import ToolRegistry
 from apex_host.types import ApexPhase
@@ -215,8 +215,8 @@ class TestRepairEngineLLMPath:
             _make_failed_task(), "exit code 1", "recon",
             _empty_evidence(), _empty_subgraph(),
         )
-        assert isinstance(result, TaskSpec)
-        assert result.params["tool"] == "nmap"
+        assert isinstance(result, RepairRequest)
+        assert result.repaired_task.params["tool"] == "nmap"
 
     async def test_corrected_task_has_right_args(self) -> None:
         router = _StubRouter(_StubLLM(_valid_repair_json()))
@@ -226,7 +226,7 @@ class TestRepairEngineLLMPath:
             _empty_evidence(), _empty_subgraph(),
         )
         assert result is not None
-        assert _TARGET in result.params["args"]
+        assert _TARGET in result.repaired_task.params["args"]
 
     async def test_cannot_repair_returns_none(self) -> None:
         router = _StubRouter(_StubLLM(_cannot_repair_json()))

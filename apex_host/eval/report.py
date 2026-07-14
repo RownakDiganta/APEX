@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import collections
 import json
-from dataclasses import asdict, dataclass, field
+import os
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -358,7 +360,7 @@ def format_text(report: RunReport) -> str:
             lines.append(f"  {family:<20}: {count:,}")
         if report.seeding_promotion:
             p = report.seeding_promotion
-            lines.append(f"  Reflector bootstrap:")
+            lines.append("  Reflector bootstrap:")
             lines.append(f"    passes        : {p.get('passes_run', 'n/a')}")
             lines.append(f"    promoted      : {p.get('records_promoted', 'n/a')}")
             lines.append(f"    remaining     : {p.get('records_remaining', 'n/a')}")
@@ -477,10 +479,26 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
 
 
 def write_report_json(report: RunReport, path: str | Path) -> None:
-    """Write the full report as pretty-printed JSON to *path*."""
+    """Write the full report as pretty-printed JSON to *path*.
+
+    The write is atomic (P7-I06 / A05): data is first written to a temporary
+    sibling file, synced, then renamed into place.  A process crash during the
+    write leaves the original file intact — never a truncated or zero-byte file.
+    """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(
-        json.dumps(to_json_dict(report), indent=2, default=str),
-        encoding="utf-8",
-    )
+    data = json.dumps(to_json_dict(report), indent=2, default=str)
+    # Write to a temp sibling in the same directory so that rename is atomic.
+    fd, tmp_path = tempfile.mkstemp(dir=out.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        Path(tmp_path).replace(out)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise

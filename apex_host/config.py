@@ -3,7 +3,9 @@
 """Typed configuration for the APEX host application."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as _dc_fields
+
+from apex_host.security.redaction import REDACTED_PLACEHOLDER as _REDACTED
 
 
 @dataclass(slots=True)
@@ -139,3 +141,90 @@ class ApexConfig:
     # True (--trace-records): per-record DEBUG logs are visible with -v, showing
     #   each promoted record ID.
     trace_knowledge_records: bool = False
+    # ---------------------------------------------------------------------------
+    # Phase 7 — Async timeout fields (P7-I03, P7-I05, P7-I10)
+    # ---------------------------------------------------------------------------
+    # subprocess_sigterm_grace_seconds: time to wait after SIGTERM before
+    #   escalating to SIGKILL on command timeout or cancellation (A07/A08 fix).
+    subprocess_sigterm_grace_seconds: float = 5.0
+    # browser_launch_timeout_seconds: maximum time allowed for
+    #   playwright.chromium.launch() before raising TimeoutError (A09 fix).
+    browser_launch_timeout_seconds: float = 30.0
+    # telnet_read_timeout_seconds: per-read timeout inside TelnetExecutor's
+    #   banner-read loop.  The outer asyncio.wait_for still applies.
+    telnet_read_timeout_seconds: float = 10.0
+    # retrieval_channel_timeout_seconds: maximum time for a single retrieval
+    #   channel (BM25, vector, graph) before it is skipped and an empty result
+    #   is returned for that channel.
+    retrieval_channel_timeout_seconds: float = 5.0
+    # parser_timeout_seconds: maximum wall-clock time for a parser call.
+    parser_timeout_seconds: float = 10.0
+    # Configuration schema version — increment when the config format changes in a
+    # backward-incompatible way (new required fields, renamed fields, type changes).
+    # Exposed via to_safe_dict() so consumers can detect incompatible changes.
+    config_schema_version: str = "1"
+
+    # ------------------------------------------------------------------
+    # Safe serialisation and canonical CLI→config construction
+    # ------------------------------------------------------------------
+
+    def to_safe_dict(self) -> dict[str, object]:
+        """Return all fields as a JSON-serialisable dict with sensitive values redacted.
+
+        ``password_candidates`` entries are replaced with ``"[redacted]"``.
+        All other fields are returned verbatim — no other field stores a plaintext secret.
+        """
+        d: dict[str, object] = {f.name: getattr(self, f.name) for f in _dc_fields(self)}
+        if self.password_candidates:
+            d["password_candidates"] = [_REDACTED] * len(self.password_candidates)
+        return d
+
+    @classmethod
+    def from_cli_args(cls, args: object) -> "ApexConfig":
+        """Canonical CLI→config factory used by main.py and eval/run_htb_local.py.
+
+        Accepts an ``argparse.Namespace`` (or any attribute-holder).  This is the
+        single place that maps CLI argument names to ``ApexConfig`` field names so
+        that both entry points stay in sync without duplicating logic.
+
+        Key invariant: when ``--llm-provider`` is absent (``args.llm_provider`` is
+        ``None``), the ``ApexConfig`` field default of ``"fake"`` is preserved.
+        The CLI must register that flag with ``default=None``, not ``"openai"``.
+        """
+        def _g(attr: str, default: object) -> object:
+            v = getattr(args, attr, None)
+            return default if v is None else v
+
+        kwargs: dict[str, object] = {
+            "target": getattr(args, "target"),
+            "payload_repo_path": _g("payload_repo", "./payloads"),
+            "max_turns": _g("max_turns", 20),
+            "dry_run": bool(_g("dry_run", True)),
+            "web_wordlist_path": _g("web_wordlist", None),
+            "max_web_paths": _g("max_web_paths", 50),
+            "username_candidates": list(getattr(args, "username", None) or []),
+            "password_candidates": list(getattr(args, "password", None) or []),
+            "max_access_attempts": _g("max_access_attempts", 1),
+            "use_llm": bool(_g("use_llm", False)),
+            # llm_provider: CLI None → field default "fake".
+            # The CLI flag must use default=None (not "openai") so this fallback fires.
+            "llm_provider": _g("llm_provider", "fake"),
+            "llm_base_url": _g("llm_base_url", None),
+            "knowledge_root": _g("knowledge_root", None),
+            "policy_file": _g("policy_file", None),
+            "llm_stop_on_repeated_plan": bool(_g("llm_stop_on_repeated_plan", True)),
+        }
+        if getattr(args, "max_llm_calls", None) is not None:
+            kwargs["max_llm_calls_per_run"] = int(getattr(args, "max_llm_calls"))
+        if getattr(args, "max_llm_calls_per_phase", None) is not None:
+            kwargs["max_llm_calls_per_phase"] = int(getattr(args, "max_llm_calls_per_phase"))
+        if getattr(args, "llm_timeout", None) is not None:
+            kwargs["llm_request_timeout_seconds"] = float(getattr(args, "llm_timeout"))
+        llm_model = getattr(args, "llm_model", None)
+        if llm_model:
+            kwargs["planner_model"] = str(llm_model)
+            kwargs["executor_model"] = str(llm_model)
+            kwargs["parser_model"] = str(llm_model)
+        if getattr(args, "trace_records", False):
+            kwargs["trace_knowledge_records"] = True
+        return cls(**kwargs)  # type: ignore[arg-type]

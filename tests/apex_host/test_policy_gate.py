@@ -236,7 +236,7 @@ class TestApprovedReachesRunner:
             run_calls.append(cmd)
             return _fake_tool_result(stdout=f"[dry-run] {cmd.tool}")
 
-        monkeypatch.setattr("apex_host.graph.run_command", _spy_run_command)
+        monkeypatch.setattr("apex_host.tools.runner.run_command", _spy_run_command)
 
         target = "127.0.0.1"
         api = _make_api()
@@ -269,7 +269,7 @@ class TestBlockedNeverReachesRunner:
                 f"run_command must not be called when task is blocked; called with {cmd}"
             )
 
-        monkeypatch.setattr("apex_host.graph.run_command", _forbidden_run_command)
+        monkeypatch.setattr("apex_host.tools.runner.run_command", _forbidden_run_command)
 
         target = "127.0.0.1"
         api = _make_api()
@@ -289,7 +289,7 @@ class TestBlockedNeverReachesRunner:
         """Blocked tasks are recorded in state['policy_decisions']."""
         advisor = _FakeAdvisor(always_blocked=True)
         monkeypatch.setattr(
-            "apex_host.graph.run_command",
+            "apex_host.tools.runner.run_command",
             AsyncMock(return_value=_fake_tool_result()),
         )
 
@@ -312,7 +312,7 @@ class TestBlockedNeverReachesRunner:
         """The tool_result for a blocked task must carry policy_blocked=True."""
         advisor = _FakeAdvisor(always_blocked=True)
         monkeypatch.setattr(
-            "apex_host.graph.run_command",
+            "apex_host.tools.runner.run_command",
             AsyncMock(return_value=_fake_tool_result()),
         )
 
@@ -335,7 +335,7 @@ class TestBlockedNeverReachesRunner:
         """The error field in a blocked result contains the policy reason."""
         advisor = _FakeAdvisor(always_blocked=True)
         monkeypatch.setattr(
-            "apex_host.graph.run_command",
+            "apex_host.tools.runner.run_command",
             AsyncMock(return_value=_fake_tool_result()),
         )
 
@@ -373,7 +373,7 @@ class TestBlockedCredentialNeverReachesTelnet:
             "apex_host.agents.telnet_executor.TelnetExecutor.run", _forbidden_telnet_run
         )
         monkeypatch.setattr(
-            "apex_host.graph.run_command",
+            "apex_host.tools.runner.run_command",
             AsyncMock(return_value=_fake_tool_result()),
         )
 
@@ -403,7 +403,7 @@ class TestBlockedCredentialNeverReachesTelnet:
         """Blocked credential task appears in policy_decisions."""
         advisor = _FakeAdvisor(block_tool="telnet_access")
         monkeypatch.setattr(
-            "apex_host.graph.run_command",
+            "apex_host.tools.runner.run_command",
             AsyncMock(return_value=_fake_tool_result()),
         )
 
@@ -630,7 +630,7 @@ class TestBlockedBrowserNeverReachesExecutor:
             "apex_host.agents.browser_executor.BrowserExecutor.run", _forbidden_browser_run
         )
         monkeypatch.setattr(
-            "apex_host.graph.run_command",
+            "apex_host.tools.runner.run_command",
             AsyncMock(return_value=_fake_tool_result()),
         )
 
@@ -660,7 +660,7 @@ class TestBlockedBrowserNeverReachesExecutor:
         """Blocked browser task produces a policy_decisions entry with tool='browser'."""
         advisor = _FakeAdvisor(block_tool="browser")
         monkeypatch.setattr(
-            "apex_host.graph.run_command",
+            "apex_host.tools.runner.run_command",
             AsyncMock(return_value=_fake_tool_result()),
         )
 

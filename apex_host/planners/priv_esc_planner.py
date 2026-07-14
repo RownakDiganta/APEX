@@ -19,7 +19,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from memfabric.ids import new_id, now
-from memfabric.types import AbandonSignal, EvidenceBundle, Goal, SubgraphView, TaskSpec
+from memfabric.types import (
+    AbandonSignal,
+    ClaimDependency,
+    EvidenceBundle,
+    Goal,
+    SubgraphView,
+    TaskSpec,
+)
 
 from apex_host.planners.capabilities import capabilities_from_subgraph
 from apex_host.planning.models import PlanDecision
@@ -27,9 +34,11 @@ from apex_host.tools.registry import ToolRegistry
 from apex_host.types import ApexPhase
 
 if TYPE_CHECKING:
+    from apex_host.llm.gateway import LLMGateway
     from apex_host.llm.router import ModelRouter
     from apex_host.planning.budget import LLMBudgetTracker
     from apex_host.planning.engine import PlanningEngine
+    from apex_host.policy.llm_guard import LLMPolicyGuard
 
 
 class _PrivEscDeterministic:
@@ -75,6 +84,15 @@ class _PrivEscDeterministic:
                     },
                     subgraph_anchor=goal.anchor_node,
                     phase=goal.phase,
+                    # searchsploit queries the service version string.
+                    claim_dependencies=(
+                        ClaimDependency(
+                            node_id=cap.source_node_id, field_name="version"
+                        ),
+                        ClaimDependency(
+                            node_id=cap.source_node_id, field_name="service"
+                        ),
+                    ),
                 )
             )
 
@@ -97,6 +115,8 @@ class PrivEscPlanner:
         confidence_threshold: float = 0.4,
         max_retries: int = 1,
         budget_tracker: "LLMBudgetTracker | None" = None,
+        guard: "LLMPolicyGuard | None" = None,
+        gateway: "LLMGateway | None" = None,
     ) -> None:
         self._core = _PrivEscDeterministic(target, registry)
         self._engine: PlanningEngine | None = None
@@ -112,6 +132,8 @@ class PrivEscPlanner:
                 confidence_threshold=confidence_threshold,
                 max_retries=max_retries,
                 budget=budget_tracker,
+                guard=guard,
+                gateway=gateway,
             )
 
     @property

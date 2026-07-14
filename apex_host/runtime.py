@@ -9,6 +9,7 @@ touches state through MemoryAPI, consistent with memfabric Invariant 1.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -52,6 +53,35 @@ class ApexRuntime:
     registry: ToolRegistry
     # Populated by run() after the graph completes; None before the first run.
     last_budget: LLMBudgetTracker | None = None
+    # Internal flag to track whether aclose() has already been called.
+    _closed: bool = False
+
+    async def aclose(self) -> None:
+        """Gracefully shut down all resources held by this runtime.
+
+        Idempotent: safe to call more than once.  Does not raise if called
+        before ``run()`` has been invoked.
+
+        Phase 7 (P7-I09): provides a clean shutdown path for callers that need
+        to release resources (e.g. thread pools, open file handles) after the
+        engagement completes or is cancelled.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        # Cancel any background tasks that were started but not awaited.
+        # Currently ApexRuntime does not start background tasks directly; this
+        # hook is provided for future use and ensures the pattern is in place.
+        tasks = [
+            t for t in asyncio.all_tasks()
+            if t is not asyncio.current_task() and not t.done()
+        ]
+        if tasks:
+            logger.debug("aclose: cancelling %d pending task(s)", len(tasks))
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        logger.debug("aclose: runtime closed")
 
     async def seed(self) -> int:
         """Load the payload repo into staged knowledge and promote it once.
@@ -158,6 +188,7 @@ class ApexRuntime:
             "repair_count": 0,
             "policy_decisions": [],
             "duplicate_actions": [],
+            "completed_fingerprints": [],
         }
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": run_id},

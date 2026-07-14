@@ -11,9 +11,7 @@ Section 8 invariants tested here:
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -198,7 +196,7 @@ class TestRetrieverGate:
                 {"tier": "semantic"},
             )
 
-        results = await retriever.search(
+        await retriever.search(
             text="nginx vulnerability severity",
             k=5,
             tiers=[Tier.semantic],
@@ -258,7 +256,7 @@ class TestRetrieverGate:
         )
 
         # Should not raise — dense channel failure is swallowed gracefully
-        results = await retriever.search(text="test", k=5, tiers=[Tier.semantic])
+        results, _diag = await retriever.search(text="test", k=5, tiers=[Tier.semantic])
         assert isinstance(results, list)
 
 
@@ -269,19 +267,19 @@ class TestRetrieverCache:
         await lexical.add("d1", "cache test document content", {"tier": "semantic"})
 
         # First call: channels execute
-        r1 = await retriever.search(
+        r1, _ = await retriever.search(
             text="cache test", k=5, tiers=[Tier.semantic, Tier.working]
         )
         calls_after_first = spy_embedder.call_count + spy_graph.call_count  # type: ignore[union-attr]
 
         # Second call: must be a cache hit (no channel calls)
-        r2 = await retriever.search(
+        r2, _ = await retriever.search(
             text="cache test", k=5, tiers=[Tier.semantic, Tier.working]
         )
         calls_after_second = spy_embedder.call_count + spy_graph.call_count  # type: ignore[union-attr]
 
         assert calls_after_second == calls_after_first   # no new calls
-        assert len(r1) == len(r2)
+        assert len(r1) == len(r2)  # same results returned from cache
 
     async def test_different_query_is_cache_miss(self) -> None:
         retriever, lexical, spy_embedder, spy_graph = make_retriever(tau=100.0)
@@ -313,7 +311,7 @@ class TestRetrieverIntegration:
         await lexical.add("d1", "important security finding", {"tier": "semantic"})
         await lexical.add("d2", "other unrelated content", {"tier": "semantic"})
 
-        results = await retriever.search(
+        results, _ = await retriever.search(
             text="important security finding", k=5, tiers=[Tier.semantic]
         )
         ids = [e.id for e in results]
@@ -324,7 +322,7 @@ class TestRetrieverIntegration:
         await lexical.add("sem", "some knowledge here", {"tier": "semantic"})
         await lexical.add("proc", "some knowledge here", {"tier": "procedural"})
 
-        results = await retriever.search(
+        results, _ = await retriever.search(
             text="some knowledge", k=5, tiers=[Tier.semantic]
         )
         ids = [e.id for e in results]
