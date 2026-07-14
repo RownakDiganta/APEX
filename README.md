@@ -693,6 +693,30 @@ been exercised in-process and against a locally started service on the
 same machine. Full detail:
 [`docs/remote-tool-backend.md`](docs/remote-tool-backend.md).
 
+**APEX application container (Infra Phase 5):** `docker/apex/Dockerfile`
+builds a reproducible, non-root, `uv.lock`-locked image containing
+`apex_host` + `memfabric` and only runtime dependencies (no pytest/ruff/
+mypy, no Kali tools, no raw knowledge corpora — only the ~49 MB compiled
+subset). Build and smoke-test **just this image** (no Compose environment
+exists yet):
+
+```bash
+docker build -f docker/apex/Dockerfile -t apex:phase5 .
+
+docker run --rm apex:phase5 python -m apex_host.main --help
+docker run --rm apex:phase5 python -m apex_host.eval.run_htb_local --help
+docker run --rm apex:phase5 id   # confirms non-root (uid=1000)
+```
+
+The default command (`python -m apex_host.main --help`) is intentionally
+safe — starting the container does **not** begin a live engagement, does
+not require an API key or HTB VPN, and does not contact any remote tool
+service. This is not yet the full deployment: the Kali tool-service image
+(Infra Phase 6), Docker Compose wiring the two together, and VPN
+networking are all still pending. Full detail, including the knowledge/
+report/browser-support strategy and every verified smoke-test command:
+[`docs/apex-container.md`](docs/apex-container.md).
+
 ---
 
 ## APEX Host Quickstart
