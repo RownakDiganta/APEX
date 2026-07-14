@@ -1,20 +1,26 @@
 # .dockerignore
-# Build-context exclusions for docker/apex/Dockerfile (Infra Phase 5) — keeps secrets, VCS metadata, caches, tests, and raw knowledge corpora out of the image build context.
+# Build-context exclusions shared by every Dockerfile under docker/ (Infra Phase 5's docker/apex/Dockerfile and Infra Phase 6's docker/kali/Dockerfile) — keeps secrets, VCS metadata, caches, tests, and raw knowledge corpora out of the image build context.
 #
 # This file governs what the Docker CLI sends to the daemon as the build
-# context when building from the repository root:
+# context when building from the repository root, regardless of which
+# Dockerfile is selected via `-f`:
 #   docker build -f docker/apex/Dockerfile -t apex:phase5 .
+#   docker build -f docker/kali/Dockerfile -t apex-kali:phase6 .
 #
-# It does NOT, by itself, decide what ends up *in* the image — the
+# It does NOT, by itself, decide what ends up *in* either image — each
 # Dockerfile's COPY instructions are additionally selective (they name exact
 # files/directories, they never do a blanket `COPY . .`). Both layers matter:
 # this file keeps large/sensitive things out of the context sent to the
-# daemon in the first place; the Dockerfile's explicit COPY list keeps the
+# daemon in the first place; each Dockerfile's explicit COPY list keeps the
 # image itself minimal even for things that *do* reach the daemon.
+# docker/kali/Dockerfile does not COPY Knowledge/*/compiled/ at all (the
+# Kali tool-service appliance carries no knowledge corpora, see
+# docs/kali-container.md) — only docker/apex/Dockerfile does.
 #
 # Required-file guarantee: pyproject.toml, uv.lock, memfabric/, apex_host/,
-# apex_tool_service/, and Knowledge/*/compiled/ are NEVER excluded below —
-# every pattern here was checked against that list before being added.
+# apex_tool_service/, docker/ (this whole directory, both Dockerfiles), and
+# Knowledge/*/compiled/ are NEVER excluded below — every pattern here was
+# checked against that list before being added.
 
 # ---------------------------------------------------------------------------
 # Version control

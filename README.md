@@ -686,12 +686,12 @@ is needed for ordinary use. New CLI flags: `--tool-backend
 `--tool-service-timeout SECS` (on both `apex_host.main` and
 `apex_host.eval.run_htb_local`). The bearer token has **no CLI flag** —
 set it via `export APEX_TOOL_SERVICE_TOKEN=...` instead (CLI args leak
-into shell history and `ps`). **What's still missing:** the Docker/Compose
-deployment that would actually run `apex_tool_service` inside a Kali
-container reachable over a network — today `RemoteToolBackend` has only
-been exercised in-process and against a locally started service on the
-same machine. Full detail:
-[`docs/remote-tool-backend.md`](docs/remote-tool-backend.md).
+into shell history and `ps`). **Updated in Infra Phase 6:**
+`RemoteToolBackend` has now been verified against a real Dockerized
+`apex_tool_service` instance (see the Kali container section below) — what
+remains missing is Docker Compose wiring the APEX and Kali containers
+together on a shared network, and VPN routing to reach an authorized HTB
+target. Full detail: [`docs/remote-tool-backend.md`](docs/remote-tool-backend.md).
 
 **APEX application container (Infra Phase 5):** `docker/apex/Dockerfile`
 builds a reproducible, non-root, `uv.lock`-locked image containing
@@ -711,11 +711,49 @@ docker run --rm apex:phase5 id   # confirms non-root (uid=1000)
 The default command (`python -m apex_host.main --help`) is intentionally
 safe — starting the container does **not** begin a live engagement, does
 not require an API key or HTB VPN, and does not contact any remote tool
-service. This is not yet the full deployment: the Kali tool-service image
-(Infra Phase 6), Docker Compose wiring the two together, and VPN
-networking are all still pending. Full detail, including the knowledge/
-report/browser-support strategy and every verified smoke-test command:
-[`docs/apex-container.md`](docs/apex-container.md).
+service. This is not yet the full deployment: Docker Compose wiring the
+two images together and VPN networking are still pending. Full detail,
+including the knowledge/report/browser-support strategy and every
+verified smoke-test command: [`docs/apex-container.md`](docs/apex-container.md).
+
+**Kali tool-service container (Infra Phase 6):** `docker/kali/Dockerfile`
+builds the real, running counterpart to `apex_tool_service` — an official,
+digest-pinned `kalilinux/kali-rolling` image with only the six
+allowlist-mapped binaries installed (`nmap`, `curl`, `iputils-ping` →
+`ping`, `netcat-openbsd` → `nc`/`netcat`, `telnet` client only), running
+the restricted HTTP service as a non-root user. Build and smoke-test it:
+
+```bash
+docker build -f docker/kali/Dockerfile -t apex-kali:phase6 .
+
+docker run -d --name apex-kali -p 8080:8080 \
+  -e APEX_TOOL_SERVICE_TOKEN=your-local-dev-token \
+  apex-kali:phase6
+
+curl -s http://127.0.0.1:8080/health   # no token needed
+
+curl -s -X POST http://127.0.0.1:8080/v1/execute \
+  -H "Authorization: Bearer your-local-dev-token" \
+  -d '{"tool": "curl", "arguments": ["--version"]}'
+
+docker rm -f apex-kali   # stop and remove
+```
+
+No Docker Compose wiring exists yet between this image and the APEX
+application container, and no live HTB/VPN target is contacted by any of
+the commands above — every one of them talks only to the container's own
+loopback interface. A real `apex_host.tools.remote_backend.RemoteToolBackend`
+client was verified against a real running instance of this image during
+Infra Phase 6 (`ToolResult(backend="kali-service", returncode=0, ...)` for
+a real `curl --version` execution), closing the "still missing" gap noted
+above for Infra Phase 4 — `RemoteToolBackend` has now been exercised
+against a real Dockerized service, not just in-process. One notable,
+empirically-verified finding: `nmap`'s default/SYN-scan mode does **not**
+work unprivileged inside this container (`-sT` is required) — see
+[`docs/kali-container.md`](docs/kali-container.md) §5 for the full
+capability investigation. Full detail on every installed/excluded tool,
+the build design, and all nine parts of this phase's runtime validation:
+[`docs/kali-container.md`](docs/kali-container.md).
 
 ---
 

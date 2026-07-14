@@ -4320,10 +4320,19 @@ list and rationale):**
 **renumbered by Infra Phase 3** — see that phase's record below): Infra
 Phase 3 builds the restricted Kali tool service (`apex_tool_service/`);
 Phase 4 implements `RemoteToolBackend`'s transport and wires
-`config.tool_backend` into the default path; Phase 5 adds Dockerfiles;
-Phase 6 adds Compose; Phase 7 wires `ToolCommand.stdin`; Phase 8 adds
-`.env.example` + CLI flags; Phase 9+ covers VPN validation, CI publishing,
-and Meow-specific live-run work.
+`config.tool_backend` into the default path; Phase 5 adds the APEX
+application Dockerfile; Phase 6 adds the Kali tool-service Dockerfile;
+Phase 7 wires `ToolCommand.stdin`; Phase 8 adds `.env.example` + CLI
+flags; Phase 9+ covers VPN validation, CI publishing, and Meow-specific
+live-run work.
+>
+> **Correction (Infra Phase 6, 2026-07-15):** this projection originally
+> said "Phase 6 adds Compose" — that did not happen. Infra Phase 6 built
+> the Kali tool-service container image (`docker/kali/Dockerfile`) instead;
+> Docker Compose remains unstarted (deferred again, see that phase's
+> record below). Numbering beyond Phase 6 in this paragraph is historical
+> projection, not a commitment — treat only the completed-phase records
+> below as authoritative.
 
 ---
 
@@ -4697,8 +4706,128 @@ freshly built `apex:phase5` image):**
 | `docker history --no-trunc` secret scan | Clean |
 | `git diff --check` | exit 0 |
 
-**Deferred to Infra Phase 6+:** Kali tool-service Docker image; Docker
-Compose; `.env.example`; container entrypoint/preflight orchestration; VPN
-networking; CI image publishing; Meow diagnosis; deterministic Meow tests;
-authorized live Meow validation. **None of these were started in this
+**Deferred to Infra Phase 6+ (as of Infra Phase 5):** Kali tool-service
+Docker image; Docker Compose; `.env.example`; container entrypoint/
+preflight orchestration; VPN networking; CI image publishing; Meow
+diagnosis; deterministic Meow tests; authorized live Meow validation.
+**None of these were started in Infra Phase 5.**
+
+### Infra Phase 6 — Kali Linux tool-service container image ✓ COMPLETE
+
+**Date:** 2026-07-15
+**Files:** `docker/kali/Dockerfile`, `docker/kali/entrypoint.py`,
+`tests/docker/test_apex_kali_dockerfile.py` (53 static tests),
+`docs/kali-container.md` (full design/evidence record)
+
+Built and validated, against a real Docker daemon, the running counterpart
+to `apex_tool_service` (Infra Phase 3): a Kali Linux container that starts
+only the restricted HTTP tool-execution service, with a small,
+evidence-justified set of pre-installed binaries.
+
+**Base image:** official `kalilinux/kali-rolling`, pinned by digest
+(`sha256:8a1ea7281085ffef4963e82766c70869d7db910df88dcbb1f03d2899420b9577`),
+used for both the multi-stage `builder` and `runtime` stages. No
+community/unofficial Kali image; no `:latest` tag. APT package versions are
+explicitly NOT pinned (documented limitation — Kali rolling has no dated
+snapshot repository).
+
+**Installed tools** (map 1:1 to `apex_tool_service/allowlist.py::ALLOWED_TOOLS`,
+verified live via a running container's own `GET /health`): `nmap`, `curl`,
+`iputils-ping` (→ `ping`), `netcat-openbsd` (→ **both** `nc` and `netcat`,
+verified via `update-alternatives` symlinks — one package satisfies both
+allowlist entries), `telnet` (client only — `telnetd` deliberately not
+installed), `ca-certificates`. Explicitly excluded, with evidence recorded
+in `docs/kali-container.md` §3: `kali-linux-{default,large,everything}`,
+`metasploit-framework`, `sqlmap`, `hydra`, `medusa`, `patator`, `gobuster`,
+`ffuf`, `nikto`, `whatweb`, `masscan`, `john`, `hashcat`, `telnetd`,
+`openssh-server`, any Docker client, `sudo`, `iproute2`.
+
+**Python provisioning:** a **uv-managed** (`python-build-standalone`)
+CPython 3.11.14 — deliberately not Kali's own rolling `python3` package,
+because `apex_tool_service` is unavoidably bundled with `apex_host`/
+`memfabric` in one Hatchling distribution (see "Packaging limitation"
+below), so `uv sync` installs the full heavy dependency graph
+(numpy/faiss-cpu/playwright/langgraph); Kali's bleeding-edge `python3`
+risked missing prebuilt wheels for those packages, which would have forced
+a from-source build requiring a full compiler toolchain. The managed
+interpreter (`/opt/uv-python`) and the prepared venv (`/app/.venv`) are
+copied byte-for-byte into the runtime stage at matching absolute paths.
+`uv` itself is not present in the runtime image.
+
+**Non-root execution:** dedicated `apextool` user, UID/GID 1000, no login
+shell (`nologin`), no `sudo`, no password. Verified live:
+`docker run --rm apex-kali:phase6 id` → `uid=1000(apextool)
+gid=1000(apextool)`.
+
+**Linux capability finding (empirical, load-bearing for future Meow work):**
+`ping` and `nmap -sT` work unprivileged under Docker's default capability
+set with **zero** capability grant (no `--cap-add`, no `setcap` anywhere in
+this Dockerfile — capability decisions are deliberately deferred to a
+future Compose phase). `nmap`'s **default/SYN-scan mode does NOT work
+unprivileged** — verified live: a bare-flags nmap request (the exact
+request shape used in every prior phase's documented API examples) fails
+with `returncode=1`, `stderr: "Couldn't open a raw socket... QUITTING!"`
+— nmap 7.99 does not auto-fallback to a connect scan. Any future caller of
+this container (a `ReconPlanner`-driven task, a manual API call) **must
+pass `-sT` explicitly**, or a future Compose phase must grant
+`--cap-add=NET_RAW --cap-add=NET_ADMIN` (untested, deferred). Full
+investigation: `docs/kali-container.md` §5/§14.
+
+**Port/health/auth:** `EXPOSE 8080`; `APEX_TOOL_SERVICE_HOST=0.0.0.0`
+(overriding the library's own `127.0.0.1`-only default, since a container's
+purpose is external reachability); `HEALTHCHECK` targets the unauthenticated
+`GET /health` via `curl`, no tool invoked, no token required. No
+`APEX_TOOL_SERVICE_TOKEN` is ever set in the image (verified: unset →
+`/v1/execute` fails closed with 503; execution requires an operator-supplied
+`-e APEX_TOOL_SERVICE_TOKEN=...` at `docker run` time).
+
+**Observability addition (`docker/kali/entrypoint.py`):** discovered that
+`apex_tool_service`'s own `INFO`-level audit lines (`execution_accepted`/
+`execution_complete`) were silently dropped under Python's default logging
+configuration when run as a container's sole process — only uvicorn's own
+access-log lines and `WARNING`-level events reached `docker logs`. Added a
+narrowly-scoped entrypoint script (explicitly an allowed `docker/kali/`
+support-file type) that calls `logging.basicConfig(level=logging.INFO)`
+before delegating to the unmodified `apex_tool_service.__main__.main()` —
+a pure observability change; no allowlist/validation/auth/execution logic
+in `apex_tool_service` itself was touched. Verified live, before and after.
+
+**Packaging limitation (documented, not fixed — per task brief
+"consider-but-do-not-perform"):** because `apex_tool_service` shares one
+Hatchling distribution with `apex_host`/`memfabric`, the copied `/app/.venv`
+layer is 313 MB (the majority of the image's 813 MB total), almost
+entirely unused-at-runtime scientific/LLM dependencies. This image never
+starts, imports, or exposes anything from `apex_host`/`memfabric` — the
+weight is a build-size/attack-surface cost, not a functional or security
+leak. A future package split was considered and explicitly not performed.
+
+**Real end-to-end validation performed (all 9 parts of this phase's
+runtime-validation checklist, recorded with full command transcripts in
+`docs/kali-container.md` §13):** no-token fail-closed startup; test-token
+authenticated execution; safe tool executions including the nmap privilege
+demonstration; unknown/dangerous-tool and shell-metacharacter rejection;
+non-root `id` check; installed/excluded-tool inspection; dev-tool absence;
+filesystem secret/data absence; and — the phase's completion gate — a
+**real** `apex_host.tools.remote_backend.RemoteToolBackend` client
+constructed with `dry_run=False` executing `curl --version` against the
+**real running Dockerized container**, returning
+`ToolResult(backend="kali-service", returncode=0, error=None, ...)`,
+proving the full chain real client → real container → real binary →
+`ToolResult`. All temporary containers were stopped and removed after
+validation.
+
+**Minor pre-existing discrepancy surfaced (not fixed, out of this phase's
+scope):** `docs/kali-tool-service.md` §5 states `RemoteToolBackend` should
+normalize the server's `backend` field to `"remote"`; the real Infra Phase 4
+implementation (`apex_host/tools/remote_backend.py::_map_response`) instead
+passes the server's own value through verbatim, so a successful response's
+`ToolResult.backend` is `"kali-service"`, not `"remote"`. Recorded for
+visibility; `apex_host/tools/remote_backend.py` is outside this phase's
+authorized file list (`docker/kali/` only).
+
+**Deferred to Infra Phase 7+ (as of Infra Phase 6):** Docker Compose wiring
+this image and the Infra Phase 5 APEX application image together; VPN
+container/networking; `.env.example`; Linux capability grants for
+default/SYN-scan nmap support; CI image publishing; Meow-specific
+diagnosis/tests/live validation. **None of these were started in this
 phase.**
