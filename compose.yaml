@@ -1,0 +1,163 @@
+# compose.yaml
+# Docker Compose integration wiring the APEX application container to the Kali tool-service container over an internal, non-host-published network (Infra Phase 7).
+#
+# Topology:
+#
+#   apex container  --internal authenticated HTTP-->  kali container
+#   (docker/apex/Dockerfile)      apex-internal        (docker/kali/Dockerfile)
+#                                  network              http://kali:8080
+#
+# Start (safe, target-free — see docs/docker-compose.md for full detail):
+#
+#   APEX_TOOL_SERVICE_TOKEN=replace-with-a-disposable-test-token \
+#     docker compose up --build --abort-on-container-exit
+#
+# `--abort-on-container-exit` is the chosen workflow: the `apex` service's
+# default command is a bounded, dry-run connectivity smoke check that exits
+# 0 quickly, while `kali` is a long-running HTTP server with no natural
+# exit — without this flag, `docker compose up` would leave `kali` running
+# indefinitely after `apex` finishes. See docs/docker-compose.md "Safe
+# default behavior" for the full rationale, including why the default
+# command is dry-run (never contacts `kali`) and how to run the REAL
+# connectivity check (`--no-dry-run`) explicitly.
+#
+# No top-level `version:` key — this file uses the modern Compose
+# Specification, where `version:` is deprecated/ignored by Compose v2.
+# `docker compose version` (v2.34.0-desktop.1, verified this phase) does
+# not require it.
+#
+# HTB VPN routing is NOT configured anywhere in this file (deferred to a
+# later Infra Phase — see docs/docker-compose.md §17). Nothing in this
+# environment can reach an HTB target; every command validated against it
+# in Infra Phase 7 touched only the `apex-internal` network and each
+# container's own loopback interface.
+
+services:
+  # ---------------------------------------------------------------------
+  # kali — the restricted tool-execution appliance (Infra Phase 6).
+  # Reachable ONLY from other services on `apex-internal`; never published
+  # to the host (no `ports:` mapping — see the `expose:` note below).
+  # ---------------------------------------------------------------------
+  kali:
+    build:
+      context: .
+      dockerfile: docker/kali/Dockerfile
+    networks:
+      - apex-internal
+    environment:
+      # Fail-fast interpolation: `docker compose config`/`up`/`build` all
+      # refuse to proceed if this is unset or empty, per this phase's own
+      # requirement — no reusable default token is baked in anywhere.
+      APEX_TOOL_SERVICE_TOKEN: ${APEX_TOOL_SERVICE_TOKEN:?APEX_TOOL_SERVICE_TOKEN must be set — see docs/docker-compose.md}
+    # `expose:` documents intent (reachable on the Compose network at port
+    # 8080) but is not strictly required — Compose already makes every
+    # service's ports reachable to other services on the same network
+    # without it. It is intentionally NOT `ports:`, which would publish
+    # the port to the host — the one thing this phase's task brief
+    # explicitly forbids by default.
+    expose:
+      - "8080"
+    # No `healthcheck:` override here: docker/kali/Dockerfile already bakes
+    # in a HEALTHCHECK (curl against the unauthenticated GET /health, no
+    # tool invoked, no secret exposed — see docs/kali-container.md §6).
+    # Docker Compose reads a container's health status from whichever
+    # HEALTHCHECK is active (image-defined or compose-defined); duplicating
+    # it here would only risk the two definitions drifting apart. `apex`'s
+    # `depends_on: kali: condition: service_healthy` below relies on this
+    # same, single, image-defined healthcheck.
+    #
+    # No `user:` override: the image's own `USER apextool` (UID/GID 1000,
+    # no login shell, no sudo — docs/kali-container.md §5) already applies.
+    #
+    # No `privileged:`, no `cap_add:`, no `network_mode: host`, no
+    # `/var/run/docker.sock` mount, anywhere in this file. `ping` and
+    # `nmap -sT` were empirically verified (Infra Phase 6) to work
+    # unprivileged with zero added capabilities; `nmap`'s default/SYN-scan
+    # mode does not, and this phase's task brief explicitly forbids adding
+    # NET_RAW/NET_ADMIN "merely to make default Nmap SYN scans work" — see
+    # docs/docker-compose.md §15 for the full, unchanged-from-Phase-6
+    # capability discussion.
+    #
+    # No volumes: kali never mounts `./run_reports` or any other APEX
+    # report/knowledge/secret path — it has no reason to read or write
+    # anything outside its own image filesystem.
+
+  # ---------------------------------------------------------------------
+  # apex — the orchestration/planning/policy/memory application (Infra
+  # Phase 5). Waits for `kali` to report healthy before starting.
+  # ---------------------------------------------------------------------
+  apex:
+    build:
+      context: .
+      dockerfile: docker/apex/Dockerfile
+    depends_on:
+      kali:
+        condition: service_healthy
+    networks:
+      - apex-internal
+    environment:
+      # Generic (non-Telnet, non-browser) commands route through
+      # RemoteToolBackend to the `kali` service by service name — Compose's
+      # built-in DNS resolves `kali` to the container's address on
+      # `apex-internal`; no fixed IP is configured anywhere (see
+      # docs/docker-compose.md "Service discovery").
+      #
+      # IMPORTANT: apex_host/config.py itself never reads environment
+      # variables (test_arch_08_config_py_has_no_env_access) — these three
+      # variables are read directly by
+      # apex_host/eval/compose_smoke.py (APEX_TOOL_BACKEND,
+      # APEX_TOOL_SERVICE_URL) and by RemoteToolBackend.__init__ itself
+      # (APEX_TOOL_SERVICE_TOKEN, as a fallback — see
+      # docs/remote-tool-backend.md §3.2). A full multi-turn engagement
+      # (`run_htb_local.py`) would instead need the equivalent
+      # `--tool-backend remote --tool-service-url http://kali:8080` CLI
+      # flags, since that entry point's ApexConfig is built via CLI
+      # arguments, not these env vars directly — see
+      # docs/docker-compose.md "Internal networking" for the full
+      # env-var-vs-CLI-flag explanation.
+      APEX_TOOL_BACKEND: remote
+      APEX_TOOL_SERVICE_URL: http://kali:8080
+      APEX_TOOL_SERVICE_TOKEN: ${APEX_TOOL_SERVICE_TOKEN:?APEX_TOOL_SERVICE_TOKEN must be set — see docs/docker-compose.md}
+    volumes:
+      # Report persistence outside the container — a plain bind mount
+      # (rather than a named volume) so an operator can inspect
+      # ./run_reports/compose_smoke.json directly from the host without an
+      # extra `docker cp`. `/app/run_reports` is already created and
+      # chowned to the image's non-root `apex` user (UID 1000) at build
+      # time (docker/apex/Dockerfile) — write-access from inside the
+      # container was verified empirically this phase (see
+      # docs/docker-compose.md "Report persistence" for the macOS
+      # bind-mount UID finding).
+      - ./run_reports:/app/run_reports
+    # Compiled knowledge is available exactly once: baked into the
+    # `apex` image itself at /app/knowledge (docker/apex/Dockerfile,
+    # docs/apex-container.md §9) — this file does NOT additionally mount
+    # ./Knowledge or ./knowledge over it, which would create a second,
+    # differently-cased, possibly-inconsistent copy. No raw knowledge
+    # corpus, no secrets directory, and no `.ovpn` file is mounted
+    # anywhere in this file.
+    #
+    # No `user:` override: the image's own `USER apex` (UID/GID 1000)
+    # already applies. No Docker socket, no host networking, no
+    # `privileged:`, no added capabilities.
+    #
+    # Safe default command: a bounded, dry-run-by-default connectivity
+    # smoke check (apex_host/eval/compose_smoke.py) — NOT a live
+    # engagement, NOT `run_htb_local`, and NOT `--no-dry-run`. It proves
+    # configuration validity (backend selection, service discovery once
+    # `kali` is healthy) and exits 0 without contacting `kali` for real.
+    # See docs/docker-compose.md "Safe default behavior" and
+    # "Connectivity smoke test" for the explicit, real-contact invocation
+    # (`docker compose run --rm apex python -m apex_host.eval.compose_smoke
+    # --no-dry-run`) used during this phase's runtime validation.
+    command: ["python", "-m", "apex_host.eval.compose_smoke"]
+
+networks:
+  # A single, dedicated, internal-by-convention network — Compose does not
+  # expose any service on this network to the host unless a service also
+  # declares a `ports:` mapping (neither service here does). No fixed IPs
+  # are assigned to either service; both are reached only via Compose's
+  # built-in service-name DNS. No HTB routing exists on this network —
+  # see docs/docker-compose.md §17 "Deferred VPN phase".
+  apex-internal:
+    name: apex-internal
