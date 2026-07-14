@@ -2340,6 +2340,21 @@ path as the payload repo loader.
 > **Directory name:** the real on-disk directory is `knowledge/` (all
 > lowercase, no typo).  Earlier notes that said `Knowlwdge/` were incorrect.
 > Use `--knowledge-root ./knowledge` on the CLI.
+>
+> **Correction (Infra Phase 5, 2026-07-14):** the statement above is only
+> true on a case-**insensitive** filesystem (macOS/APFS, where `Knowledge`
+> and `knowledge` resolve to the same inode). `git ls-files` shows every
+> tracked path under this directory actually uses `Knowledge/` (capital
+> K) — confirmed during Infra Phase 5's container build investigation. On
+> a case-**sensitive** filesystem (Linux — what any CI runner, Docker
+> build, or non-macOS contributor's checkout uses), only `Knowledge/`
+> exists; `--knowledge-root ./knowledge` would silently find nothing
+> there. This paragraph is left in place per this file's append-only
+> correction convention (§21 R12) rather than rewritten — see
+> `docs/apex-container.md` §9 for the full investigation and how
+> `docker/apex/Dockerfile` handles the mismatch (copies from the real
+> `Knowledge/` source path, to a deliberately lowercase `/app/knowledge/`
+> destination inside the image).
 
 ### 18.1 Directory layout
 
@@ -4576,7 +4591,114 @@ test's `dry_run` flipped — see rationale in that test's updated docstring),
 | `uv run python -m apex_tool_service --help` | exit 0 |
 | `git diff --check` | exit 0 |
 
-**Deferred to Infra Phase 5+ (unchanged):** Kali Dockerfile; APEX
+**Deferred at the time this Phase 4 record was written; the APEX
+Dockerfile was completed in Infra Phase 5 (see that record below — left
+here unrewritten per the append-only convention):** Kali Dockerfile; APEX
 Dockerfile; Docker Compose; VPN networking; CI publishing; `.env.example`;
 any Meow-specific diagnosis, deterministic Meow test, or authorized live
-Meow validation. **None of these were started in this phase.**
+Meow validation. **Still entirely unstarted after Infra Phase 5:** Kali
+Dockerfile; Docker Compose; VPN networking; CI publishing; `.env.example`;
+any Meow-specific work.
+
+---
+
+### Infra Phase 5 — APEX application container image ✓ COMPLETE
+
+**Completion date:** 2026-07-14
+
+**Full design, security properties, and current limitations:**
+[`docs/apex-container.md`](docs/apex-container.md) (new document, per this
+phase's own instruction). This entry is a summary and progress record.
+
+**Scope:** build a reproducible, non-root, `uv.lock`-locked container image
+for the APEX *application* (`apex_host` + `memfabric`) that can run the
+established CLIs without a local Python/uv setup. **Not in scope and NOT
+done:** the Kali tool-service image, Docker Compose, VPN containers,
+`.env.example`, GitHub Actions, container-orchestration/entrypoint
+scripting beyond the plain `CMD`, or any Meow-specific change — none of
+these were started.
+
+**Files:** [`docker/apex/Dockerfile`](docker/apex/Dockerfile) (new,
+multi-stage), [`.dockerignore`](.dockerignore) (new, repository root),
+`tests/docker/test_apex_dockerfile.py` (new, 35 static tests — no Docker
+daemon required to run them).
+
+**Base image:** `python:3.11.14-slim-bookworm`, pinned by digest
+(`sha256:65a93d69fa75478d554f4ad27c85c1e69fa184956261b4301ebaf6dbb0a3543d`
+— the manifest-list digest, verified via `docker buildx imagetools inspect`
+so it resolves correctly per-platform). `3.11.14` matches the exact patch
+version every prior Infra Phase has developed/tested against
+(`.python-version` pins `3.11`). Debian slim over Alpine specifically to
+avoid musl-libc/scientific-Python-wheel incompatibility risk
+(`numpy`/`faiss-cpu`). The `uv` binary itself comes from
+`ghcr.io/astral-sh/uv:0.11.28`, also digest-pinned
+(`sha256:0f36cb9361a3346885ca3677e3767016687b5a170c1a6b88465ec14aefec90aa`).
+
+**Multi-stage build:** `uv` (binary source) → `builder` (`uv sync --frozen
+--no-dev --no-install-project` for deps, then `--no-editable` after
+copying first-party source, for optimal Docker layer caching) →
+`runtime` (copies only the finished `/app/.venv`; no build toolchain, no
+`uv`, no `pyproject.toml`/`uv.lock`, no raw source tree — the
+`--no-editable` install means none of that is needed at runtime).
+
+**Non-root user:** `apex`, UID/GID 1000 (explicit, not `--system` — avoids
+a spurious `useradd` warning), no password, no login shell, no `sudo`.
+Verified: `docker run --rm apex:phase5 id` → `uid=1000(apex) gid=1000(apex)`.
+
+**Knowledge strategy (investigated, not assumed):** `Knowledge/` (the real,
+git-tracked, capital-K directory — see the correction note added to §18
+above) is 4.3 GB total; `Knowledge/*/compiled/` is ~49 MB. Only the four
+`compiled/` subdirectories are copied into the image (source path
+`Knowledge/...`, destination `/app/knowledge/...` — deliberately lowercase
+to match every documented `--knowledge-root` CLI example). Raw corpora
+(SecLists 1.9 GB, NVD CVE raw feed 2.3 GB, GTFOBins/LOLBAS/
+PayloadsAllTheThings, raw PDFs) never reach the Docker build context at
+all — excluded in `.dockerignore`.
+
+**`apex_tool_service` is present in the image but never started.** It is
+a package of the same Hatchling distribution as `apex_host`/`memfabric`
+(`[tool.hatch.build.targets.wheel] packages = [...]`), so `uv sync` cannot
+build the project wheel without it — but no `CMD`/`ENTRYPOINT` in
+`docker/apex/Dockerfile` references `apex_tool_service`, statically
+enforced by a dedicated test.
+
+**Browser/Playwright:** the Python `playwright` package is installed
+(runtime dependency); no browser binary (`playwright install chromium`)
+was installed — `BrowserExecutor` only imports Playwright when
+`dry_run=False`, and installing a real browser bundle was judged a
+separate future decision (documented, not made, in
+`docs/apex-container.md` §12).
+
+**No HEALTHCHECK added** — APEX is a one-shot CLI, not a long-running
+server; a check that only confirmed "Python starts" would be theater, not
+real readiness (documented decision, `docs/apex-container.md` §"Health
+check decision").
+
+**Validation (all against a clean-rebuilt `.venv`, Python 3.11.14, and a
+freshly built `apex:phase5` image):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest -q` (full) | **2946 passed** (2911 baseline + 35 new static Dockerfile tests), no regressions |
+| `uv run ruff check .` | `All checks passed!` |
+| `uv run mypy` | Success — 137 source files |
+| `uv run python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `docker build -f docker/apex/Dockerfile -t apex:phase5 .` | Success — 688 MB, ~132 s cold / ~10 s cached |
+| `docker run --rm apex:phase5 python -m apex_host.main --help` | exit 0 |
+| `docker run --rm apex:phase5 python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `docker run --rm apex:phase5 python -c "import apex_host, memfabric"` | `imports-ok` |
+| `docker run --rm apex:phase5 id` | `uid=1000(apex) gid=1000(apex)` — non-root |
+| Writable `/app/run_reports` | Verified as non-root user |
+| `pytest`/`ruff`/`mypy` inside the image | All `None` (absent) |
+| `nmap`/`telnet`/`nc`/`hydra`/`gobuster`/`ffuf` inside the image | All absent from `PATH` |
+| `docker run --rm apex:phase5 python -m apex_host.knowledge.compiler.verify_compiled --knowledge-root /app/knowledge` | All 9 required outputs verified OK (63,783 records) |
+| `docker history --no-trunc` secret scan | Clean |
+| `git diff --check` | exit 0 |
+
+**Deferred to Infra Phase 6+:** Kali tool-service Docker image; Docker
+Compose; `.env.example`; container entrypoint/preflight orchestration; VPN
+networking; CI image publishing; Meow diagnosis; deterministic Meow tests;
+authorized live Meow validation. **None of these were started in this
+phase.**

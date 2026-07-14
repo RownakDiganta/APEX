@@ -1,0 +1,168 @@
+# .dockerignore
+# Build-context exclusions for docker/apex/Dockerfile (Infra Phase 5) — keeps secrets, VCS metadata, caches, tests, and raw knowledge corpora out of the image build context.
+#
+# This file governs what the Docker CLI sends to the daemon as the build
+# context when building from the repository root:
+#   docker build -f docker/apex/Dockerfile -t apex:phase5 .
+#
+# It does NOT, by itself, decide what ends up *in* the image — the
+# Dockerfile's COPY instructions are additionally selective (they name exact
+# files/directories, they never do a blanket `COPY . .`). Both layers matter:
+# this file keeps large/sensitive things out of the context sent to the
+# daemon in the first place; the Dockerfile's explicit COPY list keeps the
+# image itself minimal even for things that *do* reach the daemon.
+#
+# Required-file guarantee: pyproject.toml, uv.lock, memfabric/, apex_host/,
+# apex_tool_service/, and Knowledge/*/compiled/ are NEVER excluded below —
+# every pattern here was checked against that list before being added.
+
+# ---------------------------------------------------------------------------
+# Version control
+# ---------------------------------------------------------------------------
+.git
+.github
+.gitignore
+
+# ---------------------------------------------------------------------------
+# Python virtual environments and caches — the image builds its own venv
+# from uv.lock; a locally-created .venv must never be copied in verbatim
+# (wrong platform, may contain dev-only packages, defeats reproducibility).
+# ---------------------------------------------------------------------------
+.venv
+venv
+env
+__pycache__
+*.py[cod]
+*$py.class
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+*.egg-info
+build
+dist
+
+# ---------------------------------------------------------------------------
+# Secrets and environment files — none exist in this repository yet
+# (.env.example is a later phase), but excluded defensively so a locally
+# created .env (or any VPN credential bundle) can never be baked into an
+# image by accident.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+*.ovpn
+secrets/
+*.pem
+*.key
+
+# ---------------------------------------------------------------------------
+# IDE / OS artifacts
+# ---------------------------------------------------------------------------
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.log
+
+# ---------------------------------------------------------------------------
+# Local run output — ephemeral, never a build input. The image creates its
+# own empty, writable /app/run_reports at build time (see Dockerfile).
+# ---------------------------------------------------------------------------
+run_reports
+
+# ---------------------------------------------------------------------------
+# Tests — not required at runtime; excluding them keeps the build context
+# smaller and guarantees no accidental `COPY tests` could ever ship test
+# doubles or fixtures into a production image.
+# ---------------------------------------------------------------------------
+tests
+
+# ---------------------------------------------------------------------------
+# Documentation and historical artifacts — not required at runtime.
+# docs/ contains only Markdown design documents; APEX reads no file under
+# docs/ at import time or runtime. README.md and CLAUDE.md are similarly
+# unnecessary inside the image (they document the *repository*, not
+# something the running application consults).
+# ---------------------------------------------------------------------------
+docs
+README.md
+CLAUDE.md
+APEX-Nexus-Unified-Architecture-Detailed.md
+Makefile
+
+# ---------------------------------------------------------------------------
+# Examples — a small (12 KB) memfabric demo script (examples/smoke_run.py),
+# not imported by apex_host and not needed to run any APEX CLI.
+# ---------------------------------------------------------------------------
+examples
+
+# ---------------------------------------------------------------------------
+# Knowledge/ — raw vendored corpora and downloaded datasets (~4.3 GB on
+# disk; verified via `du -sh` during this phase's investigation). The
+# Dockerfile's COPY instructions pull in ONLY the four `*/compiled/`
+# subdirectories (~49 MB total) by exact, explicit path — everything listed
+# below is excluded from the build context entirely so it can never reach
+# the daemon, regardless of what the Dockerfile does or does not COPY.
+#
+# NOTE ON CASING: the tracked directory is `Knowledge/` (capital K) — see
+# the Dockerfile's own comment on this. Patterns below match that exact
+# casing since Docker's dockerignore matching is case-sensitive on the
+# Linux daemon this normally builds against, even though the local checkout
+# filesystem (macOS/APFS) is case-insensitive.
+# ---------------------------------------------------------------------------
+
+# Raw vendored payload-technique repositories (GTFOBins, LOLBAS,
+# PayloadsAllTheThings) and the SecLists wordlist corpus (1.9 GB alone).
+Knowledge/payload_db/SecLists
+Knowledge/payload_db/PayloadsAllTheThings
+Knowledge/payload_db/GTFOBins
+Knowledge/payload_db/LOLBAS
+
+# Raw threat-intelligence datasets: NVD CVE feed (2.3 GB — by far the
+# largest single item in the repository), MITRE ATT&CK, CWE, CAPEC raw
+# downloads. The compiled/ JSONL distillations of all four are what ships.
+Knowledge/intel_db/cve
+Knowledge/intel_db/cwe
+Knowledge/intel_db/capec
+Knowledge/intel_db/attack
+
+# Raw methodology PDFs (NIST/OWASP/PTES guides) — the compiled/ chunked
+# JSONL is what the retrieval pipeline actually reads at runtime.
+Knowledge/methodology_db/*.pdf
+
+# Raw HTB legal/policy source PDFs — only policy_db/compiled/ is read by
+# apex_host.policy.policy_loader at runtime.
+Knowledge/policy_db/sources
+
+# Archives, local caches/indexes, and OS artifacts that may exist locally
+# under Knowledge/ but are never part of a clean checkout or the compiled
+# output.
+Knowledge/**/*.zip
+Knowledge/**/*.tar
+Knowledge/**/*.tar.gz
+Knowledge/**/*.7z
+Knowledge/**/*.gz
+Knowledge/**/.cache
+Knowledge/**/cache
+Knowledge/**/*.faiss
+Knowledge/**/*.idx
+Knowledge/**/*.index
+Knowledge/**/*.sqlite
+Knowledge/**/*.db
+Knowledge/**/*.tmp
+Knowledge/**/.DS_Store
+
+# ---------------------------------------------------------------------------
+# Deliberately NOT excluded (documented so a future edit does not
+# accidentally break the build):
+#   pyproject.toml, uv.lock       — required for `uv sync --frozen`
+#   memfabric/, apex_host/,
+#   apex_tool_service/            — first-party source, required to build
+#   Knowledge/*/compiled/         — explicitly COPYed by the Dockerfile
+#   .python-version               — not excluded, but also not COPYed by
+#                                    the Dockerfile (build uses the base
+#                                    image's system Python directly via
+#                                    UV_PYTHON_DOWNLOADS=never); harmless
+#                                    either way since no COPY references it
+# ---------------------------------------------------------------------------
