@@ -62,8 +62,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Enable LLM-backed planning (default: fully deterministic, no API calls)",
     )
     parser.add_argument(
-        "--llm-provider", dest="llm_provider", default="openai", metavar="PROVIDER",
-        help="LLM provider when --use-llm is set (default: openai; supports OpenRouter)",
+        "--llm-provider", dest="llm_provider", default=None, metavar="PROVIDER",
+        help="LLM provider when --use-llm is set (default: fake/deterministic; use 'openai' for real LLM)",
     )
     parser.add_argument(
         "--llm-model", dest="llm_model", default=None, metavar="MODEL",
@@ -143,36 +143,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 async def run(args: argparse.Namespace) -> None:
     import sys
 
-    config_kwargs: dict[str, object] = dict(
-        target=args.target,
-        payload_repo_path=args.payload_repo,
-        max_turns=args.max_turns,
-        dry_run=args.dry_run,
-        web_wordlist_path=args.web_wordlist,
-        max_web_paths=args.max_web_paths,
-        username_candidates=list(args.username),
-        password_candidates=list(args.password),
-        max_access_attempts=args.max_access_attempts,
-        use_llm=args.use_llm,
-        llm_provider=args.llm_provider,
-        llm_base_url=args.llm_base_url,
-        knowledge_root=args.knowledge_root,
-        policy_file=args.policy_file,
-        llm_stop_on_repeated_plan=args.llm_stop_on_repeated_plan,
-    )
-    if args.max_llm_calls is not None:
-        config_kwargs["max_llm_calls_per_run"] = args.max_llm_calls
-    if args.max_llm_calls_per_phase is not None:
-        config_kwargs["max_llm_calls_per_phase"] = args.max_llm_calls_per_phase
-    if args.llm_timeout is not None:
-        config_kwargs["llm_request_timeout_seconds"] = args.llm_timeout
-    if args.llm_model:
-        config_kwargs["planner_model"] = args.llm_model
-        config_kwargs["executor_model"] = args.llm_model
-        config_kwargs["parser_model"] = args.llm_model
-    if getattr(args, "trace_records", False):
-        config_kwargs["trace_knowledge_records"] = True
-    config = ApexConfig(**config_kwargs)  # type: ignore[arg-type]
+    config = ApexConfig.from_cli_args(args)
 
     if args.preflight:
         from apex_host.tools.preflight import check_local_tools

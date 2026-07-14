@@ -18,8 +18,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from memfabric.ids import new_id, now
+from memfabric.ids import now
 from memfabric.types import Edge, KnowledgeEntry, Node, ParsedObservation
+from apex_host.graph_ids import service_id as _canon_service_id, tech_id as _tech_id_fn, runs_edge_id
 
 # Ordered pattern set — first match wins
 _SSH_RE = re.compile(r"SSH-(?P<proto>\d+\.\d+)-(?P<software>[^\s\r\n]+)")
@@ -32,14 +33,15 @@ _TELNET_RE = re.compile(r"(login:\s*$|Escape character is|telnet>)", re.IGNORECA
 
 
 def _service_id(host: str, port: str, service_name: str) -> str:
+    """Return canonical service node ID. Falls back to a banner-specific ID when port is unknown."""
     if port:
-        return f"service:{host}:{port}/tcp"
+        return _canon_service_id(host, port, "tcp")
+    # No port available (banner-only probe): use a banner-specific discriminator.
     return f"service:{host}:banner:{service_name}"
 
 
 def _tech_id(host: str, tech_name: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "_", tech_name.lower()).strip("_")
-    return f"tech:{host}:{slug}"
+    return _tech_id_fn(host, tech_name)
 
 
 class BannerParser:
@@ -160,7 +162,7 @@ class BannerParser:
         )
         edges.append(
             Edge(
-                id=new_id(),
+                id=runs_edge_id(svc_id, tid),
                 from_id=svc_id,
                 to_id=tid,
                 type="runs",
@@ -213,7 +215,7 @@ class BannerParser:
         )
         edges.append(
             Edge(
-                id=new_id(),
+                id=runs_edge_id(svc_id, tid),
                 from_id=svc_id,
                 to_id=tid,
                 type="runs",
@@ -271,7 +273,7 @@ class BannerParser:
             )
             edges.append(
                 Edge(
-                    id=new_id(),
+                    id=runs_edge_id(svc_id, tid),
                     from_id=svc_id,
                     to_id=tid,
                     type="runs",

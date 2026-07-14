@@ -45,7 +45,16 @@ class GraphMatcher(Protocol):
 # ---------------------------------------------------------------------------
 
 class StubEmbedder:
-    """Raises if used without a real embedder being configured."""
+    """Raises if used without a real embedder being configured.
+
+    ``is_configured = False`` signals to ``HybridRetriever`` that no real
+    embedder is available.  The engine uses the BM25-score gate (legacy
+    behavior) when ``is_configured`` is False, preserving backward compatibility.
+    Real host-app embedders should set ``is_configured = True`` so the engine
+    fires the dense channel unconditionally (Option A+ gate).
+    """
+
+    is_configured: bool = False
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         raise RuntimeError(

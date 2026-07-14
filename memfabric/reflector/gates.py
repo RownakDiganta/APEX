@@ -14,10 +14,13 @@ Decay:
 
 Quarantine:
     win_rate < config.winrate_floor (only skills with enough data)
+
+Skill outcome classification:
+    classify_skill_outcome() maps Outcome + execution flags → SkillOutcomeDisposition
 """
 from __future__ import annotations
 
-from memfabric.types import KnowledgeEntry, Skill
+from memfabric.types import KnowledgeEntry, Outcome, Skill, SkillOutcomeDisposition
 
 
 def should_promote_knowledge(entry: KnowledgeEntry, *, min_confidence: float) -> bool:
@@ -40,9 +43,42 @@ def should_promote_skill(
     )
 
 
-def should_decay(skill: Skill, *, current_run: int, decay_unused_runs: int) -> bool:
-    """Return True if the skill should have its confidence decayed this pass."""
-    return (current_run - skill.last_used_run) >= decay_unused_runs
+def should_decay(
+    skill: Skill,
+    *,
+    current_run: int,
+    decay_unused_runs: int,
+    grace_runs: int = 0,
+) -> bool:
+    """Return True if the skill should have its confidence decayed this pass.
+
+    Decay is suppressed during the grace period after promotion (``grace_runs``
+    Reflector passes).  This prevents freshly promoted skills from immediately
+    losing confidence before they have had a chance to be selected and executed.
+
+    ``last_used_run_number`` (set by MemoryAPI lifecycle methods) is used
+    preferentially over the legacy ``last_used_run`` field so that usage recorded
+    via ``record_skill_retrieved`` / ``record_skill_selected`` /
+    ``record_skill_execution`` correctly resets the decay clock.
+
+    The idempotence guard (``last_decay_run_number``) is enforced by
+    ``MemoryAPI.decay_skill()``, not here — this function is a pure predicate.
+    """
+    if skill.quarantined:
+        return False
+
+    # Grace period: suppress decay for newly promoted skills.
+    if skill.promoted_run_number is not None and grace_runs > 0:
+        if (current_run - skill.promoted_run_number) < grace_runs:
+            return False
+
+    # Use last_used_run_number (new field) preferentially over legacy last_used_run.
+    last_used = (
+        skill.last_used_run_number
+        if skill.last_used_run_number is not None
+        else skill.last_used_run
+    )
+    return (current_run - last_used) >= decay_unused_runs
 
 
 def decayed_confidence(skill: Skill, *, decay_factor: float) -> float:
@@ -58,11 +94,60 @@ def win_rate(skill: Skill) -> float | None:
     return skill.wins / total
 
 
-def should_quarantine(skill: Skill, *, winrate_floor: float) -> bool:
-    """Return True if the skill's live win-rate is below the quarantine floor."""
+def should_quarantine(
+    skill: Skill,
+    *,
+    winrate_floor: float,
+    min_evidence_count: int = 0,
+) -> bool:
+    """Return True if the skill's live win-rate is below the quarantine floor.
+
+    ``min_evidence_count`` is the minimum number of executions (or wins+losses for
+    backward compatibility) before quarantine is considered.  Default 0 preserves
+    existing behaviour: any skill with any win/loss data is eligible for quarantine.
+
+    Evidence count uses ``max(execution_count, wins + losses)`` for backward
+    compatibility with tests that set wins/losses directly without going through
+    ``record_skill_execution()``.
+    """
     if skill.quarantined:
-        return False   # already quarantined
+        return False
+
+    # Evidence threshold.
+    evidence = max(skill.execution_count, skill.wins + skill.losses)
+    if evidence < min_evidence_count:
+        return False
+
     rate = win_rate(skill)
     if rate is None:
-        return False   # no data yet
+        return False
     return rate < winrate_floor
+
+
+def classify_skill_outcome(
+    outcome: Outcome,
+    *,
+    is_policy_blocked: bool = False,
+    is_conflict_blocked: bool = False,
+    is_duplicate_skipped: bool = False,
+) -> SkillOutcomeDisposition:
+    """Map an execution outcome to a SkillOutcomeDisposition.
+
+    Blocking events (policy block, conflict block, duplicate skip) take
+    precedence over the outcome value — they indicate the task was never
+    executed, so no skill performance data can be inferred.
+
+    ``WIN``  — task succeeded (``Outcome.success``).
+    ``LOSS`` — task failed fundamentally (``Outcome.fundamental``).
+    ``NEUTRAL`` — transient failure (``script_error``, ``fixable``); skill is not
+      penalised as the error may be infrastructure-related, not skill quality.
+    ``NOT_EXECUTED`` — the task was blocked before any tool ran.
+    """
+    if is_policy_blocked or is_conflict_blocked or is_duplicate_skipped:
+        return SkillOutcomeDisposition.NOT_EXECUTED
+    if outcome == Outcome.success:
+        return SkillOutcomeDisposition.WIN
+    if outcome == Outcome.fundamental:
+        return SkillOutcomeDisposition.LOSS
+    # script_error and fixable are transient; no penalty.
+    return SkillOutcomeDisposition.NEUTRAL

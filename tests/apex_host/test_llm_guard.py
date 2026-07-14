@@ -25,7 +25,7 @@ from memfabric.ids import new_id
 from apex_host.config import ApexConfig
 from apex_host.planning.engine import PlanningEngine
 from apex_host.planning.models import PlanDecision
-from apex_host.planning.repair import RepairEngine
+from apex_host.planning.repair import RepairEngine, RepairRequest
 from apex_host.policy.llm_guard import LLMPolicyGuard
 from apex_host.types import ApexPhase
 
@@ -601,7 +601,7 @@ class TestPlanningEngineGuard:
             target=TARGET,
             guard=guard,
         )
-        result = await engine.plan(
+        await engine.plan(
             _make_goal(), ApexPhase.recon, _empty_subgraph(), _empty_evidence()
         )
 
@@ -626,7 +626,7 @@ class TestPlanningEngineGuard:
             target=TARGET,
             guard=guard,
         )
-        result = await engine.plan(
+        await engine.plan(
             _make_goal(), ApexPhase.recon, _empty_subgraph(), _empty_evidence()
         )
 
@@ -805,7 +805,7 @@ class TestRepairEngineGuard:
             _empty_subgraph(),
         )
         assert result is not None
-        assert isinstance(result, TaskSpec)
+        assert isinstance(result, RepairRequest)
 
     @pytest.mark.asyncio
     async def test_repair_dry_run_returns_none_before_guard(self) -> None:
@@ -888,7 +888,7 @@ class TestNoRealLLMCalls:
             guard=guard,
         )
         # No exception — guard never fires because LLM path is never taken
-        result = await engine.plan(
+        await engine.plan(
             _make_goal(), ApexPhase.recon, _empty_subgraph(), _empty_evidence()
         )
         assert fallback.call_count == 1

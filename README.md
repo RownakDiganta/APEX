@@ -179,9 +179,322 @@ See `examples/smoke_run.py` for a complete end-to-end demonstration.
 python -m pytest tests/ -v
 ```
 
-234 tests total: 194 in `tests/` covering all Section 8 invariants (including
-LangGraph-specific tests in `tests/test_graph_loop.py`), plus 40 in
-`tests/apex_host/` for the host application layer below.
+2668 tests total (as of 2026-07-14 Phase 11 final verification): the `tests/` directory
+covers all Section 8 memfabric invariants (including LangGraph-specific tests in
+`tests/test_graph_loop.py`) plus:
+- 17 concurrency/atomicity/defensive-copy tests in `tests/test_graph_atomicity.py`
+- 51 transaction-correctness tests in `tests/test_graph_transaction_complete.py`
+  (reader isolation, commit/index/cache coherence, rollback integrity, proposal
+  staging isolation, public deletion API, defensive copies, architecture scan,
+  episode contract)
+- 40 Phase 1 re-open correction tests in `tests/test_graph_phase1_extended.py`
+  (deep copy isolation at all nesting depths, query snapshot Option C contract,
+  pre-batch snapshot completeness, episode capability pre-check, rollback-failure
+  injection, repository-wide architecture scan, `_graph_lock` holders table)
+- 7 deterministic stress tests in `tests/test_graph_stress.py`
+  (100+ concurrent writers, mixed readers/writers, LWW correctness, write-clock
+  monotonicity, open-tasks consistency under concurrent writes)
+- 117 Phase 4 retrieval and cache correctness tests in `tests/test_retrieval_phase4.py`
+  (gate Option A+, complete SHA-256 cache-key schema, cache invalidation events,
+  deep-copy immutability, k validation, RRF determinism, diagnostics, identifier
+  channel, channel soft/hard failures, index_generation advancement)
+- 96 Phase 5 Reopen tests in `tests/apex_host/test_phase5_reopen.py`
+  (`BudgetReservation` lifecycle, concurrent atomic reservation, gateway
+  exclusivity architecture scans, `RepairRequest` structure, fail-closed guard,
+  sanitize/check_prompt/check_output content-safety checkpoints, `LLMCallStatus`
+  properties)
+- 126 Phase 6 dispatcher tests in `tests/apex_host/test_phase6_dispatcher.py`
+  (`ExecutionDisposition` properties, `classify_retry`, `ErrorCategory`,
+  `TaskRegistry` atomicity and snapshot/restore, `TaskDispatcher` policy/conflict/
+  duplicate gates, executor routing, SHA-256 fingerprint, F06–F13 regression guards)
+- 131 Phase 7 async responsiveness tests in `tests/apex_host/test_phase7_async.py`
+  (event-loop heartbeat, BM25 thread offload, JSONL concurrent append, SIGTERM
+  grace period, browser launch timeout, atomic file write, config timeout fields,
+  `aclose()` idempotency, compiled loader async, bounded concurrency, cancellation
+  propagation, F15/F16 regression guards, lock duration, `async_utils` helpers)
+- 80 Phase 8 secret-redaction and graph-representation tests in
+  `tests/apex_host/test_phase8_redaction.py`
+  (REDACT — central module constants and recursive redact_value/dict/session_text;
+  CANARY — canary password never survives into EKG node props, episodic log, or
+  episode.data; BOUND — secret_hint always REDACTED_PLACEHOLDER, live stdout
+  always SESSION_REDACTED_PLACEHOLDER with stdout_length metadata; GRAPH_ID —
+  all canonical builder functions host_id/service_id/tech_id/credential_id/etc.;
+  URL — normalize_url strips default ports, lowercases, deduplicates equivalent
+  URLs; PAR — parallel edges between same node pair both visible via
+  get_edges_for_node; DANGLE — put_edge rejects missing from_id or to_id;
+  SCHEMA — EKG_SCHEMA_VERSION="1" in every export_ekg output; ARCH — AST scan
+  confirms no hard-coded "[redacted]" strings in source, no inline ID f-strings
+  in parsers; INT — full nmap→EKG + access→EKG pipeline with canonical IDs)
+- 80 Phase 9 shared-state boundaries and canonical configuration tests in
+  `tests/apex_host/test_phase9_config.py`
+  (CFG — ApexConfig field defaults, to_safe_dict password redaction, schema version,
+  mutation isolation; CLI — parse_args defaults, from_cli_args round-trip, llm_provider
+  safe default end-to-end; ENV — no env vars required, no API key fields, OS isolation;
+  STATE — ApexGraphState/TurnState field names, operator.add semantics, serialisability,
+  no infra objects in state; SERIAL — JSON serializability, password redaction,
+  field count alignment; ARCH — no inline ID f-strings, no api._ private access,
+  no in-place state mutations, source-level defaults; E2E — dry_run preserved through
+  CLI, canonical IDs in seeded EKG, to_safe_dict on real config)
+
+- 120 Phase 10 orchestration decomposition tests in
+  `tests/apex_host/test_phase10_orchestration.py`
+  (CHAR — characterization of each node's observable behaviour; BUILD — graph
+  construction, wiring, node topology; ROUTE — pure routing-function correctness;
+  COMP — outcome_for/is_repairable/should_complete pure functions; MODEL —
+  make_pd_entry/task_info helpers; DEPS — OrchestrationDeps and build_planners;
+  ARCH — module boundaries, file structure, no-state-in-deps; PAR — new graph
+  matches original behaviour; E2E — full dry-run engagement; FIX — F06/F07/F08/
+  F09/F13 regression fixes)
+
+- 50 Phase 11 final verification tests in `tests/test_final_verification.py`
+  (GRAPH — transaction atomicity, LWW, episodic immutability, provenance, rollback;
+  CONFLICT — open conflict blocks, resolution lifecycle, field detection, budget;
+  SKILL — staging promotion, decay, quarantine, merge via API;
+  RETRIEVAL — gate open/close, cache key coverage, mutation invalidation, tier bounds;
+  LLM — gateway architecture, budget atomicity, guard block, redaction;
+  EXEC — task registry dedup, policy gate wiring, repair exclusions, parser failure;
+  ASYNC — event loop heartbeat, async write, task cancellation, executor timeout;
+  SECRET — sanitization, canary redaction, parallel edges, canonical IDs, schema version;
+  CONFIG — safe defaults, from_cli_args parity, store bypass scan, file header scan;
+  INTEG — dry-run engagement, staging gate, all CONFIRMED findings verified fixed)
+
+while `tests/apex_host/` covers the full host application layer — parsers,
+planners, executors, knowledge seeding, policy enforcement, LLM wiring, and
+the complete engagement graph.
+
+> **Note for contributors:** the count grows as new findings are remediated.
+> Run `python -m pytest tests/ --collect-only -q | tail -1` for the current count.
+
+---
+
+## Atomic Graph Updates and Transaction Visibility
+
+All graph writes in `MemoryAPI` are serialised through `_graph_lock`
+(`asyncio.Lock`), eliminating the TOCTOU race where concurrent async
+coroutines could interleave between a `get_node`/`get_edge` read and the
+paired `put_node`/`put_edge` write. The lock is also acquired by all reader
+paths (`query()`, `get_subgraph()`, `open_tasks()`) so that no reader ever
+observes a partially-written batch (Design A — reader isolation).
+
+### Transaction model
+
+`apply_deltas(nodes=..., edges=..., episodes=..., knowledge=..., skills=...)` is
+the atomic batch-write surface. All writes in a batch succeed together or none
+are visible: nodes first, then edges, then episodes, then knowledge and skill
+proposals. A failure at any step triggers a full rollback of everything committed
+in that batch, and the cache is busted so stale results cannot be returned.
+
+The lock nesting order is inviolable (must never be reversed):
+`_graph_lock` → `_staging_lock` → `GraphStore._lock`
+
+Internal helpers (`_upsert_node_locked`, `_upsert_edge_locked`,
+`_delete_node_locked`, `_delete_edge_locked`, `_rollback_locked`) require the
+caller to hold `_graph_lock`. They call `self._graph.*` directly — never the
+public `MemoryAPI` methods — to avoid deadlock (asyncio.Lock is not reentrant).
+
+### Per-field LWW with `logical_version`
+
+`_write_clock` is a monotonic counter incremented at the start of every
+`upsert_node` / `upsert_edge` call. `logical_version` is the primary ordering
+key for last-writer-wins field merges — wall-clock timestamps are observational
+metadata only. Two concurrent writers updating disjoint fields on the same node
+both survive: the second writer reads the first writer's committed state and
+merges field-by-field on top of it.
+
+### Reader isolation guarantee
+
+Three reader paths previously lacked `_graph_lock` and could observe partial
+batch state (Phase 1 Comprehensive fix):
+
+- `query()` — subgraph attachment now under `_graph_lock`
+- `get_subgraph()` — acquires `_graph_lock` for the full graph traversal
+- `open_tasks()` — acquires `_graph_lock` for the node + edge enumeration
+
+In the single-process asyncio runtime, a reader coroutine that starts after a
+writer releases the lock always sees the complete committed batch state. A reader
+that starts while the writer holds the lock blocks at `async with _graph_lock:`
+until the writer finishes — partial state is never observable.
+
+### Rollback behavior
+
+A failed `apply_deltas` batch:
+1. Restores `_write_clock` to its pre-batch value (first action — preserves
+   `logical_version` ordering across retries).
+2. Removes any newly-created nodes and edges from the graph store, lexical
+   index, and vector index (via `_delete_node_locked` / `_delete_edge_locked`).
+3. Restores the pre-batch snapshot for any node or edge that was updated (not
+   newly created) by the failed batch.
+4. Rolls back episode appends via `_pop_episodes` (called through `getattr`
+   on the `JSONLEpisodicStore` — the standard `EpisodicStore` Protocol
+   does not expose this method to prevent accidental misuse).
+5. Removes staged knowledge and skill proposals added in the failed batch.
+6. Busts the retrieval cache (`kv.delete_prefix("retrieval:")`) so stale
+   cached results from the failed batch are not served.
+
+Earlier committed writes on the same nodes are preserved — rollback is
+limited to the failed batch.
+
+### Deletion API
+
+`MemoryAPI.delete_node(node_id)` and `MemoryAPI.delete_edge(edge_id)` are the
+public deletion surface. Each acquires `_graph_lock`, calls the corresponding
+locked helper (which removes the entry from the graph store, lexical index, and
+vector index), then busts the retrieval cache. Callers must not call store
+methods directly.
+
+### Defensive copies
+
+`NetworkXGraphStore.get_node`, `get_edge`, `get_subgraph`, `all_nodes`,
+`all_edges` return copies of stored objects via `_copy_node` / `_copy_edge`
+helpers. Callers can freely mutate the returned `props` dict without corrupting
+stored state.
+
+### Episode contract
+
+`JSONLEpisodicStore.append` is append-only and never mutates existing records.
+`_pop_episodes` is a private rollback method not exposed on the `EpisodicStore`
+Protocol. It is called only by `_rollback_locked` via `getattr` — not by any
+other code path.
+
+### Architecture bypass scan
+
+`tests/test_graph_transaction_complete.py::test_g01` performs an AST-level scan
+of every production `memfabric/` source file and fails if any file outside
+`api.py` and `graph_networkx.py` calls store mutation methods (`put_node`,
+`put_edge`, `delete_node`, `delete_edge`, `append`) directly. This is the
+authoritative check that Invariant 1 (MemoryAPI is the sole state surface) holds
+across the entire substrate.
+
+### Single-process scope
+
+`_graph_lock` is an `asyncio.Lock` (cooperative multitasking, same event loop
+only). The reader isolation guarantee above applies within a single process.
+Multi-process deployments must replace `_graph_lock` with a distributed advisory
+lock (e.g. Redis `SETNX`) backed by the same durable graph store.
+
+---
+
+## Sensitive Data Handling
+
+All credential material is kept out of the EKG and episodic log by three
+graduated mechanisms:
+
+| Layer | What | Where |
+|---|---|---|
+| `REDACTED_PLACEHOLDER = "[redacted]"` | `credential.secret_hint` on every EKG node | `apex_host.security.redaction` |
+| `SESSION_REDACTED_PLACEHOLDER = "[session_redacted]"` | Live telnet session raw stdout in episodic log | `apex_host.security.redaction` |
+| `redact_session_text(text, passwords)` | Arbitrary session text before storage in `access_state.evidence` | `apex_host.security.redaction` |
+
+**Rule:** `apex_host.security.redaction` is the sole source of these constants
+and functions.  No other `apex_host` source file may contain the string literals
+`"[redacted]"` or `"[session_redacted]"` as code constants.  Import them by name.
+
+`TelnetExecutor` stores `stdout_length` and `shell_found` metadata alongside
+`SESSION_REDACTED_PLACEHOLDER` so debugging information survives without leaking
+credential content.
+
+---
+
+## Graph Identity and Relationships
+
+### Canonical ID builders (`apex_host/graph_ids.py`)
+
+Every EKG node and edge ID is constructed by a function in `apex_host/graph_ids.py`.
+No inline f-strings are permitted in parsers.
+
+| Function | Returns | Example |
+|---|---|---|
+| `host_id(ip)` | `"host:{ip}"` | `"host:10.0.0.1"` |
+| `service_id(host, port, proto)` | `"service:{host}:{port}/{proto}"` | `"service:10.0.0.1:22/tcp"` |
+| `tech_id(host, name)` | `"tech:{host}:{slug}"` | `"tech:10.0.0.1:openssh"` |
+| `credential_id(host, user)` | `"credential:{host}:{user}"` | `"credential:10.0.0.1:root"` |
+| `access_state_id(host, user)` | `"access_state:{host}:{user}"` | `"access_state:10.0.0.1:root"` |
+| `endpoint_id(url)` | `"endpoint:{normalized_url}"` | `"endpoint:http://host/login"` |
+| `auth_flow_id(url)` | `"auth_flow:{normalized_url}"` | `"auth_flow:http://host/login"` |
+
+Tech nodes are host-scoped (`tech:{host}:{slug}`) so the same software found on
+two different hosts produces distinct EKG nodes.
+
+### URL normalization (`normalize_url`)
+
+`normalize_url(url)` produces canonical URLs for deduplication:
+- Lowercases scheme and host
+- Strips default ports (`:80` from `http://`, `:443` from `https://`)
+- Collapses double slashes in paths
+- Strips trailing `/` from non-root paths
+
+Two equivalent URLs (`http://host:80/path/` and `http://host/path`) produce
+the same `endpoint_id` and therefore the same EKG node.
+
+### Parallel edges and dangling-edge prevention
+
+`NetworkXGraphStore.get_edges_for_node()` reads from the internal `_edges` dict
+(not NetworkX iterators), so ALL edges between any node pair are visible —
+including multiple edge types between the same source and target.
+
+`NetworkXGraphStore.put_edge()` validates that both `from_id` and `to_id` exist
+as nodes before writing the edge, raising `ValueError` with a diagnostic message
+if either is missing.  This prevents dangling edges from entering the graph.
+
+### EKG schema versioning
+
+`export_ekg()` always includes `"schema_version": "1"` as the first key in the
+returned dict.  The version constant is `apex_host.graph_ids.EKG_SCHEMA_VERSION`.
+
+---
+
+## Reliability Remediation Status
+
+> **Important:** The architecture documentation (CLAUDE.md, this README, and
+> the architecture doc) describes the *intended* invariants of the system.  Only
+> invariants that are covered by a passing test in `tests/` should be treated as
+> implementation-verified guarantees.  The remaining invariants are design goals
+> being enforced progressively through the remediation program below.
+
+A Phase 0 audit (2026-07-13) identified **21 findings** across 5 repair phases.
+Phase 1 is complete; Phases 2–5 are open.  All findings are documented in
+[`docs/reviewer_findings_audit.md`](docs/reviewer_findings_audit.md).
+The full traceability matrix is in [`docs/remediation_traceability_matrix.md`](docs/remediation_traceability_matrix.md).
+The validation baseline is in [`docs/remediation_validation_baseline.md`](docs/remediation_validation_baseline.md).
+The remediation roadmap and 12 binding rules are in `CLAUDE.md` Section 21.
+
+**Fixed (Phase 1 + Phase 1 Comprehensive):**
+
+| Area | Finding(s) | Status |
+|---|---|---|
+| `memfabric` cache | F01 — `_cache_key` excluded `k`; different-sized requests shared cache entry | **FIXED** |
+| `memfabric` rollback | F02, F19 — `apply_deltas` rollback did not restore `_write_clock` | **FIXED** |
+| Reader isolation | (new) — `query()`, `get_subgraph()`, `open_tasks()` could observe partial batch state | **FIXED** |
+| Deletion API | (new) — no public `delete_node`/`delete_edge` on `MemoryAPI` surface | **FIXED** |
+| Rollback completeness | (new) — rollback used direct store calls, bypassing locked helpers | **FIXED** |
+| TOCTOU race | (new) — concurrent field-merge could lose writes without `_graph_lock` | **FIXED** |
+| Defensive copies | (new) — `NetworkXGraphStore` returned live internal objects | **FIXED** |
+
+**Open findings by area:**
+
+| Area | Finding(s) | Severity | Repair Phase |
+|---|---|---|---|
+| LLM budget | F03, F04 — `RepairEngine` bypasses `LLMBudgetTracker`; tracker not injected | Medium | 2 |
+| LLM planning | F05 — `_context_hash` too coarse; false "repeated context" skips valid LLM calls | Low | 2 |
+| LLM guard | F14 — `LLMPolicyGuard` not wired into `build_apex_graph` by default | Low | 2 |
+| Graph routing | F06 — `route_after_write` only checks first task result in multi-task turns | Medium | 3 |
+| Graph routing | F07 — browser episode outcome reads stale `state["last_error"]` | Medium | 3 |
+| Graph routing | F08 — `reflect_or_continue` peek omits `current_phase` from `decide_phase` | Low | 2 |
+| Graph safety | F09 — `asyncio.gather` in `_run_tasks` lacks `return_exceptions=True` | Medium | 3 |
+| Parser idempotency | F10, F11 — `NmapParser` and `AccessParser` edge IDs not deterministic | Low | 3 |
+| Episodic log | F13 — duplicate-skip tasks written as `Outcome.success` episodes | Low | 3 |
+| Planner efficiency | F12 — `CredentialPlanner` calls `capabilities_from_subgraph` twice per `plan()` | Low | 4 |
+| Documentation | F17 — README test count stale (corrected to 1311 at Phase 0; 1328 at Phase 1; 1386 at Phase 1 Comprehensive; 1426 at Phase 1 re-open) | Info | 10 |
+| Tooling | F18 — no test enforces the file-header convention (CLAUDE.md §12.6) | Info | 4 |
+| Conflict invariant | F20 — `dependents_blocked_by()` is implemented but never called in planner/query paths | Medium | 5 |
+| Reflector invariant | F21 — Reflector directly mutates staged Skill objects, bypassing `MemoryAPI` | Low | 5 |
+
+None of the open findings affect the safety invariants (`dry_run=True` default,
+no subprocess outside `runner.py`, `policy_enabled=True` by default). The
+`MemoryAPI`-as-sole-state-surface invariant has one known exception (F21) in
+the Reflector skill-merge path; it does not affect correctness in the cooperative
+asyncio runtime but is a documented invariant violation that must be fixed in
+Phase 5.
 
 ---
 

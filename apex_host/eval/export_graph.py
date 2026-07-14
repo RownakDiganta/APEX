@@ -13,8 +13,12 @@ module never touches a store directly.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from apex_host.graph_ids import EKG_SCHEMA_VERSION
 
 if TYPE_CHECKING:
     from memfabric.api import MemoryAPI
@@ -39,6 +43,7 @@ async def export_ekg(
     """
     subgraph = await api.get_subgraph(anchor, depth=depth)
     return {
+        "schema_version": EKG_SCHEMA_VERSION,
         "anchor": anchor,
         "nodes": [
             {
@@ -67,5 +72,25 @@ async def export_ekg(
 
 
 def write_json(data: dict[str, Any], path: str | Path) -> None:
-    """Write *data* as pretty-printed JSON to *path*."""
-    Path(path).write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+    """Write *data* as pretty-printed JSON to *path*.
+
+    The write is atomic (P7-I06 / A06): data is first written to a temporary
+    sibling file, synced, then renamed into place.  A process crash during the
+    write leaves the original file intact — never a truncated or zero-byte file.
+    """
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(data, indent=2, default=str)
+    fd, tmp_path = tempfile.mkstemp(dir=out.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(serialized)
+            fh.flush()
+            os.fsync(fh.fileno())
+        Path(tmp_path).replace(out)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise

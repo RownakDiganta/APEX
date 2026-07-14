@@ -73,6 +73,11 @@ class ApexGraphState(TypedDict):
     # action gate.  Fields per entry: fingerprint, tool, target, phase,
     # disposition, reason, meaningful_state_change.
     duplicate_actions: Annotated[list[dict[str, Any]], operator.add]
+    # Checkpoint-persistent TaskRegistry snapshots.  Each entry is a
+    # TaskRecord.to_dict() dict.  ``operator.add`` accumulates records across
+    # turns; ``TaskRegistry.restore_from_snapshot()`` uses this to skip
+    # already-completed tasks after a resume from checkpoint.
+    completed_fingerprints: Annotated[list[dict[str, Any]], operator.add]
 
 
 CompiledApexGraph = Any

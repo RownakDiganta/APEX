@@ -30,9 +30,9 @@ from apex_host.planning.fingerprint import DuplicateActionTracker, task_fingerpr
 # ---------------------------------------------------------------------------
 
 class TestTaskFingerprint:
-    def test_returns_8_char_hex(self) -> None:
+    def test_returns_16_char_hex(self) -> None:
         fp = task_fingerprint("recon", "nmap", ["-sV", "10.10.10.10"], "10.10.10.10")
-        assert len(fp) == 8
+        assert len(fp) == 16
         assert all(c in "0123456789abcdef" for c in fp)
 
     def test_stable_across_calls(self) -> None:
@@ -76,9 +76,9 @@ class TestTaskFingerprint:
         assert fp1 != fp2
 
     def test_empty_optional_fields(self) -> None:
-        # Should not raise, and produce valid 8-char output.
+        # Should not raise, and produce valid 16-char output.
         fp = task_fingerprint("recon", "nc", [], "10.10.10.10")
-        assert len(fp) == 8
+        assert len(fp) == 16
 
 
 # ---------------------------------------------------------------------------

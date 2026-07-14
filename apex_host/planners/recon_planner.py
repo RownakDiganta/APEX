@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 from memfabric.ids import new_id, now
 from memfabric.types import (
     AbandonSignal,
+    ClaimDependency,
     EvidenceBundle,
     Goal,
     SubgraphView,
@@ -44,8 +45,10 @@ from apex_host.tools.registry import ToolRegistry
 from apex_host.types import ApexPhase
 
 if TYPE_CHECKING:
+    from apex_host.llm.gateway import LLMGateway
     from apex_host.llm.router import ModelRouter
     from apex_host.planning.budget import LLMBudgetTracker
+    from apex_host.policy.llm_guard import LLMPolicyGuard
     from apex_host.planning.engine import PlanningEngine
 
 # Capability names that a raw nc banner probe is safe and informative for.
@@ -85,6 +88,7 @@ class _ReconDeterministic:
     def _nmap_task(self, goal: Goal) -> list[TaskSpec] | AbandonSignal:
         if self._registry.get("nmap") is None:
             return AbandonSignal(reason="nmap not available in allowed_tools")
+        host_node_id = f"host:{self._target}"
         return [
             TaskSpec(
                 id=new_id(),
@@ -101,6 +105,10 @@ class _ReconDeterministic:
                 },
                 subgraph_anchor=goal.anchor_node,
                 phase=goal.phase,
+                # Nmap probes the host IP — depends on ip being undisputed.
+                claim_dependencies=(
+                    ClaimDependency(node_id=host_node_id, field_name="ip"),
+                ),
             )
         ]
 
@@ -154,6 +162,15 @@ class _ReconDeterministic:
                     },
                     subgraph_anchor=goal.anchor_node,
                     phase=goal.phase,
+                    # Banner probe reads the port and state from the service node.
+                    claim_dependencies=(
+                        ClaimDependency(
+                            node_id=cap.source_node_id, field_name="port"
+                        ),
+                        ClaimDependency(
+                            node_id=cap.source_node_id, field_name="state"
+                        ),
+                    ),
                 )
             )
 
@@ -174,6 +191,8 @@ class ReconPlanner:
         confidence_threshold: float = 0.4,
         max_retries: int = 1,
         budget_tracker: "LLMBudgetTracker | None" = None,
+        guard: "LLMPolicyGuard | None" = None,
+        gateway: "LLMGateway | None" = None,
     ) -> None:
         self._core = _ReconDeterministic(target, registry)
         self._engine: PlanningEngine | None = None
@@ -189,6 +208,8 @@ class ReconPlanner:
                 confidence_threshold=confidence_threshold,
                 max_retries=max_retries,
                 budget=budget_tracker,
+                guard=guard,
+                gateway=gateway,
             )
 
     @property

@@ -15,8 +15,16 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from memfabric.ids import new_id, now
+from memfabric.ids import now
 from memfabric.types import Edge, KnowledgeEntry, Node, ParsedObservation, RawObservation
+from apex_host.graph_ids import (
+    host_id as _host_id_fn,
+    endpoint_id as _endpoint_id,
+    tech_id as _tech_id_fn,
+    exposes_edge_id,
+    runs_edge_id,
+    contains_edge_id,
+)
 
 _HTTP_STATUS_RE = re.compile(r"^HTTP/[\d.]+\s+(?P<code>\d{3})")
 _HEADER_LINE_RE = re.compile(r"^(?P<name>[A-Za-z-]+):\s*(?P<value>.+)$")
@@ -81,12 +89,12 @@ class CommandParser:
 
         url = _normalize_url(target)
         host = _host_from_target(target)
-        host_id = f"host:{host}"
-        endpoint_id = f"endpoint:{url}"
+        h_id = _host_id_fn(host)
+        ep_id = _endpoint_id(url)
 
         nodes.append(
             Node(
-                id=endpoint_id,
+                id=ep_id,
                 type="endpoint",
                 props={
                     "url": url,
@@ -102,9 +110,9 @@ class CommandParser:
         )
         edges.append(
             Edge(
-                id=new_id(),
-                from_id=host_id,
-                to_id=endpoint_id,
+                id=exposes_edge_id(h_id, ep_id),
+                from_id=h_id,
+                to_id=ep_id,
                 type="exposes",
                 props={},
                 confidence=0.85,
@@ -120,11 +128,10 @@ class CommandParser:
             if sm:
                 product = sm.group("product").strip()
                 version = sm.group("version") or ""
-                slug = re.sub(r"[^a-z0-9]+", "_", product.lower()).strip("_")
-                tech_id = f"tech:{host}:{slug}"
+                t_id = _tech_id_fn(host, product)
                 nodes.append(
                     Node(
-                        id=tech_id,
+                        id=t_id,
                         type="tech",
                         props={"name": product, "version": version, "source_header": "server"},
                         confidence=0.8,
@@ -135,9 +142,9 @@ class CommandParser:
                 )
                 edges.append(
                     Edge(
-                        id=new_id(),
-                        from_id=endpoint_id,
-                        to_id=tech_id,
+                        id=runs_edge_id(ep_id, t_id),
+                        from_id=ep_id,
+                        to_id=t_id,
                         type="runs",
                         props={},
                         confidence=0.8,
@@ -176,18 +183,18 @@ class CommandParser:
         timestamp = now()
         url = _normalize_url(target)
         host = _host_from_target(target)
-        host_id = f"host:{host}"
-        endpoint_id = f"endpoint:{url}"
+        h_id = _host_id_fn(host)
+        ep_id = _endpoint_id(url)
 
         # Extract page title
         title = ""
         tm = re.search(r"<title[^>]*>([^<]{1,300})</title>", text, re.IGNORECASE)
         if tm:
-            title = " ".join(tm.group(1).split())  # collapse whitespace
+            title = " ".join(tm.group(1).split())
 
         nodes: list[Node] = [
             Node(
-                id=endpoint_id,
+                id=ep_id,
                 type="endpoint",
                 props={"url": url, "title": title},
                 confidence=0.75,
@@ -198,9 +205,9 @@ class CommandParser:
         ]
         edges: list[Edge] = [
             Edge(
-                id=new_id(),
-                from_id=host_id,
-                to_id=endpoint_id,
+                id=exposes_edge_id(h_id, ep_id),
+                from_id=h_id,
+                to_id=ep_id,
                 type="exposes",
                 props={},
                 confidence=0.75,
@@ -214,7 +221,6 @@ class CommandParser:
         seen_paths: set[str] = set()
         for m in re.finditer(r"""href=["']([^"'#?]+)["']""", text, re.IGNORECASE):
             href = m.group(1).strip()
-            # Skip external absolute URLs and non-path values
             if href.startswith("http://") or href.startswith("https://"):
                 continue
             if not href.startswith("/"):
@@ -223,13 +229,13 @@ class CommandParser:
             if path in seen_paths or path == "/":
                 continue
             seen_paths.add(path)
-            if len(seen_paths) > 20:  # bounded — stop after 20 link endpoints
+            if len(seen_paths) > 20:
                 break
             link_url = f"{url.rstrip('/')}{path}"
-            link_id = f"endpoint:{link_url}"
+            lnk_id = _endpoint_id(link_url)
             nodes.append(
                 Node(
-                    id=link_id,
+                    id=lnk_id,
                     type="endpoint",
                     props={"url": link_url, "path": path},
                     confidence=0.5,
@@ -240,9 +246,9 @@ class CommandParser:
             )
             edges.append(
                 Edge(
-                    id=new_id(),
-                    from_id=endpoint_id,
-                    to_id=link_id,
+                    id=contains_edge_id(ep_id, lnk_id),
+                    from_id=ep_id,
+                    to_id=lnk_id,
                     type="contains",
                     props={},
                     confidence=0.5,

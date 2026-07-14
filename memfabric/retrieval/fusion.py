@@ -58,7 +58,10 @@ def fuse_rrf(
             if doc_id not in first_meta:
                 first_meta[doc_id] = meta
 
-    ranked = sorted(fused_scores.items(), key=lambda kv: kv[1], reverse=True)
+    # Sort by descending score; break ties by ascending doc_id for determinism.
+    # Without a stable secondary key, tie-breaking depends on dict insertion order
+    # which can vary across Python versions and sessions.
+    ranked = sorted(fused_scores.items(), key=lambda kv: (-kv[1], kv[0]))
     result = [(doc_id, score, first_meta[doc_id]) for doc_id, score in ranked]
 
     if top_n is not None:

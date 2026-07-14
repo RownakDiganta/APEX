@@ -11,6 +11,10 @@ The worker:
 
 This runs asynchronously and NEVER blocks the orchestrator loop.
 The worker is the ONLY component allowed to promote a proposal.
+
+F21 fix (Phase 3): all Skill object mutations go through MemoryAPI methods
+(merge_skill_candidate, decay_skill, quarantine_skill).  The worker never
+mutates Skill objects returned by get_staged_skills() directly.
 """
 from __future__ import annotations
 
@@ -52,8 +56,14 @@ class ReflectorWorker:
         self._run_count: int = 0
 
     async def run_once(self) -> None:
-        """Process all new episodes since the last cursor, then apply gates."""
-        self._run_count += 1
+        """Process all new episodes since the last cursor, then apply gates.
+
+        ``advance_run_number()`` is called first so that all lifecycle events
+        within this pass share the same global run number.  ``_run_count`` is
+        updated to reflect the global counter (replacing the previous local
+        ``+= 1`` increment).
+        """
+        self._run_count = await self._api.advance_run_number()
 
         # 1. Fetch new episodes
         new_episodes = await self._api._episodic.since(self._cursor)
@@ -112,7 +122,7 @@ class ReflectorWorker:
                 await self._propose_negative_skill([ep])
 
     async def _generalise_and_propose(self, chain: list[Episode]) -> None:
-        # Check for similar existing skill
+        # get_staged_skills() returns deep copies — safe to compare, never mutate.
         staged = await self._api.get_staged_skills()
         candidate = generalize(
             chain,
@@ -129,17 +139,23 @@ class ReflectorWorker:
                 best_match = existing
 
         if best_match and best_sim >= self._config.skill_merge_theta:
-            # Merge into existing skill
-            best_match.wins += 1
-            best_match.evidence_count += 1
-            best_match.confidence = min(
-                1.0,
-                best_match.confidence + 0.05 * (1.0 - best_match.confidence),
+            # F21 fix: route through MemoryAPI instead of direct object mutation.
+            merged = await self._api.merge_skill_candidate(
+                best_match.id, run_number=self._run_count
             )
-            logger.info(
-                "reflector merged into skill id=%s name=%s wins=%d",
-                best_match.id, best_match.name, best_match.wins,
-            )
+            if merged:
+                logger.info(
+                    "reflector merged into skill id=%s name=%s",
+                    best_match.id, best_match.name,
+                )
+            else:
+                # Skill disappeared (quarantined between lookup and merge);
+                # propose a new one instead.
+                await self._api.propose_skill(candidate)
+                logger.info(
+                    "reflector proposed new skill name=%s (merge target gone)",
+                    candidate.name,
+                )
         else:
             await self._api.propose_skill(candidate)
             logger.info(
@@ -156,6 +172,8 @@ class ReflectorWorker:
         )
         candidate.name = "NEGATIVE_" + candidate.name
         candidate.description = "[negative] " + candidate.description
+        # candidate is a newly-created Skill not yet in the staging dict;
+        # setting losses on it before proposal is intentional (initial state).
         candidate.losses += 1
         await self._api.propose_skill(candidate)
         logger.info("reflector proposed negative skill name=%s", candidate.name)
@@ -230,12 +248,30 @@ class ReflectorWorker:
     # ------------------------------------------------------------------
 
     async def _apply_decay_and_quarantine(self) -> None:
+        """Apply quarantine and confidence decay to all non-quarantined skills.
+
+        Uses the global run number (``self._run_count``) — set by
+        ``advance_run_number()`` at the start of ``run_once()`` — so that
+        ``decay_skill()``'s idempotence guard works correctly and all lifecycle
+        events in the same pass share the same ordering key.
+
+        Passes ``config.skill_grace_runs`` and ``config.skill_confidence_floor``
+        so the decay policy respects both the grace period and the floor.
+        """
         for skill in await self._api.get_staged_skills():
             if skill.quarantined:
                 continue
 
-            if should_quarantine(skill, winrate_floor=self._config.winrate_floor):
-                await self._api.quarantine_skill(skill.id)
+            if should_quarantine(
+                skill,
+                winrate_floor=self._config.winrate_floor,
+                min_evidence_count=self._config.min_evidence_count,
+            ):
+                await self._api.quarantine_skill(
+                    skill.id,
+                    reason="winrate_below_floor",
+                    current_run_number=self._run_count,
+                )
                 logger.info("reflector quarantined skill id=%s name=%s", skill.id, skill.name)
                 continue
 
@@ -243,9 +279,15 @@ class ReflectorWorker:
                 skill,
                 current_run=self._run_count,
                 decay_unused_runs=self._config.decay_unused_runs,
+                grace_runs=self._config.skill_grace_runs,
             ):
                 new_conf = decayed_confidence(skill, decay_factor=self._config.decay_factor)
-                await self._api.decay_skill(skill.id, self._config.decay_factor)
+                await self._api.decay_skill(
+                    skill.id,
+                    self._config.decay_factor,
+                    current_run_number=self._run_count,
+                    confidence_floor=self._config.skill_confidence_floor,
+                )
                 logger.info(
                     "reflector decayed skill id=%s conf %.3f→%.3f",
                     skill.id, skill.confidence, new_conf,

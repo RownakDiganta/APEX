@@ -9,6 +9,14 @@ Invariants enforced here:
 
 For testing the store can be created with ``path=None`` which uses an
 entirely in-memory list (no file I/O).
+
+Phase 7 async invariant (P7-I01 / A03)
+---------------------------------------
+``append()`` holds ``asyncio.Lock`` to protect the in-memory index, but
+offloads the actual file write to a thread via ``asyncio.to_thread`` so the
+event loop is not blocked on file I/O.  The lock is still held during the
+thread call — the event loop is free to run other coroutines that do not need
+this lock, but concurrent appends are serialised correctly.
 """
 from __future__ import annotations
 
@@ -22,6 +30,16 @@ from memfabric.ids import new_id, now
 from memfabric.types import Episode, Outcome
 
 logger = logging.getLogger(__name__)
+
+
+def _append_line_sync(path: pathlib.Path, line: str) -> None:
+    """Append one JSONL line to *path*.
+
+    Pure function — safe to call from a thread pool.  Keeps the actual
+    ``open`` / ``write`` / ``close`` sequence off the event loop (A03 fix).
+    """
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(line)
 
 
 def _episode_to_dict(ep: Episode) -> dict[str, Any]:
@@ -93,8 +111,11 @@ class JSONLEpisodicStore:
             self._order.append(episode.id)
 
             if self._path is not None:
-                with self._path.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(_episode_to_dict(episode)) + "\n")
+                # Offload file I/O to a thread so the event loop is not
+                # blocked during the write (P7-I01 / A03).  The asyncio.Lock
+                # is still held; the event loop runs other coroutines freely.
+                line = json.dumps(_episode_to_dict(episode)) + "\n"
+                await asyncio.to_thread(_append_line_sync, self._path, line)
 
             logger.debug("append episode id=%s outcome=%s", episode.id, episode.outcome.value)
             return episode.id

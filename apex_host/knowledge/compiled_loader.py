@@ -19,6 +19,7 @@ Typical usage (via seed_loader.seed_compiled_knowledge):
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import pathlib
@@ -117,7 +118,9 @@ async def _load_jsonl_file(
     """Read one JSONL file and propose each record via MemoryAPI."""
     count = 0
     try:
-        text = path.read_text(encoding="utf-8")
+        # Offload file read to a thread so the event loop is not blocked on
+        # potentially large JSONL files (P7-I10 / A04).
+        text = await asyncio.to_thread(path.read_text, encoding="utf-8")
     except OSError as exc:
         logger.warning("compiled_loader: cannot read %s: %s", path, exc)
         return 0

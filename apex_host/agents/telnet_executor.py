@@ -10,6 +10,9 @@ Safety invariants:
 - Uses asyncio.open_connection, never subprocess or shell=True.
 - Credentials must come from explicit operator config (task.params), never
   guessed by this executor.
+- Live session stdout is NEVER stored in episode.data — only a
+  [session_redacted] placeholder is kept (P8-S03).  Use
+  apex_host.security.redaction for any further scrubbing needs.
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from memfabric.types import Episode, EvidenceBundle, ExecutorResult, Outcome, TaskSpec
+from apex_host.security.redaction import SESSION_REDACTED_PLACEHOLDER
 
 if TYPE_CHECKING:
     from apex_host.config import ApexConfig
@@ -104,12 +108,16 @@ class TelnetExecutor:
 
         outcome = Outcome.success if _login_succeeded(stdout) else Outcome.fundamental
         logger.info("telnet %s:%s user=%r outcome=%s", target, port_str, username, outcome.value)
+        # P8-S03: never store raw session transcript in the episodic log.
+        # Keep length + outcome flag for debugging without leaking credentials.
         episode = Episode(
             agent="apex.credential",
             action=f"telnet {target}:{port_str} user={username}",
             outcome=outcome,
             data={
-                "stdout": stdout,
+                "stdout": SESSION_REDACTED_PLACEHOLDER,
+                "stdout_length": len(stdout),
+                "shell_found": _login_succeeded(stdout),
                 "target": target,
                 "port": port_str,
                 "username": username,
