@@ -6,16 +6,24 @@
 
 ``--dry-run`` (default True) threads through ApexConfig.dry_run -> runtime.py
 -> graph.py -> tools/runner.py, guaranteeing no real command execution unless
-the host explicitly passes ``--no-dry-run``.
+the host explicitly passes ``--no-dry-run``. ``APEX_TARGET``/``APEX_DRY_RUN``/
+other ``APEX_*`` environment variables are an alternative to their CLI-flag
+equivalents (see ``apex_host/config_env.py`` and
+``docs/environment-configuration.md``) — an explicit CLI flag always wins,
+and ``APEX_DRY_RUN=false`` alone can never enable real execution without the
+explicit ``--no-dry-run`` flag also being passed.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import logging
+import os
 import pprint
+import sys
 
 from apex_host.config import ApexConfig
+from apex_host.config_env import EnvConfigError, load_env_file, merge_env_into_args, merge_log_level
 from apex_host.runtime import build_runtime
 
 logger = logging.getLogger(__name__)
@@ -23,13 +31,27 @@ logger = logging.getLogger(__name__)
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="apex_host", description="APEX cybersecurity host application")
-    parser.add_argument("--target", required=True, help="Engagement target (host or URL)")
+    parser.add_argument(
+        "--target", required=False, default=None,
+        help=(
+            "Engagement target (host or URL). May be omitted if APEX_TARGET "
+            "is set (a blank APEX_TARGET counts as unset) — explicit "
+            "--target always wins. At least one of the two is required."
+        ),
+    )
     parser.add_argument("--payload-repo", default="./payloads", help="Path to the payload repo (RAG seed corpus)")
-    parser.add_argument("--max-turns", type=int, default=20, help="Maximum engagement turns")
+    parser.add_argument(
+        "--max-turns", type=int, default=None,
+        help="Maximum engagement turns (default: 20, or $APEX_MAX_TURNS)",
+    )
     dry_run_group = parser.add_mutually_exclusive_group()
     dry_run_group.add_argument(
-        "--dry-run", dest="dry_run", action="store_true", default=True,
-        help="Simulate tool execution; perform no real commands (default)",
+        "--dry-run", dest="dry_run", action="store_true", default=None,
+        help=(
+            "Simulate tool execution; perform no real commands (default — "
+            "matches $APEX_DRY_RUN when true; $APEX_DRY_RUN=false alone can "
+            "never enable real execution)"
+        ),
     )
     dry_run_group.add_argument(
         "--no-dry-run", dest="dry_run", action="store_false",
@@ -58,8 +80,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Maximum access validation attempts per run (default: 1; never brute-forces)",
     )
     parser.add_argument(
-        "--use-llm", dest="use_llm", action="store_true", default=False,
-        help="Enable LLM-backed planning (default: fully deterministic, no API calls)",
+        "--use-llm", dest="use_llm", action="store_true", default=None,
+        help=(
+            "Enable LLM-backed planning (default: fully deterministic, no API "
+            "calls; also settable via $APEX_USE_LLM)"
+        ),
     )
     parser.add_argument(
         "--llm-provider", dest="llm_provider", default=None, metavar="PROVIDER",
@@ -158,12 +183,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "count. Only useful when diagnosing knowledge-seeding issues."
         ),
     )
+    parser.add_argument(
+        "--env-file", dest="env_file", default=None, metavar="PATH",
+        help=(
+            "Explicitly load a dotenv-format file (e.g. .env) before "
+            "resolving $APEX_* environment values. Never loaded implicitly — "
+            "omit this flag to use only real, exported environment variables."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 async def run(args: argparse.Namespace) -> None:
-    import sys
-
     config = ApexConfig.from_cli_args(args)
 
     if args.preflight:
@@ -194,8 +225,22 @@ async def run(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+    raw_args = parse_args(argv)
+    # Single, explicit merge point: environment values fill in whichever CLI
+    # flags were left at their argparse `default=None` (i.e. not passed). An
+    # explicit CLI flag always wins — see apex_host/config_env.py.
+    try:
+        env = None
+        if raw_args.env_file:
+            env = {**load_env_file(raw_args.env_file), **os.environ}
+        args = merge_env_into_args(raw_args, env)
+    except EnvConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    log_level_name = merge_log_level(args.verbose)
+    effective_level = getattr(logging, log_level_name) if log_level_name else logging.INFO
+    logging.basicConfig(level=effective_level)
     # Suppress chatty HTTP transport libs when -v is set but --http-debug is not.
     if args.verbose and not getattr(args, "http_debug", False):
         for _noisy in ("openai", "openai._base_client", "httpx", "httpcore"):

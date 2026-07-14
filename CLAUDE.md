@@ -4948,3 +4948,150 @@ nmap support; wiring a full multi-turn engagement
 publishing; Meow-specific diagnosis, deterministic Meow tests, or
 authorized live Meow validation. **None of these were started in this
 phase.**
+
+### Infra Phase 8 — Environment configuration workflow ✓ COMPLETE
+
+**Date:** 2026-07-15
+**Files:** `.env.example`, `apex_host/config_env.py`,
+`apex_host/eval/check_config.py`, `compose.yaml` (updated), `.gitignore` /
+`.dockerignore` (updated), `apex_host/main.py` /
+`apex_host/eval/run_htb_local.py` (updated CLI defaults + merge wiring),
+`docs/environment-configuration.md` (152 new focused tests across five
+files — see below)
+
+Built the `.env.example` workflow, centralized `APEX_*` environment-variable
+loading in a single new module, and documented every supported
+configuration value. `apex_host/config.py` itself still never reads the
+environment — the pre-existing architecture invariant
+(`test_arch_08_config_py_has_no_env_access`) was preserved unchanged, per
+this phase's own instruction to "revise the design with the least invasive
+approach" rather than relax that test.
+
+**Centralized loader:** `apex_host/config_env.py` — the sole place
+(outside two narrow, documented, pre-existing exceptions:
+`RemoteToolBackend.__init__`'s `APEX_TOOL_SERVICE_TOKEN` fallback and
+`OpenAIModelRouter`'s `OPENAI_API_KEY`/`OPENAI_BASE_URL` reads, both
+unchanged) `apex_host` reads `APEX_*` environment variables. Strict
+boolean/int/float parsing (never Python truthy-string heuristics), backend/
+log-level/URL validation, and a generic `merge_env_into_args()` that fills
+`None`-valued CLI attributes from a validated environment value — never
+overwriting an explicit CLI flag. Every function accepts an injected
+`Mapping[str, str]`, defaulting to `os.environ` only when none is given, so
+tests never patch global process state.
+
+**Precedence (binding, tested):** explicit CLI argument > environment
+value > built-in safe default. Implemented by changing the relevant CLI
+flags' `argparse` declarations from concrete defaults (e.g. `default=True`,
+`default=20`) to `default=None`, then merging once at the top of each
+entry point's `main()` before `ApexConfig.from_cli_args()` is called.
+
+**Two fields have dedicated, stricter rules layered on the generic merge:**
+
+- **`dry_run` — asymmetric safety rule.** `APEX_DRY_RUN` can only ever
+  *reinforce* the safe default (`true`, or absent, → `True`); `APEX_DRY_RUN
+  =false` with no explicit `--no-dry-run` CLI flag raises a clear
+  `EnvConfigError` rather than silently enabling real execution — CLAUDE.md
+  §13.5's "explicit CLI flag required for real execution" invariant now
+  extends to environment variables too, and this phase's own philosophy
+  rule 10 ("no automatic live engagement may start from loading .env") is
+  enforced structurally, not just by convention.
+- **`target` — "at least one of two, blank counts as absent."** Explicit
+  `--target` always wins; `APEX_TARGET` is the fallback; a blank
+  `APEX_TARGET` counts as unset; `apex_host.main`/`run_htb_local` require
+  at least one (clear error otherwise); `apex_host.eval.check_config`
+  substitutes a synthetic placeholder (`"config-check"`) instead of
+  requiring one, since it validates configuration shape only.
+
+**`apex_host/eval/check_config.py`** — new safe validation command
+(`python -m apex_host.eval.check_config`). No target required; no network
+call by default (`--check-connectivity` is the sole, explicit opt-in, and
+even then only issues `GET /health`, never `POST /v1/execute`); prints a
+fully redacted summary (`ApexConfig.to_safe_dict()` plus
+`tool_service_token`/`OPENAI_API_KEY` shown as `present`/`absent` only,
+never the value); exits `0`/`1`/`2` for valid/invalid/malformed-invocation.
+Validates: remote backend requires URL and token (only when not in
+dry-run); malformed URL; negative timeout; `max_turns < 1`; LLM enabled
+with a real provider requires `OPENAI_API_KEY` (never required when
+disabled or `llm_provider=fake`).
+
+**`.env.example`** — one committed, secret-free template covering APEX
+execution, target/runtime-file paths, tool backend, LLM configuration
+(defaults to `fake`/`false`, never an external provider), and tool-service
+server configuration. Every tool-service default documented is the real,
+verified `apex_tool_service/settings.py::ServiceSettings` value (30s/120s/
+32/512/65536/1048576/1048576) — not the illustrative numbers this phase's
+own task brief happened to suggest, per its own "do not invent values"
+instruction. `APEX_TARGET=` and both secret fields
+(`APEX_TOOL_SERVICE_TOKEN=`, `OPENAI_API_KEY=`) are blank. A commented-out,
+inert note documents that HTB VPN integration (`APEX_HTB_OVPN_PATH`-style)
+does not exist yet — no such variable is read anywhere, and `compose.yaml`
+references nothing VPN-related.
+
+**`.gitignore`/`.dockerignore`:** both now cover `.env`, `.env.local`,
+`.env.*.local`, `secrets/`, `*.ovpn` using exact-name patterns (never a
+broad `.env*` glob that would catch `.env.example`). `.dockerignore`'s
+`.env.*` entry (a genuine glob, unlike Git's exact-name `.env`) is followed
+by an explicit `!.env.example` negation, restoring it to the build context
+— verified live: `git check-ignore -q .env` exits 0 (ignored),
+`git check-ignore -q .env.example` exits 1 (not ignored).
+
+**`compose.yaml`:** the required-token fail-fast interpolation
+(`${APEX_TOOL_SERVICE_TOKEN:?...}`) is unchanged; every other variable
+(`APEX_TOOL_BACKEND`, `APEX_TOOL_SERVICE_URL`, and all nine
+`apex_tool_service` server-configuration variables on the `kali` service)
+now uses `${VAR:-default}` interpolation with the default matching the
+real, verified implementation default — overridable via `.env` with zero
+behavior change for anyone who does not edit it. Verified live:
+`docker compose config` renders correctly with real defaults; a real
+`docker compose up --build --abort-on-container-exit` run (using a fresh,
+temporary `.env` copied from `.env.example`, never overwriting any
+pre-existing user `.env`) completed the same safe dry-run smoke check as
+Infra Phase 7, unaffected by this phase's changes.
+
+**`python-dotenv` — retained, and given genuine, tested use.** Was
+declared as a dependency since Infra Phase 1 but never imported anywhere.
+This phase adds `apex_host.config_env.load_env_file()` — the **only**
+place `apex_host` reads a dotenv-format file, and only when a caller
+explicitly passes `--env-file PATH` (new flag on all three CLI entry
+points: `apex_host.main`, `apex_host.eval.run_htb_local`,
+`apex_host.eval.check_config`). Uses `dotenv_values()` (never
+`load_dotenv()`), so the real process environment is never mutated as a
+side effect — the returned mapping flows only through each function's
+explicit `env=` parameter. Never loaded automatically or implicitly from
+the working directory; Docker Compose's own, entirely separate, built-in
+`.env` reading is unaffected and unchanged.
+
+**Tests (152 new, across 5 files):**
+`tests/apex_host/test_config_env.py` (89 — strict parsing, target/dry_run
+resolution rules, generic merge, dotenv loading), `tests/apex_host/
+test_check_config.py` (20 — safe defaults, redaction, every validation
+rule), `tests/docker/test_env_files.py` (34 — `.env.example` content,
+required-variable coverage, no secrets/target, real-default matching, Git/
+Docker ignore-rule behavior), `tests/apex_host/test_phase8_env_architecture.py`
+(8 — environment reads confined to an approved, closed file set;
+`config.py` still has zero env access; every secret-shaped `ApexConfig`
+field is redacted by `to_safe_dict()`; no `load_dotenv()` anywhere), plus 3
+existing `tests/docker/test_compose.py` tests updated for the new
+`${VAR:-default}` interpolation syntax (2 tests in
+`tests/apex_host/test_llm_wiring.py` were also updated: `--use-llm`'s raw
+CLI default changed from `False` to `None`, an intentional, documented
+change required for the env-merge design — the *resolved* `ApexConfig`
+value is unchanged and still asserted).
+
+**Real end-to-end validation performed (recorded with full command
+transcripts in `docs/environment-configuration.md` and this response):**
+safe/default config check; valid remote config check with a disposable
+token; missing-token failure; invalid-backend failure; malformed-number
+failure; token-leak search (grep across stdout/stderr and both images'
+`docker history --no-trunc`); `cp .env.example .env` → verified ignored by
+Git, read automatically by Compose, safe default Compose mode working with
+only the token filled in, no target contacted, `.env` absent from both
+built images; full strict-validation suite (lock, sync, full pytest count,
+ruff, mypy, both CLI `--help` commands, diff check, git status).
+
+**Deferred to Infra Phase 9+ (as of Infra Phase 8):** final container
+entrypoint/preflight orchestration beyond what already exists; HTB VPN
+container/tunnel routing; GitHub Actions/CI image publishing; wiring a full
+multi-turn engagement (`apex_host.eval.run_htb_local`) into Compose;
+Meow-specific diagnosis, deterministic Meow tests, or authorized live Meow
+validation. **None of these were started in this phase.**

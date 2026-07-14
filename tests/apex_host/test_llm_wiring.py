@@ -137,9 +137,15 @@ class TestOpenAIModelRouterBaseURL:
 
 class TestMainParseCLI:
     def test_default_no_llm(self) -> None:
+        # Infra Phase 8: --use-llm's raw argparse default is None (not False)
+        # so apex_host.config_env.merge_env_into_args can distinguish "not
+        # passed" from "explicitly disabled" when filling in $APEX_USE_LLM.
+        # The fully-resolved ApexConfig still defaults use_llm to False.
+        from apex_host.config import ApexConfig
         from apex_host.main import parse_args
         args = parse_args(["--target", "10.0.0.1"])
-        assert args.use_llm is False
+        assert args.use_llm is None
+        assert ApexConfig.from_cli_args(args).use_llm is False
 
     def test_use_llm_flag(self) -> None:
         from apex_host.main import parse_args
@@ -190,9 +196,13 @@ class TestMainParseCLI:
 
 class TestRunHTBLocalParseCLI:
     def test_default_no_llm(self) -> None:
+        # Infra Phase 8: see TestMainParseCLI.test_default_no_llm's comment —
+        # same None-by-default raw-parse contract applies here.
+        from apex_host.config import ApexConfig
         from apex_host.eval.run_htb_local import parse_args
         args = parse_args(["--target", "10.0.0.1"])
-        assert args.use_llm is False
+        assert args.use_llm is None
+        assert ApexConfig.from_cli_args(args).use_llm is False
 
     def test_use_llm_flag(self) -> None:
         from apex_host.eval.run_htb_local import parse_args

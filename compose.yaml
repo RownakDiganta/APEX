@@ -31,6 +31,16 @@
 # environment can reach an HTB target; every command validated against it
 # in Infra Phase 7 touched only the `apex-internal` network and each
 # container's own loopback interface.
+#
+# Infra Phase 8: every environment variable interpolated below (other than
+# the required token) now uses Compose's `${VAR:-default}` syntax, with the
+# default matching either apex_tool_service/settings.py's own real,
+# implemented ServiceSettings default (for the "kali" service) or this
+# file's own pre-existing Infra Phase 7 default (for "apex"'s tool-backend
+# selection). This means every value is now overridable by copying
+# .env.example to .env and uncommenting/editing a line, with zero behavior
+# change for anyone who does not. Every name here matches .env.example
+# exactly — see docs/environment-configuration.md "Docker Compose usage".
 
 services:
   # ---------------------------------------------------------------------
@@ -49,6 +59,22 @@ services:
       # refuse to proceed if this is unset or empty, per this phase's own
       # requirement — no reusable default token is baked in anywhere.
       APEX_TOOL_SERVICE_TOKEN: ${APEX_TOOL_SERVICE_TOKEN:?APEX_TOOL_SERVICE_TOKEN must be set — see docs/docker-compose.md}
+      # Everything below is optional — each default matches
+      # apex_tool_service/settings.py's own real, implemented
+      # ServiceSettings default exactly (Infra Phase 8; see .env.example
+      # "Tool-service server configuration"). Overriding any of these here
+      # via Compose takes precedence over the equivalent `ENV` baked into
+      # docker/kali/Dockerfile, since Compose's own `environment:` always
+      # wins over a Dockerfile's `ENV` at container-start time.
+      APEX_TOOL_SERVICE_HOST: ${APEX_TOOL_SERVICE_HOST:-0.0.0.0}
+      APEX_TOOL_SERVICE_PORT: ${APEX_TOOL_SERVICE_PORT:-8080}
+      APEX_TOOL_SERVICE_DEFAULT_TIMEOUT_SECONDS: ${APEX_TOOL_SERVICE_DEFAULT_TIMEOUT_SECONDS:-30}
+      APEX_TOOL_SERVICE_MAX_TIMEOUT_SECONDS: ${APEX_TOOL_SERVICE_MAX_TIMEOUT_SECONDS:-120}
+      APEX_TOOL_SERVICE_MAX_ARGUMENTS: ${APEX_TOOL_SERVICE_MAX_ARGUMENTS:-32}
+      APEX_TOOL_SERVICE_MAX_ARGUMENT_LENGTH: ${APEX_TOOL_SERVICE_MAX_ARGUMENT_LENGTH:-512}
+      APEX_TOOL_SERVICE_MAX_STDIN_BYTES: ${APEX_TOOL_SERVICE_MAX_STDIN_BYTES:-65536}
+      APEX_TOOL_SERVICE_MAX_STDOUT_BYTES: ${APEX_TOOL_SERVICE_MAX_STDOUT_BYTES:-1048576}
+      APEX_TOOL_SERVICE_MAX_STDERR_BYTES: ${APEX_TOOL_SERVICE_MAX_STDERR_BYTES:-1048576}
     # `expose:` documents intent (reachable on the Compose network at port
     # 8080) but is not strictly required — Compose already makes every
     # service's ports reachable to other services on the same network
@@ -115,8 +141,8 @@ services:
       # arguments, not these env vars directly — see
       # docs/docker-compose.md "Internal networking" for the full
       # env-var-vs-CLI-flag explanation.
-      APEX_TOOL_BACKEND: remote
-      APEX_TOOL_SERVICE_URL: http://kali:8080
+      APEX_TOOL_BACKEND: ${APEX_TOOL_BACKEND:-remote}
+      APEX_TOOL_SERVICE_URL: ${APEX_TOOL_SERVICE_URL:-http://kali:8080}
       APEX_TOOL_SERVICE_TOKEN: ${APEX_TOOL_SERVICE_TOKEN:?APEX_TOOL_SERVICE_TOKEN must be set — see docs/docker-compose.md}
     volumes:
       # Report persistence outside the container — a plain bind mount

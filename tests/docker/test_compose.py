@@ -215,15 +215,23 @@ def test_both_services_receive_the_same_token_variable() -> None:
 # ---------------------------------------------------------------------------
 
 def test_apex_tool_service_url_uses_kali_service_name() -> None:
+    # Infra Phase 8: interpolated with a $APEX_TOOL_SERVICE_URL override
+    # (default unchanged: http://kali:8080) rather than a bare literal.
     data = _compose_dict()
     apex_env = data["services"]["apex"]["environment"]
-    assert apex_env["APEX_TOOL_SERVICE_URL"] == "http://kali:8080"
+    value = apex_env["APEX_TOOL_SERVICE_URL"]
+    assert value.startswith("${APEX_TOOL_SERVICE_URL:-")
+    assert value.endswith("http://kali:8080}")
 
 
 def test_apex_tool_backend_is_remote_by_default() -> None:
+    # Infra Phase 8: interpolated with a $APEX_TOOL_BACKEND override
+    # (default unchanged: remote) rather than a bare literal.
     data = _compose_dict()
     apex_env = data["services"]["apex"]["environment"]
-    assert apex_env["APEX_TOOL_BACKEND"] == "remote"
+    value = apex_env["APEX_TOOL_BACKEND"]
+    assert value.startswith("${APEX_TOOL_BACKEND:-")
+    assert value.endswith("remote}")
 
 
 def test_dedicated_network_exists() -> None:
@@ -315,14 +323,19 @@ def test_apex_default_command_is_the_smoke_module() -> None:
 
 
 def test_no_hardcoded_target_ip_anywhere() -> None:
+    # 0.0.0.0 is a bind-all address (APEX_TOOL_SERVICE_HOST's real
+    # apex_tool_service default, Infra Phase 8), not a target — the only
+    # literal IPv4 addresses allowed anywhere in this file.
     import re
 
+    allowed = {"0.0.0.0"}
     ipv4 = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
     for ln in _compose_text().splitlines():
         stripped = ln.strip()
         if stripped.startswith("#"):
             continue
-        assert ipv4.search(stripped) is None, f"unexpected IPv4 literal in compose.yaml: {ln!r}"
+        for match in ipv4.finditer(stripped):
+            assert match.group(0) in allowed, f"unexpected IPv4 literal in compose.yaml: {ln!r}"
 
 
 def test_no_hardcoded_api_key() -> None:

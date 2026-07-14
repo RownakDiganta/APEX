@@ -1,0 +1,364 @@
+# test_env_files.py
+# Static tests for .env.example content and .gitignore/.dockerignore rules (Infra Phase 8) — does not require a Docker daemon.
+"""Static checks for the environment-file workflow.
+
+Covers: `.env.example` exists, documents every variable
+`apex_host/config_env.py` and `apex_tool_service/settings.py` genuinely
+support, contains no non-empty secret and no target, has no duplicate
+variable names, and its commented-out default values match the real
+implemented defaults. Also covers Git/Docker ignore-rule behavior: `.env`
+is ignored, `.env.example` is not, `.env.local`/`secrets/`/`*.ovpn` are
+ignored, and Docker's build context excludes real `.env` files while
+retaining `.env.example`.
+"""
+from __future__ import annotations
+
+import pathlib
+import re
+import subprocess
+
+_REPO_ROOT = pathlib.Path(__file__).parent.parent.parent
+_ENV_EXAMPLE_PATH = _REPO_ROOT / ".env.example"
+_GITIGNORE_PATH = _REPO_ROOT / ".gitignore"
+_DOCKERIGNORE_PATH = _REPO_ROOT / ".dockerignore"
+
+
+def _env_example_text() -> str:
+    return _ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
+
+
+def _env_example_lines() -> list[str]:
+    """Every `KEY=value` assignment line (commented-out examples included,
+    since those are still meaningful documentation, but tracked separately
+    from active/uncommented lines)."""
+    return _env_example_text().splitlines()
+
+
+def _active_assignments() -> dict[str, str]:
+    """Only uncommented `KEY=value` lines — the variables actually "on" in
+    a fresh `cp .env.example .env`."""
+    result: dict[str, str] = {}
+    for ln in _env_example_lines():
+        stripped = ln.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        result[key.strip()] = value.strip()
+    return result
+
+
+_ASSIGNMENT_RE = re.compile(r"^(?:# )?([A-Z][A-Z0-9_]*)=(.*)$")
+
+
+def _all_assignments_including_commented() -> list[tuple[str, str]]:
+    """Every real `KEY=value` pair, whether commented out (`# KEY=value`,
+    a single-space comment marker — this file's own documented-default
+    convention) or active. Deliberately does NOT match a shell command
+    embedded inside a multi-line usage example (e.g. `#   KEY=$(...)`,
+    indented well past the single-space comment marker) — those describe
+    how to invoke a command, not a variable this file documents."""
+    result: list[tuple[str, str]] = []
+    for ln in _env_example_lines():
+        m = _ASSIGNMENT_RE.match(ln)
+        if m:
+            result.append((m.group(1), m.group(2).strip()))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# .env.example — existence and structure
+# ---------------------------------------------------------------------------
+
+
+def test_env_example_exists() -> None:
+    assert _ENV_EXAMPLE_PATH.is_file()
+
+
+def test_file_header_convention() -> None:
+    lines = _env_example_lines()
+    assert lines[0] == "# .env.example"
+    assert lines[1].startswith("# ")
+
+
+def test_env_example_committed_not_ignored() -> None:
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", ".env.example"], cwd=_REPO_ROOT,
+    )
+    assert result.returncode == 1, ".env.example must NOT be gitignored"
+
+
+
+
+# ---------------------------------------------------------------------------
+# Required documented variables
+# ---------------------------------------------------------------------------
+
+_REQUIRED_VARIABLES = {
+    "APEX_DRY_RUN", "APEX_TARGET", "APEX_TOOL_BACKEND", "APEX_TOOL_SERVICE_URL",
+    "APEX_TOOL_SERVICE_TOKEN", "APEX_USE_LLM", "APEX_LLM_PROVIDER", "APEX_LLM_MODEL",
+    "OPENAI_API_KEY", "OPENAI_BASE_URL",
+}
+
+
+def test_all_required_variables_documented() -> None:
+    all_names = {name for name, _ in _all_assignments_including_commented()}
+    missing = _REQUIRED_VARIABLES - all_names
+    assert not missing, f"missing required documented variables: {missing}"
+
+
+def test_tool_service_server_variables_documented() -> None:
+    all_names = {name for name, _ in _all_assignments_including_commented()}
+    for name in (
+        "APEX_TOOL_SERVICE_HOST", "APEX_TOOL_SERVICE_PORT",
+        "APEX_TOOL_SERVICE_DEFAULT_TIMEOUT_SECONDS", "APEX_TOOL_SERVICE_MAX_TIMEOUT_SECONDS",
+        "APEX_TOOL_SERVICE_MAX_ARGUMENTS", "APEX_TOOL_SERVICE_MAX_ARGUMENT_LENGTH",
+        "APEX_TOOL_SERVICE_MAX_STDIN_BYTES", "APEX_TOOL_SERVICE_MAX_STDOUT_BYTES",
+        "APEX_TOOL_SERVICE_MAX_STDERR_BYTES",
+    ):
+        assert name in all_names, f"missing tool-service variable: {name}"
+
+
+def test_variable_names_are_unique() -> None:
+    """Every KEY should appear (commented or not) at most once — a
+    duplicate would be confusing and a likely copy-paste mistake."""
+    names = [name for name, _ in _all_assignments_including_commented()]
+    duplicates = {n for n in names if names.count(n) > 1}
+    assert not duplicates, f"duplicate variable names in .env.example: {duplicates}"
+
+
+# ---------------------------------------------------------------------------
+# No secrets, no target
+# ---------------------------------------------------------------------------
+
+
+def test_tool_service_token_is_blank() -> None:
+    active = _active_assignments()
+    assert "APEX_TOOL_SERVICE_TOKEN" in active
+    assert active["APEX_TOOL_SERVICE_TOKEN"] == ""
+
+
+def test_openai_api_key_is_blank() -> None:
+    active = _active_assignments()
+    assert "OPENAI_API_KEY" in active
+    assert active["OPENAI_API_KEY"] == ""
+
+
+def test_no_target_provided() -> None:
+    active = _active_assignments()
+    assert "APEX_TARGET" in active
+    assert active["APEX_TARGET"] == "", "no default target may ever be provided"
+
+
+def test_no_hardcoded_target_ip_anywhere() -> None:
+    """No non-loopback/non-bind-all IPv4 literal anywhere — comment or not."""
+    ipv4 = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
+    allowed = {"0.0.0.0"}
+    for ln in _env_example_lines():
+        for match in ipv4.finditer(ln):
+            assert match.group(0) in allowed, f"unexpected IPv4 literal: {ln!r}"
+
+
+def test_no_openai_style_api_key_pattern() -> None:
+    text = _env_example_text()
+    assert re.search(r"sk-[A-Za-z0-9]{10,}", text) is None
+
+
+def test_no_realistic_looking_token_value() -> None:
+    text = _env_example_text().lower()
+    for bad in ("phase7-test-token", "phase8-test-token", "phase8-baseline-token", "dev-only-token"):
+        assert bad not in text
+
+
+def test_every_non_blank_value_is_a_safe_default_or_placeholder() -> None:
+    """Every *active* (uncommented) assignment must be either blank or a
+    documented safe default — never something secret-shaped."""
+    active = _active_assignments()
+    for key, value in active.items():
+        if not value:
+            continue
+        assert not re.search(r"sk-[A-Za-z0-9]{10,}", value)
+        assert "token" not in value.lower() or key.endswith("_TOKEN") is False
+
+
+# ---------------------------------------------------------------------------
+# Comments explain required fields
+# ---------------------------------------------------------------------------
+
+
+def _preceding_comment_block(assignment_line: str) -> str:
+    """The contiguous run of `#`-prefixed comment lines immediately above
+    the first line matching *assignment_line* exactly (e.g.
+    ``"APEX_TOOL_SERVICE_TOKEN="``), joined into one string."""
+    lines = _env_example_lines()
+    idx = lines.index(assignment_line)
+    block: list[str] = []
+    i = idx - 1
+    while i >= 0 and lines[i].strip().startswith("#"):
+        block.insert(0, lines[i])
+        i -= 1
+    return "\n".join(block)
+
+
+def test_required_token_has_explanatory_comment() -> None:
+    block = _preceding_comment_block("APEX_TOOL_SERVICE_TOKEN=")
+    assert "REQUIRED" in block
+
+
+def test_target_has_explanatory_comment() -> None:
+    block = _preceding_comment_block("APEX_TARGET=")
+    assert "no default target" in block.lower()
+
+
+# ---------------------------------------------------------------------------
+# Values match implemented defaults (apex_tool_service/settings.py)
+# ---------------------------------------------------------------------------
+
+
+def test_documented_defaults_match_service_settings() -> None:
+    all_pairs = dict(_all_assignments_including_commented())
+    expected = {
+        "APEX_TOOL_SERVICE_PORT": "8080",
+        "APEX_TOOL_SERVICE_DEFAULT_TIMEOUT_SECONDS": "30",
+        "APEX_TOOL_SERVICE_MAX_TIMEOUT_SECONDS": "120",
+        "APEX_TOOL_SERVICE_MAX_ARGUMENTS": "32",
+        "APEX_TOOL_SERVICE_MAX_STDIN_BYTES": "65536",
+        "APEX_TOOL_SERVICE_MAX_STDOUT_BYTES": "1048576",
+        "APEX_TOOL_SERVICE_MAX_STDERR_BYTES": "1048576",
+    }
+    for key, expected_value in expected.items():
+        assert all_pairs.get(key) == expected_value, (
+            f"{key} documented as {all_pairs.get(key)!r}, but the real "
+            f"ServiceSettings default is {expected_value!r}"
+        )
+
+
+def test_apex_dry_run_default_matches_safety_invariant() -> None:
+    active = _active_assignments()
+    assert active["APEX_DRY_RUN"] == "true"
+
+
+def test_apex_use_llm_default_is_false() -> None:
+    active = _active_assignments()
+    assert active["APEX_USE_LLM"] == "false"
+
+
+def test_apex_llm_provider_default_is_fake() -> None:
+    active = _active_assignments()
+    assert active["APEX_LLM_PROVIDER"] == "fake", (
+        "must not default to an external provider — the safe default is 'fake'"
+    )
+
+
+def test_apex_tool_backend_default_is_remote_for_compose() -> None:
+    active = _active_assignments()
+    assert active["APEX_TOOL_BACKEND"] == "remote"
+
+
+def test_apex_tool_service_url_matches_compose_service_name() -> None:
+    active = _active_assignments()
+    assert active["APEX_TOOL_SERVICE_URL"] == "http://kali:8080"
+
+
+# ---------------------------------------------------------------------------
+# VPN section — deferred, never referenced by Compose
+# ---------------------------------------------------------------------------
+
+
+def test_vpn_variable_not_active() -> None:
+    active = _active_assignments()
+    assert not any("OVPN" in k or "VPN" in k for k in active), (
+        "no VPN variable may be active in .env.example this phase"
+    )
+
+
+def test_compose_yaml_does_not_reference_vpn_variable() -> None:
+    compose_text = (_REPO_ROOT / "compose.yaml").read_text(encoding="utf-8")
+    assert "OVPN" not in compose_text
+    assert "APEX_HTB" not in compose_text
+
+
+# ---------------------------------------------------------------------------
+# Git ignore rules
+# ---------------------------------------------------------------------------
+
+
+def _git_check_ignore(path: str) -> bool:
+    """True if *path* would be ignored by git (relative to repo root)."""
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", path], cwd=_REPO_ROOT,
+    )
+    return result.returncode == 0
+
+
+class TestGitIgnoreRules:
+    def test_env_is_ignored(self) -> None:
+        assert _git_check_ignore(".env")
+
+    def test_env_local_is_ignored(self) -> None:
+        assert _git_check_ignore(".env.local")
+
+    def test_env_example_is_not_ignored(self) -> None:
+        assert not _git_check_ignore(".env.example")
+
+    def test_secrets_directory_is_ignored(self) -> None:
+        assert _git_check_ignore("secrets/anything.txt")
+
+    def test_ovpn_files_are_ignored(self) -> None:
+        assert _git_check_ignore("client.ovpn")
+        assert _git_check_ignore("vpn/client.ovpn")
+
+    def test_no_broad_env_star_glob_in_gitignore(self) -> None:
+        """The task brief's explicit requirement: never a bare `.env*`
+        pattern that would silently also match .env.example."""
+        lines = [
+            ln.strip() for ln in _GITIGNORE_PATH.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        assert ".env*" not in lines
+
+
+# ---------------------------------------------------------------------------
+# Docker ignore rules
+# ---------------------------------------------------------------------------
+
+
+class TestDockerIgnoreRules:
+    def test_dockerignore_excludes_env(self) -> None:
+        lines = _dockerignore_lines()
+        assert ".env" in lines
+
+    def test_dockerignore_excludes_env_local(self) -> None:
+        lines = _dockerignore_lines()
+        assert ".env.local" in lines
+
+    def test_dockerignore_negates_env_example(self) -> None:
+        """`.env.*` is a glob that would otherwise also match
+        `.env.example` — the explicit `!.env.example` negation must be
+        present, and must appear after the `.env.*` pattern it negates."""
+        text = _DOCKERIGNORE_PATH.read_text(encoding="utf-8")
+        assert "!.env.example" in text
+        assert text.index(".env.*") < text.index("!.env.example")
+
+    def test_dockerignore_excludes_ovpn_and_secrets(self) -> None:
+        lines = _dockerignore_lines()
+        assert "*.ovpn" in lines
+        assert "secrets/" in lines
+
+    def test_neither_dockerfile_copies_env(self) -> None:
+        for dockerfile in ("docker/apex/Dockerfile", "docker/kali/Dockerfile"):
+            text = (_REPO_ROOT / dockerfile).read_text(encoding="utf-8")
+            for ln in text.splitlines():
+                stripped = ln.strip()
+                if stripped.startswith("#"):
+                    continue
+                if re.match(r"^COPY\b", stripped):
+                    assert ".env" not in stripped, f"{dockerfile}: COPY references .env: {stripped!r}"
+
+
+def _dockerignore_lines() -> list[str]:
+    return [
+        ln.strip() for ln in _DOCKERIGNORE_PATH.read_text(encoding="utf-8").splitlines()
+        if ln.strip() and not ln.strip().startswith("#") and not ln.strip().startswith("!")
+    ]
