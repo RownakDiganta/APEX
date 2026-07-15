@@ -810,10 +810,21 @@ Clearly, up front:
   flag (CLAUDE.md §13.5), and `run` mode additionally requires an explicit
   `--confirm-live` CLI flag with no environment-variable substitute.
 - **No target is contacted** by the default Compose workflow above.
-- **HTB VPN integration is still pending** — nothing in this Compose
-  environment can reach an authorized HTB target.
+- **HTB VPN integration (Infra Phase 10) is code-complete but not
+  live-validated** — a dedicated `vpn` container, an `htb` Compose
+  profile, and a network-namespace-sharing design exist and were verified
+  with a real Docker environment (missing-profile fail-fast, bounded
+  invalid-profile failure, and a mock-VPN namespace test proving Kali is
+  reachable through the shared namespace) — but no real HTB profile was
+  available during development, so live OpenVPN initialization and real
+  target reachability were never tested. See
+  [`docs/htb-vpn-container.md`](docs/htb-vpn-container.md) and
+  [`docs/htb-vpn-manual-validation.md`](docs/htb-vpn-manual-validation.md)
+  for the architecture and the exact remaining steps an operator with a
+  real profile must run.
 - **Live Meow (or any other machine) execution is not ready** through this
-  workflow — that remains a later phase.
+  workflow — that remains a later phase, and requires completing the live
+  VPN validation above first.
 
 To run a full dry-run engagement against a placeholder target through
 Compose (writes a report to the mounted `./run_reports/`, never contacts
@@ -839,6 +850,45 @@ non-root/capability/security properties:
 [`docs/environment-configuration.md`](docs/environment-configuration.md), and
 [`docs/container-entrypoint.md`](docs/container-entrypoint.md) (the
 `check`/`smoke`/`dry-run`/`run`/`exec` mode reference).
+
+**HTB VPN container (Infra Phase 10):** `docker/vpn/Dockerfile` builds a
+small, first-party, auditable OpenVPN container that owns the HTB tunnel
+and network namespace. A dedicated `htb` Compose profile
+(`compose.htb.yaml`, an override merged on top of `compose.yaml`) makes
+`kali` share the VPN container's network namespace
+(`network_mode: service:vpn`) so its outbound tool traffic uses the
+tunnel, while `apex` reaches both Kali's tool API and the VPN container's
+own first-party readiness API (`GET /health`, `GET /route-check` — no
+FastAPI/uvicorn dependency, stdlib `http.server` only) at
+`http://vpn:8080`/`http://vpn:8090`. Only the `vpn` service ever receives
+`NET_ADMIN`/`/dev/net/tun`; `apex` and `kali` remain unprivileged and
+non-root in every mode, including HTB mode (verified live via `docker
+inspect`). The default Compose workflow is completely unaffected — `vpn`
+is gated behind `profiles: ["htb"]` and never starts on a bare `docker
+compose up`:
+
+```bash
+# Default (unaffected by VPN additions):
+docker compose up --build --abort-on-container-exit
+
+# HTB mode (requires a real .ovpn profile — see the manual validation doc):
+APEX_TOOL_SERVICE_TOKEN=<disposable> APEX_HTB_OVPN_PATH=./secrets/htb.ovpn \
+  docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
+  up --build --abort-on-container-exit
+```
+
+A route-check utility (`apex_host/eval/vpn_route_check.py`) answers
+"would traffic to this target use the VPN route?" via a no-packet `ip
+route get` lookup — manual/operator-invoked only, never called by any
+automatic preflight path. **No real HTB profile was available during
+development** — the VPN image, missing/invalid-profile fail-fast
+behavior, and the network-namespace-sharing mechanism were all verified
+against a real Docker environment (including a mock-VPN integration test
+proving Kali is reachable through the shared namespace), but live OpenVPN
+initialization and real target reachability were never tested. Full
+architecture: [`docs/htb-vpn-container.md`](docs/htb-vpn-container.md).
+Exact remaining steps for an operator with a real profile:
+[`docs/htb-vpn-manual-validation.md`](docs/htb-vpn-manual-validation.md).
 
 ---
 

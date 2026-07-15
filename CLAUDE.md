@@ -5264,3 +5264,267 @@ against a real target); GitHub Actions/CI image publishing; Meow-specific
 diagnosis, deterministic Meow tests, or authorized live Meow validation.
 **None of these were started in this phase.** No git branch was created;
 no commit or push was made as part of this phase's work.
+
+---
+
+### Infra Phase 10 — HTB VPN networking architecture ✓ CODE COMPLETE — LIVE VALIDATION REQUIRED
+
+**Date:** 2026-07-15
+**Files:** `docker/vpn/` (new — `Dockerfile`, `entrypoint.py`,
+`readiness_server.py`, `tunnel_status.py`, `route_check.py`),
+`compose.yaml` (updated — new `vpn` service, profile-gated),
+`compose.htb.yaml` (new — Compose override activating HTB mode),
+`compose.mock-vpn.yaml` (new — test-only override substituting a harmless
+HTTP server for the real OpenVPN build), `apex_host/config.py` /
+`apex_host/config_env.py` (updated — four new VPN fields/env vars),
+`apex_host/eval/preflight.py` (updated — VPN readiness checks),
+`apex_host/eval/vpn_route_check.py` (new — manual route-lookup CLI),
+`apex_host/container_entrypoint.py` (updated — VPN CLI flags),
+`.env.example` (updated — VPN section populated), `docs/htb-vpn-container.md`
+(new), `docs/htb-vpn-manual-validation.md` (new), plus correction notes in
+`docs/docker-compose.md` and `docs/container-entrypoint.md`. 177 new
+tests across 8 new test files plus updates to `tests/docker/test_compose.py`
+and `tests/docker/test_env_files.py`.
+
+Implemented the Docker-side HTB VPN networking architecture this phase's
+own task brief required, and validated everything locally reproducible
+without a real HTB profile — a dedicated VPN container, an `htb` Compose
+profile, network-namespace sharing between `kali` and `vpn`, VPN-specific
+preflight checks, a no-packet route-lookup utility, and a mock namespace
+integration test proving the topology works against a real Docker daemon.
+**No real, authorized HTB `.ovpn` profile was available in this
+development environment** — live OpenVPN initialization, real tunnel/route
+establishment, and real target reachability were never tested. This phase
+is **code-complete, not live-validated** — see
+`docs/htb-vpn-manual-validation.md` for the exact remaining steps an
+operator with a real profile must perform.
+
+**Topology and the coherent design chosen** (of the three options this
+phase's task brief posed for APEX-to-Kali service discovery once `kali`
+shares `vpn`'s network namespace): **Option 1** — the VPN service itself
+joins `apex-internal`, and `apex` reaches the shared namespace through
+`vpn`'s own Compose DNS name and exposed ports (`http://vpn:8080` for
+Kali's real tool API, `http://vpn:8090` for the VPN container's own
+readiness API). Option 2 (aliasing `vpn` as `kali`) was rejected — `kali`
+has no Compose DNS identity of its own once it uses `network_mode:
+service:vpn`, so inventing an alias would not remove a real constraint.
+Option 3 (binding Kali's HTTP service to `0.0.0.0:8080` inside the shared
+namespace) was already true unconditionally since Infra Phase 6 — a
+supporting fact, not a separate design choice.
+
+**Why a separate `compose.htb.yaml` override file, not one shared
+`compose.yaml`:** Compose has no mechanism for a single named service to
+have two different `network_mode`/`networks` configurations depending on
+which `--profile` flag is active — profiles only gate whether a whole
+service starts, not which of two configs it uses. `compose.htb.yaml` is
+the standard Compose "override file" idiom: merged via `-f compose.yaml
+-f compose.htb.yaml`, it redefines only `kali` (network mode) and `apex`
+(service-discovery environment variables), never `vpn` itself, and never
+touches the base file. Discovered and fixed during this phase: `network_mode`
+and `networks` are mutually exclusive per the Compose Specification —
+`compose.htb.yaml` uses the Compose Spec's `!reset` tag to explicitly
+clear `kali`'s inherited `networks:`/`expose:` from the base file, since
+without it `docker compose config` fails validation.
+
+**Discovered and fixed during this phase:** Compose validates/interpolates
+every service declared in a file up front, **regardless of whether that
+service's profile is active** — `profiles:` only gates whether a service
+*starts*. An initial version of `vpn`'s `volumes:` entry in the base
+`compose.yaml` used the fail-fast `${APEX_HTB_OVPN_PATH:?...}` form,
+which broke the default (non-`htb`-profile) `docker compose config`/`up`
+workflow entirely — a bare `docker compose up` failed before ever
+reaching the profile gate. Fixed by using a **soft** default
+(`${APEX_HTB_OVPN_PATH:-/dev/null}`) in the base file (harmless — `vpn`
+never actually starts by default anyway) and moving the **real** fail-fast
+requirement into `compose.htb.yaml`'s own `vpn.volumes:` override
+(Compose's list-merge semantics: a list declared in an override file
+replaces the base file's list entirely) — only evaluated when
+`compose.htb.yaml` is explicitly merged in. Verified live: default
+`docker compose config` renders identically to Infra Phase 9 (no `vpn`
+service in the output at all — Compose excludes non-active-profile
+services from `config`, not merely from `up`); HTB-mode `docker compose
+-f compose.yaml -f compose.htb.yaml --profile htb config` with no
+`APEX_HTB_OVPN_PATH` set fails clearly and immediately.
+
+**`docker/vpn/` — the VPN image and its four first-party scripts, all
+stdlib-only** (no FastAPI/uvicorn/httpx/`apex_host` import — deliberately,
+to avoid the same "one Hatchling distribution pulls in the whole
+scientific-Python dependency tree" packaging problem `docs/kali-container.md`
+already documented for the Kali image):
+
+- `entrypoint.py` — verifies `/vpn/htb.ovpn` exists and is readable and
+  `/dev/net/tun` exists (both fail-fast, non-zero, before anything else
+  starts); starts the readiness HTTP server in a daemon background
+  thread; runs OpenVPN in the foreground as an argv-list subprocess
+  (`--auth-nocache`, never `--route`/`--redirect-gateway` — whatever the
+  profile itself specifies is what takes effect); forwards
+  `SIGTERM`/`SIGINT` to the OpenVPN child and propagates its exit code.
+  Never opens the profile for writing.
+- `readiness_server.py` — a minimal `http.server`-based HTTP server:
+  `GET /health` (`{"status", "service", "tunnel", "route_cidr"}` only —
+  never the profile, certificate, full route table, or an environment
+  dump) and `GET /route-check?target=<ip>` (delegates to `route_check.py`).
+  Unauthenticated by design, matching `apex_tool_service`'s own
+  `GET /health` precedent (Infra Phase 3) — it reveals nothing sensitive.
+- `tunnel_status.py` — `check_tunnel_status(route_cidr)` runs `ip -o link
+  show`/`ip route show` (read-only inspection, never `add`/`del`) and
+  determines readiness from BOTH a tunnel-shaped (`tun*`/`tap*`/`ppp*`)
+  UP interface AND a matching route — process existence alone is
+  insufficient, per this phase's own explicit requirement. `validate_cidr()`
+  strictly validates the configured CIDR via `ipaddress.ip_network`.
+- `route_check.py` — `run_route_get(target)` validates the target as a
+  syntactically well-formed IP address (`ipaddress.ip_address`, rejecting
+  hostnames/CIDR-notation/shell-metacharacter strings) **before** ever
+  constructing the `["ip", "route", "get", target]` argv list — never a
+  shell, never any other `ip` subcommand, bounded timeout, sends no
+  packet (a kernel routing-table lookup only).
+
+**Root, by necessity — the one documented exception to this project's
+universal non-root convention.** OpenVPN must create a tun/tap device and
+modify this container's own routing table, which requires `CAP_NET_ADMIN`
+*and*, in practice, root inside the container's own user namespace —
+`NET_ADMIN` alone does not grant a non-root user permission to open
+`/dev/net/tun` or reconfigure routes. `apex` and `kali` remain non-root in
+every mode, including HTB mode — verified live via `docker inspect`
+(`kali`'s `User=apextool`, `CapAdd=[]` unchanged while sharing `vpn`'s
+namespace).
+
+**Configuration (Infra Phase 10 additions to the existing `config_env.py`/
+`ApexConfig` layer, not a new parallel system):** `apex_host/config.py`
+gained four fields — `vpn_service_url: str | None = None`,
+`vpn_health_timeout_seconds: float = 10.0`, `htb_route_cidr: str =
+"10.129.0.0/16"`, `htb_ovpn_path: str | None = None` — wired into
+`from_cli_args()` and `to_safe_dict()`. `htb_ovpn_path`'s redaction is
+**basename-only** (not full `"[redacted]"`) — per this phase's own
+instruction: "the VPN profile path is sensitive operational configuration
+but not necessarily a credential... show only that it is configured or
+its basename." `apex_host/config_env.py` gained
+`ENV_VPN_SERVICE_URL`/`ENV_VPN_HEALTH_TIMEOUT_SECONDS`/`ENV_HTB_ROUTE_CIDR`/
+`ENV_HTB_OVPN_PATH` and a new `validate_cidr()` strict parser (independently
+re-implemented, not imported, from `docker/vpn/tunnel_status.py`'s own
+`validate_cidr` — `apex_host` and `docker/vpn/` are deliberately
+non-overlapping dependency trees). All four flow through the existing
+generic env-merge (`merge_env_into_args`), so CLI > environment > safe
+default precedence is inherited automatically, not reimplemented.
+
+**Preflight (Infra Phase 10 additions to the Infra Phase 9
+`apex_host/eval/preflight.py` module):** `check_htb_profile_configured(path,
+required=)` — host-side only, checks file existence/readability via
+`Path.exists()`/`os.access()`, **never opens the file for content** (a
+canary-style test, `test_never_reads_file_content`, confirms fake
+credential material placed in a test fixture never appears in the check's
+own detail message); soft pass when unconfigured (mirrors `check_policy`'s
+established pattern), hard failure when configured-but-missing/unreadable
+regardless of `required`. `check_vpn_readiness(url, expected_route_cidr,
+timeout, client=)` — one HTTP round trip to the VPN readiness server's
+`GET /health`, producing two `PreflightCheck`s ("VPN service reachable",
+"VPN tunnel/route ready") from the single response; returns `[]` (zero
+network calls) when `vpn_service_url` is unset — proven by
+`test_default_config_produces_no_checks` and
+`test_run_smoke_checks_default_config_has_no_vpn_checks`, the load-bearing
+tests establishing that every non-HTB invocation is byte-for-byte
+unaffected. **Deliberately never calls `/route-check`** — that endpoint is
+reserved for the manual utility only
+(`test_never_calls_route_check_endpoint`). Both new checks are wired into
+`run_local_checks`/`run_vpn_checks`, which `run_smoke_checks` and
+`_handle_run` (in `container_entrypoint.py`) both call — `check` and
+`dry-run` modes only ever run the local (filesystem-only) HTB-profile
+check; `smoke` and `run` also run the network-touching VPN readiness
+checks.
+
+**`apex_host/eval/vpn_route_check.py`** — the manual, operator-invoked
+route-lookup CLI (`python -m apex_host.eval.vpn_route_check
+--vpn-service-url http://vpn:8090 --target <ip>`). Client-side IP
+validation (`ipaddress.ip_address`) happens before any HTTP request is
+constructed. **Never wired into any automatic preflight path or engagement
+mode** — this is deliberate and tested
+(`test_vpn_preflight.py::test_never_calls_route_check_endpoint`); it exists
+solely for the manual validation workflow documented in
+`docs/htb-vpn-manual-validation.md`.
+
+**Mock VPN namespace integration — real Docker, no real HTB profile,
+clearly labeled throughout as a mock:** `compose.mock-vpn.yaml`
+substitutes a plain, official, digest-pinned `python -m http.server` for
+the real `docker/vpn/Dockerfile` build (no OpenVPN, no `NET_ADMIN`, no
+`/dev/net/tun`, no real profile). Run via `docker compose -f compose.yaml
+-f compose.htb.yaml -f compose.mock-vpn.yaml --profile htb up --build`.
+**Verified live, this phase:** the real, unmodified `kali` image was
+reachable at `http://vpn:8080` while sharing the mock `vpn` service's
+network namespace — a real `GET /health` and a real `curl --version`
+executed successfully through it (`[PASS] Kali health`, `[PASS] remote
+tool smoke` in `apex`'s own preflight output). `docker inspect
+newapex-kali-1` showed `NetworkMode=container:<vpn-container-id>`,
+`CapAdd=[]`, `User=apextool` — namespace sharing granted zero extra
+privilege, confirming the design. `[FAIL] VPN service reachable` (HTTP 404
+from the mock, which has no real `/health` JSON contract) is the expected,
+correct outcome — it proves the VPN readiness check is not a false
+positive against a non-VPN service. Neither `kali`'s port 8080 nor the
+mock `vpn`'s port 8090 was published to the host (verified via `docker
+compose port` and a direct host `curl` failing with connection refused).
+**This mock proves only the network-namespace-sharing mechanism — it does
+NOT start OpenVPN, does NOT create a real tunnel, and does NOT prove HTB
+connectivity in any way.** Every file and doc section describing it says
+so explicitly.
+
+**Real (non-mock) runtime validation performed, all without a real HTB
+profile:** VPN image built (`docker build -f docker/vpn/Dockerfile`, 234
+MB, ~7s from cache); `docker image inspect`/`docker history --no-trunc`
+confirmed no `.ovpn` file, no credential, no `apex_host`/`memfabric`
+source anywhere in the image, root user (documented), exec-form
+`ENTRYPOINT`, `EXPOSE 8090` only; missing-profile fail-fast (`docker run
+--rm --entrypoint sh apex-vpn... -c "..."` with no mount → clear error,
+exit 1); missing-`/dev/net/tun` fail-fast (profile mounted via `/dev/null`
+substitute, no `--device` flag → clear error, exit 1); a harmless,
+deliberately-invalid `.ovpn` file (garbage text, no real config directives)
+mounted into the **real** `docker/vpn/Dockerfile` build via
+`compose.htb.yaml` → OpenVPN itself rejected it in under a second
+("Options error: Unrecognized option..."), the entrypoint propagated exit
+code 1, no hang, no leaked profile structure beyond OpenVPN's own
+diagnostic naming of the invalid first token; default (non-`htb`-profile)
+`docker compose up --build --abort-on-container-exit` re-verified
+end-to-end after all `vpn` service additions — 7 required checks pass
+(now including one new, always-soft-pass `[PASS] HTB profile configured`
+line), `apex` exits `0`, byte-for-byte consistent with Infra Phase 9's own
+verified output. All temporary containers/networks/images were removed
+after each scenario via `docker compose down --remove-orphans` plus
+targeted `docker rmi` — **no `docker network prune`/`docker system
+prune`** was used anywhere in this phase.
+
+**Tests (177 new):** `tests/docker/test_vpn_dockerfile.py` (28 — base
+image, packages, no-profile/no-credentials/no-APEX-source static checks,
+exec-form entrypoint, healthcheck, root-usage documentation, support
+scripts' argv-list/no-shell discipline), `tests/docker/test_compose_htb.py`
+(22 — override-file structure, `!reset` handling via a custom PyYAML
+loader, kali network-mode/depends_on, apex environment overrides, vpn's
+fail-fast volume override), `tests/docker/test_vpn_scripts.py` (58 —
+dynamically imported via `importlib.util.spec_from_file_location` since
+`docker/vpn/` is not an installed package; CIDR/IP validation, route/
+interface parsing, subprocess mocking for `run_route_get`/
+`check_tunnel_status`, and a **real, local-only HTTP round trip** against
+the actual `readiness_server.ReadinessHandler` on an ephemeral loopback
+port), `tests/apex_host/test_vpn_config.py` (23), `tests/apex_host/
+test_vpn_preflight.py` (23 — including the load-bearing "default config
+produces zero network calls" tests), `tests/apex_host/test_vpn_route_check.py`
+(13), `tests/docker/test_compose_mock_vpn.py` (9 — mock file structure,
+capability-free, clearly labeled). Plus updates to the existing
+`tests/docker/test_compose.py` (new `vpn`-service tests; the three tests
+that previously asserted "no VPN configuration in this phase" —
+`test_no_service_network_mode`, `test_no_unexpected_capabilities`,
+`test_no_ssh_or_vpn_configuration` — were rewritten to assert the new,
+intentional, scoped invariants: no `network_mode: service:*` in the
+**base** file specifically, `NET_ADMIN` allowed **only** on `vpn`, no
+literal host `.ovpn` path anywhere) and `tests/docker/test_env_files.py`
+(same treatment for `.env.example`'s VPN section).
+
+**Total test count after Infra Phase 10:** 3469 passed (up from 3283 at
+Infra Phase 9), `ruff check .` clean, `mypy` clean across 143 source files.
+
+**Deferred / explicitly not performed in this phase:** live OpenVPN
+initialization against a real HTB server; real tunnel/route establishment;
+real HTB target reachability validation; GitHub Actions/CI publishing;
+Meow-specific diagnosis, deterministic Meow exploitation logic, or any
+machine-specific code (CLAUDE.md §13.8/§13.9's standing prohibition,
+unchanged and re-verified — no target IP, expected credential, or
+machine-specific routing decision was added anywhere in this phase). No
+git branch was created; no commit or push was made as part of this
+phase's work.

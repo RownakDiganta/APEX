@@ -1,7 +1,7 @@
 # compose.yaml
-# Docker Compose integration wiring the APEX application container to the Kali tool-service container over an internal, non-host-published network (Infra Phase 7).
+# Docker Compose integration wiring the APEX application container to the Kali tool-service container over an internal, non-host-published network (Infra Phase 7), plus an optional "htb" profile (Infra Phase 10) that adds a dedicated VPN container for authorized HTB engagements.
 #
-# Topology:
+# Default topology (always active, no profile flag needed):
 #
 #   apex container  --internal authenticated HTTP-->  kali container
 #   (docker/apex/Dockerfile)      apex-internal        (docker/kali/Dockerfile)
@@ -13,24 +13,41 @@
 #     docker compose up --build --abort-on-container-exit
 #
 # `--abort-on-container-exit` is the chosen workflow: the `apex` service's
-# default command is a bounded, dry-run connectivity smoke check that exits
-# 0 quickly, while `kali` is a long-running HTTP server with no natural
-# exit — without this flag, `docker compose up` would leave `kali` running
-# indefinitely after `apex` finishes. See docs/docker-compose.md "Safe
-# default behavior" for the full rationale, including why the default
-# command is dry-run (never contacts `kali`) and how to run the REAL
-# connectivity check (`--no-dry-run`) explicitly.
+# default command is a bounded connectivity smoke check that exits quickly,
+# while `kali` is a long-running HTTP server with no natural exit — without
+# this flag, `docker compose up` would leave `kali` running indefinitely
+# after `apex` finishes. See docs/docker-compose.md "Safe default behavior"
+# for the full rationale.
 #
 # No top-level `version:` key — this file uses the modern Compose
 # Specification, where `version:` is deprecated/ignored by Compose v2.
 # `docker compose version` (v2.34.0-desktop.1, verified this phase) does
 # not require it.
 #
-# HTB VPN routing is NOT configured anywhere in this file (deferred to a
-# later Infra Phase — see docs/docker-compose.md §17). Nothing in this
-# environment can reach an HTB target; every command validated against it
-# in Infra Phase 7 touched only the `apex-internal` network and each
-# container's own loopback interface.
+# HTB VPN routing (Infra Phase 10): the `vpn` service below is gated behind
+# the "htb" Compose profile (`profiles: ["htb"]`) — it is NEVER started by
+# a bare `docker compose up`. The default topology above (apex + kali on
+# apex-internal) is completely unaffected by its existence and remains
+# VPN-independent and target-free, exactly as it was in Infra Phase 7-9.
+# The full HTB-mode topology (vpn + kali sharing vpn's network namespace +
+# apex) requires a SECOND compose file, `compose.htb.yaml`, merged in via
+# `-f`:
+#
+#   APEX_TOOL_SERVICE_TOKEN=... APEX_HTB_OVPN_PATH=./secrets/htb.ovpn \
+#     docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
+#     up --build --abort-on-container-exit
+#
+# Why a second file rather than one: Compose has no mechanism to give a
+# single named service two different `network_mode`/`networks`
+# configurations depending on which profile is active — profiles only
+# gate whether a whole service starts, not which of two configs it uses.
+# `compose.htb.yaml` is the standard Compose idiom for this
+# ("docker-compose override file") — it redefines `kali`'s networking
+# (`network_mode: service:vpn` instead of `networks: [apex-internal]`) and
+# `apex`'s `APEX_TOOL_SERVICE_URL`/`APEX_VPN_SERVICE_URL` for HTB mode
+# only, leaving THIS file's `kali`/`apex` service definitions completely
+# unmodified for the default, non-htb case. Full design, trust boundary,
+# and every verified command: docs/htb-vpn-container.md.
 #
 # Infra Phase 8: every environment variable interpolated below (other than
 # the required token) now uses Compose's `${VAR:-default}` syntax, with the
@@ -107,6 +124,72 @@ services:
     # No volumes: kali never mounts `./run_reports` or any other APEX
     # report/knowledge/secret path — it has no reason to read or write
     # anything outside its own image filesystem.
+
+  # ---------------------------------------------------------------------
+  # vpn — the dedicated OpenVPN + readiness-server appliance (Infra
+  # Phase 10, docker/vpn/Dockerfile). Gated behind the "htb" Compose
+  # profile — NEVER started by a bare `docker compose up` (no `profiles:`
+  # key at all on `kali`/`apex` above means they always start; `vpn`
+  # having `profiles: ["htb"]` means it starts ONLY when `--profile htb`
+  # is passed). In HTB mode, `kali` shares this service's network
+  # namespace (`compose.htb.yaml`'s `network_mode: service:vpn`) — see
+  # docs/htb-vpn-container.md for the full topology and why this specific
+  # design was chosen over the alternatives.
+  # ---------------------------------------------------------------------
+  vpn:
+    build:
+      context: .
+      dockerfile: docker/vpn/Dockerfile
+    profiles:
+      - htb
+    networks:
+      - apex-internal
+    environment:
+      APEX_HTB_ROUTE_CIDR: ${APEX_HTB_ROUTE_CIDR:-10.129.0.0/16}
+    volumes:
+      # Soft default (/dev/null) here, NOT the fail-fast `:?` form —
+      # Compose interpolates/validates EVERY service declared in a file
+      # up front, regardless of whether that service's profile is active
+      # (`profiles:` only gates whether a service actually *starts*, not
+      # whether its config is parsed). A `:?` requirement here would break
+      # the "default safe Compose workflow must not require a VPN
+      # profile" invariant, since a bare `docker compose up`/`config`
+      # (no --profile htb) would fail before ever reaching that gate —
+      # verified this phase (see docs/htb-vpn-container.md §5 for the
+      # exact error this fix resolves). The REAL fail-fast requirement
+      # lives in compose.htb.yaml instead, which replaces this entire
+      # `volumes:` list (Compose's list-merge semantics: declared-in-
+      # override replaces, not merges) — it is only ever evaluated when
+      # `compose.htb.yaml` is explicitly merged in via `-f`. Read-only
+      # (`:ro`) either way — the VPN container's own entrypoint
+      # (docker/vpn/entrypoint.py) never writes to this path, defense in
+      # depth on top of the read-only mount itself. NEVER copied into any
+      # image — see docker/vpn/Dockerfile's own "profile is never baked
+      # in" comment.
+      - ${APEX_HTB_OVPN_PATH:-/dev/null}:/vpn/htb.ovpn:ro
+    # Only this service receives NET_ADMIN and /dev/net/tun — never kali,
+    # never apex. See docker/vpn/Dockerfile's own extensive comment on why
+    # this is the one narrow, documented exception to this project's
+    # otherwise-universal non-root convention (OpenVPN's own operational
+    # requirement to create a tun device and modify this container's own
+    # routing table).
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    # `expose:` documents intent (the readiness server, port 8090, is
+    # reachable to other services on apex-internal) — never `ports:`,
+    # which would publish it to the host.
+    expose:
+      - "8090"
+    # No `healthcheck:` override: docker/vpn/Dockerfile already bakes one
+    # in (GET /health against the readiness server itself — tunnel/route
+    # status, not mere OpenVPN process existence). `compose.htb.yaml`'s
+    # `depends_on: vpn: condition: service_healthy` relies on this same,
+    # single, image-defined healthcheck.
+    #
+    # No volumes beyond the profile mount above: vpn never mounts
+    # `./run_reports` or any APEX/knowledge path — it has no reason to.
 
   # ---------------------------------------------------------------------
   # apex — the orchestration/planning/policy/memory application (Infra

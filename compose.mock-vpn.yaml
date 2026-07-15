@@ -1,0 +1,59 @@
+# compose.mock-vpn.yaml
+# TEST-ONLY Compose override (Infra Phase 10) — substitutes a harmless `python -m http.server` for the real OpenVPN container, proving the kali-shares-vpn-namespace mechanism and APEX-to-shared-namespace service discovery WITHOUT requiring a real HTB profile, NET_ADMIN, or /dev/net/tun. Layered on top of compose.yaml + compose.htb.yaml.
+#
+# ******************************************************************
+# * THIS IS A MOCK VPN NAMESPACE INTEGRATION TEST FIXTURE.         *
+# * It proves ONLY that the Compose network-namespace-sharing      *
+# * mechanism works (kali reachable through the vpn service's own  *
+# * Compose DNS name once it shares that service's namespace).     *
+# * It does NOT start OpenVPN, does NOT create a tunnel, and does  *
+# * NOT prove HTB connectivity in any way. Never use this file to  *
+# * claim live HTB access — see docs/htb-vpn-container.md §18 and  *
+# * docs/htb-vpn-manual-validation.md for what actually proves     *
+# * that.                                                          *
+# ******************************************************************
+#
+# Usage (see docs/htb-vpn-container.md §18 "Mock validation" for the full
+# transcript this phase recorded):
+#
+#   APEX_TOOL_SERVICE_TOKEN=... APEX_HTB_OVPN_PATH=/dev/null \
+#     docker compose -f compose.yaml -f compose.htb.yaml -f compose.mock-vpn.yaml \
+#     --profile htb up --build --abort-on-container-exit
+#
+# Three files, in this exact order: compose.yaml (base topology) ->
+# compose.htb.yaml (kali network_mode: service:vpn, apex service
+# discovery) -> compose.mock-vpn.yaml (THIS file, replacing vpn's real
+# OpenVPN build with a trivial, capability-free HTTP server). Later files
+# override earlier ones for any key they redeclare; every key NOT
+# redeclared here (kali's network_mode, apex's APEX_TOOL_SERVICE_URL/
+# APEX_VPN_SERVICE_URL) is inherited unchanged from compose.htb.yaml.
+#
+# APEX_HTB_OVPN_PATH is still required to be set (compose.htb.yaml's own
+# fail-fast interpolation is unaffected by this file) even though the mock
+# vpn service never reads it — /dev/null is the conventional harmless
+# value to use here, since no real profile is needed for this test.
+
+services:
+  vpn:
+    # Replace the real build (docker/vpn/Dockerfile) with a plain,
+    # official, digest-pinned base image running nothing but Python's own
+    # stdlib http.server module — no OpenVPN, no first-party VPN script,
+    # no capability, no device, no profile mount.
+    build: !reset null
+    image: python:3.11.14-slim-bookworm@sha256:65a93d69fa75478d554f4ad27c85c1e69fa184956261b4301ebaf6dbb0a3543d
+    command: ["python3", "-m", "http.server", "8090"]
+    # Explicitly clear every real-vpn-service capability/device/mount —
+    # this mock proves namespace SHARING works; it must not accidentally
+    # inherit the real service's elevated privileges.
+    cap_add: !reset null
+    devices: !reset null
+    volumes: !reset null
+    healthcheck:
+      test: [
+        "CMD", "python3", "-c",
+        "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/', timeout=2).status == 200 else 1)",
+      ]
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 5

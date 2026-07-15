@@ -588,6 +588,21 @@ actual code, not merely designed:
 - No git branch was created; no commit or push was made as part of this
   phase's work.
 
+> **Correction (Infra Phase 10, 2026-07-15):** "HTB VPN routing is not
+> configured anywhere" is now out of date — a dedicated `vpn` container
+> and `htb` Compose profile exist (`docs/htb-vpn-container.md`).
+> `run_local_checks`/`run_vpn_checks` in `apex_host/eval/preflight.py`
+> (called from every mode of this entrypoint, including `smoke` and
+> `run`) now include VPN readiness checks (`check_htb_profile_configured`,
+> `check_vpn_readiness`) that fire automatically once
+> `config.vpn_service_url`/`config.htb_ovpn_path` are configured — inert
+> otherwise, so every claim in §3.1-§3.4 above about the default,
+> non-VPN-configured behavior of each mode remains accurate unchanged.
+> `run` mode's live-execution path is still unexercised against a real
+> HTB target — that remains outstanding, tracked in
+> `docs/htb-vpn-manual-validation.md`. GitHub Actions/CI publishing and
+> any Meow-specific work remain out of scope, unchanged.
+
 ---
 
 ## 20. Relationship to `apex_host/eval/check_config.py`

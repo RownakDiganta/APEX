@@ -496,7 +496,185 @@ def check_llm_readiness(config: ApexConfig) -> PreflightCheck:
 
 
 # ---------------------------------------------------------------------------
-# 8. Live confirmation (run mode only)
+# 8. HTB VPN readiness (Infra Phase 10)
+# ---------------------------------------------------------------------------
+#
+# All VPN checks in this section are inert (never fire, never contact a
+# network) unless the caller explicitly configures a VPN service URL —
+# the same "safe by omission" pattern ``check_tool_service_health``/
+# ``check_remote_smoke`` already establish for the Kali tool service.
+# None of these checks import or start the engagement graph, mount the
+# Docker socket, or inspect another container directly — they only ever
+# speak plain, bounded HTTP to the VPN container's own first-party
+# readiness server (``docker/vpn/readiness_server.py``).
+
+_VPN_HEALTH_TIMEOUT_SECONDS = 10.0
+_VPN_READINESS_SERVICE_NAME = "apex-vpn-readiness"
+
+
+def check_htb_profile_configured(htb_ovpn_path: str | None, *, required: bool = False) -> PreflightCheck:
+    """Host-side visibility check: does the configured ``.ovpn`` profile
+    path exist and is it readable? Never opens or reads the file's
+    *content* — only ``Path.exists()``/``os.access(..., os.R_OK)``, so no
+    credential material is ever touched by this check, only its
+    filesystem metadata.
+
+    This is a *host*-side convenience check — the apex container itself
+    never mounts or reads the profile at runtime (only the ``vpn``
+    container does, via ``compose.htb.yaml``); this check exists so an
+    operator can validate their local ``.env``/``secrets/`` setup with
+    ``apex_host.eval.check_config`` or ``container_entrypoint.py check``
+    *before* running ``docker compose --profile htb up``.
+
+    ``htb_ovpn_path=None`` (not configured) is a soft, informational pass
+    when ``required=False`` (every mode except a future explicit
+    "preparing for HTB" check) — matching the ``check_policy`` pattern:
+    an unconfigured VPN profile is a legitimate, safe state for
+    ``check``/``smoke``/``dry-run``. A *configured* path that does not
+    exist or is not readable is always a hard failure, regardless of
+    ``required`` — an operator who set the variable clearly intended to
+    use it.
+    """
+    if not htb_ovpn_path:
+        if required:
+            return PreflightCheck(
+                name="HTB profile configured", passed=False, required=True,
+                detail="APEX_HTB_OVPN_PATH is not set — required to use the htb Compose profile",
+            )
+        return PreflightCheck(
+            name="HTB profile configured", passed=True, required=False,
+            detail="APEX_HTB_OVPN_PATH not set — VPN/htb mode not in use",
+        )
+    path = Path(htb_ovpn_path)
+    if not path.exists():
+        return PreflightCheck(
+            name="HTB profile configured", passed=False, required=True,
+            detail=f"configured profile not found: {path.name} (path exists check failed)",
+        )
+    if not os.access(path, os.R_OK):
+        return PreflightCheck(
+            name="HTB profile configured", passed=False, required=True,
+            detail=f"configured profile {path.name} exists but is not readable",
+        )
+    return PreflightCheck(
+        name="HTB profile configured", passed=True, required=True,
+        detail=f"profile found and readable: {path.name}",
+    )
+
+
+async def check_vpn_readiness(
+    vpn_service_url: str | None,
+    *,
+    expected_route_cidr: str = "10.129.0.0/16",
+    timeout_seconds: float = _VPN_HEALTH_TIMEOUT_SECONDS,
+    client: httpx.AsyncClient | None = None,
+) -> list[PreflightCheck]:
+    """Query the VPN container's own readiness HTTP server
+    (``docker/vpn/readiness_server.py``, ``GET /health``) and produce two
+    checks from the single response: "VPN service reachable" and "VPN
+    tunnel/route ready". One HTTP round trip, not two.
+
+    ``vpn_service_url=None`` (the default everywhere outside the ``htb``
+    Compose profile) returns an empty list — no checks, no network call.
+    This is what keeps every non-HTB invocation of
+    ``run_local_checks``/``run_smoke_checks`` byte-for-byte unaffected by
+    this section's existence.
+
+    Never inspects another container directly and never mounts the Docker
+    socket — this function only ever speaks HTTP to *vpn_service_url*.
+    Never pings, scans, or contacts an HTB target — the readiness
+    server's own ``/health`` endpoint performs only local ``ip link
+    show``/``ip route show`` inspection (see
+    ``docker/vpn/tunnel_status.py``), never a route lookup or the
+    ``/route-check`` endpoint (that one is deliberately excluded from
+    this automatic preflight path — see
+    ``apex_host/eval/vpn_route_check.py``'s own module docstring for why
+    it remains a manual-only tool).
+
+    *client* is injectable for tests, matching
+    ``check_tool_service_health``'s own convention.
+    """
+    if not vpn_service_url:
+        return []
+
+    parsed = urlsplit(vpn_service_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return [
+            PreflightCheck(
+                name="VPN service reachable", passed=False,
+                detail=f"vpn_service_url {vpn_service_url!r} is not a valid http(s) URL",
+            ),
+        ]
+
+    url = f"{vpn_service_url.rstrip('/')}/health"
+    try:
+        if client is not None:
+            response = await client.get(url, timeout=timeout_seconds)
+        else:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as owned_client:
+                response = await owned_client.get(url)
+    except httpx.RequestError as exc:
+        return [
+            PreflightCheck(
+                name="VPN service reachable", passed=False,
+                detail=f"GET {url} failed: {exc.__class__.__name__}",
+            ),
+        ]
+
+    if response.status_code != 200:
+        return [
+            PreflightCheck(
+                name="VPN service reachable", passed=False,
+                detail=f"GET {url} -> HTTP {response.status_code}",
+            ),
+        ]
+    try:
+        data: Any = response.json()
+    except ValueError:
+        return [
+            PreflightCheck(
+                name="VPN service reachable", passed=False,
+                detail=f"GET {url} returned a non-JSON body",
+            ),
+        ]
+    if not isinstance(data, dict) or data.get("service") != _VPN_READINESS_SERVICE_NAME:
+        return [
+            PreflightCheck(
+                name="VPN service reachable", passed=False,
+                detail=f"unexpected readiness payload from {url}: {data!r}",
+            ),
+        ]
+
+    service_check = PreflightCheck(
+        name="VPN service reachable", passed=True,
+        detail=f"{url} -> ok (service={_VPN_READINESS_SERVICE_NAME})",
+    )
+
+    tunnel_ready = bool(data.get("tunnel"))
+    reported_cidr = data.get("route_cidr")
+    if tunnel_ready and reported_cidr == expected_route_cidr:
+        tunnel_check = PreflightCheck(
+            name="VPN tunnel/route ready", passed=True,
+            detail=f"tunnel up, route {reported_cidr} present",
+        )
+    elif tunnel_ready:
+        tunnel_check = PreflightCheck(
+            name="VPN tunnel/route ready", passed=False,
+            detail=(
+                f"tunnel up but reported route_cidr={reported_cidr!r} does not "
+                f"match expected {expected_route_cidr!r} — see APEX_HTB_ROUTE_CIDR"
+            ),
+        )
+    else:
+        tunnel_check = PreflightCheck(
+            name="VPN tunnel/route ready", passed=False,
+            detail=f"VPN service reports status={data.get('status')!r} — tunnel not yet ready",
+        )
+    return [service_check, tunnel_check]
+
+
+# ---------------------------------------------------------------------------
+# 9. Live confirmation (run mode only)
 # ---------------------------------------------------------------------------
 
 def check_live_confirmation(*, confirmed: bool, dry_run: bool) -> PreflightCheck:
@@ -530,9 +708,14 @@ def run_local_checks(
     report_path: str | None = None,
     graph_path: str | None = None,
     policy_required: bool = False,
+    htb_profile_required: bool = False,
 ) -> list[PreflightCheck]:
     """The checks common to every mode: configuration, report directory,
-    compiled knowledge, policy, LLM readiness. Never contacts a network."""
+    compiled knowledge, policy, LLM readiness, HTB profile visibility.
+    Never contacts a network — ``check_htb_profile_configured`` only
+    inspects local filesystem metadata (never the VPN service itself;
+    that is ``run_vpn_checks``, below, called separately since it is
+    async and network-touching)."""
     return [
         check_configuration(config),
         check_report_directory(
@@ -541,7 +724,24 @@ def run_local_checks(
         check_compiled_knowledge(config.knowledge_root),
         check_policy(config, required=policy_required),
         check_llm_readiness(config),
+        check_htb_profile_configured(config.htb_ovpn_path, required=htb_profile_required),
     ]
+
+
+async def run_vpn_checks(config: ApexConfig) -> list[PreflightCheck]:
+    """VPN readiness checks (Infra Phase 10) — a thin wrapper around
+    ``check_vpn_readiness`` that reads its parameters from *config*.
+    Returns an empty list (no network call at all) when
+    ``config.vpn_service_url`` is unset — the default for every
+    non-``htb``-profile invocation, which is what keeps
+    ``run_smoke_checks``'s behavior byte-for-byte unchanged for the
+    default (non-VPN) Compose workflow.
+    """
+    return await check_vpn_readiness(
+        config.vpn_service_url,
+        expected_route_cidr=config.htb_route_cidr,
+        timeout_seconds=config.vpn_health_timeout_seconds,
+    )
 
 
 async def run_smoke_checks(
@@ -552,7 +752,9 @@ async def run_smoke_checks(
     graph_path: str | None = None,
 ) -> PreflightResult:
     """``check`` mode's local checks, plus Kali health and one harmless
-    remote-tool execution — used by the entrypoint's ``smoke`` mode."""
+    remote-tool execution — used by the entrypoint's ``smoke`` mode.
+    Also includes VPN readiness checks (Infra Phase 10) when
+    ``config.vpn_service_url`` is configured — inert otherwise (§ above)."""
     checks = run_local_checks(
         config, default_report_dir=default_report_dir,
         report_path=report_path, graph_path=graph_path,
@@ -560,4 +762,5 @@ async def run_smoke_checks(
     checks.append(check_remote_backend_selected(config))
     checks.append(await check_tool_service_health(config.tool_service_url))
     checks.append(await check_remote_smoke(config))
+    checks.extend(await run_vpn_checks(config))
     return PreflightResult(checks)

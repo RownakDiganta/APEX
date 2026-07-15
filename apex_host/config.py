@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields as _dc_fields
+from os.path import basename as _basename
 
 from apex_host.security.redaction import REDACTED_PLACEHOLDER as _REDACTED
 
@@ -202,6 +203,39 @@ class ApexConfig:
     # tool_service_timeout_seconds: overall request timeout budget for
     # RemoteToolBackend. CLI: --tool-service-timeout.
     tool_service_timeout_seconds: float = 120.0
+    # ---------------------------------------------------------------------------
+    # Infra Phase 10 — HTB VPN readiness configuration
+    # (docs/htb-vpn-container.md; docker/vpn/; apex_host/eval/preflight.py)
+    # ---------------------------------------------------------------------------
+    # vpn_service_url: base URL of the VPN container's own readiness HTTP
+    # server (docker/vpn/readiness_server.py — GET /health, GET
+    # /route-check). None (unset) means VPN preflight checks are skipped
+    # entirely — the safe default for every non-HTB-profile invocation.
+    # CLI: --vpn-service-url. Env: APEX_VPN_SERVICE_URL.
+    vpn_service_url: str | None = None
+    # vpn_health_timeout_seconds: bounded timeout for the GET /health call
+    # above. CLI: --vpn-health-timeout. Env: APEX_VPN_HEALTH_TIMEOUT_SECONDS.
+    vpn_health_timeout_seconds: float = 10.0
+    # htb_route_cidr: the private route APEX expects the VPN tunnel to
+    # install once connected — used only to compare against what the VPN
+    # container's own readiness server reports (docker/vpn/tunnel_status.py);
+    # never used to construct or inject a route directive anywhere.
+    # HTB machine labs commonly use 10.129.0.0/16, but this is configurable
+    # since not every HTB profile/region is guaranteed to match that exact
+    # range. CLI: --htb-route-cidr. Env: APEX_HTB_ROUTE_CIDR.
+    htb_route_cidr: str = "10.129.0.0/16"
+    # htb_ovpn_path: the HOST filesystem path to the .ovpn profile — this
+    # field exists purely for host-side, PRE-Compose visibility/validation
+    # (apex_host/eval/preflight.py::check_htb_profile_configured checks
+    # only that the file exists and is readable; it is NEVER opened for
+    # its content). The apex container itself never reads this path at
+    # runtime — the profile is mounted directly into the *vpn* container
+    # by compose.htb.yaml, never into apex. Sensitive operational
+    # configuration, not a credential — to_safe_dict() below shows only
+    # the basename, never the full host path. Env: APEX_HTB_OVPN_PATH.
+    # No CLI flag (mirrors tool_service_token's own "env-var only for a
+    # sensitive path" precedent, though this is not itself a secret).
+    htb_ovpn_path: str | None = None
     # Configuration schema version — increment when the config format changes in a
     # backward-incompatible way (new required fields, renamed fields, type changes).
     # Exposed via to_safe_dict() so consumers can detect incompatible changes.
@@ -218,6 +252,12 @@ class ApexConfig:
         ``tool_service_token`` is replaced with ``"[redacted]"`` when non-empty
         (RemoteToolBackend authentication token — contract only in this phase,
         but redacted defensively since it is credential-shaped).
+        ``htb_ovpn_path`` (Infra Phase 10), when set, is replaced with just its
+        ``os.path.basename`` — the VPN profile path is sensitive operational
+        configuration (it can reveal host directory structure/username) but
+        not itself a credential, so the filename alone is shown rather than
+        a full "[redacted]" — this lets an operator confirm *which* profile
+        is configured without exposing the full host path.
         All other fields are returned verbatim — no other field stores a plaintext secret.
         """
         d: dict[str, object] = {f.name: getattr(self, f.name) for f in _dc_fields(self)}
@@ -225,6 +265,8 @@ class ApexConfig:
             d["password_candidates"] = [_REDACTED] * len(self.password_candidates)
         if self.tool_service_token:
             d["tool_service_token"] = _REDACTED
+        if self.htb_ovpn_path:
+            d["htb_ovpn_path"] = _basename(self.htb_ovpn_path)
         return d
 
     @classmethod
@@ -271,7 +313,16 @@ class ApexConfig:
             # (`ps`) while environment variables set via `export` are not.
             "tool_backend": _g("tool_backend", "local"),
             "tool_service_url": _g("tool_service_url", None),
+            # Infra Phase 10 — HTB VPN readiness configuration. All three
+            # are None/safe-default unless a caller (container_entrypoint.py
+            # for the first two; config_env.py's env merge for all three)
+            # explicitly sets them — no VPN behavior is enabled by default.
+            "vpn_service_url": _g("vpn_service_url", None),
+            "htb_route_cidr": _g("htb_route_cidr", "10.129.0.0/16"),
+            "htb_ovpn_path": _g("htb_ovpn_path", None),
         }
+        if getattr(args, "vpn_health_timeout", None) is not None:
+            kwargs["vpn_health_timeout_seconds"] = float(getattr(args, "vpn_health_timeout"))
         if getattr(args, "max_llm_calls", None) is not None:
             kwargs["max_llm_calls_per_run"] = int(getattr(args, "max_llm_calls"))
         if getattr(args, "max_llm_calls_per_phase", None) is not None:
