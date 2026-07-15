@@ -558,6 +558,20 @@ no VPN-related network configuration exists anywhere in `compose.yaml` or
 either Dockerfile. This is explicitly deferred to a later Infra Phase —
 see §21.
 
+> **Correction (Infra Phase 10, 2026-07-15):** the statement above
+> described this repository's state as of Infra Phase 7 and is preserved
+> as-is per this document's own append-only convention. It is now
+> **out of date**: Infra Phase 10 added a dedicated `vpn` container, an
+> `htb` Compose profile (`compose.htb.yaml`), and a network-namespace-
+> sharing design (`kali` shares `vpn`'s namespace) — code-complete and
+> verified against a real Docker environment, but **not** live-validated
+> against a real HTB target (no real `.ovpn` profile was available during
+> development). The default, non-`htb`-profile workflow described
+> throughout the rest of this document (§1-§16, §18-§20) is completely
+> unaffected and remains accurate. Full detail:
+> [`docs/htb-vpn-container.md`](htb-vpn-container.md); exact remaining
+> live-validation steps: [`docs/htb-vpn-manual-validation.md`](htb-vpn-manual-validation.md).
+
 ---
 
 ## 18. Cleanup
@@ -609,6 +623,13 @@ target exists anywhere in this repository as of this phase — see §17 for
 the full statement of what this environment can and cannot reach. A
 future Infra Phase must add VPN container/tunnel wiring before any
 authorized live engagement could run through this Compose environment.
+
+> **Correction (Infra Phase 10, 2026-07-15):** this VPN container/tunnel
+> wiring now exists — see the §17 correction note above and
+> [`docs/htb-vpn-container.md`](htb-vpn-container.md). Live validation
+> against a real HTB target remains outstanding and is tracked in
+> [`docs/htb-vpn-manual-validation.md`](htb-vpn-manual-validation.md), not
+> in this document.
 
 ---
 

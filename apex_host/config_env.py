@@ -72,6 +72,18 @@ ENV_USE_LLM = "APEX_USE_LLM"
 ENV_LLM_PROVIDER = "APEX_LLM_PROVIDER"
 ENV_LLM_MODEL = "APEX_LLM_MODEL"
 
+# Infra Phase 10 — HTB VPN readiness configuration. See
+# docs/htb-vpn-container.md and apex_host/eval/preflight.py.
+ENV_VPN_SERVICE_URL = "APEX_VPN_SERVICE_URL"
+ENV_VPN_HEALTH_TIMEOUT_SECONDS = "APEX_VPN_HEALTH_TIMEOUT_SECONDS"
+ENV_HTB_ROUTE_CIDR = "APEX_HTB_ROUTE_CIDR"
+# ENV_HTB_OVPN_PATH is a HOST filesystem path, not a credential — read
+# directly (never a secret-style env-var-only convention like the token
+# below); still not wired into any --xxx CLI flag on apex_host.main or
+# apex_host.eval.run_htb_local, since the profile is a Compose/VPN-container
+# concern (compose.htb.yaml), not something those two entry points act on.
+ENV_HTB_OVPN_PATH = "APEX_HTB_OVPN_PATH"
+
 # Deliberately NOT read by this module — see the module docstring.
 ENV_TOOL_SERVICE_TOKEN = "APEX_TOOL_SERVICE_TOKEN"
 
@@ -214,6 +226,26 @@ def validate_url(name: str, raw: str) -> str:
     if not parsed.netloc:
         raise EnvConfigError(f"{name}: not a valid URL: {raw!r}")
     return stripped
+
+
+def validate_cidr(name: str, raw: str) -> str:
+    """Validate *raw* as a well-formed CIDR network (e.g. ``10.129.0.0/16``).
+
+    Uses ``ipaddress.ip_network`` (stdlib) — the same validation approach
+    ``docker/vpn/tunnel_status.py::validate_cidr`` uses inside the VPN
+    container itself; kept as an independent implementation here rather
+    than an import, since ``apex_host`` must not depend on anything under
+    ``docker/vpn/`` (that directory is copied into a *different*,
+    dependency-free image — see ``docker/vpn/Dockerfile``).
+    """
+    import ipaddress
+
+    stripped = raw.strip()
+    try:
+        network = ipaddress.ip_network(stripped, strict=False)
+    except ValueError as exc:
+        raise EnvConfigError(f"{name}: {raw!r} is not a valid CIDR network") from exc
+    return str(network)
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +398,17 @@ def merge_env_into_args(
     # skipped there via the hasattr() guard above.
     _fill("export_json", ENV_REPORT_PATH, lambda n, r: r)
     _fill("export_graph", ENV_GRAPH_PATH, lambda n, r: r)
+    # Infra Phase 10 — HTB VPN readiness configuration. Only present on
+    # apex_host.container_entrypoint's namespaces (check/smoke/dry-run/run
+    # all declare these flags) — silently skipped elsewhere via the
+    # hasattr() guard above.
+    _fill("vpn_service_url", ENV_VPN_SERVICE_URL, validate_url)
+    _fill(
+        "vpn_health_timeout", ENV_VPN_HEALTH_TIMEOUT_SECONDS,
+        lambda n, r: parse_float_strict(n, r, minimum=0.0),
+    )
+    _fill("htb_route_cidr", ENV_HTB_ROUTE_CIDR, validate_cidr)
+    _fill("htb_ovpn_path", ENV_HTB_OVPN_PATH, lambda n, r: r)
 
     # dry_run and target use their own dedicated resolution rules (above) —
     # both are *always* resolved (never left None), unlike the generic

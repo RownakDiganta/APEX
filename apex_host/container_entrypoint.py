@@ -67,6 +67,7 @@ from apex_host.eval.preflight import (
     check_live_confirmation,
     run_local_checks,
     run_smoke_checks,
+    run_vpn_checks,
 )
 
 _DEFAULT_REPORT_DIR = "/app/run_reports"
@@ -105,6 +106,25 @@ def _add_common_config_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--env-file", dest="env_file", default=None, metavar="PATH",
         help="Explicitly load a dotenv-format file before resolving environment values (never automatic).",
+    )
+    # Infra Phase 10 — HTB VPN readiness. All default=None so the generic
+    # env merge (apex_host.config_env.merge_env_into_args) can fill them;
+    # every mode is unaffected when none of these are set (the default,
+    # non-htb-profile case) — see apex_host/eval/preflight.py::run_vpn_checks.
+    parser.add_argument(
+        "--vpn-service-url", dest="vpn_service_url", default=None, metavar="URL",
+        help="Base URL of the VPN container's readiness server, e.g. http://vpn:8090 (htb Compose profile only).",
+    )
+    parser.add_argument(
+        "--vpn-health-timeout", dest="vpn_health_timeout", type=float, default=None, metavar="SECS",
+    )
+    parser.add_argument(
+        "--htb-route-cidr", dest="htb_route_cidr", default=None, metavar="CIDR",
+        help="Expected HTB private route (default: 10.129.0.0/16) — compared against what the VPN service reports.",
+    )
+    parser.add_argument(
+        "--htb-ovpn-path", dest="htb_ovpn_path", default=None, metavar="PATH",
+        help="Host-side visibility only — path to the .ovpn profile (existence/readability checked, never opened for content).",
     )
     parser.add_argument("--json", dest="json_output", action="store_true", default=False)
     parser.add_argument("-v", "--verbose", action="store_true", default=False)
@@ -326,6 +346,7 @@ async def _handle_run(args: argparse.Namespace) -> int:
 
         checks.append(await check_tool_service_health(config.tool_service_url))
         checks.append(await check_remote_smoke(config))
+    checks.extend(await run_vpn_checks(config))
 
     result = PreflightResult(checks)
     _emit_result(result, json_output=args.json_output)

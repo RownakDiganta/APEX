@@ -1,0 +1,101 @@
+# compose.htb.yaml
+# Compose override file (Infra Phase 10) — activates HTB VPN mode: redefines kali's networking to share the vpn service's network namespace, and points apex at the VPN-shared address for both the Kali tool API and the VPN readiness endpoint. Merged with compose.yaml via `-f`, never used standalone.
+#
+# Usage (see docs/htb-vpn-container.md and docs/htb-vpn-manual-validation.md
+# for the full walkthrough):
+#
+#   APEX_TOOL_SERVICE_TOKEN=... APEX_HTB_OVPN_PATH=./secrets/htb.ovpn \
+#     docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
+#     up --build --abort-on-container-exit
+#
+# This file is a Compose *override* — it only makes sense merged on top of
+# compose.yaml (`-f compose.yaml -f compose.htb.yaml`, in that order).
+# Running `docker compose -f compose.htb.yaml up` alone is invalid: this
+# file does not declare a `build.dockerfile` for kali/apex on its own, and
+# the `vpn` service itself lives entirely in compose.yaml (unchanged by
+# this file — this file never redefines `vpn`).
+#
+# Why an override file rather than one shared compose.yaml: Compose has no
+# mechanism to give a single named service two different
+# `network_mode`/`networks` configurations depending on which `--profile`
+# flag is passed — profiles only gate whether a whole service starts, not
+# which of two configs it uses. This is the standard, documented Compose
+# idiom for "same base services, different topology in an alternate mode."
+#
+# Network-namespace-sharing design (the one coherent choice made and
+# proven by tests — see docs/htb-vpn-container.md §7-8 for the full
+# rationale and the two alternatives considered):
+#
+#   kali:  network_mode: "service:vpn"   (drops its own network identity —
+#          it now shares the `vpn` container's network namespace/interface
+#          entirely; `kali`'s Compose DNS name stops resolving on
+#          apex-internal once this is active)
+#   apex:  APEX_TOOL_SERVICE_URL -> http://vpn:8080  (kali's port 8080 is
+#          still bound inside the shared namespace — reachable through the
+#          `vpn` service's OWN Compose DNS name, since `vpn` is the
+#          container that actually holds the network identity now)
+#          APEX_VPN_SERVICE_URL -> http://vpn:8090  (the VPN container's
+#          own first-party readiness server, same shared address)
+#
+# `network_mode: service:X` shares ONLY the network namespace — not
+# capabilities, not the filesystem, not the user namespace. `kali` gains
+# no capability from this (still no NET_ADMIN, still non-root, still no
+# /dev/net/tun) — verified live, see docs/htb-vpn-container.md §12.
+
+services:
+  kali:
+    # !reset clears the value inherited from compose.yaml's `networks:
+    # [apex-internal]` — network_mode and networks are mutually exclusive
+    # per the Compose Specification; without this, `docker compose config`
+    # fails validation (verified this phase — see docs/htb-vpn-container.md
+    # §7 for the exact error before this fix).
+    networks: !reset null
+    network_mode: "service:vpn"
+    # Likewise: `expose:` is meaningless once this service has no network
+    # stack of its own (its ports are the `vpn` container's ports).
+    expose: !reset null
+    depends_on:
+      vpn:
+        condition: service_healthy
+    # No cap_add, no privileged, no user override anywhere in this file —
+    # kali remains exactly as unprivileged/non-root as the default
+    # topology (docker/kali/Dockerfile's own USER apextool, unmodified).
+
+  vpn:
+    volumes:
+      # Replaces (not merges with — Compose's list-merge semantics: a
+      # list declared in an override file replaces the base file's list
+      # entirely) compose.yaml's soft `${APEX_HTB_OVPN_PATH:-/dev/null}`
+      # default with the REAL fail-fast requirement. This is only ever
+      # evaluated when compose.htb.yaml is explicitly merged in via `-f`
+      # — the default, non-htb `docker compose up` never sees this `:?`
+      # form at all (see compose.yaml's own comment on why the base
+      # file's default must be soft).
+      - ${APEX_HTB_OVPN_PATH:?Set APEX_HTB_OVPN_PATH to a local .ovpn file to use the htb profile — see docs/htb-vpn-manual-validation.md}:/vpn/htb.ovpn:ro
+
+  apex:
+    depends_on:
+      vpn:
+        condition: service_healthy
+    environment:
+      # Overrides compose.yaml's ${APEX_TOOL_SERVICE_URL:-http://kali:8080}
+      # default — kali no longer has its own Compose DNS name once it
+      # shares vpn's network namespace (see this file's own header
+      # comment). Compose's environment-mapping merge combines this with
+      # every OTHER key already set in compose.yaml's apex.environment
+      # (APEX_TOOL_BACKEND, APEX_TOOL_SERVICE_TOKEN) — none of those are
+      # repeated or changed here.
+      APEX_TOOL_SERVICE_URL: http://vpn:8080
+      # The VPN container's own readiness endpoint — see
+      # apex_host/eval/preflight.py::run_vpn_checks, which fires
+      # automatically inside the (unchanged) `smoke` default command once
+      # this variable is set.
+      APEX_VPN_SERVICE_URL: http://vpn:8090
+      APEX_HTB_ROUTE_CIDR: ${APEX_HTB_ROUTE_CIDR:-10.129.0.0/16}
+    # command: unchanged — still the base file's ["smoke",
+    # "--knowledge-root", "/app/knowledge"]. In HTB mode this now
+    # ADDITIONALLY performs VPN readiness/tunnel-route checks (since
+    # APEX_VPN_SERVICE_URL is now set) — still never a live engagement,
+    # never a target, never `run_htb_local`. This satisfies "the APEX
+    # service in HTB profile mode should initially run VPN
+    # readiness/preflight only" — see docs/htb-vpn-container.md §14.

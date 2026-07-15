@@ -71,11 +71,15 @@ def test_no_top_level_version_key() -> None:
 # Services: exactly apex + kali, no unexplained extras
 # ---------------------------------------------------------------------------
 
-def test_apex_and_kali_services_exist() -> None:
+def test_apex_kali_vpn_services_exist() -> None:
+    """Infra Phase 10 adds a third service, `vpn` — profile-gated (see
+    test_vpn_service_is_profile_gated below), never started by a bare
+    `docker compose up`. compose.yaml's parsed service list is exactly
+    these three; no unexplained extras."""
     data = _compose_dict()
-    assert set(data["services"].keys()) == {"apex", "kali"}, (
-        "compose.yaml should start only the two intended application "
-        "services unless a helper service is separately justified"
+    assert set(data["services"].keys()) == {"apex", "kali", "vpn"}, (
+        "compose.yaml should declare only the three intended services "
+        "unless a helper service is separately justified"
     )
 
 
@@ -83,17 +87,28 @@ def test_services_use_intended_dockerfiles() -> None:
     data = _compose_dict()
     apex = data["services"]["apex"]
     kali = data["services"]["kali"]
+    vpn = data["services"]["vpn"]
     assert apex["build"]["dockerfile"] == "docker/apex/Dockerfile"
     assert kali["build"]["dockerfile"] == "docker/kali/Dockerfile"
+    assert vpn["build"]["dockerfile"] == "docker/vpn/Dockerfile"
 
 
 def test_build_context_is_repo_root() -> None:
     data = _compose_dict()
-    for name in ("apex", "kali"):
+    for name in ("apex", "kali", "vpn"):
         assert data["services"][name]["build"]["context"] == ".", (
             f"{name} must build from the repository root, matching each "
             "Dockerfile's own documented build command"
         )
+
+
+def test_vpn_service_is_profile_gated() -> None:
+    """`vpn` must never start as part of the default `docker compose up`
+    — only `kali`/`apex` (no `profiles:` key at all) start unconditionally."""
+    data = _compose_dict()
+    assert data["services"]["vpn"].get("profiles") == ["htb"]
+    assert "profiles" not in data["services"]["apex"]
+    assert "profiles" not in data["services"]["kali"]
 
 
 # ---------------------------------------------------------------------------
@@ -116,14 +131,19 @@ def test_no_host_networking() -> None:
         assert svc.get("network_mode") != "host", f"{name} must not use host networking"
 
 
-def test_no_service_network_mode() -> None:
-    """`network_mode: service:*` is explicitly out of scope for this phase."""
+def test_no_service_network_mode_in_base_file() -> None:
+    """None of the THREE services declared directly in this base
+    compose.yaml uses `network_mode: service:*` — kali's namespace-sharing
+    with vpn (Infra Phase 10) is declared only in the separate
+    compose.htb.yaml OVERRIDE file (tests/docker/test_compose_htb.py),
+    never in this base file, so the default `docker compose up` workflow
+    is completely unaffected by its existence."""
     data = _compose_dict()
     for name, svc in data["services"].items():
         network_mode = svc.get("network_mode")
         if network_mode is not None:
             assert not str(network_mode).startswith("service:"), (
-                f"{name} must not use network_mode: service:* in this phase"
+                f"{name} must not use network_mode: service:* in the base compose.yaml"
             )
 
 
@@ -137,21 +157,63 @@ def test_no_docker_socket_mounted() -> None:
             assert "docker.sock" not in vol_str, f"{name} must not mount the Docker socket"
 
 
-def test_no_unexpected_capabilities() -> None:
+def test_apex_and_kali_have_no_added_capabilities() -> None:
+    """Only `vpn` (Infra Phase 10) may add NET_ADMIN — see
+    test_vpn_has_exactly_net_admin_capability below. Neither apex nor kali
+    gains any capability from vpn's existence; NET_RAW remains forbidden
+    everywhere (unchanged from Infra Phase 7 — nmap's default/SYN-scan
+    mode still requires it and it is still deliberately not granted)."""
     data = _compose_dict()
-    for name, svc in data["services"].items():
-        cap_add = svc.get("cap_add", [])
-        assert "NET_ADMIN" not in cap_add, f"{name} must not add NET_ADMIN in this phase"
+    for name in ("apex", "kali"):
+        cap_add = data["services"][name].get("cap_add", [])
+        assert "NET_ADMIN" not in cap_add, f"{name} must not add NET_ADMIN"
         assert "NET_RAW" not in cap_add, (
             f"{name} must not add NET_RAW merely to enable default Nmap SYN scans "
-            "in this phase — deferred, see docs/docker-compose.md"
+            "— deferred, see docs/docker-compose.md"
         )
+    assert "NET_RAW" not in data["services"]["vpn"].get("cap_add", []), (
+        "vpn must not add NET_RAW either — only NET_ADMIN is justified "
+        "(OpenVPN's own operational requirement, see docs/htb-vpn-container.md)"
+    )
 
 
-def test_no_ssh_or_vpn_configuration() -> None:
+def test_vpn_has_exactly_net_admin_capability() -> None:
+    data = _compose_dict()
+    cap_add = data["services"]["vpn"].get("cap_add", [])
+    assert cap_add == ["NET_ADMIN"], (
+        f"vpn should add exactly NET_ADMIN, no more, no less — got {cap_add!r}"
+    )
+
+
+def test_only_vpn_mounts_dev_net_tun() -> None:
+    data = _compose_dict()
+    for name in ("apex", "kali"):
+        assert "devices" not in data["services"][name], f"{name} must not mount any device"
+    devices = data["services"]["vpn"].get("devices", [])
+    assert any("/dev/net/tun" in str(d) for d in devices), "vpn must mount /dev/net/tun"
+
+
+def test_no_ssh_configuration() -> None:
     text = _non_comment_text()
-    assert ".ovpn" not in text
-    assert "openvpn" not in text.lower()
+    assert "sshd" not in text.lower()
+    assert "openssh" not in text.lower()
+
+
+def test_no_literal_host_ovpn_path() -> None:
+    """The .ovpn profile path is always interpolated
+    (${APEX_HTB_OVPN_PATH:...}), never a literal host filesystem path —
+    the only concrete ".ovpn"-shaped string anywhere in this file is the
+    container-internal mount target `/vpn/htb.ovpn`, which is not a host
+    path and contains no operator-specific information."""
+    text = _non_comment_text()
+    assert "openvpn" not in text.lower(), "compose.yaml should reference the vpn SERVICE, never the openvpn binary directly"
+    for line in text.splitlines():
+        if ".ovpn" not in line:
+            continue
+        assert "APEX_HTB_OVPN_PATH" in line or "/vpn/htb.ovpn" in line, (
+            f"unexpected literal .ovpn reference in compose.yaml: {line!r}"
+        )
+        assert "secrets/" not in line, f"compose.yaml must not hardcode a secrets/ path: {line!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +239,19 @@ def test_apex_has_no_published_ports() -> None:
     data = _compose_dict()
     apex = data["services"]["apex"]
     assert "ports" not in apex
+
+
+def test_vpn_has_no_published_ports() -> None:
+    data = _compose_dict()
+    vpn = data["services"]["vpn"]
+    assert "ports" not in vpn, "vpn's readiness server (port 8090) must not be published to the host"
+
+
+def test_vpn_exposes_8090_internally() -> None:
+    data = _compose_dict()
+    vpn = data["services"]["vpn"]
+    exposed = [str(p) for p in vpn.get("expose", [])]
+    assert "8090" in exposed
 
 
 # ---------------------------------------------------------------------------
@@ -330,11 +405,14 @@ def test_apex_default_command_is_smoke_mode() -> None:
 
 def test_no_hardcoded_target_ip_anywhere() -> None:
     # 0.0.0.0 is a bind-all address (APEX_TOOL_SERVICE_HOST's real
-    # apex_tool_service default, Infra Phase 8), not a target — the only
-    # literal IPv4 addresses allowed anywhere in this file.
+    # apex_tool_service default, Infra Phase 8), not a target. 10.129.0.0
+    # is the network address of the default HTB route CIDR
+    # (APEX_HTB_ROUTE_CIDR's own safe default, Infra Phase 10) — a
+    # documented, generic private-lab range, not any specific engagement
+    # target — the only literal IPv4 addresses allowed anywhere in this file.
     import re
 
-    allowed = {"0.0.0.0"}
+    allowed = {"0.0.0.0", "10.129.0.0"}
     ipv4 = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
     for ln in _compose_text().splitlines():
         stripped = ln.strip()

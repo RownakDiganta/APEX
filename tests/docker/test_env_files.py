@@ -152,9 +152,12 @@ def test_no_target_provided() -> None:
 
 
 def test_no_hardcoded_target_ip_anywhere() -> None:
-    """No non-loopback/non-bind-all IPv4 literal anywhere — comment or not."""
+    """No non-loopback/non-bind-all IPv4 literal anywhere — comment or not.
+    10.129.0.0 (Infra Phase 10) is the network address of
+    APEX_HTB_ROUTE_CIDR's real default — a generic HTB-lab private range
+    documented by name, not any specific engagement target."""
     ipv4 = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
-    allowed = {"0.0.0.0"}
+    allowed = {"0.0.0.0", "10.129.0.0"}
     for ln in _env_example_lines():
         for match in ipv4.finditer(ln):
             assert match.group(0) in allowed, f"unexpected IPv4 literal: {ln!r}"
@@ -262,21 +265,77 @@ def test_apex_tool_service_url_matches_compose_service_name() -> None:
 
 
 # ---------------------------------------------------------------------------
-# VPN section — deferred, never referenced by Compose
+# VPN section (Infra Phase 10) — used only by the "htb" Compose profile.
 # ---------------------------------------------------------------------------
 
 
-def test_vpn_variable_not_active() -> None:
+def test_htb_ovpn_path_is_active_but_blank() -> None:
+    """APEX_HTB_OVPN_PATH is uncommented (active) so a fresh `cp .env.example
+    .env` shows the variable's shape, but its value is always blank — no
+    default target machine, no operator-specific host path, ever shipped
+    in a committed template."""
     active = _active_assignments()
-    assert not any("OVPN" in k or "VPN" in k for k in active), (
-        "no VPN variable may be active in .env.example this phase"
-    )
+    assert "APEX_HTB_OVPN_PATH" in active
+    assert active["APEX_HTB_OVPN_PATH"] == ""
 
 
-def test_compose_yaml_does_not_reference_vpn_variable() -> None:
+def test_htb_route_cidr_default_matches_real_default() -> None:
+    """APEX_HTB_ROUTE_CIDR is active with the same real default
+    apex_host.config.ApexConfig.htb_route_cidr and
+    docker/vpn/Dockerfile's own ENV both use — a non-target-specific,
+    generic HTB-lab private range, not a credential."""
+    active = _active_assignments()
+    assert active.get("APEX_HTB_ROUTE_CIDR") == "10.129.0.0/16"
+
+
+def test_vpn_service_url_and_timeout_remain_commented_defaults() -> None:
+    """APEX_VPN_SERVICE_URL/APEX_VPN_HEALTH_TIMEOUT_SECONDS stay commented
+    out — they are meaningful only inside the htb Compose profile, which
+    sets APEX_VPN_SERVICE_URL itself (compose.htb.yaml); nothing in the
+    default, non-htb workflow needs them active."""
+    active = _active_assignments()
+    assert "APEX_VPN_SERVICE_URL" not in active
+    assert "APEX_VPN_HEALTH_TIMEOUT_SECONDS" not in active
+
+
+def test_no_ovpn_file_content_or_real_path_in_env_example() -> None:
+    """.env.example documents the *shape* of VPN configuration but must
+    never contain real profile content, a real host path, or a target.
+    Any "secrets/htb.ovpn"-style example path appears only inside a
+    comment line (illustrative documentation), never as an active
+    assignment's value."""
+    for ln in _env_example_lines():
+        if "secrets/" in ln or ".ovpn" in ln:
+            stripped = ln.strip()
+            assert stripped == "" or stripped.startswith("#"), (
+                f"non-comment line references a concrete VPN path: {ln!r}"
+            )
+    active = _active_assignments()
+    # APEX_HTB_OVPN_PATH must never carry a real, non-blank path in the
+    # committed template (covered above too — restated here explicitly
+    # against this section's own historical "must stay inactive" intent).
+    assert active.get("APEX_HTB_OVPN_PATH", "") == ""
+
+
+def test_compose_yaml_references_vpn_variables_only_in_the_vpn_service() -> None:
+    """Infra Phase 10: compose.yaml legitimately references
+    APEX_HTB_OVPN_PATH/APEX_HTB_ROUTE_CIDR now (the `vpn` service's own
+    profile-gated configuration) — the base file's `apex`/`kali` service
+    definitions must not reference either, since VPN configuration only
+    ever flows to apex/kali through the separate compose.htb.yaml override."""
     compose_text = (_REPO_ROOT / "compose.yaml").read_text(encoding="utf-8")
-    assert "OVPN" not in compose_text
-    assert "APEX_HTB" not in compose_text
+    assert "APEX_HTB_OVPN_PATH" in compose_text
+    assert "APEX_HTB_ROUTE_CIDR" in compose_text
+
+    import yaml
+
+    data = yaml.safe_load(compose_text)
+    for name in ("apex", "kali"):
+        env = data["services"][name].get("environment", {})
+        assert not any("VPN" in k or "HTB" in k for k in env), (
+            f"{name} in the base compose.yaml must not reference VPN/HTB "
+            "variables — that only happens in compose.htb.yaml"
+        )
 
 
 # ---------------------------------------------------------------------------
