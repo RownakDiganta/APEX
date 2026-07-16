@@ -143,19 +143,41 @@ class TestWorkflowExistence:
 
     def test_vendored_workflow_files_are_not_project_workflows(self) -> None:
         """Vendored third-party corpora under Knowledge/ (GTFOBins,
-        SecLists, LOLBAS, PayloadsAllTheThings) ship their own
-        `.github/workflows/` directories — these must never be confused
-        with, counted as, or discovered as this project's own workflows.
-        The project's workflow directory is exactly `.github/workflows/`
-        at the repository root; nothing under `Knowledge/` is inside it."""
-        vendored_github_dirs = list((_REPO_ROOT / "Knowledge").glob("**/.github"))
-        assert len(vendored_github_dirs) > 0, (
-            "expected to find at least one vendored .github directory under "
-            "Knowledge/ (sanity check that this test is exercising something real)"
-        )
+        SecLists, LOLBAS, PayloadsAllTheThings) each ship their own
+        upstream `.github/workflows/` directory *when present on disk* —
+        these must never be confused with, counted as, or discovered as
+        this project's own workflows. The project's workflow directory is
+        exactly `.github/workflows/` at the repository root; nothing
+        under `Knowledge/` is ever inside it.
+
+        The raw corpora themselves are gitignored (CLAUDE.md §18 "RAW
+        PAYLOAD SOURCES (ignore)": `Knowledge/payload_db/{SecLists,
+        PayloadsAllTheThings,GTFOBins,LOLBAS}/`) — they exist only when
+        someone has locally vendored them for knowledge-compilation work
+        and are **not** part of what `actions/checkout` fetches on a
+        GitHub-hosted runner (or any fresh clone). This test must
+        therefore hold across *every* repository layout, including one
+        where none of these directories exist at all — it must never
+        require their presence (an earlier version of this test did,
+        via `assert len(vendored_github_dirs) > 0`, and failed on exactly
+        the GitHub-hosted checkout this invariant is meant to protect)."""
+        knowledge_dir = _REPO_ROOT / "Knowledge"
+        vendored_github_dirs = list(knowledge_dir.glob("**/.github")) if knowledge_dir.is_dir() else []
+
+        # The actual invariant: IF a vendored .github directory exists
+        # (locally, or in some future checkout layout), it is never
+        # nested inside, equal to, or otherwise confusable with this
+        # project's own workflow directory. This loop is correctly a
+        # no-op — not a failure — when the list is empty.
         for vendored_dir in vendored_github_dirs:
             assert _WORKFLOWS_DIR not in vendored_dir.parents
             assert vendored_dir != _WORKFLOWS_DIR.parent
+
+        # An assertion that fires unconditionally, independent of whether
+        # any vendored corpus happens to be present on disk, so this test
+        # still verifies something real even in a checkout with no
+        # Knowledge/ vendored content at all.
+        assert knowledge_dir not in _WORKFLOWS_DIR.parents
 
 
 # ---------------------------------------------------------------------------

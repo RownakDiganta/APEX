@@ -143,6 +143,29 @@ async def test_local_backend_timeout_sets_timed_out_flag() -> None:
 async def test_local_backend_arguments_passed_as_list_not_shell_expanded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """`nmap` is used here purely as an example tool NAME — this test's
+    actual subject is `apex_host.tools.runner.run_command`'s argv-list
+    invocation discipline (never a single shell string), which has
+    nothing to do with whether the `nmap` *binary* happens to be
+    installed on whatever machine runs this test.
+
+    `runner.run_command` checks `shutil.which(cmd.tool)` before ever
+    calling `asyncio.create_subprocess_exec` (CLAUDE.md §12.7's
+    documented "missing tools degrade gracefully" behavior) — on a
+    machine where `nmap` is genuinely on PATH (e.g. this project's own
+    Homebrew-provisioned local dev Macs), that check passes and
+    `create_subprocess_exec` is reached; on a machine where it is not
+    (e.g. a bare GitHub Actions `ubuntu-latest` runner, which does not
+    ship `nmap` by default), `run_command` returns an ordinary
+    "not found in PATH" `ToolResult` *before* ever reaching
+    `create_subprocess_exec` — so `_fake_exec` below is never called and
+    `captured["args"]` is never set, raising `KeyError: "args"`. That is
+    not a backend bug and not a reason to weaken this assertion — it was
+    an invalid assumption that `nmap` is present in PATH on every machine
+    this test might run on. `shutil.which` is mocked below so this test's
+    actual subject (argv-list construction) is exercised deterministically
+    regardless of what happens to be installed on the host.
+    """
     captured: dict[str, object] = {}
 
     class _FakeProc:
@@ -155,6 +178,9 @@ async def test_local_backend_arguments_passed_as_list_not_shell_expanded(
         captured["args"] = args
         return _FakeProc()
 
+    import apex_host.tools.runner as runner_module
+
+    monkeypatch.setattr(runner_module.shutil, "which", lambda tool: f"/usr/bin/{tool}")
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
     backend = LocalToolBackend(_config(allowed_tools=["nmap"], dry_run=False))
     await backend.execute("nmap", ["-T4", "127.0.0.1;whoami".replace(";", "-")])
