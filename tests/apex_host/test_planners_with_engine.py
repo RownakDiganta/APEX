@@ -565,10 +565,21 @@ class TestGlobalPlannerPhaseSelection:
         )
         assert phase == ApexPhase.credential
 
-    def test_host_service_endpoint_auth_returns_priv_esc(self) -> None:
+    def test_host_service_endpoint_auth_flow_only_still_returns_credential(self) -> None:
+        """Phase 12A Bug B fix: auth_flow (login page merely discovered) does
+        NOT skip credential validation — only access_state (a validated
+        login) may. Supersedes the old (buggy) priv_esc expectation."""
         gp = GlobalPlanner(max_turns=20)
         phase = gp.decide_phase(
             node_types_seen={"host", "service", "endpoint", "auth_flow"}, turn_count=0
+        )
+        assert phase == ApexPhase.credential
+
+    def test_host_service_endpoint_access_state_returns_priv_esc(self) -> None:
+        """access_state (a validated login) does advance past credential."""
+        gp = GlobalPlanner(max_turns=20)
+        phase = gp.decide_phase(
+            node_types_seen={"host", "service", "endpoint", "access_state"}, turn_count=0
         )
         assert phase == ApexPhase.priv_esc
 

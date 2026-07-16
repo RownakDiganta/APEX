@@ -131,15 +131,20 @@ class TestApexGraphExecution:
         assert final_state["completed"] is True
 
     async def test_phase_progresses_with_seeded_graph_state(self) -> None:
-        """With host+endpoint+auth_flow+service already known, GlobalPlanner
+        """With host+endpoint+access_state+service already known, GlobalPlanner
         should route straight to priv_esc on the very first turn — proving
         global_plan/route_phase correctly read live EKG state rather than
-        relying on accumulated turn history."""
+        relying on accumulated turn history.
+
+        Phase 12A (Bug B fix): this used to seed ``auth_flow`` (a merely
+        *discovered* login page) and still expect a priv_esc route — that
+        was the bug. Only ``access_state`` (a *validated* login) may skip
+        past the credential phase, so the seed uses ``access_state`` here."""
         api = make_api()
         target = "10.0.0.5"
         timestamp = now()
         host_id = f"host:{target}"
-        for node_type in ("host", "endpoint", "auth_flow", "service"):
+        for node_type in ("host", "endpoint", "access_state", "service"):
             node_id = host_id if node_type == "host" else f"{node_type}:{target}:seed"
             await api.upsert_node(
                 Node(
@@ -154,7 +159,7 @@ class TestApexGraphExecution:
             )
         # graph traversal needs these reachable from the host anchor
         from memfabric.types import Edge
-        for node_type in ("endpoint", "auth_flow", "service"):
+        for node_type in ("endpoint", "access_state", "service"):
             await api.upsert_edge(
                 Edge(
                     id=f"edge:{node_type}:{target}",

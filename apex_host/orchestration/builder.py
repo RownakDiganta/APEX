@@ -21,6 +21,7 @@ from apex_host.graph_state import ApexGraphState, CompiledApexGraph
 from apex_host.orchestration.context_node import make_context_node
 from apex_host.orchestration.continuation_node import make_continuation_node
 from apex_host.orchestration.dependencies import OrchestrationDeps, build_planners
+from apex_host.orchestration.diagnostics_node import make_unknown_phase_node
 from apex_host.orchestration.dispatch_node import (
     make_browser_node,
     make_execute_node,
@@ -33,6 +34,7 @@ from apex_host.orchestration.parsing_node import make_parsing_node
 from apex_host.orchestration.planning_node import make_global_plan_node
 from apex_host.orchestration.repair_node import make_repair_node
 from apex_host.orchestration.routing import (
+    UNKNOWN_PHASE_NODE,
     route_after_global_plan,
     route_after_reflect,
     route_after_write,
@@ -192,6 +194,10 @@ def build_apex_graph(
     sg.add_node("write_memory", make_memory_node(deps))
     sg.add_node("repair_agent", make_repair_node(deps))
     sg.add_node("reflect_or_continue", make_continuation_node(deps))
+    # Bug E (Phase 12A/R1) fix: dedicated diagnostic-and-terminate node for
+    # any phase route_after_global_plan cannot dispatch — never falls
+    # through silently to END. See orchestration/diagnostics_node.py.
+    sg.add_node(UNKNOWN_PHASE_NODE, make_unknown_phase_node(deps))
 
     # Edges
     sg.add_edge(START, "load_context")
@@ -201,9 +207,11 @@ def build_apex_graph(
         {
             "recon_agent": "recon_agent", "web_agent": "web_agent",
             "browser_agent": "browser_agent", "execute_agent": "execute_agent",
-            "priv_esc_agent": "priv_esc_agent", END: END,
+            "priv_esc_agent": "priv_esc_agent", UNKNOWN_PHASE_NODE: UNKNOWN_PHASE_NODE,
+            END: END,
         },
     )
+    sg.add_edge(UNKNOWN_PHASE_NODE, END)
     for _an in ("recon_agent", "web_agent", "browser_agent", "execute_agent", "priv_esc_agent"):
         sg.add_edge(_an, "parse_observation")
     sg.add_edge("parse_observation", "write_memory")

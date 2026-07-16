@@ -18,6 +18,30 @@ New in this version:
 The LLM seam for GlobalPlanner is reserved for future goal decomposition
 (breaking a high-level goal into sub-goals). Phase selection itself remains
 deterministic so the engagement never gets stuck or loops unexpectedly.
+
+Phase 12A (R1) state-machine fixes
+-----------------------------------
+Bug A (oscillation): budget-exhaustion forcing used to be keyed off the
+``current_phase`` argument alone — it only fired on the single call where
+``current_phase`` happened to equal the exhausted phase.  Because the
+*next* turn's ``current_phase`` is whatever the *previous* call returned
+(round-tripped through ``ApexGraphState``), that phase's own budget was
+never exhausted, so forcing silently stopped applying and ``_select_phase``
+fell back to its organic, EKG-driven condition — which still failed (no
+real ``access_state`` yet) and bounced the engagement straight back into
+the just-exhausted phase, forever.  ``decide_phase`` now checks every
+budget-tracked phase's *own persistent* ``_spent`` counter on every call,
+independent of what ``current_phase`` names — so a phase that has
+exhausted its budget stays force-skipped on every subsequent call, not
+just one.
+
+Bug B (auth_flow != access_state): ``_select_phase`` used to let a bare
+``auth_flow`` node (a login mechanism merely *discovered*, e.g. by
+``BrowserParser`` finding a login form) satisfy the same condition as
+``access_state`` (a *validated* successful login), skipping the credential
+phase entirely.  Only ``access_state`` now gates the credential→priv_esc
+transition; discovering a login page no longer substitutes for actually
+attempting to authenticate.
 """
 from __future__ import annotations
 
@@ -42,6 +66,21 @@ _DEFAULT_PHASE_BUDGETS: dict[str, int] = {
     ApexPhase.priv_esc.value: 4,
     ApexPhase.exploit.value: 4,
     ApexPhase.lateral.value: 4,
+}
+
+# Maps a budget-tracked phase to the EKG node type that, when synthetically
+# injected into node_types_seen, lets _select_phase's organic condition
+# advance past that phase even though it was never really satisfied.  Used
+# only when the named phase's own turn budget is exhausted (see decide_phase).
+#
+# credential -> "access_state" (not "auth_flow", per Bug B above): forcing
+# past credential on budget exhaustion must use the same field that
+# legitimately signals success, so a forced skip and a real success are
+# handled by exactly one gate in _select_phase.
+_PHASE_COMPLETION_NODE: dict[str, str] = {
+    ApexPhase.recon.value: "service",
+    ApexPhase.web.value: "endpoint",
+    ApexPhase.credential.value: "access_state",
 }
 
 
@@ -107,11 +146,22 @@ class GlobalPlanner:
 
         Decision order (first match wins):
         1. Hard budget ceiling → done.
-        2. Current phase budget exhausted → advance to the next EKG-driven phase.
+        2. Any budget-tracked phase whose own budget is exhausted is
+           force-skipped (see ``_PHASE_COMPLETION_NODE``), regardless of
+           ``current_phase`` — this is the Bug A fix: forcing must survive
+           across turns, not just the one call where ``current_phase``
+           happens to name the exhausted phase.
         3. EKG-driven phase selection.
 
         Parameters
         ----------
+        current_phase:
+            Accepted for backward compatibility and diagnostic/logging call
+            sites (``apex_host/orchestration/planning_node.py`` and
+            ``continuation_node.py`` both pass it).  It is no longer the
+            sole trigger for budget-exhaustion forcing — see (2) above —
+            since keying forcing off a single-call match was the root cause
+            of the credential/priv_esc oscillation (Bug A).
         has_web_capability:
             When ``False`` (e.g. no HTTP/HTTPS service in the EKG), the web
             phase is skipped entirely and the engagement proceeds directly from
@@ -121,17 +171,13 @@ class GlobalPlanner:
         if turn_count >= self._max_turns:
             return ApexPhase.done
 
-        # If the current phase has exhausted its budget, skip to the EKG logic
-        # for the *next* phase by pretending the completion node was observed.
+        # Force past any budget-tracked phase whose own persistent budget
+        # counter is exhausted, no matter what current_phase names.  This is
+        # what makes the forced skip *stick* turn over turn: as long as the
+        # phase's budget stays at 0, its completion node stays injected.
         forced_node_types = set(node_types_seen)
-        if current_phase and self.budget_remaining(current_phase) == 0:
-            _phase_to_completion_node: dict[str, str] = {
-                ApexPhase.recon.value: "service",
-                ApexPhase.web.value: "endpoint",
-                ApexPhase.credential.value: "auth_flow",
-            }
-            completion_node = _phase_to_completion_node.get(current_phase)
-            if completion_node:
+        for phase_value, completion_node in _PHASE_COMPLETION_NODE.items():
+            if self.budget_remaining(phase_value) == 0:
                 forced_node_types.add(completion_node)
 
         return self._select_phase(forced_node_types, has_web_capability=has_web_capability)
@@ -145,10 +191,14 @@ class GlobalPlanner:
         services were discovered, preventing wasted budget on a pure-telnet
         or pure-SSH target.
 
-        ``access_state`` in node_types_seen signals a successful login and
-        triggers priv_esc advance alongside the existing ``auth_flow`` trigger,
-        so the engagement advances naturally after a successful telnet login
-        without waiting for the credential phase budget to exhaust.
+        Only ``access_state`` (a *validated* successful login) advances the
+        engagement past the credential phase (Bug B fix).  A bare
+        ``auth_flow`` node — a login mechanism that was merely *discovered*
+        (e.g. a web login form found by ``BrowserParser``) — no longer
+        substitutes for it: finding a login page is not equivalent to
+        authenticating, so it must not skip the one phase
+        (``CredentialPlanner``/``execute_agent``) capable of ever producing
+        ``access_state``.
         """
         if "host" not in node_types_seen:
             return ApexPhase.recon
@@ -156,7 +206,7 @@ class GlobalPlanner:
             return ApexPhase.recon
         if "endpoint" not in node_types_seen and has_web_capability:
             return ApexPhase.web
-        if "auth_flow" not in node_types_seen and "access_state" not in node_types_seen:
+        if "access_state" not in node_types_seen:
             return ApexPhase.credential
         if "service" in node_types_seen:
             return ApexPhase.priv_esc
