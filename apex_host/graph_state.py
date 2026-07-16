@@ -87,6 +87,14 @@ class ApexGraphState(TypedDict):
     # timed out, across the whole run, without re-querying the episodic
     # store. See docs/remote-tool-backend.md "Report fields".
     execution_backend_log: Annotated[list[dict[str, Any]], operator.add]
+    # Phase 12A (R1, Bug E): one entry per state-machine anomaly the
+    # orchestration layer could not route normally — currently populated
+    # only by ``unknown_phase_agent`` when GlobalPlanner produces a phase
+    # value with no registered dispatch node (e.g. a not-yet-routable
+    # ApexPhase member). Fields per entry: {phase, turn_count, reason}.
+    # An unroutable phase must never disappear silently into END — this
+    # field is the durable, checkpoint-visible record of why it stopped.
+    diagnostic_events: Annotated[list[dict[str, Any]], operator.add]
 
 
 CompiledApexGraph = Any

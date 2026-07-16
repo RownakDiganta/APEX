@@ -171,6 +171,7 @@ async def test_build_apex_graph_default_construction_uses_local_backend_for_gene
         "turn_count": 0, "planner_decisions": [], "tool_results": None,
         "repair_count": 0, "policy_decisions": [], "duplicate_actions": [],
         "completed_fingerprints": [], "execution_backend_log": [],
+        "diagnostic_events": [],
     })
     log = final.get("execution_backend_log") or []
     assert log, "expected at least one backend-tagged execution in a recon turn"

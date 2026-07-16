@@ -382,13 +382,16 @@ class TestGlobalPlannerAccessStateTrigger:
         )
         assert phase == ApexPhase.priv_esc
 
-    def test_auth_flow_still_triggers_priv_esc(self) -> None:
-        """Existing auth_flow trigger still works (backward-compatible)."""
+    def test_auth_flow_alone_does_not_trigger_priv_esc(self) -> None:
+        """Phase 12A Bug B fix: auth_flow (a discovered login page) is NOT
+        equivalent to access_state (a validated login) — it must not skip
+        the credential phase. Superseded the old (buggy) expectation that
+        auth_flow alone advanced to priv_esc."""
         phase = self._gp().decide_phase(
             node_types_seen={"host", "service", "endpoint", "auth_flow"},
             turn_count=0,
         )
-        assert phase == ApexPhase.priv_esc
+        assert phase == ApexPhase.credential
 
     def test_no_access_state_no_auth_flow_stays_credential(self) -> None:
         """Without access_state or auth_flow, we stay in credential."""

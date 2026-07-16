@@ -19,9 +19,13 @@ class TestSyntheticRun:
         node_types = {n.type for n in subgraph.nodes}
         assert {"host", "service", "endpoint", "auth_flow"} <= node_types
 
-    async def test_run_synthetic_machine_reaches_priv_esc(self) -> None:
+    async def test_run_synthetic_machine_reaches_credential(self) -> None:
+        """Phase 12A Bug B fix: the synthetic seed's auth_flow node represents
+        a *discovered* login page, not a validated login — it must route to
+        credential (to attempt validation), not skip straight to priv_esc.
+        Supersedes the old (buggy) 'reaches_priv_esc' expectation."""
         metrics = await run_synthetic_machine(max_turns=1)
-        assert metrics.reached_phase == "priv_esc"
+        assert metrics.reached_phase == "credential"
         assert metrics.turns_used == 1
         assert metrics.completed is True
 
