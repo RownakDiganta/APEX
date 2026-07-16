@@ -217,9 +217,48 @@ does **not** by itself prove the target host is currently reachable
 (a route can exist to a host that is powered off, still booting, or
 network-isolated for another reason) — that's step 11.
 
+**A route that resolves here can still fail to connect.** This was
+observed during this project's own validation: `would use route: True`
+with a valid `tun0` device, yet a real TCP connection to the same target
+returned a delayed `EHOSTUNREACH` ("No route to host") several seconds
+later — consistent with an ICMP unreachable arriving from somewhere in
+the network path (most likely HTB's own infrastructure, or the target
+machine itself, not a local misconfiguration — see the exact diagnostic
+transcript in step 11 below). If you see this combination, treat it as
+target-side evidence, not a route-lookup bug, and re-check the HTB UI:
+is the machine's status still "Running"? Has it fully finished booting
+(HTB often needs 1-2 extra minutes after first showing "Running")? Is
+this the correct, current IP (step 9)?
+
 ---
 
 ## 11. Perform a minimal reachability check from Kali
+
+**Preferred — the combined route + connect diagnostic** (one command,
+shows both results together, exactly reproduces the discrepancy above if
+it recurs):
+
+```bash
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
+  exec apex python -m apex_host.eval.vpn_route_check \
+  --vpn-service-url http://vpn:8090 \
+  --target <the-real-machine-IP> --port 23
+```
+
+Replace `23` with whichever port you actually care about (e.g. `22` for
+SSH, `80` for HTTP). **Expected result when everything is genuinely
+working:** `outcome: connected`. If instead you see `outcome: unreachable`
+with `errno: 113 (EHOSTUNREACH)`, or `outcome: timeout`, see the note at
+the end of step 10 and the troubleshooting table below — both are
+target/network-side signals, not something to "fix" in this repository's
+Compose files (this exact plumbing was independently re-verified: real
+namespace sharing, real `NET_ADMIN`/`/dev/net/tun` on `vpn` only, a
+correct routing table with the expected `10.129.0.0/16 via <gateway> dev
+tun0` entry, and no local firewall rules present in the `vpn` container
+to block egress).
+
+**From Kali directly** (the container that actually shares the VPN
+namespace and is the one your real engagement traffic will flow through):
 
 ```bash
 docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
@@ -228,12 +267,21 @@ docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
 
 **Expected result:** 2 ICMP replies. Some HTB machines/firewalls block
 ICMP — a failure here does not necessarily mean the machine is
-unreachable for other protocols. If you need a TCP-level check instead,
+unreachable for other protocols. For a TCP-level check from Kali
+specifically (as opposed to the VPN container via the diagnostic above),
 use the same `docker compose ... exec kali` pattern with `nc -zv -w 2
-<IP> <port>` against a port you already know should be open (or run a
-real `nmap -sT` scan through the normal APEX engagement flow once you're
-ready to actually begin working the machine — that is a separate,
-deliberate step, not part of this readiness validation).
+<IP> <port>` against a port you already know should be open — since Kali
+shares the VPN container's network namespace, it should observe the
+*exact same* result as the `/diagnose` check above; if the two genuinely
+disagree, that itself is worth re-testing (network conditions on an HTB
+lab can change between two commands run seconds apart) before assuming a
+namespace-sharing problem.
+
+Once you're ready to actually begin working the machine, run a real
+`nmap -sT -Pn -n -p <ports> <IP>` (unprivileged connect-scan — Kali is
+intentionally non-root with no `NET_RAW`, so a default SYN scan will not
+work; `-sT` always does) through the normal APEX engagement flow — that
+is a separate, deliberate step, not part of this readiness validation.
 
 ---
 
@@ -264,6 +312,8 @@ they are not managed by Compose and `down` does not touch them.
 | `vpn` container healthy but `route_present: false` | Tunnel is up but hasn't installed the expected route yet, or your profile uses a non-default range | Wait a few more seconds and re-check; if it persists, run `docker compose ... exec vpn ip route show` directly and compare against `APEX_HTB_ROUTE_CIDR` |
 | Stale target IP / "unreachable" after working fine before | HTB machine was reset/restarted and got a new IP | Re-check the HTB UI (step 8/9) and update `APEX_TARGET` |
 | Machine shows as reachable in route lookup but `ping`/`nc` both fail | Machine not fully booted yet, or ICMP/the specific port is filtered | Wait 1-2 minutes after HTB reports "Running"; try a TCP port check instead of ICMP |
+| `vpn_route_check.py --port` shows `outcome: unreachable`, `errno: 113 (EHOSTUNREACH)`, several seconds of delay, **despite** `would use route: True` in the same output | The route resolves correctly (verified: correct namespace sharing, correct `NET_ADMIN`/`/dev/net/tun` on `vpn` only, correct `10.129.0.0/16` routing-table entry, no local firewall rules in the `vpn` container) — a *delayed* `EHOSTUNREACH` (not instant) means an ICMP Host/Network Unreachable was actually received back from the network, i.e. from HTB's own infrastructure or the target itself, not from a local misconfiguration | Re-check the HTB UI: machine still "Running"? Fully booted (allow 1-2 extra minutes)? Correct, current IP? Try a different port you know should be open. If it persists across several minutes and multiple ports, treat it as an HTB-side/target-side condition, not a repository bug — this exact scenario was reproduced and traced during this project's own validation with no Compose/Dockerfile change required to resolve it |
+| `outcome: timeout` (no `errno`, no response at all) from the same diagnostic | A SYN was sent but nothing came back within the bound — equivalent to `nmap`'s "filtered" | Usually a stateful firewall (on HTB's side or the target's own) silently dropping the packet; try a longer `--timeout`, a different port, or accept that the port is filtered from outside |
 | Profile expired or wrong HTB region | HTB profiles can expire or be tied to a specific VPN server/region | Re-download a fresh `.ovpn` from the HTB UI (step 1) |
 | `AUTH_FAILED` in `vpn` container logs | HTB VPN sessions are typically single-session — you may already be connected elsewhere (another machine, your host's own OpenVPN client, a previous container that wasn't cleaned up) | Disconnect any other active session for this profile, then retry |
 | You also have a host-level VPN client (HTB's own desktop app, or a manually-run `openvpn` on your Mac) running at the same time | Simultaneous host-level and container-level VPN sessions against the same HTB profile will conflict (single-session limit) or cause routing confusion even if HTB allowed it | Use exactly one — either the container (this workflow) or a host-level client, never both against the same profile at the same time |

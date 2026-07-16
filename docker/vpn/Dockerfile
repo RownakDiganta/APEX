@@ -55,6 +55,7 @@ COPY docker/vpn/entrypoint.py /app/entrypoint.py
 COPY docker/vpn/readiness_server.py /app/readiness_server.py
 COPY docker/vpn/route_check.py /app/route_check.py
 COPY docker/vpn/tunnel_status.py /app/tunnel_status.py
+COPY docker/vpn/connect_check.py /app/connect_check.py
 
 # ---------------------------------------------------------------------------
 # The VPN profile is NEVER baked into this image. /vpn is an empty
