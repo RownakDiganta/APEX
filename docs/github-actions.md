@@ -167,15 +167,27 @@ APEX_HTB_OVPN_PATH=./secrets/ci-placeholder.ovpn \
 ```
 
 `docker compose config` is pure YAML interpolation/validation — it never
-starts a container, never creates `/dev/net/tun`, never contacts HTB, and
-never checks that `APEX_HTB_OVPN_PATH` actually points at a real file
-(only `up`/`run` would attempt to mount it). No dummy `.ovpn` file is
-created anywhere in either workflow. Both renders are redirected to a
-temp file, never printed to the job log — defense in depth even though
-only disposable placeholder values are ever used. `ci.yml`'s
-`compose-validate` job additionally asserts `/dev/net/tun` and the
-placeholder profile path do not exist on the runner after rendering, as
-an explicit, positive proof that nothing VPN-related was started.
+starts a container, never contacts HTB, and never checks that
+`APEX_HTB_OVPN_PATH` actually points at a real file (only `up`/`run`
+would attempt to mount it). No dummy `.ovpn` file is created anywhere in
+either workflow. Both renders are redirected to a temp file, never
+printed to the job log — defense in depth even though only disposable
+placeholder values are ever used. `ci.yml`'s `compose-validate` job
+additionally asserts, as explicit positive proof that nothing VPN-related
+was started: no `openvpn` process is running, no `tun0` network interface
+exists, no container is running at all, and the placeholder profile path
+was never created.
+
+> **Correction (2026-07-16):** an earlier version of this job instead
+> asserted `test ! -e /dev/net/tun` (the device node itself must not
+> exist). That assertion was **wrong** and failed on a real GitHub-hosted
+> run: GitHub-hosted Ubuntu runners commonly already have `/dev/net/tun`
+> present by default, entirely independent of whether any container has
+> ever requested it — its mere existence proves nothing about whether a
+> VPN was started. The corrected, equally strong invariants (no `openvpn`
+> process, no `tun0` interface, no running container) are what the
+> current workflow actually checks; the device-file-existence check was
+> removed, not weakened around.
 
 Docker and the Compose v2 plugin are pre-installed on GitHub's
 `ubuntu-latest` hosted runners — no extra setup step is needed just to
@@ -515,8 +527,13 @@ verifiable from this local environment):
 
 Both Compose-validation steps render configuration only — `docker compose
 config`, never `up`. `ci.yml`'s `compose-validate` job explicitly asserts
-`/dev/net/tun` does not exist and the placeholder `.ovpn` path was never
-created, as positive proof rather than merely omitting the `up` command.
+no `openvpn` process is running, no `tun0` network interface exists, no
+container is running at all, and the placeholder `.ovpn` path was never
+created, as positive proof rather than merely omitting the `up` command
+(§8 documents why a `/dev/net/tun` device-file-existence check — used in
+an earlier, incorrect version of this job — is not a valid proof of
+anything, since GitHub-hosted runners commonly have that device node
+present regardless of any container activity).
 Neither workflow file contains a real HTB target IP, a real HTB route
 CIDR beyond the already-public, documented `10.129.0.0/16` lab range
 constant, or any machine-specific value — statically enforced by
