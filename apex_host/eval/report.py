@@ -10,6 +10,28 @@ Public API:
     format_text(report) -> str          — human-readable string
     to_json_dict(report) -> dict        — JSON-serialisable dict
     write_report_json(report, path)     — write JSON to disk
+
+Phase 12C — canonical outcome integration
+------------------------------------------
+``RunReport.outcome``/``success``/``termination_reason``/``termination_phase``/
+``termination_turn``/``stall_reason`` are a direct projection of
+``apex_host.orchestration.outcome.EngagementOutcome`` — the SAME model the
+compiled graph itself uses to decide when and why an engagement ends (see
+that module's docstring for the full precedence rules). This module never
+computes a second, independent classification: ``status`` (the older,
+four-value string: "success"/"stopped_max_turns"/"stopped_error"/
+"abandoned") and ``completed_successfully`` are both derived FROM the
+canonical outcome via ``legacy_status_for()``/``is_success_outcome()``, not
+computed independently.
+
+``final_state["outcome"]`` is set by the graph itself on every real
+engagement run. ``_derive_outcome_from_state()`` provides a best-effort
+fallback ONLY for a ``final_state`` that predates Phase 12C (never had the
+``outcome`` field populated — e.g. hand-constructed test fixtures) so
+``build_report()`` remains backward compatible; it reproduces the exact
+conditions the old ``_determine_status()`` used, mapped onto
+``EngagementOutcome`` values, and is never consulted when the graph already
+supplied a real outcome.
 """
 from __future__ import annotations
 
@@ -20,6 +42,19 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from apex_host.orchestration.outcome import (
+    EngagementOutcome,
+    is_success_outcome,
+    legacy_status_for,
+)
+from apex_host.planners.priv_esc_opportunities import (
+    ENUM_COMMANDS,
+    already_run_commands,
+    evidence_from_subgraph,
+    opportunities_from_subgraph,
+    rank_opportunities,
+)
 
 if TYPE_CHECKING:
     from memfabric.types import SubgraphView
@@ -107,36 +142,119 @@ class RunReport:
     credential_outcome_counts: dict[str, int] = field(default_factory=dict)
     credential_validation_entries: list[dict[str, Any]] = field(default_factory=list)
 
+    # Phase 12C — canonical engagement outcome. `outcome`/`success` are the
+    # single source of truth for how and why this run ended; `status` and
+    # `completed_successfully` above are derived FROM these, never computed
+    # independently (see module docstring). `termination_reason`/
+    # `termination_phase`/`termination_turn` describe exactly where and why;
+    # `stall_reason` is set only for the three stall-derived outcomes
+    # (duplicate_task_stall / no_actionable_task / policy_blocked).
+    outcome: str = ""
+    success: bool = False
+    termination_reason: str = ""
+    termination_phase: str = ""
+    termination_turn: int = 0
+    stall_reason: str = ""
+    # no_action_count: turns whose planner produced zero selected tasks
+    # (derived from `planner_decisions`, which browser-phase turns never
+    # populate — see apex_host/orchestration/dispatch_node.py).
+    no_action_count: int = 0
+    # access_summary: {"validated": bool, "protocol": str|None,
+    # "username": str|None} — never a password. Empty username/protocol
+    # when validated is False.
+    access_summary: dict[str, Any] = field(default_factory=dict)
+
+    # Phase 13 — privilege-escalation planning summary, derived from
+    # final_state["privilege_summary"]/["privilege_state"]/["enumeration_complete"]
+    # (populated by apex_host.orchestration.dispatch_node.make_priv_esc_node
+    # on every priv_esc turn). A planning/reasoning summary only — never
+    # reflects an executed exploit or an actually-elevated shell.
+    privilege_state: str = ""
+    privilege_opportunity_count: int = 0
+    privilege_categories: dict[str, int] = field(default_factory=dict)
+    privilege_attempted_count: int = 0
+    privilege_exhausted_count: int = 0
+    privilege_remaining_count: int = 0
+    privilege_enumeration_complete: bool = False
+    # Up to 5 recommended_next_action strings from the highest-ranked
+    # remaining (non-exhausted) opportunities — advisory text for a human
+    # operator, never an executable command APEX itself would run.
+    privilege_recommendations: list[str] = field(default_factory=list)
+
+    # Phase 13B — safe privilege enumeration & evidence collection summary.
+    # All derived directly from the final subgraph's priv_esc_evidence /
+    # priv_esc_opportunity nodes (never from the possibly-one-turn-stale
+    # state snapshot) except enum_commands_failed, which is derived from
+    # error_episodes (a failed enumeration command produces no EKG node at
+    # all — see apex_host/parsers/priv_esc_parser.py::parse_enumeration).
+    enum_commands_completed: int = 0
+    enum_commands_failed: int = 0
+    enum_evidence_count: int = 0
+    enum_evidence_categories: dict[str, int] = field(default_factory=dict)
+    # Opportunities whose source_tool is "priv_esc_enum" specifically (as
+    # opposed to the Phase 13A searchsploit/analytical producers).
+    enum_new_opportunities: int = 0
+    # Duplicate priv_esc-phase tasks the dispatcher's fingerprint gate
+    # prevented from executing a second time (a real, observed count from
+    # state["duplicate_actions"] — see apex_host.orchestration.dispatch_node).
+    enum_duplicate_opportunities_avoided: int = 0
+    # True once every command in ENUM_COMMANDS has been recorded as evidence
+    # for this target — never True if enumeration never started.
+    enum_completeness: bool = False
+
 
 # ---------------------------------------------------------------------------
-# Status helper
+# Canonical outcome resolution
 # ---------------------------------------------------------------------------
 
-def _determine_status(
+def _derive_outcome_from_state(
     node_counts: dict[str, int],
     turns_used: int,
     max_turns: int,
     error_episodes: list[dict[str, Any]],
     completed: bool,
-) -> str:
-    """Derive a run status string from terminal conditions.
-
-    Returns one of: "success" | "stopped_max_turns" | "stopped_error" | "abandoned"
+) -> EngagementOutcome:
+    """Best-effort ``EngagementOutcome`` for a ``final_state`` that predates
+    Phase 12C (never had ``outcome`` populated by the graph). Reproduces the
+    exact conditions the old ``_determine_status()`` used, one-to-one, so
+    every pre-Phase-12C scenario still classifies identically — this is a
+    fallback path, never a second independent model (see module docstring).
     """
     if "access_state" in node_counts:
-        return "success"
+        return EngagementOutcome.validated_access
 
     total_errors = len(error_episodes)
     if turns_used > 0 and total_errors >= turns_used and not node_counts:
-        return "stopped_error"
+        return EngagementOutcome.tool_failure
 
     if turns_used >= max_turns:
-        return "stopped_max_turns"
+        return EngagementOutcome.max_turns_exhausted
 
     if completed:
-        return "abandoned"
+        return EngagementOutcome.no_actionable_task
 
-    return "stopped_max_turns"
+    return EngagementOutcome.max_turns_exhausted
+
+
+def _resolve_outcome(
+    final_state: "ApexGraphState",
+    node_counts: dict[str, int],
+    turns_used: int,
+    max_turns: int,
+    error_episodes: list[dict[str, Any]],
+    completed: bool,
+) -> EngagementOutcome:
+    """The one place ``RunReport`` decides which ``EngagementOutcome``
+    applies — the graph's own ``final_state["outcome"]`` when present
+    (every real engagement run sets this), else the backward-compatible
+    fallback above."""
+    raw = final_state.get("outcome")
+    if raw:
+        try:
+            return EngagementOutcome(raw)
+        except ValueError:
+            pass
+    return _derive_outcome_from_state(node_counts, turns_used, max_turns, error_episodes, completed)
 
 
 # ---------------------------------------------------------------------------
@@ -203,10 +321,12 @@ def build_report(
         if e.get("error")
     ][:3]
 
-    completed_successfully = "access_state" in node_counts
-    status = _determine_status(
-        node_counts, turns_used, config.max_turns, error_episodes, final_state["completed"]
+    resolved_outcome = _resolve_outcome(
+        final_state, node_counts, turns_used, config.max_turns,
+        error_episodes, final_state["completed"],
     )
+    completed_successfully = is_success_outcome(resolved_outcome)
+    status = legacy_status_for(resolved_outcome)
 
     planner_decisions = list(final_state.get("planner_decisions") or [])
 
@@ -262,6 +382,89 @@ def build_report(
         category = str(entry.get("error_category", "unknown"))
         credential_outcome_counts[category] = credential_outcome_counts.get(category, 0) + 1
 
+    # Phase 12C: no-action count — turns whose planner produced zero
+    # selected tasks (an AbandonSignal or empty task list). Never counts
+    # browser-phase turns, which do not call a planner at all.
+    no_action_count = sum(
+        1 for d in planner_decisions if int(d.get("selected_task_count", 0) or 0) == 0
+    )
+
+    # Phase 12C: access summary — never a password. The successful
+    # credential_validation_log entry (if any) supplies protocol/username;
+    # falls back to "telnet" when access_state exists but no Phase 12B
+    # credential_validation_log entry was recorded (matches Telnet's
+    # pre-Phase-12B behavior, which predates that log).
+    access_summary: dict[str, Any] = {"validated": False, "protocol": None, "username": None}
+    if "access_state" in node_counts:
+        successful_entry = next((e for e in raw_cred_log if e.get("success")), None)
+        access_summary = {
+            "validated": True,
+            "protocol": str(successful_entry.get("protocol")) if successful_entry else "telnet",
+            "username": str(successful_entry.get("username")) if successful_entry else None,
+        }
+
+    termination_reason = str(final_state.get("termination_reason") or "")
+    termination_phase = str(final_state.get("termination_phase") or "")
+    stall_reason = str(final_state.get("stall_reason") or "")
+
+    # Phase 13: privilege-escalation planning summary. Derived directly from
+    # the FINAL subgraph's priv_esc_opportunity nodes (not from
+    # final_state["privilege_summary"]) so the report is always complete and
+    # accurate — the state-field snapshot is refreshed at the START of each
+    # priv_esc turn (before that turn's own opportunities are parsed and
+    # written), so it is always exactly one turn stale; the report, built
+    # after the engagement fully completes, has no such lag. `enumeration_complete`
+    # is still cross-checked against the state field as a defensive fallback.
+    ranked_opportunities = rank_opportunities(opportunities_from_subgraph(subgraph))
+    privilege_categories: dict[str, int] = {}
+    for o in ranked_opportunities:
+        privilege_categories[o.category.value] = privilege_categories.get(o.category.value, 0) + 1
+    privilege_opportunity_count = len(ranked_opportunities)
+    privilege_attempted_count = sum(1 for o in ranked_opportunities if o.attempted)
+    privilege_exhausted_count = sum(1 for o in ranked_opportunities if o.exhausted)
+    privilege_remaining_count = sum(1 for o in ranked_opportunities if not o.exhausted)
+    if ranked_opportunities:
+        privilege_state = (
+            "exhausted" if privilege_remaining_count == 0 else "opportunities_found"
+        )
+    else:
+        privilege_state = str(final_state.get("privilege_state") or "")
+    privilege_enumeration_complete = (
+        bool(ranked_opportunities) and privilege_remaining_count == 0
+    ) or bool(final_state.get("enumeration_complete", False))
+    privilege_recommendations = [
+        o.recommended_next_action for o in ranked_opportunities if not o.exhausted
+    ][:5]
+
+    # Phase 13B: safe privilege enumeration & evidence collection summary.
+    # Derived directly from the final subgraph's priv_esc_evidence nodes
+    # (one per completed+parsed enumeration command — see
+    # apex_host/parsers/priv_esc_parser.py::parse_enumeration) and from
+    # error_episodes for the failed-command count (a failed command never
+    # produces an evidence node at all).
+    enum_evidence = evidence_from_subgraph(subgraph)
+    enum_commands_completed = len(enum_evidence)
+    enum_evidence_categories: dict[str, int] = {}
+    for ev in enum_evidence:
+        enum_evidence_categories[ev.category.value] = (
+            enum_evidence_categories.get(ev.category.value, 0) + 1
+        )
+    enum_commands_failed = sum(
+        1 for e in error_episodes if str(e.get("tool", "")) == "priv_esc_enum"
+    )
+    enum_new_opportunities = sum(
+        1 for n in subgraph.nodes
+        if n.type == "priv_esc_opportunity" and n.props.get("source_tool") == "priv_esc_enum"
+    )
+    enum_duplicate_opportunities_avoided = sum(
+        1 for d in raw_dup if d.get("phase") == "priv_esc"
+    )
+    # Completeness: every fixed enumeration command has a recorded
+    # priv_esc_evidence node for this target (already_run_commands reads the
+    # same command_key prop this parser writes).
+    enum_completed_keys = already_run_commands(subgraph)
+    enum_completeness = bool(enum_completed_keys) and set(ENUM_COMMANDS).issubset(enum_completed_keys)
+
     return RunReport(
         target=config.target,
         mode="dry-run" if config.dry_run else "live",
@@ -301,6 +504,29 @@ def build_report(
         credential_attempts_by_protocol=credential_attempts_by_protocol,
         credential_outcome_counts=credential_outcome_counts,
         credential_validation_entries=raw_cred_log,
+        outcome=resolved_outcome.value,
+        success=completed_successfully,
+        termination_reason=termination_reason,
+        termination_phase=termination_phase,
+        termination_turn=turns_used,
+        stall_reason=stall_reason,
+        no_action_count=no_action_count,
+        access_summary=access_summary,
+        privilege_state=privilege_state,
+        privilege_opportunity_count=privilege_opportunity_count,
+        privilege_categories=privilege_categories,
+        privilege_attempted_count=privilege_attempted_count,
+        privilege_exhausted_count=privilege_exhausted_count,
+        privilege_remaining_count=privilege_remaining_count,
+        privilege_enumeration_complete=privilege_enumeration_complete,
+        privilege_recommendations=privilege_recommendations,
+        enum_commands_completed=enum_commands_completed,
+        enum_commands_failed=enum_commands_failed,
+        enum_evidence_count=enum_commands_completed,
+        enum_evidence_categories=enum_evidence_categories,
+        enum_new_opportunities=enum_new_opportunities,
+        enum_duplicate_opportunities_avoided=enum_duplicate_opportunities_avoided,
+        enum_completeness=enum_completeness,
     )
 
 
@@ -314,6 +540,45 @@ def _samples_from_summary(final_state: "ApexGraphState") -> list[str]:
 # Human-readable formatter
 # ---------------------------------------------------------------------------
 
+# Phase 12C: (headline word, human-readable phrase) per outcome — used to
+# render lines like "SUCCESS — validated SSH access" / "STOPPED — maximum
+# turns exhausted" / "BLOCKED — policy prevented further progress" /
+# "FAILED — parser error" / "CANCELLED — user interrupted run".
+_OUTCOME_HEADLINE: dict[EngagementOutcome, tuple[str, str]] = {
+    EngagementOutcome.validated_access: ("SUCCESS", "validated {protocol} access"),
+    EngagementOutcome.goal_completed: ("STOPPED", "engagement reached its organic completion state"),
+    EngagementOutcome.max_turns_exhausted: ("STOPPED", "maximum turns exhausted"),
+    EngagementOutcome.phase_budget_exhausted: ("STOPPED", "phase budget exhausted"),
+    EngagementOutcome.no_actionable_task: ("STOPPED", "no actionable task remained"),
+    EngagementOutcome.duplicate_task_stall: ("STOPPED", "repeated duplicate or stagnant tasks"),
+    EngagementOutcome.policy_blocked: ("BLOCKED", "policy prevented further progress"),
+    EngagementOutcome.planner_failure: ("FAILED", "planner error"),
+    EngagementOutcome.parser_failure: ("FAILED", "parser error"),
+    EngagementOutcome.tool_failure: ("FAILED", "tool/backend failure"),
+    EngagementOutcome.memory_failure: ("FAILED", "memory failure"),
+    EngagementOutcome.unknown_phase: ("FAILED", "unroutable phase"),
+    EngagementOutcome.configuration_failure: ("FAILED", "configuration error"),
+    EngagementOutcome.internal_error: ("FAILED", "internal error"),
+    EngagementOutcome.cancelled: ("CANCELLED", "user interrupted run"),
+}
+
+
+def outcome_headline(report: RunReport) -> str:
+    """Render the one-line headline for *report*'s outcome, e.g.
+    ``"SUCCESS — validated ssh access"`` or ``"BLOCKED — policy prevented
+    further progress"``. Falls back to the raw outcome string for any value
+    not in the table (forward-compatible with a future enum member)."""
+    try:
+        outcome = EngagementOutcome(report.outcome)
+    except ValueError:
+        return f"UNKNOWN — {report.outcome or 'no outcome recorded'}"
+    category, phrase = _OUTCOME_HEADLINE.get(outcome, ("UNKNOWN", report.outcome))
+    if "{protocol}" in phrase:
+        protocol = str(report.access_summary.get("protocol") or "telnet")
+        phrase = phrase.format(protocol=protocol)
+    return f"{category} — {phrase}"
+
+
 def format_text(report: RunReport) -> str:
     """Render a human-readable engagement report string."""
     lines: list[str] = []
@@ -325,11 +590,70 @@ def format_text(report: RunReport) -> str:
         " APEX HTB Engagement Report",
         f" Target : {report.target}   Mode : {report.mode}",
         f" Status : {report.status.upper()}   Successful : {success_label}",
+        f" Outcome: {outcome_headline(report)}",
         f" Turns  : {report.turns_used}   "
         f"Final phase : {report.final_phase}   "
         f"Completed : {'Yes' if report.completed else 'No'}",
         _SEP,
     ]
+
+    # Engagement Outcome detail (Phase 12C — the canonical model; always
+    # shown, even for a run that never terminated cleanly, so `outcome`
+    # being empty is itself visible rather than silently omitted)
+    lines.append("\nEngagement Outcome")
+    lines.append(f"  Outcome           : {report.outcome or '(none — run did not terminate)'}")
+    lines.append(f"  Termination phase : {report.termination_phase or 'n/a'}")
+    lines.append(f"  Termination turn  : {report.termination_turn}")
+    lines.append(f"  Reason            : {report.termination_reason or 'n/a'}")
+    if report.stall_reason:
+        lines.append(f"  Stall reason      : {report.stall_reason}")
+    if report.access_summary.get("validated"):
+        lines.append(
+            f"  Access validated  : protocol={report.access_summary.get('protocol')} "
+            f"username={report.access_summary.get('username')}"
+        )
+    if report.no_action_count:
+        lines.append(f"  No-action turns   : {report.no_action_count}")
+
+    # Privilege Escalation Summary (Phase 13 — shown only when the priv_esc
+    # phase produced any state at all; a target never reaching that phase
+    # shows nothing here). Planning/reasoning output only — never reflects
+    # an executed exploit or an actually-elevated shell.
+    if report.privilege_state:
+        lines.append("\nPrivilege Escalation Summary")
+        lines.append(f"  Enumeration status : {report.privilege_state}")
+        lines.append(f"  Opportunity count  : {report.privilege_opportunity_count}")
+        cat_detail = ", ".join(
+            f"{cat}={count}" for cat, count in sorted(report.privilege_categories.items())
+        )
+        lines.append(f"  Categories         : {cat_detail or 'none'}")
+        lines.append(f"  Attempted          : {report.privilege_attempted_count}")
+        lines.append(f"  Exhausted          : {report.privilege_exhausted_count}")
+        lines.append(f"  Remaining          : {report.privilege_remaining_count}")
+        lines.append(f"  Enumeration done   : {'Yes' if report.privilege_enumeration_complete else 'No'}")
+        if report.privilege_recommendations:
+            lines.append("  Recommendations:")
+            for rec in report.privilege_recommendations:
+                lines.append(f"    {rec[:160]}")
+
+    # Privilege Enumeration Summary (Phase 13B — shown only when at least
+    # one enumeration command was ever attempted; a target that never
+    # reached bounded SSH enumeration shows nothing here). Read-only
+    # enumeration output only — never reflects an executed exploit.
+    if report.enum_commands_completed or report.enum_commands_failed:
+        lines.append("\nPrivilege Enumeration Summary")
+        lines.append(
+            f"  Commands executed  : {report.enum_commands_completed} "
+            f"(failed: {report.enum_commands_failed})"
+        )
+        lines.append(f"  Evidence collected : {report.enum_evidence_count}")
+        ev_cat_detail = ", ".join(
+            f"{cat}={count}" for cat, count in sorted(report.enum_evidence_categories.items())
+        )
+        lines.append(f"  Evidence categories: {ev_cat_detail or 'none'}")
+        lines.append(f"  New opportunities  : {report.enum_new_opportunities}")
+        lines.append(f"  Duplicates avoided : {report.enum_duplicate_opportunities_avoided}")
+        lines.append(f"  Enumeration done   : {'Yes' if report.enum_completeness else 'No'}")
 
     # Phase summary
     phase_table: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
@@ -549,6 +873,36 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
             "attempts_by_protocol": report.credential_attempts_by_protocol,
             "outcome_counts": report.credential_outcome_counts,
             "entries": report.credential_validation_entries,
+        },
+        "engagement_outcome": {
+            "outcome": report.outcome,
+            "success": report.success,
+            "headline": outcome_headline(report),
+            "termination_reason": report.termination_reason,
+            "termination_phase": report.termination_phase,
+            "termination_turn": report.termination_turn,
+            "stall_reason": report.stall_reason,
+            "no_action_count": report.no_action_count,
+            "access_summary": report.access_summary,
+        },
+        "privilege_escalation": {
+            "state": report.privilege_state,
+            "opportunity_count": report.privilege_opportunity_count,
+            "categories": report.privilege_categories,
+            "attempted_count": report.privilege_attempted_count,
+            "exhausted_count": report.privilege_exhausted_count,
+            "remaining_count": report.privilege_remaining_count,
+            "enumeration_complete": report.privilege_enumeration_complete,
+            "recommendations": report.privilege_recommendations,
+        },
+        "privilege_enumeration": {
+            "commands_completed": report.enum_commands_completed,
+            "commands_failed": report.enum_commands_failed,
+            "evidence_count": report.enum_evidence_count,
+            "evidence_categories": report.enum_evidence_categories,
+            "new_opportunities": report.enum_new_opportunities,
+            "duplicate_opportunities_avoided": report.enum_duplicate_opportunities_avoided,
+            "enumeration_complete": report.enum_completeness,
         },
     }
 

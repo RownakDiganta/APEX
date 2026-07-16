@@ -1499,3 +1499,136 @@ no real command execution, no API keys required.
 | 9 | `payload_db` | `compiled/wordlist_manifest.jsonl` | 10 |
 
 If any file is missing, run `make compile-knowledge` first.
+
+## Engagement Termination & Outcome Reporting
+
+Every APEX engagement — dry-run or live — terminates with exactly one
+structured `EngagementOutcome` (`apex_host/orchestration/outcome.py`), a
+15-member enum covering success, resource exhaustion, bounded stall
+detection, policy blocks, and every category of hard failure
+(planner/parser/tool/memory/unknown-phase/configuration/cancelled/internal).
+`RunReport.status`/`completed_successfully` (the older four-value string and
+boolean) are *derived from* this one model, never computed independently.
+
+**Success still means exactly one thing:** a validated `access_state` node
+exists in the EKG (`EngagementOutcome.validated_access`). No other outcome —
+including an organic, non-error completion of the phase ladder — is ever
+treated as success.
+
+A bounded `StallTracker` (`apex_host/orchestration/stall.py`) detects an
+engagement that stops making progress — repeated duplicate tasks, repeated
+policy blocks, repeated no-op turns, or a repeated EKG/planner fingerprint —
+and terminates cleanly (`duplicate_task_stall` / `no_actionable_task` /
+`policy_blocked`) rather than looping until `max_turns`. Progress resets
+every stall counter.
+
+Both CLI entry points (`apex_host.main`, `apex_host.eval.run_htb_local`)
+return a deterministic process exit code derived from the outcome:
+
+| Code | Meaning |
+|---|---|
+| `0` | Success (`validated_access`, `goal_completed`) |
+| `1` | Exhausted / stalled (`max_turns_exhausted`, `phase_budget_exhausted`, `no_actionable_task`, `duplicate_task_stall`) |
+| `2` | Configuration error |
+| `3` | Policy blocked |
+| `4` | Operational failure (planner/parser/tool/memory/unknown-phase/internal) |
+| `130` | Cancelled (Ctrl+C / SIGINT) |
+
+```bash
+$ python -m apex_host.eval.run_htb_local --target 10.10.10.14 --dry-run
+...
+ Outcome: SUCCESS — validated ssh access
+$ echo $?
+0
+```
+
+Exactly one terminal `Episode` (`action="engagement_terminated"`) is written
+per engagement via `MemoryAPI.apply_deltas` — never duplicated, never
+bypassing the transactional path. Full design, precedence rules, stall
+semantics, report field reference, and current limitations:
+[`docs/engagement-outcomes.md`](docs/engagement-outcomes.md).
+
+## Privilege Escalation Planning Framework
+
+The `priv_esc` phase is a **planning framework, not privilege escalation.**
+`PrivEscPlanner` organizes enumeration, reasons about opportunities, avoids
+duplicate work, and determines when it has run out of safe things to do —
+it never executes an exploit, never escalates privileges, and never
+generates a payload.
+
+Every investigation — a `searchsploit` exploit-db lookup (local, zero
+target interaction) or an analytical signal derived from data earlier
+phases already captured (e.g. docker/sudo group membership from a Phase
+12B credential-validation `id` output — zero new tool execution) — becomes
+a structured `PrivilegeOpportunity` record (`apex_host/types.py`), stored
+in the EKG as a `priv_esc_opportunity` node with a category, a confidence
+level, bounded evidence, and a human-readable `recommended_next_action`
+(advisory text for an operator — never a command APEX itself would run).
+
+The planner reconstructs already-recorded opportunities from the EKG before
+planning and never re-investigates the same service/version or the same
+analytical signal twice — bounded to one attempt per opportunity. Once
+every enumerable opportunity has been recorded, it returns an explicit
+"enumeration exhausted" signal instead of looping.
+
+```
+Privilege Escalation Summary
+  Enumeration status : opportunities_found
+  Opportunity count  : 3
+  Categories         : docker=1, sudo=1, vulnerable_service=1
+  Attempted          : 3
+  Exhausted          : 1
+  Remaining          : 2
+  Recommendations:
+    Manually verify docker-group container-mount-escape escalation...
+```
+
+At the time this framework was introduced, no new live command execution
+against the target was added — a deliberate scope boundary, not an
+oversight. Phase 13B (below) later lifted that specific boundary in a
+narrow, safety-reviewed way. Full design, the opportunity model, the
+analytical-derivation rationale, and current limitations:
+[`docs/privilege-escalation-planning.md`](docs/privilege-escalation-planning.md).
+
+## Safe Privilege Enumeration & Evidence Collection
+
+Phase 13B extends the planning framework above with a small, fixed set of
+**harmless, read-only** enumeration commands (`id`, `uname -a`, `sudo -n
+-l`, `find ... -perm -4000`, `getcap -r /`, `mount`, `crontab -l`,
+`systemctl list-units`, ...) executed over the SAME already-validated SSH
+session Phase 12B's `SSHExecutor` uses to prove a credential works. This is
+still **not** privilege escalation: every command is read-only, nothing is
+written to the target, no exploit is executed, no payload or reverse shell
+is generated, and no persistence mechanism is ever established.
+
+Each command's output is parsed **deterministically** (regex/line-based —
+never an LLM) into a structured `PrivilegeEvidence` record
+(`apex_host/types.py`), stored in the EKG as a `priv_esc_evidence` node.
+Where the extracted facts justify it (a NOPASSWD sudo rule, an interesting
+SUID binary, an unusual capability, an NFS mount, docker/sudo group
+membership), a `priv_esc_opportunity` and a human-readable
+`priv_esc_recommendation` are derived from that evidence:
+
+```
+host --collects--> priv_esc_evidence --produces--> priv_esc_opportunity --recommends--> priv_esc_recommendation
+```
+
+The planner gates enumeration on three conditions: a real, already-validated
+SSH `access_state` exists, `--username`/`--password` are configured (the
+SAME credentials already proven, never guessed or brute-forced), and at
+least one fixed command has not already been recorded for this target — a
+completed enumeration command is never repeated.
+
+```
+Privilege Enumeration Summary
+  Commands executed  : 6 (failed: 0)
+  Evidence collected : 6
+  Evidence categories: cron=1, identity=1, kernel_version=1, mounts=1, os_info=1, sudo=1
+  New opportunities  : 1
+  Duplicates avoided : 0
+  Enumeration done   : No
+```
+
+Full design, the evidence model, every supported command and parser, and
+current limitations:
+[`docs/privilege-enumeration.md`](docs/privilege-enumeration.md).

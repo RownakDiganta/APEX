@@ -804,12 +804,14 @@ class TestDependencies:
         engine = RepairEngine(
             model_router=None, allowed_tools=config.allowed_tools, dry_run=True
         )
+        from apex_host.orchestration.stall import StallTracker
+
         deps = OrchestrationDeps(
             api=api, dispatcher=dispatcher,
             global_planner=GlobalPlanner(max_turns=1),
             phase_planners=phase_planners,
             repair_engine=engine, config=config,
-            anchor_id="host:10.10.10.1",
+            anchor_id="host:10.10.10.1", stall_tracker=StallTracker(),
         )
         assert "10.10.10.1" in deps.anchor_id
 

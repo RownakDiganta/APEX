@@ -152,6 +152,17 @@ class GlobalPlanner:
            across turns, not just the one call where ``current_phase``
            happens to name the exhausted phase.
         3. EKG-driven phase selection.
+        4. Phase 12C: if that selection is ``priv_esc`` and priv_esc's own
+           budget is exhausted, return ``done`` instead of ``priv_esc`` —
+           priv_esc is the last phase in the ladder with nothing further to
+           force-advance into (unlike recon/web/credential, which have a
+           ``_PHASE_COMPLETION_NODE`` entry naming the next phase), so
+           without this check the engagement would keep dispatching
+           ``priv_esc_agent`` every remaining turn until the *global*
+           ``max_turns`` ceiling, wasting the whole remainder of the run.
+           ``apex_host.orchestration.outcome.evaluate_termination()``
+           classifies this as ``phase_budget_exhausted`` — a distinct,
+           reported reason, not a silent ride-out to ``max_turns_exhausted``.
 
         Parameters
         ----------
@@ -180,7 +191,10 @@ class GlobalPlanner:
             if self.budget_remaining(phase_value) == 0:
                 forced_node_types.add(completion_node)
 
-        return self._select_phase(forced_node_types, has_web_capability=has_web_capability)
+        selected = self._select_phase(forced_node_types, has_web_capability=has_web_capability)
+        if selected is ApexPhase.priv_esc and self.budget_remaining(ApexPhase.priv_esc.value) == 0:
+            return ApexPhase.done
+        return selected
 
     def _select_phase(
         self, node_types_seen: set[str], *, has_web_capability: bool = True

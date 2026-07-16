@@ -205,6 +205,15 @@ class ApexRuntime:
             "execution_backend_log": [],
             "diagnostic_events": [],
             "credential_validation_log": [],
+            "outcome": "",
+            "termination_reason": "",
+            "termination_phase": "",
+            "stall_reason": "",
+            "privilege_state": "",
+            "privilege_summary": {},
+            "opportunity_ids": [],
+            "attempted_opportunities": [],
+            "enumeration_complete": False,
         }
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": run_id},
@@ -212,6 +221,29 @@ class ApexRuntime:
         }
         try:
             final_state: ApexGraphState = await graph.ainvoke(initial, config=invoke_config)
+        except asyncio.CancelledError:
+            # Phase 12C: best-effort terminal episode for a cancelled
+            # engagement (e.g. Ctrl+C / SIGINT during the run). The exact
+            # phase/turn at the moment of cancellation is not recoverable
+            # here (no checkpointer is configured for this call — see
+            # build_apex_graph()'s docstring), so the episode records that
+            # explicitly rather than guessing. Writing is wrapped in its
+            # own try/except so a secondary failure here never masks the
+            # original cancellation — CancelledError is always re-raised.
+            logger.warning("engagement cancelled — recording best-effort terminal episode")
+            try:
+                from apex_host.orchestration.outcome import EngagementOutcome, TerminationDecision
+                from apex_host.orchestration.terminal_episode import write_terminal_episode
+
+                decision = TerminationDecision(
+                    terminate=True, outcome=EngagementOutcome.cancelled, success=False,
+                    reason="engagement cancelled (interrupt received); exact phase/turn not recoverable",
+                    phase="unknown", turn=-1,
+                )
+                await write_terminal_episode(self.api, decision, run_id=run_id)
+            except Exception as inner_exc:
+                logger.warning("failed to write cancellation terminal episode: %s", inner_exc)
+            raise
         finally:
             aclose = getattr(tool_backend, "aclose", None)
             if aclose is not None:

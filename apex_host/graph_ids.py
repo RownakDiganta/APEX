@@ -249,6 +249,51 @@ def token_id(url: str, token_name: str) -> str:
     return f"token:{_normalize_endpoint_url(url)}:{token_name}"
 
 
+def priv_esc_opportunity_id(target: str, category: str, discriminator: str) -> str:
+    """Canonical ID for a privilege-escalation opportunity node (Phase 13).
+
+    ``discriminator`` distinguishes multiple opportunities in the same
+    category for the same target (e.g. a service+version slug for
+    ``vulnerable_service``, or a username for ``sudo``/``docker`` group
+    hints) — slugged the same way ``tech_id`` slugs technology names, so the
+    ID is stable and dedup-safe across turns/reruns.
+
+    >>> priv_esc_opportunity_id("10.10.10.14", "vulnerable_service", "vsftpd 2.3.4")
+    'priv_esc_opportunity:10.10.10.14:vulnerable_service:vsftpd-2-3-4'
+    >>> priv_esc_opportunity_id("10.10.10.14", "sudo", "sudo-group-root")
+    'priv_esc_opportunity:10.10.10.14:sudo:sudo-group-root'
+    """
+    return f"priv_esc_opportunity:{target}:{category}:{_slug(discriminator)}"
+
+
+def priv_esc_evidence_id(target: str, command_key: str, port: str = "") -> str:
+    """Canonical ID for a privilege-enumeration evidence node (Phase 13B).
+
+    ``command_key`` is the fixed enumeration-command allowlist key (e.g.
+    ``"sudo_l"``, ``"suid"``) — never the raw command string — so the ID is
+    stable regardless of how the command is phrased internally.
+
+    >>> priv_esc_evidence_id("10.10.10.14", "sudo_l")
+    'priv_esc_evidence:10.10.10.14:sudo-l'
+    >>> priv_esc_evidence_id("10.10.10.14", "sudo_l", port="2222")
+    'priv_esc_evidence:10.10.10.14:sudo-l:2222'
+    """
+    suffix = f":{port}" if port else ""
+    return f"priv_esc_evidence:{target}:{_slug(command_key)}{suffix}"
+
+
+def priv_esc_recommendation_id(opportunity_id: str) -> str:
+    """Canonical ID for a recommendation node derived from *opportunity_id*.
+
+    One recommendation per opportunity (1:1) — see
+    ``apex_host/parsers/priv_esc_parser.py``.
+
+    >>> priv_esc_recommendation_id("priv_esc_opportunity:10.10.10.14:sudo:sudo-group-root")
+    'priv_esc_recommendation:priv_esc_opportunity:10.10.10.14:sudo:sudo-group-root'
+    """
+    return f"priv_esc_recommendation:{opportunity_id}"
+
+
 # ---------------------------------------------------------------------------
 # Edge ID builders
 # ---------------------------------------------------------------------------
@@ -305,3 +350,39 @@ def requires_edge_id(from_node_id: str, to_node_id: str) -> str:
     'requires:endpoint:http://host/login:auth_flow:http://host/login'
     """
     return f"requires:{from_node_id}:{to_node_id}"
+
+
+def indicates_edge_id(from_node_id: str, to_node_id: str) -> str:
+    """Canonical ID for an 'indicates' edge (access_state/service → priv_esc_opportunity).
+
+    >>> indicates_edge_id("access_state:10.0.0.1:root", "priv_esc_opportunity:10.0.0.1:sudo:sudo-group-root")
+    'indicates:access_state:10.0.0.1:root:priv_esc_opportunity:10.0.0.1:sudo:sudo-group-root'
+    """
+    return f"indicates:{from_node_id}:{to_node_id}"
+
+
+def collects_edge_id(from_node_id: str, to_node_id: str) -> str:
+    """Canonical ID for a 'collects' edge (host → priv_esc_evidence, Phase 13B).
+
+    >>> collects_edge_id("host:10.0.0.1", "priv_esc_evidence:10.0.0.1:sudo_l")
+    'collects:host:10.0.0.1:priv_esc_evidence:10.0.0.1:sudo_l'
+    """
+    return f"collects:{from_node_id}:{to_node_id}"
+
+
+def produces_edge_id(from_node_id: str, to_node_id: str) -> str:
+    """Canonical ID for a 'produces' edge (priv_esc_evidence → priv_esc_opportunity, Phase 13B).
+
+    >>> produces_edge_id("priv_esc_evidence:10.0.0.1:sudo_l", "priv_esc_opportunity:10.0.0.1:sudo:sudo-group-root")
+    'produces:priv_esc_evidence:10.0.0.1:sudo_l:priv_esc_opportunity:10.0.0.1:sudo:sudo-group-root'
+    """
+    return f"produces:{from_node_id}:{to_node_id}"
+
+
+def recommends_edge_id(from_node_id: str, to_node_id: str) -> str:
+    """Canonical ID for a 'recommends' edge (priv_esc_opportunity → priv_esc_recommendation, Phase 13B).
+
+    >>> recommends_edge_id("priv_esc_opportunity:10.0.0.1:sudo:x", "priv_esc_recommendation:priv_esc_opportunity:10.0.0.1:sudo:x")
+    'recommends:priv_esc_opportunity:10.0.0.1:sudo:x:priv_esc_recommendation:priv_esc_opportunity:10.0.0.1:sudo:x'
+    """
+    return f"recommends:{from_node_id}:{to_node_id}"

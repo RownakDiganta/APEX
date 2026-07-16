@@ -15,6 +15,12 @@ Key invariants:
   planner — the URL is derived from state, not from a planner output.
 - ``asyncio.gather`` uses ``return_exceptions=True`` (F09) so one failing
   coroutine does not cancel concurrent tasks.
+- Phase 12C: an exception raised directly by ``planner.plan()`` (as opposed
+  to a normal ``AbandonSignal``) is caught here and converted into an
+  ``EngagementOutcome.planner_failure`` upstream-preset outcome — see
+  ``apex_host.orchestration.outcome`` module docstring, precedence level 2
+  — rather than propagating out of the node closure and crashing
+  ``graph.ainvoke()``.
 """
 from __future__ import annotations
 
@@ -28,6 +34,8 @@ from apex_host.execution.context import ExecutionContext
 from apex_host.execution.dispositions import ExecutionDisposition
 from apex_host.graph_state import ApexGraphState
 from apex_host.orchestration.models import task_info
+from apex_host.orchestration.outcome import EngagementOutcome
+from apex_host.planners.priv_esc_opportunities import privilege_state_fields
 from apex_host.types import ApexPhase
 
 if TYPE_CHECKING:
@@ -75,10 +83,30 @@ async def _dispatch_tasks(
         phase=state["phase"],
         anchor_node=anchor,
     )
-    subgraph = await deps.api.get_subgraph(anchor, depth=2)
-    evidence = await deps.api.query(text=goal.description, subgraph_anchor=anchor)
+    try:
+        subgraph = await deps.api.get_subgraph(anchor, depth=2)
+        evidence = await deps.api.query(text=goal.description, subgraph_anchor=anchor)
+    except Exception as exc:
+        logger.error("MemoryAPI read failed in phase %s: %s", state["phase"], exc)
+        return {
+            "current_task": None, "last_tool_result": None, "tool_results": None,
+            "last_error": f"memory failure: {exc}", "planner_decisions": [],
+            "outcome": EngagementOutcome.memory_failure.value,
+            "termination_reason": f"{type(exc).__name__}: {exc}",
+            "termination_phase": state["phase"],
+        }
 
-    plan_result = await planner.plan(goal, subgraph, evidence)
+    try:
+        plan_result = await planner.plan(goal, subgraph, evidence)
+    except Exception as exc:
+        logger.error("planner raised in phase %s: %s", state["phase"], exc)
+        return {
+            "current_task": None, "last_tool_result": None, "tool_results": None,
+            "last_error": f"planner failure: {exc}", "planner_decisions": [],
+            "outcome": EngagementOutcome.planner_failure.value,
+            "termination_reason": f"{type(exc).__name__}: {exc}",
+            "termination_phase": state["phase"],
+        }
 
     from apex_host.planning.models import PlanDecision as _PD
 
@@ -182,9 +210,24 @@ def make_web_node(deps: "OrchestrationDeps") -> Any:
 
 
 def make_priv_esc_node(deps: "OrchestrationDeps") -> Any:
-    """Return the ``priv_esc_agent`` node bound to the priv_esc planner."""
+    """Return the ``priv_esc_agent`` node bound to the priv_esc planner.
+
+    Phase 13: after dispatching, refreshes the ``privilege_state``/
+    ``privilege_summary``/``opportunity_ids``/``attempted_opportunities``/
+    ``enumeration_complete`` state fields from a fresh EKG read — mirrors
+    the read-after-write "peek" pattern ``continuation_node.py`` already
+    uses, scoped only to this node so other phase agents are unaffected. A
+    failed refresh degrades gracefully (state fields simply keep their
+    previous value this turn) rather than failing the whole turn.
+    """
     async def priv_esc_agent(state: "ApexGraphState") -> dict[str, Any]:
-        return await _dispatch_tasks(deps, state, deps.phase_planners[ApexPhase.priv_esc.value])
+        result = await _dispatch_tasks(deps, state, deps.phase_planners[ApexPhase.priv_esc.value])
+        try:
+            subgraph = await deps.api.get_subgraph(deps.anchor_id, depth=2)
+            result.update(privilege_state_fields(subgraph, target=state["target"]))
+        except Exception as exc:
+            logger.debug("priv_esc_agent: privilege-state summary refresh failed: %s", exc)
+        return result
     return priv_esc_agent
 
 

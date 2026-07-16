@@ -180,6 +180,13 @@ class TestApexGraphExecution:
 
         final_state = await graph.ainvoke(make_initial_state(target))
 
-        assert final_state["phase"] == "priv_esc"
+        # Phase 12C: `phase` always becomes "done" once an engagement
+        # terminates (the canonical outcome model) — `termination_phase`
+        # records the phase actually active (priv_esc, dispatched by
+        # global_plan this same turn from the seeded access_state) when
+        # termination was decided.
+        assert final_state["phase"] == "done"
+        assert final_state["termination_phase"] == "priv_esc"
+        assert final_state["outcome"] == "validated_access"
         assert final_state["turn_count"] == 1
         assert final_state["completed"] is True

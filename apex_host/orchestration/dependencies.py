@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from apex_host.config import ApexConfig
     from apex_host.execution.dispatcher import TaskDispatcher
     from apex_host.llm.gateway import LLMGateway
+    from apex_host.orchestration.stall import StallTracker
     from apex_host.planning.budget import LLMBudgetTracker
     from apex_host.planning.repair import RepairEngine
     from apex_host.planners.global_planner import GlobalPlanner
@@ -42,6 +43,11 @@ class OrchestrationDeps:
     repair_engine: "RepairEngine"
     config: "ApexConfig"
     anchor_id: str
+    # Phase 12C — bounded stall detector, one instance per engagement.
+    # Mutated turn-over-turn by reflect_or_continue; not stored in
+    # ApexGraphState (mirrors GlobalPlanner's own _spent budget counters —
+    # see apex_host/orchestration/stall.py's module docstring).
+    stall_tracker: "StallTracker"
 
 
 def build_planners(
@@ -93,5 +99,11 @@ def build_planners(
             max_access_attempts=config.max_access_attempts,
             **_kwargs(),
         ),
-        ApexPhase.priv_esc.value: PrivEscPlanner(config.target, registry, **_kwargs()),
+        ApexPhase.priv_esc.value: PrivEscPlanner(
+            config.target,
+            registry,
+            username_candidates=config.username_candidates,
+            password_candidates=config.password_candidates,
+            **_kwargs(),
+        ),
     }
