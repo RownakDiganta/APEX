@@ -1352,13 +1352,41 @@ class TestBoundedConcurrencySemaphore:
         from apex_host.async_utils import CPU_SEMAPHORE_LIMIT
         assert CPU_SEMAPHORE_LIMIT >= 2
 
-    def test_io_semaphore_is_semaphore(self) -> None:
+    def test_io_semaphore_is_async_context_manager(self) -> None:
+        """IO_SEMAPHORE is a _LoopBoundSemaphore (not a bare
+        asyncio.Semaphore) — deliberately, since a single module-level
+        asyncio.Semaphore binds to whichever event loop first uses it and
+        raises RuntimeError on later use from a different loop (exactly
+        what pytest-asyncio's default per-test event loop triggers). The
+        meaningful contract is that it supports `async with`, not its
+        concrete type — see test_semaphore_safe_across_multiple_event_loops
+        below for the actual cross-loop-safety guarantee."""
         from apex_host.async_utils import IO_SEMAPHORE
-        assert isinstance(IO_SEMAPHORE, asyncio.Semaphore)
+        assert hasattr(IO_SEMAPHORE, "__aenter__")
+        assert hasattr(IO_SEMAPHORE, "__aexit__")
 
-    def test_cpu_semaphore_is_semaphore(self) -> None:
+    def test_cpu_semaphore_is_async_context_manager(self) -> None:
         from apex_host.async_utils import CPU_SEMAPHORE
-        assert isinstance(CPU_SEMAPHORE, asyncio.Semaphore)
+        assert hasattr(CPU_SEMAPHORE, "__aenter__")
+        assert hasattr(CPU_SEMAPHORE, "__aexit__")
+
+    def test_semaphore_safe_across_multiple_event_loops(self) -> None:
+        """Regression test for the exact GitHub Actions failure this fix
+        resolves: using IO_SEMAPHORE (via run_io) from two DIFFERENT,
+        independently-created event loops in the same process must never
+        raise 'Semaphore is bound to a different event loop'. Uses
+        asyncio.run() twice (each call creates and tears down its own new
+        event loop) to reproduce exactly what pytest-asyncio's default
+        function-scoped event loop fixture does across test functions."""
+        from apex_host.async_utils import run_io
+
+        async def _use_semaphore() -> int:
+            return await run_io(lambda: 1 + 1)
+
+        first_loop_result = asyncio.run(_use_semaphore())
+        second_loop_result = asyncio.run(_use_semaphore())
+        assert first_loop_result == 2
+        assert second_loop_result == 2
 
     @pytest.mark.asyncio
     async def test_run_io_bounded(self) -> None:

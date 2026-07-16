@@ -11,9 +11,11 @@ Phase 7 invariants enforced here
   crash during the write leaves the original file intact.
 - ``read_text_async`` reads a file via ``asyncio.to_thread`` to avoid blocking
   the event loop on potentially large reads.
-- ``IO_SEMAPHORE`` and ``CPU_SEMAPHORE`` are process-level semaphores that cap
-  the number of concurrent thread submissions so the thread pool is not
-  overwhelmed.
+- ``IO_SEMAPHORE`` and ``CPU_SEMAPHORE`` are process-level, but
+  **loop-safe**, bounded semaphores that cap the number of concurrent
+  thread submissions so the thread pool is not overwhelmed — see
+  ``_LoopBoundSemaphore`` below for why a bare ``asyncio.Semaphore`` module
+  global is unsafe here.
 
 These helpers are intended for internal use within ``apex_host``.  Nothing in
 ``memfabric/`` imports from this module (memfabric stays dependency-free from
@@ -25,6 +27,8 @@ import asyncio
 import json
 import os
 import pathlib
+import threading
+import weakref
 from typing import Any, Callable, TypeVar
 
 _T = TypeVar("_T")
@@ -41,8 +45,83 @@ IO_SEMAPHORE_LIMIT: int = max(4, (os.cpu_count() or 2) * 2)
 #: Prevents thread-pool saturation from BM25 / embedding work.
 CPU_SEMAPHORE_LIMIT: int = max(2, os.cpu_count() or 2)
 
-IO_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(IO_SEMAPHORE_LIMIT)
-CPU_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(CPU_SEMAPHORE_LIMIT)
+
+class _LoopBoundSemaphore:
+    """A bounded-concurrency async context manager safe to reuse across
+    multiple asyncio event loops from a single module-level instance.
+
+    ``asyncio.Semaphore`` (like ``asyncio.Lock``/``Event``/``Condition``)
+    binds itself, on first use, to whichever event loop is running at that
+    moment (via ``asyncio.mixins._LoopBoundMixin``). A module-level
+    ``asyncio.Semaphore`` singleton — the previous implementation here — is
+    therefore only safe for the *first* event loop that ever touches it in
+    a given process. Any later use from a *different* loop raises
+    ``RuntimeError: Semaphore is bound to a different event loop``.
+
+    This is not a hypothetical edge case: ``pytest-asyncio`` creates a
+    fresh event loop per test function by default, and this module is
+    imported exactly once per test session (Python caches modules). Any
+    test that calls ``run_io``/``run_cpu`` after an earlier test already
+    bound the shared semaphore to *its* loop hits this ``RuntimeError`` —
+    observed on a GitHub Actions runner where test collection/execution
+    order differed enough from local runs to actually trigger it.
+
+    The fix: never touch the underlying ``asyncio.Semaphore`` outside of a
+    running loop, and keep one real ``asyncio.Semaphore`` **per event
+    loop**, lazily created the first time this wrapper is used on that
+    loop. Each loop gets its own independently-enforced copy of the same
+    concurrency limit — the guarantee ("at most N concurrent thread
+    submissions") holds exactly as before *within* any single loop; it is
+    only the single-process-wide sharing of one Semaphore object across
+    unrelated loops that is removed (that sharing was never a meaningful
+    guarantee to begin with — two independent event loops, e.g. two
+    separate test functions, were never actually contending for the same
+    resource in a way this module's own callers depended on).
+
+    ``WeakKeyDictionary`` keyed by the loop object means a per-loop
+    semaphore is garbage-collected automatically once its loop is (no
+    unbounded growth across, e.g., thousands of short-lived test-created
+    loops in a long test session). A ``threading.Lock`` guards the
+    lazy-creation check — cheap, and correct even in the (currently
+    unused-by-this-project) case of multiple event loops running on
+    separate OS threads concurrently.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+            weakref.WeakKeyDictionary()
+        )
+        self._creation_lock = threading.Lock()
+
+    def _semaphore_for_current_loop(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        sem = self._by_loop.get(loop)
+        if sem is None:
+            with self._creation_lock:
+                # Re-check after acquiring the lock: another coroutine on
+                # this same loop (or, in the multi-thread case, a
+                # concurrent creation for a different loop) may have
+                # already created it.
+                sem = self._by_loop.get(loop)
+                if sem is None:
+                    sem = asyncio.Semaphore(self._limit)
+                    self._by_loop[loop] = sem
+        return sem
+
+    async def __aenter__(self) -> None:
+        await self._semaphore_for_current_loop().acquire()
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        # __aexit__ always runs on the same running loop as the matching
+        # __aenter__ (an `async with` block never spans loops), so this
+        # looks up and releases the exact semaphore instance that was
+        # acquired above.
+        self._semaphore_for_current_loop().release()
+
+
+IO_SEMAPHORE = _LoopBoundSemaphore(IO_SEMAPHORE_LIMIT)
+CPU_SEMAPHORE = _LoopBoundSemaphore(CPU_SEMAPHORE_LIMIT)
 
 
 # ---------------------------------------------------------------------------
