@@ -890,6 +890,39 @@ architecture: [`docs/htb-vpn-container.md`](docs/htb-vpn-container.md).
 Exact remaining steps for an operator with a real profile:
 [`docs/htb-vpn-manual-validation.md`](docs/htb-vpn-manual-validation.md).
 
+**GitHub Actions CI and GHCR publishing (Infra Phase 11):**
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) validates every
+pull request and push to the default branch — lock-file check, frozen
+dependency install, the full test suite, Ruff, mypy, both Compose
+configurations rendered (default and HTB — never starting a real VPN),
+and all three images built (never pushed).
+[`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)
+re-validates from scratch and then builds and publishes all three images
+to GHCR:
+
+```text
+ghcr.io/<repository-owner>/apex
+ghcr.io/<repository-owner>/apex-kali
+ghcr.io/<repository-owner>/apex-vpn
+```
+
+— but **only** on pushes to the default branch, `v*` version tags, or
+manual dispatch; **never** from a pull request, and never using
+`pull_request_target`. Pull-request builds always run with `push: false`
+and no GHCR authentication step at all — a fork PR cannot reach the
+publishing token or push an image under any circumstance. Default-branch
+pushes publish `latest` + a SHA tag; version tags publish the full
+semantic-version tag family (`v1.2.3`, `1.2.3`, `1.2`, `1`) + a SHA tag.
+Publishing authenticates with GitHub's own built-in `GITHUB_TOKEN` (no
+manually created PAT) and always depends on a fresh validation pass
+(`needs: [validate]`) — a broken build is never published. **CI never
+connects to HTB, never starts the VPN tunnel, and never runs a live APEX
+engagement** — every command either workflow runs was reproduced and
+verified locally as part of this phase (see
+[`docs/github-actions.md`](docs/github-actions.md) for the complete
+design, every job/permission/trigger, and the exact GitHub-side steps
+still required to prove a real run).
+
 ---
 
 ## APEX Host Quickstart

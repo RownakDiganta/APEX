@@ -5528,3 +5528,173 @@ unchanged and re-verified — no target IP, expected credential, or
 machine-specific routing decision was added anywhere in this phase). No
 git branch was created; no commit or push was made as part of this
 phase's work.
+
+---
+
+### Infra Phase 11 — GitHub Actions CI and GHCR image publishing ✓ CODE COMPLETE — GITHUB RUN VALIDATION REQUIRED
+
+**Date:** 2026-07-16
+**Files:** `.github/workflows/ci.yml` (new), `.github/workflows/docker-publish.yml`
+(new), `tests/github_actions/__init__.py` (new),
+`tests/github_actions/test_workflows.py` (new, 78 tests), `docs/github-actions.md`
+(new), `README.md` (updated — new GitHub Actions/GHCR paragraph in the
+APEX Host Layer section)
+
+Added the two first-party GitHub Actions workflows this phase's own task
+brief required — CI validation (`ci.yml`) and GHCR image publishing
+(`docker-publish.yml`) — plus 78 static tests proving their structure and
+content, and full documentation. Per this phase's own explicit
+instruction, this record treats Infra Phases 1-10 (including Phase 10's
+HTB VPN integration and its Cap-machine infrastructure validation) as
+already complete context for sequencing purposes; this session did not
+itself re-verify Phase 10's live-validation status and made no change to
+that phase's own CLAUDE.md record (§ above, left exactly as originally
+written per the append-only convention) — only Phase 11's own work is
+reported here.
+
+**No root `.github/workflows` directory existed before this phase** —
+confirmed by direct filesystem search. Four *vendored* `.github/workflows`
+directories exist under `Knowledge/payload_db/{GTFOBins,LOLBAS,
+PayloadsAllTheThings,SecLists}/` (each third-party corpus ships its own,
+unrelated upstream CI) — these were identified, left completely untouched,
+and are statically proven distinct from this project's own workflow
+directory by `tests/github_actions/test_workflows.py::TestWorkflowExistence::test_vendored_workflow_files_are_not_project_workflows`.
+
+**Default branch verified, not assumed:** `git symbolic-ref
+refs/remotes/origin/HEAD` → `refs/remotes/origin/main` — `main` is the
+real default branch, confirmed before writing any trigger config (the
+task brief explicitly warned "do not guess"). Git remote:
+`git@github.com:RownakDiganta/APEX.git` — neither the remote nor the
+default branch was modified.
+
+**Action pins are real, verified commit SHAs, not fabricated.** Every
+`uses:` line in both workflow files pins to a full 40-character commit
+SHA resolved via a live query against the real GitHub API
+(`https://api.github.com/repos/<owner>/<repo>/git/refs/tags/<tag>`) for
+each action's current stable release tag at the time this phase was
+written, with the corresponding version documented in an inline comment:
+`actions/checkout` (v7.0.0), `actions/setup-python` (v6.3.0),
+`astral-sh/setup-uv` (v8.3.2 — whose own release notes reference the
+exact `0.11.28` uv version this project already pins elsewhere),
+`docker/setup-buildx-action` (v4.2.0), `docker/login-action` (v4.4.0),
+`docker/metadata-action` (v6.2.0), `docker/build-push-action` (v7.3.0).
+No SHA in either file was guessed or invented — an unverifiable/fabricated
+SHA would either fail immediately (safe) or, far worse, silently resolve
+to an unintended commit (a real supply-chain risk); querying the real API
+was the only acceptable way to satisfy the task brief's explicit
+preference for full-SHA pinning.
+
+**`ci.yml`** — three jobs: `validate` (checkout → Python 3.11 → uv 0.11.28
+→ `uv lock --check` → `uv sync --frozen --all-groups` → `uv run pytest -q`
+→ `uv run ruff check .` → `uv run mypy`), `compose-validate` (renders both
+`docker compose config` and the HTB-profile override render, both
+redirected to a temp file rather than printed, then explicitly asserts
+`/dev/net/tun` and the placeholder `.ovpn` path do not exist afterward —
+positive proof, not just omission, that nothing VPN-related started),
+and `build-images` (matrix over the three Dockerfiles, `push: false`,
+GHA cache scoped per image, `needs: [validate, compose-validate]`).
+Workflow-level `permissions: contents: read` only — no job overrides it
+upward, and `docker/login-action` does not appear anywhere in this file.
+Triggers: `pull_request`, `push: branches: [main]`, `workflow_dispatch`.
+Concurrency group keyed by PR number or ref, `cancel-in-progress: true`.
+
+**`docker-publish.yml`** — two jobs: `validate` (a full, independent copy
+of the same Python + Compose validation — does not assume `ci.yml` already
+ran for this commit, since a `workflow_dispatch` or tag push may have no
+associated `ci.yml` run at all; narrowed to `permissions: contents: read`
+at the job level even though the workflow grants `packages: write`
+overall) and `build-and-push` (`needs: [validate]` — publishing is
+structurally impossible without validation passing first, not merely
+relying on branch protection). `build-and-push` computes a lowercased
+GHCR owner via bash's `${OWNER,,}` parameter expansion (no `eval`, no
+unsafe interpolation — routed through `env:` per GitHub's own
+script-injection-avoidance guidance) since the real repository owner
+login (`RownakDiganta`) is mixed-case and GHCR requires lowercase image
+names; logs in via `docker/login-action` using `secrets.GITHUB_TOKEN`
+only (no manually created PAT anywhere); uses `docker/metadata-action`
+for tags (`latest` gated on `{{is_default_branch}}` — never reassigned by
+a tag push, deliberately, since a maintainer may tag a historical release
+after `main` has moved on; unconditional `type=sha`; `type=semver`
+patterns for `{{version}}`, `v{{version}}`, `{{major}}.{{minor}}`,
+`{{major}}`) and OCI labels (`org.opencontainers.image.title`/
+`.description` explicitly overridden per matrix entry; `.source`/
+`.revision`/`.created`/`.version` populated automatically by the action
+from real repository/workflow metadata — no invented version anywhere);
+builds with `provenance: true`/`sbom: true` (pushed-image-only — `ci.yml`
+never enables either, since there is nothing to attach an attestation to
+when `push: false`). Triggers: `push: branches: [main]` + `tags: ["v*"]`,
+`workflow_dispatch` — never `pull_request`/`pull_request_target`.
+Concurrency group keyed by `github.ref`, `cancel-in-progress: false` (a
+publish must run to completion, never be interrupted mid-manifest-upload
+by an unrelated run) — a deliberately separate group namespace from
+`ci.yml`'s own.
+
+**GHCR image names:** `ghcr.io/<repository_owner, lowercased>/apex`,
+`.../apex-kali`, `.../apex-vpn` — owner derived from
+`github.repository_owner` at run time, never hardcoded.
+
+**Reproducibility caveat documented, not glossed over:** neither
+`provenance`/`sbom` attestation claims the Kali image's `apt-get install`
+step is fully reproducible beyond the pinned base digest and committed
+Dockerfile instructions — Kali rolling has no dated package-snapshot
+repository, so exact package versions can still differ between builds on
+different days (pre-existing, already-documented limitation, restated
+accurately in `docs/github-actions.md` §19 rather than overclaimed).
+
+**Tests (78 new, `tests/github_actions/test_workflows.py`):** existence
+(including the vendored-vs-project workflow distinction), triggers
+(including the `on:`-parses-as-`True` PyYAML/YAML-1.1 gotcha, handled via
+a dedicated `_triggers()` helper that tries both `"on"` and `True` as the
+top-level key), permissions (workflow- and job-level, including the
+`docker-publish.yml` `validate` job's own narrowing), Python validation
+(3.11, official `setup-uv`, all five required commands, and an explicit
+regression guard against the documented `mypy .` footgun), Compose
+validation (both renders, no `up` command anywhere, no `/dev/net/tun`
+outside the one intentional non-existence assertion, no target IP, no
+live-mode flag), image matrix (exactly three entries in both files,
+correct Dockerfile per image, correct build context), publishing (GHCR,
+`GITHUB_TOKEN`-only secret usage, `docker/login-action` confined to the
+publish workflow, metadata-action, buildx, PR `push: false`, the
+`needs: [validate]` dependency, `latest` gated correctly, SHA/semver tags
+present), cache (GHA cache enabled, scope uniquely parameterized by
+`matrix.image` in both files), and secret safety (no API-key-shaped
+literal, no realistic token value, no `.env`/`.ovpn` upload or content,
+no generic credential pattern, no HTB target IP, no live APEX execution
+flag, no `privileged: true`, no Docker-socket mount, and — the most
+load-bearing single test — a whole-file scan proving the only
+`secrets.*` context reference anywhere in either workflow is
+`GITHUB_TOKEN`). Two tests initially false-positived on this file's own
+explanatory prose (`pull_request_target`/`packages: write` mentioned in
+comments describing what is forbidden) — fixed with a `_non_comment_text()`
+helper that strips full-line `#` comments before the negative-assertion
+scan, the same pattern already established in `tests/docker/test_compose.py`.
+
+**Total test count after Infra Phase 11:** 3573 passed (up from 3495 at
+the end of the prior session's Phase 10 debugging turn — 78 new workflow
+tests), `ruff check .` clean, `mypy` clean across 143 source files
+(workflow YAML files are not part of the mypy-scoped file set and were
+never expected to be).
+
+**Local validation performed (all commands the workflows themselves
+run, reproduced directly):** `uv lock --check`, `uv sync --all-groups`,
+full `uv run pytest -q`, `uv run ruff check .`, `uv run mypy`, default
+`docker compose config` with a disposable token, the HTB-profile
+`docker compose -f compose.yaml -f compose.htb.yaml --profile htb config`
+render with the placeholder `.ovpn` path (never a real one), and a fresh
+`docker build` of all three images (`docker/apex/Dockerfile`,
+`docker/kali/Dockerfile`, `docker/vpn/Dockerfile`) tagged
+`*:phase11-ci`. `actionlint` was checked for (`command -v actionlint`)
+and was not installed — per this phase's own instruction, no unverified
+binary was installed to obtain it; GitHub-hosted execution remains the
+final workflow-syntax validation step, explicitly stated as such rather
+than assumed passed.
+
+**Deferred / explicitly not performed in this phase (structurally
+impossible without violating "do not commit or push"):** no branch was
+created, nothing was committed or pushed, so the workflows have **not**
+run on GitHub — no CI run, no publish run, no GHCR package of any kind
+exists yet, and package visibility has not been checked. `docs/github-actions.md`
+§27 lists the exact remaining steps. No APEX exploitation behavior was
+debugged, no Cap/Meow workflow was modified, no target-specific
+exploitation logic was added, and no live HTB engagement was run —
+entirely out of scope for this phase and untouched.
