@@ -457,3 +457,38 @@ def workflow_recommendation_id(workflow_node_id: str) -> str:
     'workflow_recommendation:workflow:10.10.10.14:credential_to_privesc'
     """
     return f"workflow_recommendation:{workflow_node_id}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — adaptive learning, reflection & experience replay node IDs
+#
+# No new edge-ID builders were needed for Phase 16 either: ``indicates_edge_id``
+# (host → experience, experience → workflow) and ``recommends_edge_id``
+# (experience → experience_recommendation) were already generic enough to
+# reuse — the same "don't fragment the graph" discipline Phase 14/15 applied.
+# See docs/experience-replay.md.
+# ---------------------------------------------------------------------------
+
+def experience_id(target: str, category: str, discriminator: str) -> str:
+    """Canonical ID for an experience node (Phase 16).
+
+    Content-addressed on ``target``+``category``+``discriminator`` only
+    (never on occurrence_count/confidence) — re-deriving the same
+    experience across engagements always upserts the same node, with
+    ``occurrence_count`` incremented rather than a new node created. This
+    is the entire mechanism behind "experience replay": a stable ID, not a
+    remembered Python object.
+
+    >>> experience_id("10.10.10.14", "repeated_planner_mistake", "nmap:recon")
+    'experience:10.10.10.14:repeated_planner_mistake:nmap-recon'
+    """
+    return f"experience:{target}:{category}:{_slug(discriminator)}"
+
+
+def experience_recommendation_id(experience_node_id: str) -> str:
+    """Canonical ID for an experience_recommendation node — one per experience (1:1).
+
+    >>> experience_recommendation_id("experience:10.10.10.14:successful_workflow:credential_to_privesc")
+    'experience_recommendation:experience:10.10.10.14:successful_workflow:credential_to_privesc'
+    """
+    return f"experience_recommendation:{experience_node_id}"

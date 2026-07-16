@@ -216,6 +216,7 @@ class ApexRuntime:
             "enumeration_complete": False,
             "web_session_state": {},
             "workflow_summary": {},
+            "learning_summary": {},
         }
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": run_id},
@@ -260,6 +261,54 @@ class ApexRuntime:
             logger.info("reflector.run_once() completed after engagement")
         except Exception as exc:
             logger.warning("reflector.run_once() failed (non-fatal): %s", exc)
+
+        # Phase 16 — deterministic adaptive-learning reflection pass. Runs
+        # EXACTLY ONCE per engagement, after the graph completes and after
+        # memfabric's own Reflector pass above (mirrors that timing, not the
+        # per-turn refresh pattern used by `workflow_summary`/
+        # `web_session_state`). Reads the final EKG, derives/updates
+        # `experience` + `experience_recommendation` nodes via the pure,
+        # standalone `apex_host.planners.experience_replay` module (never
+        # imported by any planner — CLAUDE.md "no automatic planner
+        # override" invariant for this phase), and writes them back through
+        # `MemoryAPI.apply_deltas` (memfabric Invariant 1, transactional).
+        # Wrapped in its own try/except so a failure here never masks the
+        # engagement's own result — graceful degradation, same as the
+        # Reflector pass above.
+        try:
+            from apex_host.graph_ids import host_id
+            from apex_host.planners.experience_replay import (
+                build_experience_graph_deltas,
+                derive_experiences_from_engagement,
+                experiences_from_subgraph,
+                reflection_summary,
+            )
+
+            subgraph = await self.api.get_subgraph(host_id(self.config.target), depth=2)
+            experiences_before = experiences_from_subgraph(subgraph)
+            experiences_after = derive_experiences_from_engagement(
+                self.config.target, subgraph, dict(final_state)
+            )
+            known_node_ids = {node.id for node in subgraph.nodes}
+            nodes, edges = build_experience_graph_deltas(
+                self.config.target, experiences_after, known_node_ids=known_node_ids
+            )
+            if nodes or edges:
+                await self.api.apply_deltas(nodes=nodes, edges=edges)
+            summary = reflection_summary(self.config.target, experiences_before, experiences_after)
+            final_state["learning_summary"] = {
+                "experiences_created": summary.experiences_created,
+                "experiences_reused": summary.experiences_reused,
+                "replay_hits": summary.replay_hits,
+                "repeated_failures": summary.repeated_failures,
+                "improved_recommendations": list(summary.improved_recommendations),
+            }
+            logger.info(
+                "experience_replay reflection pass completed: created=%d reused=%d replay_hits=%d",
+                summary.experiences_created, summary.experiences_reused, summary.replay_hits,
+            )
+        except Exception as exc:
+            logger.warning("experience_replay reflection pass failed (non-fatal): %s", exc)
 
         return final_state
 
