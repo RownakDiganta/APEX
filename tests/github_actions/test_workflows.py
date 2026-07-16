@@ -319,9 +319,26 @@ class TestComposeValidation:
             assert not re.search(r"docker compose[^\n]*\bup\b", text)
             assert "--profile htb up" not in text
 
-    def test_no_dev_net_tun_referenced(self) -> None:
+    def test_no_dev_net_tun_existence_assertion(self) -> None:
+        """`/dev/net/tun`'s mere existence proves nothing and must never
+        be asserted here — GitHub-hosted Ubuntu runners commonly already
+        have this device node present by default, entirely independent
+        of whether any container has ever requested it. An earlier
+        version of this workflow asserted `test ! -e /dev/net/tun` and
+        failed on a real GitHub-hosted run for exactly this reason (a
+        false assumption about runner state, not a real VPN-start bug)."""
         for text in (_ci_text, _publish_text):
-            assert "/dev/net/tun" not in text or "test ! -e /dev/net/tun" in text
+            assert "test ! -e /dev/net/tun" not in text
+
+    def test_no_openvpn_process_or_tun0_interface_or_running_container(self) -> None:
+        """The correct, equally strong invariants that actually prove the
+        VPN was never started: no `openvpn` process running, no `tun0`
+        network interface created, and no container running at all
+        (`docker compose config` only ever renders YAML)."""
+        text = _all_run_commands(_ci)
+        assert "pgrep -x openvpn" in text
+        assert "ip link show tun0" in text
+        assert "docker ps -q" in text
 
     def test_htb_ovpn_path_is_a_placeholder_never_a_real_secrets_path(self) -> None:
         for text in (_ci_text, _publish_text):

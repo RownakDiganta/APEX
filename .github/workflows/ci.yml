@@ -120,9 +120,33 @@ jobs:
 
       - name: Confirm no VPN-relevant runtime state was created
         run: |
-          test ! -e /dev/net/tun
+          # NOTE: /dev/net/tun's mere existence proves nothing and must
+          # never be asserted here — GitHub-hosted Ubuntu runners commonly
+          # already have this device node present by default, entirely
+          # independent of whether any container has ever requested it.
+          # An earlier version of this check asserted `test ! -e
+          # /dev/net/tun` and failed on a real GitHub-hosted run for
+          # exactly this reason (a false assumption, not a real problem —
+          # see docs/github-actions.md). The correct, equally strong
+          # invariants that actually prove the VPN was never started:
+          #   1. no `openvpn` process is running;
+          #   2. no `tun0` network interface has been created;
+          #   3. no container is running at all (`docker compose config`
+          #      only ever renders YAML — it never starts anything).
+          if pgrep -x openvpn >/dev/null 2>&1; then
+            echo "FAIL: an openvpn process is running" >&2
+            exit 1
+          fi
+          if ip link show tun0 >/dev/null 2>&1; then
+            echo "FAIL: a tun0 network interface exists" >&2
+            exit 1
+          fi
+          if [ -n "$(docker ps -q)" ]; then
+            echo "FAIL: a container is running — config rendering must never start one" >&2
+            exit 1
+          fi
           test ! -e ./secrets/ci-placeholder.ovpn
-          echo "OK: no VPN device or profile file exists after config rendering"
+          echo "OK: no openvpn process, no tun0 interface, no running container, no profile file"
 
   # ---------------------------------------------------------------------
   # Build all three project images WITHOUT pushing anywhere. No GHCR
