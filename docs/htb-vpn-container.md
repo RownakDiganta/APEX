@@ -234,11 +234,29 @@ OpenVPN process existence alone is **not** treated as readiness.
 `docker/vpn/tunnel_status.py::check_tunnel_status(route_cidr)`, which:
 
 1. Runs `ip -o link show` and looks for an interface whose name starts
-   with `tun`/`tap`/`ppp` **and** whose state is `UP` — the literal name
+   with `tun`/`tap`/`ppp` **and** whose administrative flags bracket
+   contains `UP` (e.g. `<POINTOPOINT,...,UP,LOWER_UP>`) — the literal name
    `tun0` is never assumed (a profile can specify `dev tap0` or a
    non-zero unit number).
 2. Runs `ip route show` and checks whether any route's destination
    network is the configured CIDR (or a subnet of it).
+
+   > **Correction (Infra Phase 10 bug fix, 2026-07-16):** the initial
+   > implementation checked the trailing `state <X>` token instead of the
+   > flags-bracket `UP` flag, and required it to equal exactly `UP`. Real
+   > OpenVPN `tun` interfaces almost always report `state UNKNOWN` — Linux
+   > has no carrier-detection mechanism for NOARP point-to-point devices,
+   > so the kernel's operstate for `tun`/`tap` is unreliable regardless of
+   > whether the interface is actually up and passing traffic. That
+   > version reported every genuinely-ready tunnel as `degraded`. Fixed by
+   > reading the *administrative* `UP` flag from the interface's flags
+   > bracket instead — this is always set once OpenVPN brings the
+   > interface up, and is not subject to the same ambiguity. See
+   > `docker/vpn/tunnel_status.py::find_tunnel_interface`'s own docstring
+   > for the full kernel-behavior explanation, and
+   > `tests/docker/test_vpn_scripts.py::TestFindTunnelInterface::test_real_world_tun0_with_operstate_unknown_is_still_found`
+   > / `TestCheckTunnelStatus::test_ready_with_real_world_operstate_unknown_tunnel`
+   > for the regression tests.
 
 Both are read-only inspection commands (`show`, never `add`/`del`) — no
 route is created, modified, or removed by this check, and no packet is
@@ -350,6 +368,70 @@ apex_host.eval.vpn_route_check --vpn-service-url http://vpn:8090 --target
 (`tests/apex_host/test_vpn_preflight.py::test_never_calls_route_check_endpoint`
 proves `run_vpn_checks` never hits `/route-check`) and never run against a
 real target automatically anywhere in this codebase.
+
+### 15.1 Combined route + connect diagnostic (`GET /diagnose`)
+
+A route that resolves correctly in the routing table can still fail to
+connect — this was observed and diagnosed during this project's own
+manual HTB validation: `ip route get` reported a valid route via `tun0`,
+but a real TCP connection attempt returned a **delayed** `EHOSTUNREACH`
+("No route to host") after several seconds, consistent with an ICMP
+Destination/Host Unreachable received back from somewhere in the network
+path — something a routing-table lookup alone can never detect, since it
+never sends a packet or waits for a network response.
+
+`GET /diagnose?target=<ip>&port=<port>` performs both checks in one call:
+the same no-packet route lookup, **plus** exactly one bounded, real TCP
+connect attempt (`docker/vpn/connect_check.py`), so the two results can be
+compared directly:
+
+```bash
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
+  exec apex python -m apex_host.eval.vpn_route_check \
+  --vpn-service-url http://vpn:8090 --target 10.129.156.9 --port 23
+```
+
+```text
+-- route lookup (no packet sent) --
+target:          10.129.156.9
+lookup ok:       True
+would use route: True
+device:          tun0
+gateway:         10.10.14.1
+
+-- TCP connect attempt (one bounded attempt) --
+outcome:         unreachable
+ok:              False
+errno:           113 (EHOSTUNREACH)
+elapsed:         3.34s
+detail:          [Errno 113] No route to host
+
+Note: 'unreachable' means an ICMP/kernel-level unreachable was encountered
+(this can happen even when the route lookup above succeeds — a route
+resolving in the table does not guarantee the destination is actually
+reachable); 'timeout' means no response at all came back (the same
+outcome a port scanner reports as 'filtered'); 'refused' means the host
+responded but the port is closed.
+```
+
+**Outcome vocabulary** (`connect.outcome`), each backed by the raw socket
+`errno` where one exists:
+
+| `outcome` | Meaning |
+|---|---|
+| `connected` | TCP handshake completed — port open and reachable |
+| `refused` | `ECONNREFUSED` — the host responded, but the port is closed |
+| `unreachable` | `EHOSTUNREACH`/`ENETUNREACH` — an ICMP unreachable was received, or the destination cannot actually be reached, despite what the routing table alone shows |
+| `timeout` | No response at all within the bound — equivalent to what `nmap -sT` reports as **filtered** |
+| `invalid_target` / `invalid_port` | Input validation failed before any network activity |
+
+Never sends more than one SYN, never scans a range, never retries —
+exactly one bounded attempt per call, matching the same "single probe"
+discipline as `nc -zv`. Unauthenticated, like `/health`/`/route-check` (no
+secret exposed by any of these three fields). Never called by any
+automatic preflight path — manual/operator-invoked only, via `--port` on
+`apex_host/eval/vpn_route_check.py` or a direct `curl`/`GET /diagnose`
+call.
 
 ---
 

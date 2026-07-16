@@ -32,9 +32,14 @@ from dataclasses import dataclass
 _IP_COMMAND_TIMEOUT_SECONDS = 5.0
 _TUNNEL_PREFIXES = ("tun", "tap", "ppp")
 
-# Matches an interface name at the start of an `ip -o link show` line, e.g.
-# "3: tun0: <POINTOPOINT,..." — group(1) is the interface name.
-_LINK_NAME_RE = re.compile(r"^\d+:\s+([^:@]+)[:@].*state\s+(\S+)", re.MULTILINE)
+# Matches an interface name and its flags bracket at the start of an
+# `ip -o link show` line, e.g. "3: tun0: <POINTOPOINT,...,UP,LOWER_UP> mtu
+# 1500 ... state UNKNOWN ..." — group(1) is the interface name, group(2)
+# is the comma-separated flags list. Readiness is determined from the
+# flags bracket (administrative up/down), NOT from the trailing "state"
+# token — see find_tunnel_interface()'s own docstring for why the trailing
+# state token is unreliable for tun/tap devices specifically.
+_LINK_LINE_RE = re.compile(r"^\d+:\s+([^:@]+)[:@]\s*<([^>]*)>", re.MULTILINE)
 
 
 class CidrValidationError(ValueError):
@@ -101,10 +106,36 @@ def _run_ip(*args: str) -> tuple[bool, str]:
 def find_tunnel_interface(link_show_output: str) -> str | None:
     """Parse ``ip -o link show`` output and return the first UP interface
     whose name starts with a tunnel-shaped prefix (``tun``/``tap``/``ppp``),
-    or ``None`` if none is found. Pure function — no subprocess call."""
-    for match in _LINK_NAME_RE.finditer(link_show_output):
-        name, state = match.group(1), match.group(2)
-        if name.startswith(_TUNNEL_PREFIXES) and state == "UP":
+    or ``None`` if none is found. Pure function — no subprocess call.
+
+    Readiness is determined from the **administrative** ``UP`` flag inside
+    the interface's flags bracket (``<POINTOPOINT,...,UP,LOWER_UP>``), not
+    from the trailing ``state <X>`` token that follows the flags bracket
+    in ``ip -o link show`` output. This distinction is load-bearing: Linux
+    reports the *operational* state (``state``) as ``UNKNOWN`` for NOARP
+    point-to-point interfaces — which includes essentially every ``tun``
+    device — even when the interface is fully configured and passing
+    traffic, because the kernel has no carrier-detection mechanism for a
+    software point-to-point link (see the kernel's own
+    ``Documentation/networking/operstates.rst``: "UNKNOWN: cannot conclude
+    anything, no operations have been carried out to determine actual
+    state"). A real, working OpenVPN ``tun0`` therefore commonly logs as:
+
+        3: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1500 ... state UNKNOWN ...
+
+    An earlier version of this function required ``state == "UP"``
+    exactly, which never matches this real-world output and caused every
+    genuinely-ready tunnel to be reported as not-ready (see the Infra
+    Phase 10 bug report this fix resolves). The administrative ``UP`` flag
+    in the brackets is always set once OpenVPN brings the interface up
+    (``ip link set tun0 up``, which OpenVPN performs unconditionally on a
+    successful connection) and is not subject to the same operstate
+    ambiguity.
+    """
+    for match in _LINK_LINE_RE.finditer(link_show_output):
+        name, flags_str = match.group(1), match.group(2)
+        flags = {f.strip() for f in flags_str.split(",")}
+        if name.startswith(_TUNNEL_PREFIXES) and "UP" in flags:
             return name
     return None
 
