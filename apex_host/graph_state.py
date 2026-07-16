@@ -103,6 +103,47 @@ class ApexGraphState(TypedDict):
     # counts per protocol across the whole run without re-querying the
     # episodic store. See docs/credential-validation.md "Reporting".
     credential_validation_log: Annotated[list[dict[str, Any]], operator.add]
+    # Phase 12C — canonical engagement outcome (apex_host.orchestration.outcome
+    # .EngagementOutcome value; "" until the terminating turn). Overwrite,
+    # not accumulated: set exactly once, on the single turn that terminates
+    # the engagement, either by an upstream node (planner_failure/
+    # parser_failure/memory_failure/unknown_phase) or by reflect_or_continue
+    # itself (validated_access/goal_completed/max_turns_exhausted/
+    # phase_budget_exhausted/no_actionable_task/duplicate_task_stall/
+    # policy_blocked). See docs/engagement-outcomes.md.
+    outcome: str
+    # Human-readable reason paired with `outcome` — "" until termination.
+    termination_reason: str
+    # The phase active at the moment termination was decided (captured
+    # before `phase` itself is overwritten to "done") — "" until termination.
+    termination_phase: str
+    # Set only when `outcome` is one of the three stall-derived values
+    # (duplicate_task_stall / no_actionable_task / policy_blocked); mirrors
+    # `termination_reason` for that case specifically so report consumers
+    # can distinguish "stalled" terminations without string-matching
+    # `outcome`. "" otherwise.
+    stall_reason: str
+    # Phase 13 — privilege-escalation planning summary. Refreshed every
+    # priv_esc_agent turn from a fresh EKG read (apex_host.orchestration
+    # .dispatch_node.make_priv_esc_node); every other node simply omits
+    # these keys, so LangGraph's partial-update semantics preserve the last
+    # known snapshot across non-priv_esc turns and after termination. This
+    # is a derived VIEW over priv_esc_opportunity EKG nodes — never a
+    # second, independent store of opportunity data (memfabric Invariant 1).
+    # privilege_state: a PrivilegeEnumerationStatus value ("" before the
+    # first priv_esc turn).
+    privilege_state: str
+    # privilege_summary: {opportunity_count, categories (dict[str,int]),
+    # attempted_count, exhausted_count, remaining_count}.
+    privilege_summary: dict[str, Any]
+    # opportunity_ids / attempted_opportunities: EKG node IDs of every
+    # recorded priv_esc_opportunity / the subset already attempted.
+    opportunity_ids: list[str]
+    attempted_opportunities: list[str]
+    # enumeration_complete: True once PrivilegeEnumerationStatus is
+    # `exhausted` (see apex_host.planners.priv_esc_opportunities
+    # .build_privilege_escalation_state).
+    enumeration_complete: bool
 
 
 CompiledApexGraph = Any

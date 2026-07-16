@@ -47,6 +47,8 @@ from apex_host.planning.fingerprint import task_fingerprint
 if TYPE_CHECKING:
     from apex_host.agents.browser_executor import BrowserExecutor
     from apex_host.agents.ftp_executor import FTPExecutor
+    from apex_host.agents.priv_esc_analysis_executor import PrivEscAnalysisExecutor
+    from apex_host.agents.priv_esc_enum_executor import PrivEscEnumExecutor
     from apex_host.agents.ssh_executor import SSHExecutor
     from apex_host.agents.telnet_executor import TelnetExecutor
     from apex_host.config import ApexConfig
@@ -178,6 +180,8 @@ class TaskDispatcher:
         browser_executor: "BrowserExecutor | None" = None,
         ssh_executor: "SSHExecutor | None" = None,
         ftp_executor: "FTPExecutor | None" = None,
+        priv_esc_analysis_executor: "PrivEscAnalysisExecutor | None" = None,
+        priv_esc_enum_executor: "PrivEscEnumExecutor | None" = None,
     ) -> None:
         self._advisor = advisor
         self._registry = task_registry
@@ -187,6 +191,8 @@ class TaskDispatcher:
         self._browser_executor = browser_executor
         self._ssh_executor = ssh_executor
         self._ftp_executor = ftp_executor
+        self._priv_esc_analysis_executor = priv_esc_analysis_executor
+        self._priv_esc_enum_executor = priv_esc_enum_executor
 
     async def dispatch(
         self,
@@ -372,6 +378,10 @@ class TaskDispatcher:
                 tr_dict, disposition = await self._run_ssh(task, context, args, target, parser, phase)
             elif tool == "ftp_access":
                 tr_dict, disposition = await self._run_ftp(task, context, args, target, parser, phase)
+            elif tool == "priv_esc_analyze":
+                tr_dict, disposition = await self._run_priv_esc_analysis(task, context, args, target, parser, phase)
+            elif tool == "priv_esc_enum":
+                tr_dict, disposition = await self._run_priv_esc_enum(task, context, args, target, parser, phase)
             else:
                 tr_dict, disposition = await self._run_command(task, context, args, target, parser, phase)
         except asyncio.CancelledError:
@@ -586,6 +596,96 @@ class TaskDispatcher:
 
         result = await self._ftp_executor.run(task, context.evidence)
         return _credential_result_to_tr(task, result, "ftp_access", target, parser, phase)
+
+    async def _run_priv_esc_analysis(
+        self,
+        task: TaskSpec,
+        context: ExecutionContext,
+        args: list[str],
+        target: str,
+        parser: str,
+        phase: str,
+    ) -> tuple[dict[str, Any], ExecutionDisposition]:
+        """Run a priv_esc_analyze task via PrivEscAnalysisExecutor.
+
+        Zero network, zero subprocess — see
+        ``apex_host/agents/priv_esc_analysis_executor.py``. Always
+        EXECUTED_SUCCESS on completion (there is no failure mode: the
+        executor only echoes already-computed fields; a missing/unconfigured
+        executor is the only failure path, mirrored on the other
+        specialised executors above).
+        """
+        if self._priv_esc_analysis_executor is None:
+            tr: dict[str, Any] = {
+                "task_id": task.id, "tool": "priv_esc_analyze", "args": args,
+                "target": target, "parser": parser, "stdout": "",
+                "stderr": "", "returncode": 1, "dry_run": context.dry_run,
+                "error": "priv_esc analysis executor not configured", "phase": phase,
+            }
+            return tr, ExecutionDisposition.TOOL_UNAVAILABLE
+
+        result = await self._priv_esc_analysis_executor.run(task, context.evidence)
+        ep_data = result.episode.data
+        tr = {
+            "task_id": task.id, "tool": "priv_esc_analyze", "args": args,
+            "target": target, "parser": parser, "stdout": "",
+            "stderr": "", "returncode": 0, "dry_run": False,
+            "error": None, "phase": phase,
+            "category": str(ep_data.get("category", "")),
+            "confidence": str(ep_data.get("confidence", "")),
+            "description": str(ep_data.get("description", "")),
+            "recommended_next_action": str(ep_data.get("recommended_next_action", "")),
+            "discriminator": str(ep_data.get("discriminator", "")),
+            "evidence_source": str(ep_data.get("evidence_source", "")),
+            "evidence_excerpt": str(ep_data.get("evidence_excerpt", "")),
+            "source_node_id": str(ep_data.get("source_node_id", "")),
+        }
+        return tr, ExecutionDisposition.EXECUTED_SUCCESS
+
+    async def _run_priv_esc_enum(
+        self,
+        task: TaskSpec,
+        context: ExecutionContext,
+        args: list[str],
+        target: str,
+        parser: str,
+        phase: str,
+    ) -> tuple[dict[str, Any], ExecutionDisposition]:
+        """Run a priv_esc_enum task via PrivEscEnumExecutor (Phase 13B).
+
+        A bounded, read-only enumeration command over an already-validated
+        SSH session — see ``apex_host/agents/priv_esc_enum_executor.py``.
+        Never includes the password anywhere in the returned dict.
+        """
+        if self._priv_esc_enum_executor is None:
+            tr: dict[str, Any] = {
+                "task_id": task.id, "tool": "priv_esc_enum", "args": args,
+                "target": target, "parser": parser, "stdout": "",
+                "stderr": "", "returncode": 1, "dry_run": context.dry_run,
+                "error": "priv_esc enumeration executor not configured", "phase": phase,
+            }
+            return tr, ExecutionDisposition.TOOL_UNAVAILABLE
+
+        result = await self._priv_esc_enum_executor.run(task, context.evidence)
+        ep_data = result.episode.data
+        success = bool(ep_data.get("success", False))
+        tr = {
+            "task_id": task.id, "tool": "priv_esc_enum", "args": args,
+            "target": target, "parser": parser,
+            "stdout": str(ep_data.get("stdout", "")), "stderr": "",
+            "returncode": 0 if success else 1,
+            "dry_run": bool(ep_data.get("dry_run", False)),
+            "error": ep_data.get("error"), "phase": phase,
+            "port": str(ep_data.get("port", "")),
+            "command_key": str(ep_data.get("command_key", "")),
+            "source_command": str(ep_data.get("source_command", "")),
+            "category": str(ep_data.get("category", "")),
+        }
+        disposition = (
+            ExecutionDisposition.EXECUTED_SUCCESS if success
+            else ExecutionDisposition.EXECUTED_FAILURE
+        )
+        return tr, disposition
 
     async def _run_browser(
         self,

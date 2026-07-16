@@ -254,7 +254,12 @@ class TestBugBAuthFlowIsNotAccessState:
 
         final_state = await graph.ainvoke(make_initial_state(_TARGET))
 
-        assert final_state["phase"] == "credential"
+        # Phase 12C: `phase` always becomes "done" once terminated (here,
+        # via max_turns_exhausted since no access_state was ever produced);
+        # `termination_phase` records the phase actually dispatched.
+        assert final_state["phase"] == "done"
+        assert final_state["termination_phase"] == "credential"
+        assert final_state["outcome"] == "max_turns_exhausted"
         current_task = final_state["current_task"]
         assert current_task is not None, "CredentialPlanner must have dispatched a task"
         assert current_task["params"]["tool"] == "curl"
@@ -295,7 +300,13 @@ class TestAccessStateAdvancesPastCredential:
 
         final_state = await graph.ainvoke(make_initial_state(_TARGET))
 
-        assert final_state["phase"] == "priv_esc"
+        # Phase 12C: `phase` always becomes "done" once terminated;
+        # `termination_phase` records the phase actually dispatched
+        # (priv_esc, since access_state was already present when
+        # global_plan ran this turn) and `outcome` is validated_access.
+        assert final_state["phase"] == "done"
+        assert final_state["termination_phase"] == "priv_esc"
+        assert final_state["outcome"] == "validated_access"
         assert final_state["completed"] is True
 
 
@@ -332,6 +343,7 @@ class TestBugEUnknownPhaseHandling:
         from apex_host.execution.dispatcher import TaskDispatcher
         from apex_host.execution.registry import TaskRegistry
         from apex_host.orchestration.dependencies import OrchestrationDeps
+        from apex_host.orchestration.stall import StallTracker
         from apex_host.policy import PolicyAdvisor, load_policy
 
         api = make_api()
@@ -345,7 +357,7 @@ class TestBugEUnknownPhaseHandling:
             api=api, dispatcher=dispatcher,
             global_planner=GlobalPlanner(max_turns=config.max_turns),
             phase_planners={}, repair_engine=None,  # type: ignore[arg-type]
-            config=config, anchor_id=_ANCHOR,
+            config=config, anchor_id=_ANCHOR, stall_tracker=StallTracker(),
         )
         node = make_unknown_phase_node(deps)
 
@@ -363,6 +375,10 @@ class TestBugEUnknownPhaseHandling:
         assert event["phase"] == "lateral"
         assert event["turn_count"] == 3
         assert "lateral" in event["reason"]
+        # Phase 12C: canonical outcome fields threaded through too.
+        assert result["outcome"] == "unknown_phase"
+        assert result["termination_phase"] == "lateral"
+        assert "lateral" in result["termination_reason"]
 
         # An actual Episode must have been appended — not just an in-memory dict.
         subgraph_evidence = await api.query(text="unknown_phase_diagnostic", k=5)
@@ -461,18 +477,26 @@ class TestFullRegressionCredentialToPrivEscToCompletion:
             f"priv_esc should be reached on the second dispatched turn "
             f"(right after credential's 1-turn budget); sequence was {phase_sequence}"
         )
-        # And once reached, credential must never be dispatched again —
-        # PrivEscPlanner has no organic exit condition of its own (that is
-        # explicitly out of scope for this phase; see the diagnostic
-        # report's Divergence D / Phase R4), so the engagement legitimately
-        # keeps dispatching priv_esc_agent every remaining turn until the
-        # global max_turns ceiling — not credential again.
+        # And once reached, credential must never be dispatched again.
         assert ApexPhase.credential.value not in phase_sequence[first_priv_esc + 1:], (
             f"credential re-dispatched after priv_esc — oscillation regression: {phase_sequence}"
         )
         assert all(p == ApexPhase.priv_esc.value for p in phase_sequence[first_priv_esc:]), (
             f"expected only priv_esc dispatches after it is first reached: {phase_sequence}"
         )
-        assert final_state["turn_count"] == config.max_turns
+        # Phase 12C fix: PrivEscPlanner has no organic exit condition of its
+        # own, and priv_esc's own turn budget (default 4) would eventually
+        # bound it via phase_budget_exhausted — but the stall detector
+        # (also Phase 12C) is strictly more responsive here: credential's
+        # AbandonSignal (turn 1) and priv_esc's AbandonSignal (turns 2-3,
+        # no searchsploit configured) are three *consecutive* no-action
+        # turns regardless of which phase they nominally belong to, so
+        # no_actionable_task fires at turn 3 — well before either
+        # priv_esc's own budget or the global max_turns=8 ceiling would
+        # have. Either mechanism alone would have prevented the old
+        # infinite oscillation; this proves the faster one wins.
+        assert final_state["turn_count"] == 3
+        assert final_state["turn_count"] < config.max_turns
         assert final_state["completed"] is True
-        assert final_state["completed"] is True
+        assert final_state["outcome"] == "no_actionable_task"
+        assert final_state["stall_reason"]

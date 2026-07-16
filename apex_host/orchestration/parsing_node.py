@@ -7,9 +7,17 @@
 ``graph.py`` so it can be shared with ``repair_node`` and tested in isolation.
 ``findings_from_parsed`` converts node deltas to the finding records stored
 in ``state["findings"]``.
+
+Phase 12C: an exception from ``parse_single_result`` or
+``MemoryAPI.apply_deltas`` is caught in ``parse_observation`` and converted
+into an ``EngagementOutcome.parser_failure``/``memory_failure``
+upstream-preset outcome — see ``apex_host.orchestration.outcome`` module
+docstring, precedence level 2 — rather than propagating and crashing
+``graph.ainvoke()``.
 """
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from memfabric.types import ParsedObservation, RawObservation
@@ -21,11 +29,15 @@ from apex_host.parsers.command_parser import CommandParser
 from apex_host.parsers.ffuf_parser import FfufParser
 from apex_host.parsers.gobuster_parser import GobusterParser
 from apex_host.graph_state import ApexGraphState
+from apex_host.orchestration.outcome import EngagementOutcome
 from apex_host.parsers.nmap_parser import NmapParser
+from apex_host.parsers.priv_esc_parser import PrivEscParser
 from apex_host.types import BrowserObservation
 
 if TYPE_CHECKING:
     from apex_host.orchestration.dependencies import OrchestrationDeps
+
+logger = logging.getLogger(__name__)
 
 # Module-level singleton parser instances (cheap; no model weights)
 _NMAP = NmapParser()
@@ -35,6 +47,7 @@ _COMMAND = CommandParser()
 _BANNER = BannerParser()
 _BROWSER_PARSER = BrowserParser()
 _ACCESS = AccessParser()
+_PRIV_ESC = PrivEscParser()
 
 
 def _port_from_nc_args(args: list[str]) -> str:
@@ -110,6 +123,50 @@ def parse_single_result(
     if parser_name == "curl_body":
         raw = RawObservation(raw=stdout, metadata={"source": "curl_body", "target": target})
         return _COMMAND.parse_curl_body(raw), tool_name
+    if parser_name == "priv_esc":
+        # Phase 13 — two producers share this parser field: searchsploit's
+        # real tool output and priv_esc_analyze's precomputed analytical
+        # signal (zero network, zero subprocess — see
+        # apex_host/agents/priv_esc_analysis_executor.py). Neither ever
+        # contains exploit code or payload content.
+        if tool_name == "priv_esc_analyze":
+            parsed = _PRIV_ESC.parse_analytical(
+                target=target,
+                category=str(tool_result.get("category", "")),
+                confidence=str(tool_result.get("confidence", "")),
+                description=str(tool_result.get("description", "")),
+                recommended_next_action=str(tool_result.get("recommended_next_action", "")),
+                discriminator=str(tool_result.get("discriminator", "")),
+                evidence_source=str(tool_result.get("evidence_source", "")),
+                evidence_excerpt=str(tool_result.get("evidence_excerpt", "")),
+                source_node_id=str(tool_result.get("source_node_id", "")),
+            )
+            return parsed, tool_name
+        args_list = tool_result.get("args", [])
+        service = str(args_list[0]) if args_list else ""
+        version = str(args_list[1]) if len(args_list) > 1 else ""
+        parsed = _PRIV_ESC.parse_searchsploit(stdout, target=target, service=service, version=version)
+        return parsed, tool_name
+    if parser_name == "priv_esc_enum":
+        # Phase 13B — live, read-only enumeration command output ->
+        # evidence + derived opportunity/recommendation deltas. Fact
+        # extraction is entirely deterministic (see PrivEscParser.parse_enumeration);
+        # never LLM parsing. A real connection/auth/protocol failure (the
+        # executor's own "error" field) never produced usable output, so it
+        # is never turned into an (empty, misleading) evidence node here —
+        # it is tracked instead via the existing error_episodes mechanism
+        # (see docs/privilege-enumeration.md "Enumeration state").
+        if tool_result.get("error"):
+            return ParsedObservation(), tool_name
+        parsed = _PRIV_ESC.parse_enumeration(
+            stdout,
+            target=target,
+            category=str(tool_result.get("category", "")),
+            command_key=str(tool_result.get("command_key", "")),
+            source_command=str(tool_result.get("source_command", "")),
+            port=str(tool_result.get("port", "")),
+        )
+        return parsed, tool_name
     raw = RawObservation(raw=stdout, metadata={"source": tool_name, "target": target})
     return _COMMAND.parse(raw), tool_name
 
@@ -142,12 +199,35 @@ def make_parsing_node(deps: "OrchestrationDeps") -> Any:
 
         all_findings: list[dict[str, Any]] = []
         for tool_result in results_to_parse:
-            parsed, source = parse_single_result(tool_result, state)
-            await deps.api.apply_deltas(
-                nodes=parsed.node_deltas,
-                edges=parsed.edge_deltas,
-                knowledge=parsed.proposed_knowledge,
-            )
+            try:
+                parsed, source = parse_single_result(tool_result, state)
+            except Exception as exc:
+                logger.error(
+                    "parser failed for tool=%r in phase %s: %s",
+                    tool_result.get("tool"), state["phase"], exc,
+                )
+                return {
+                    "findings": all_findings,
+                    "outcome": EngagementOutcome.parser_failure.value,
+                    "termination_reason": f"{type(exc).__name__}: {exc}",
+                    "termination_phase": state["phase"],
+                }
+
+            try:
+                await deps.api.apply_deltas(
+                    nodes=parsed.node_deltas,
+                    edges=parsed.edge_deltas,
+                    knowledge=parsed.proposed_knowledge,
+                )
+            except Exception as exc:
+                logger.error("apply_deltas failed in parse_observation: %s", exc)
+                return {
+                    "findings": all_findings,
+                    "outcome": EngagementOutcome.memory_failure.value,
+                    "termination_reason": f"{type(exc).__name__}: {exc}",
+                    "termination_phase": state["phase"],
+                }
+
             all_findings.extend(
                 findings_from_parsed(
                     parsed, phase=state["phase"],

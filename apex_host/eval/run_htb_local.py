@@ -47,6 +47,7 @@ from apex_host.eval.report import (
     write_report_json,
 )
 from apex_host.graph_state import ApexGraphState
+from apex_host.orchestration.outcome import EngagementOutcome, exit_code_for
 from apex_host.runtime import ApexRuntime, build_runtime
 
 logger = logging.getLogger(__name__)
@@ -294,8 +295,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-async def _async_main(args: argparse.Namespace) -> None:
-    config = ApexConfig.from_cli_args(args)
+async def _async_main(args: argparse.Namespace) -> int:
+    """Run the engagement (or preflight) and return a deterministic CLI exit
+    code (Phase 12C — see docs/engagement-outcomes.md "CLI exit codes").
+
+    ``--preflight`` remains a distinct utility mode (not an engagement) and
+    keeps its own plain 0/1 exit codes, unrelated to the outcome taxonomy.
+    """
+    try:
+        config = ApexConfig.from_cli_args(args)
+    except Exception as exc:  # noqa: BLE001 - any construction failure is a config error
+        print(f"error: invalid configuration: {exc}", file=sys.stderr)
+        return exit_code_for(EngagementOutcome.configuration_failure)
 
     if args.preflight:
         from apex_host.tools.preflight import check_local_tools
@@ -306,11 +317,17 @@ async def _async_main(args: argparse.Namespace) -> None:
         missing = [t for t, ok in availability.items() if not ok]
         if missing:
             print(f"\n{len(missing)} tool(s) missing.")
-            sys.exit(1)
+            return 1
         print("\nAll allowed tools found.")
-        sys.exit(0)
+        return 0
 
-    runtime, final_state, seed_results = await run_engagement(config)
+    try:
+        runtime, final_state, seed_results = await run_engagement(config)
+    except Exception as exc:  # noqa: BLE001 - surface as a deterministic operational-failure exit code
+        logger.error("engagement failed to run: %s", exc)
+        print(f"error: engagement failed: {exc}", file=sys.stderr)
+        return exit_code_for(EngagementOutcome.internal_error)
+
     subgraph = await runtime.api.get_subgraph(f"host:{config.target}", depth=10)
 
     # Derive policy_source for the report (read from the loaded policy).
@@ -340,6 +357,12 @@ async def _async_main(args: argparse.Namespace) -> None:
         write_report_json(report, args.export_json)
         print(f"Run report exported to {args.export_json}")
 
+    try:
+        resolved_outcome = EngagementOutcome(report.outcome) if report.outcome else EngagementOutcome.internal_error
+    except ValueError:
+        resolved_outcome = EngagementOutcome.internal_error
+    return exit_code_for(resolved_outcome)
+
 
 def main(argv: list[str] | None = None) -> None:
     raw_args = parse_args(argv)
@@ -355,7 +378,7 @@ def main(argv: list[str] | None = None) -> None:
         args = merge_env_into_args(raw_args, env)
     except EnvConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        sys.exit(2)
+        sys.exit(exit_code_for(EngagementOutcome.configuration_failure))
 
     log_level_name = merge_log_level(args.verbose)
     effective_level = getattr(logging, log_level_name) if log_level_name else logging.WARNING
@@ -372,7 +395,12 @@ def main(argv: list[str] | None = None) -> None:
     # The interval-progress and final-summary INFO lines remain visible.
     if args.verbose and not getattr(args, "trace_records", False):
         logging.getLogger("memfabric.reflector.worker").setLevel(logging.INFO)
-    asyncio.run(_async_main(args))
+    try:
+        exit_code = asyncio.run(_async_main(args))
+    except KeyboardInterrupt:
+        print("\nengagement cancelled", file=sys.stderr)
+        sys.exit(exit_code_for(EngagementOutcome.cancelled))
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

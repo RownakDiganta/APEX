@@ -39,6 +39,7 @@ from apex_host.orchestration.routing import (
     route_after_reflect,
     route_after_write,
 )
+from apex_host.orchestration.stall import StallTracker
 from apex_host.planners.global_planner import GlobalPlanner
 from apex_host.policy import PolicyAdvisor, load_policy
 from apex_host.tools.registry import ToolRegistry
@@ -140,6 +141,8 @@ def build_apex_graph(
     """
     from apex_host.agents.browser_executor import BrowserExecutor
     from apex_host.agents.ftp_executor import FTPExecutor
+    from apex_host.agents.priv_esc_analysis_executor import PrivEscAnalysisExecutor
+    from apex_host.agents.priv_esc_enum_executor import PrivEscEnumExecutor
     from apex_host.agents.ssh_executor import SSHExecutor
     from apex_host.agents.telnet_executor import TelnetExecutor
     from apex_host.execution.dispatcher import TaskDispatcher
@@ -169,6 +172,15 @@ def build_apex_graph(
     # "Planner integration").
     ssh_executor = SSHExecutor(config)
     ftp_executor = FTPExecutor(config)
+    # Phase 13 — zero-network, zero-subprocess analytical priv-esc executor
+    # (see apex_host/agents/priv_esc_analysis_executor.py). Routed by
+    # TaskDispatcher exactly like the other specialised executors above.
+    priv_esc_analysis_executor = PrivEscAnalysisExecutor()
+    # Phase 13B — bounded, read-only enumeration executor. Reuses the same
+    # SSH-session pattern as SSHExecutor (see
+    # apex_host/agents/priv_esc_enum_executor.py "Why this reuses
+    # SSHExecutor's model instead of ToolBackend").
+    priv_esc_enum_executor = PrivEscEnumExecutor(config)
     repair_engine = RepairEngine(
         model_router=model_router, allowed_tools=config.allowed_tools,
         target=config.target, dry_run=config.dry_run,
@@ -180,6 +192,8 @@ def build_apex_graph(
         run_command_fn=run_command_fn,
         telnet_executor=telnet_executor, browser_executor=browser_executor,
         ssh_executor=ssh_executor, ftp_executor=ftp_executor,
+        priv_esc_analysis_executor=priv_esc_analysis_executor,
+        priv_esc_enum_executor=priv_esc_enum_executor,
     )
     _max_repair = getattr(config, "max_repair_attempts", 1)
 
@@ -189,6 +203,10 @@ def build_apex_graph(
         phase_planners=phase_planners,
         repair_engine=repair_engine, config=config,
         anchor_id=_host_id(config.target),
+        # Phase 12C — one StallTracker per engagement; see
+        # apex_host/orchestration/stall.py for why it lives here rather
+        # than in ApexGraphState.
+        stall_tracker=StallTracker(),
     )
 
     # Node instantiation

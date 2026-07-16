@@ -7,18 +7,29 @@ creates one ``Episode`` record per tool_result and appends them all through
 ``MemoryAPI.apply_deltas``.  Skipped-duplicate results are never episoded
 (F13 fix).  Browser outcome is derived from the browser tool_result's own
 error field, not from ``state["last_error"]`` (F07 fix).
+
+Phase 12C: an ``apply_deltas`` exception here is caught and converted into
+an ``EngagementOutcome.memory_failure`` upstream-preset outcome (see
+``apex_host.orchestration.outcome`` module docstring, precedence level 2)
+rather than propagating and crashing ``graph.ainvoke()``. Any tool_results
+already written before the failure keep their normal episodes and error
+entries — only the remaining, unwritten results are skipped.
 """
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from memfabric.types import Episode, Outcome
 
 from apex_host.graph_state import ApexGraphState
 from apex_host.orchestration.completion import outcome_for
+from apex_host.orchestration.outcome import EngagementOutcome
 
 if TYPE_CHECKING:
     from apex_host.orchestration.dependencies import OrchestrationDeps
+
+logger = logging.getLogger(__name__)
 
 
 def make_memory_node(deps: "OrchestrationDeps") -> Any:
@@ -58,7 +69,22 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
                 task_id=tr.get("task_id"),
                 phase=state["phase"],
             )
-            await deps.api.apply_deltas(episodes=[episode])
+            try:
+                await deps.api.apply_deltas(episodes=[episode])
+            except Exception as exc:
+                logger.error("apply_deltas failed in write_memory: %s", exc)
+                failure_result: dict[str, Any] = {
+                    "outcome": EngagementOutcome.memory_failure.value,
+                    "termination_reason": f"{type(exc).__name__}: {exc}",
+                    "termination_phase": state["phase"],
+                }
+                if error_entries:
+                    failure_result["error_episodes"] = error_entries
+                if backend_entries:
+                    failure_result["execution_backend_log"] = backend_entries
+                if credential_entries:
+                    failure_result["credential_validation_log"] = credential_entries
+                return failure_result
 
             if o != Outcome.success:
                 error_entries.append({

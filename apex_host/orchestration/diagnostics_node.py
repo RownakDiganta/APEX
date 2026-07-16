@@ -9,23 +9,29 @@ turn's phase is not ``web``, not in ``routing.PHASE_NODE``, and not
 not-yet-dispatchable ``ApexPhase`` member such as ``exploit``/``lateral``, or
 any other unexpected string).
 
-Before this fix (Phase 12A / R1, Bug E), an unroutable phase fell straight
-through to LangGraph's ``END`` with no episode, no error message, and no
-trace of why the engagement stopped — indistinguishable from a normal
-successful completion. This node makes that failure mode explicit instead:
-it appends a diagnostic ``Episode`` describing exactly which phase was
-unroutable and at what turn, records the same information in
-``ApexGraphState.diagnostic_events`` (checkpoint-visible without querying
-the episodic store), sets ``last_error``, and marks the engagement
-``completed`` so the graph terminates cleanly on the very next edge.
+Before Phase 12A (R1, Bug E), an unroutable phase fell straight through to
+LangGraph's ``END`` with no episode, no error message, and no trace of why
+the engagement stopped — indistinguishable from a normal successful
+completion. This node makes that failure mode explicit instead, using the
+same canonical outcome model and terminal-episode writer every other
+termination reason uses (Phase 12C — ``apex_host.orchestration.outcome``/
+``terminal_episode``): it writes the one terminal ``Episode`` describing
+exactly which phase was unroutable and at what turn, threads
+``outcome=unknown_phase``/``termination_reason``/``termination_phase`` into
+state (plus the pre-existing ``diagnostic_events`` field, checkpoint-visible
+without querying the episodic store), and marks the engagement
+``completed`` so the graph terminates cleanly on the very next edge
+(``sg.add_edge(UNKNOWN_PHASE_NODE, END)`` in ``builder.py`` — this node
+never visits ``reflect_or_continue``, so it can never produce a second
+terminal episode for the same engagement).
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from memfabric.types import Episode, Outcome
-
 from apex_host.graph_state import ApexGraphState
+from apex_host.orchestration.outcome import EngagementOutcome, TerminationDecision
+from apex_host.orchestration.terminal_episode import terminal_state_fields, write_terminal_episode
 from apex_host.types import ApexPhase
 
 if TYPE_CHECKING:
@@ -37,33 +43,27 @@ def make_unknown_phase_node(deps: "OrchestrationDeps") -> Any:
 
     async def unknown_phase_agent(state: "ApexGraphState") -> dict[str, Any]:
         phase = state["phase"]
+        turn_count = state["turn_count"]
         reason = (
             f"GlobalPlanner produced unroutable phase {phase!r} at turn "
-            f"{state['turn_count']} — no dispatch node is registered for it "
+            f"{turn_count} — no dispatch node is registered for it "
             "(routing.PHASE_NODE has no entry and it is not 'web' or 'done'). "
             "Terminating the engagement cleanly instead of silently reaching END."
         )
-        event: dict[str, Any] = {
-            "phase": phase,
-            "turn_count": state["turn_count"],
-            "reason": reason,
-        }
-
-        episode = Episode(
-            agent="apex.orchestration",
-            action="unknown_phase_diagnostic",
-            outcome=Outcome.fundamental,
-            data=event,
-            task_id=None,
-            phase=phase,
+        decision = TerminationDecision(
+            terminate=True, outcome=EngagementOutcome.unknown_phase, success=False,
+            reason=reason, phase=phase, turn=turn_count,
         )
-        await deps.api.apply_deltas(episodes=[episode])
+        await write_terminal_episode(deps.api, decision, run_id=state["run_id"])
 
-        return {
+        event: dict[str, Any] = {"phase": phase, "turn_count": turn_count, "reason": reason}
+        result: dict[str, Any] = {
             "completed": True,
             "phase": ApexPhase.done.value,
             "last_error": reason,
             "diagnostic_events": [event],
         }
+        result.update(terminal_state_fields(decision))
+        return result
 
     return unknown_phase_agent

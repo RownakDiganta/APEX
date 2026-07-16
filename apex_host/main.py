@@ -24,6 +24,7 @@ import sys
 
 from apex_host.config import ApexConfig
 from apex_host.config_env import EnvConfigError, load_env_file, merge_env_into_args, merge_log_level
+from apex_host.orchestration.outcome import EngagementOutcome, exit_code_for
 from apex_host.runtime import build_runtime
 
 logger = logging.getLogger(__name__)
@@ -194,8 +195,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-async def run(args: argparse.Namespace) -> None:
-    config = ApexConfig.from_cli_args(args)
+async def run(args: argparse.Namespace) -> int:
+    """Run the engagement (or preflight) and return a deterministic CLI exit
+    code (Phase 12C — see docs/engagement-outcomes.md "CLI exit codes")."""
+    try:
+        config = ApexConfig.from_cli_args(args)
+    except Exception as exc:  # noqa: BLE001 - any construction failure is a config error
+        print(f"error: invalid configuration: {exc}", file=sys.stderr)
+        return exit_code_for(EngagementOutcome.configuration_failure)
 
     if args.preflight:
         from apex_host.tools.preflight import check_local_tools
@@ -207,21 +214,34 @@ async def run(args: argparse.Namespace) -> None:
         missing = [t for t, ok in availability.items() if not ok]
         if missing:
             print(f"\n{len(missing)} tool(s) missing — install or remove from allowed_tools.")
-            sys.exit(1)
+            return 1
         print("\nAll allowed tools found.")
-        sys.exit(0)
+        return 0
 
     runtime = build_runtime(config)
 
-    seed_results = await runtime.seed_all()
-    logger.info("seeded knowledge: %s", seed_results)
+    try:
+        seed_results = await runtime.seed_all()
+        logger.info("seeded knowledge: %s", seed_results)
 
-    final_state = await runtime.run()
+        final_state = await runtime.run()
+    except Exception as exc:  # noqa: BLE001 - surface as a deterministic operational-failure exit code
+        logger.error("engagement failed to run: %s", exc)
+        print(f"error: engagement failed: {exc}", file=sys.stderr)
+        return exit_code_for(EngagementOutcome.internal_error)
 
     print(f"\nAPEX engagement complete: target={config.target} dry_run={config.dry_run}")
     print(f"turns={final_state['turn_count']} final_phase={final_state['phase']}")
+    print(f"outcome={final_state.get('outcome') or 'unknown'} termination_phase={final_state.get('termination_phase') or ''}")
     print(f"findings ({len(final_state['findings'])}):")
     pprint.pprint(final_state["findings"])
+
+    try:
+        raw_outcome = final_state.get("outcome")
+        resolved_outcome = EngagementOutcome(raw_outcome) if raw_outcome else EngagementOutcome.internal_error
+    except ValueError:
+        resolved_outcome = EngagementOutcome.internal_error
+    return exit_code_for(resolved_outcome)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -236,7 +256,7 @@ def main(argv: list[str] | None = None) -> None:
         args = merge_env_into_args(raw_args, env)
     except EnvConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        sys.exit(2)
+        sys.exit(exit_code_for(EngagementOutcome.configuration_failure))
 
     log_level_name = merge_log_level(args.verbose)
     effective_level = getattr(logging, log_level_name) if log_level_name else logging.INFO
@@ -248,7 +268,12 @@ def main(argv: list[str] | None = None) -> None:
     # Suppress per-record reflector DEBUG logs unless --trace-records is set.
     if args.verbose and not getattr(args, "trace_records", False):
         logging.getLogger("memfabric.reflector.worker").setLevel(logging.INFO)
-    asyncio.run(run(args))
+    try:
+        exit_code = asyncio.run(run(args))
+    except KeyboardInterrupt:
+        print("\nengagement cancelled", file=sys.stderr)
+        sys.exit(exit_code_for(EngagementOutcome.cancelled))
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

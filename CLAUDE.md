@@ -974,6 +974,9 @@ it becomes a staged `KnowledgeEntry` at confidence 0.25–0.3.
 | `auth_flow` | A login mechanism or credential boundary | `url`, `hint` |
 | `credential` | A captured credential or token | `username`, `secret_hint` |
 | `access_state` | Current privilege level reached | `level`, `evidence` |
+| `priv_esc_opportunity` (Phase 13) | A non-executable privilege-escalation planning record — never a payload | `category`, `confidence`, `description`, `recommended_next_action`, `attempted`, `attempt_count`, `exhausted`, `source_tool` |
+| `priv_esc_evidence` (Phase 13B) | One completed+parsed read-only enumeration command's output | `category`, `source_command`, `command_key`, `confidence`, `extracted_facts`, `raw_excerpt` |
+| `priv_esc_recommendation` (Phase 13B) | Advisory text for a human operator, one per opportunity — never an executable command | `text`, `category`, `priority`, `opportunity_id` |
 
 | Edge type | Meaning |
 |---|---|
@@ -981,6 +984,10 @@ it becomes a staged `KnowledgeEntry` at confidence 0.25–0.3.
 | `runs` | service → tech, endpoint → tech |
 | `requires` | endpoint → auth_flow |
 | `contains` | endpoint → form, endpoint → token |
+| `indicates` (Phase 13) | host/access_state → priv_esc_opportunity (evidence that produced the opportunity) |
+| `collects` (Phase 13B) | host → priv_esc_evidence |
+| `produces` (Phase 13B) | priv_esc_evidence → priv_esc_opportunity |
+| `recommends` (Phase 13B) | priv_esc_opportunity → priv_esc_recommendation |
 
 #### Parser routing (in `apex_host/graph.py` `parse_observation`)
 
@@ -5907,3 +5914,553 @@ documented, deliberate consistency choice with Telnet's own original,
 tested scoping. No privilege escalation, payload execution, flag capture,
 or persistent shell access was added — `access_state` remains the
 engagement's terminal success signal, exactly as it was before this phase.
+
+### Phase 12C — Engagement Termination & Outcome Reporting ✓ COMPLETE
+
+**Full design document:** [`docs/engagement-outcomes.md`](docs/engagement-outcomes.md)
+(12 sections). This entry is a summary and progress record; that document is
+authoritative.
+
+**Scope:** Phases 12A/12B fixed *how* an engagement progresses; Phase 12C
+fixes *how it reports having stopped*. Before this phase, APEX could
+terminate for many distinct reasons — max turns, no more useful work,
+policy block, a crashed planner, a validated credential — that all
+collapsed onto the same observable shape (`completed=True`, no structured
+reason). This phase introduces **one canonical outcome model**,
+`EngagementOutcome` (`apex_host/orchestration/outcome.py`, `str, Enum`, 15
+members), plus a pure, reusable termination evaluator
+(`evaluate_termination()`) that replaces every scattered completion check
+that previously existed across `continuation_node.py`/`diagnostics_node.py`.
+There is no second, competing outcome model anywhere in the codebase —
+`RunReport.status`/`completed_successfully` (the older four-value string
+and boolean) are derived FROM `EngagementOutcome`, never computed
+independently.
+
+**Success invariant preserved exactly:** `is_success_outcome()` returns
+`True` for exactly one value, `validated_access` — an `access_state` node
+in the EKG. `goal_completed` (an organic, non-error phase-ladder
+completion) is explicitly never success. No outcome was invented to make a
+stalled or exhausted run look like a win.
+
+**Outcome precedence (`evaluate_termination()`, highest first):**
+1. `validated_access` — checked first, unconditionally, so a credential
+   validated on the last allowed turn is still success, never an
+   exhaustion outcome.
+2. An upstream-preset outcome — `dispatch_node.py`/`parsing_node.py`/
+   `memory_node.py` caught an exception and set `state["outcome"]` to
+   `planner_failure`/`parser_failure`/`memory_failure` before
+   `reflect_or_continue` ran; the evaluator is never even invoked in this
+   case.
+3. Stall-derived outcomes (`duplicate_task_stall`/`no_actionable_task`/
+   `policy_blocked`) from the new `StallTracker`.
+4. `phase_budget_exhausted`/`goal_completed` — `GlobalPlanner` returned
+   `done` for a reason other than the hard turn ceiling.
+5. `max_turns_exhausted` — the hard ceiling.
+
+`cancelled`/`configuration_failure`/`internal_error` are never produced by
+the evaluator — only outside `graph.ainvoke()`, by
+`apex_host.runtime.ApexRuntime.run()` (a new `except asyncio.CancelledError`
+clause writes a best-effort terminal episode before re-raising) and both
+CLI entry points.
+
+**Bounded stall detection (`apex_host/orchestration/stall.py`):**
+`StallTracker` tracks four streak counters (duplicate/policy-block/
+no-action/stagnant-fingerprint) across an engagement's turns and resets all
+of them the moment genuine progress is observed (a real, non-duplicate,
+non-policy-blocked task was dispatched). Once any streak reaches 3
+consecutive turns it reports a terminal outcome — the engagement can no
+longer loop forever on an unproductive pattern. The stagnant-fingerprint
+streak is the catch-all: it fires when the underlying EKG/phase state never
+changes across turns even if the *specific* stall cause alternates
+(duplicate, then policy-blocked, then no-action — none individually
+reaching the threshold).
+
+**Phase-budget-exhaustion gap closed:** `GlobalPlanner.decide_phase()` now
+also checks whether its EKG-driven selection is `priv_esc` and priv_esc's
+own budget is already exhausted — if so it returns `done` instead of
+`priv_esc`. `priv_esc` is the last phase in the ladder with no
+`_PHASE_COMPLETION_NODE` entry to force-advance into (unlike recon/web/
+credential), so without this check the engagement would keep dispatching
+`priv_esc_agent` every remaining turn until the *global* `max_turns`
+ceiling. Classified distinctly as `phase_budget_exhausted`, not folded into
+a generic `max_turns_exhausted`.
+
+**Exactly one terminal episode:** `apex_host/orchestration/terminal_episode.py`
+is the one place a terminal `Episode` (`action="engagement_terminated"`) is
+built and written, shared by the two structurally mutually exclusive call
+sites that can end an engagement — `continuation_node.py`'s
+`reflect_or_continue` and `diagnostics_node.py`'s `unknown_phase_agent`
+(routes directly to `END`, never visits the other). "Exactly one" holds by
+graph topology, not a runtime guard. Writes go through
+`MemoryAPI.apply_deltas` (memfabric Invariant 1).
+
+**`ApexGraphState` gained four new plain (overwrite) fields:** `outcome`,
+`termination_reason`, `termination_phase`, `stall_reason`. Design note:
+`phase` is now always forced to `"done"` on any termination (previously
+inconsistent across code paths); `termination_phase` is the new, single
+place to find which phase was actually active when the engagement stopped.
+
+**`RunReport` gained eight new fields** (`outcome`, `success`,
+`termination_reason`, `termination_phase`, `termination_turn`,
+`stall_reason`, `no_action_count`, `access_summary` — the last never
+containing a password), all projections of `EngagementOutcome`.
+`format_text()` gained an `Outcome:` header line and an "Engagement
+Outcome" detail section; `to_json_dict()` gained an `"engagement_outcome"`
+block. A backward-compatible `_derive_outcome_from_state()` fallback
+reproduces the old `_determine_status()` conditions exactly for any
+`final_state` that predates Phase 12C (no `outcome` key at all).
+
+**CLI exit codes** on both `apex_host.main` and `apex_host.eval.run_htb_local`:
+`0`=success, `1`=exhausted/stalled, `2`=configuration error, `3`=policy
+blocked, `4`=operational failure, `130`=cancelled (Ctrl+C/SIGINT caught
+around the top-level `asyncio.run()` call on both entry points).
+`--preflight` keeps its own plain `0`/`1` exit codes (a distinct utility
+mode, not an engagement outcome). `--help` is unaffected on both entry
+points — argparse's own `SystemExit(0)` fires before any of this logic.
+
+**Files changed (new):** `apex_host/orchestration/outcome.py`,
+`apex_host/orchestration/stall.py`, `apex_host/orchestration/terminal_episode.py`,
+`docs/engagement-outcomes.md`, `tests/apex_host/test_phase12c_outcomes.py`
+(138 tests).
+
+**Files changed (modified):** `apex_host/orchestration/continuation_node.py`
+(full rewrite of `reflect_or_continue` around the new evaluator/stall
+tracker), `apex_host/orchestration/diagnostics_node.py` (`unknown_phase_agent`
+now writes the canonical terminal episode), `apex_host/orchestration/dispatch_node.py`
+(planner-exception and MemoryAPI-read-exception catching →
+`planner_failure`/`memory_failure`), `apex_host/orchestration/parsing_node.py`
+(parser-exception and `apply_deltas`-exception catching → `parser_failure`/
+`memory_failure`), `apex_host/orchestration/memory_node.py`
+(`apply_deltas`-exception catching → `memory_failure`, preserving
+already-written entries from earlier tool_results in the same turn),
+`apex_host/orchestration/dependencies.py` (new `stall_tracker` field on
+`OrchestrationDeps`), `apex_host/orchestration/builder.py` (constructs the
+`StallTracker`), `apex_host/planners/global_planner.py` (priv_esc-budget
+force-`done` fix), `apex_host/graph_state.py` (four new fields),
+`apex_host/runtime.py` (`CancelledError` handling; four new state keys in
+the `initial` literal), `apex_host/eval/run_synthetic_machine.py` (same
+four new state keys), `apex_host/eval/metrics.py` (`reached_phase` now
+prefers `termination_phase`), `apex_host/eval/report.py` (eight new
+`RunReport` fields, outcome-headline table, JSON block), `apex_host/main.py`
++ `apex_host/eval/run_htb_local.py` (exit-code wiring), `README.md`.
+
+**Regressions fixed during this phase (self-directed, no user feedback
+prompted these — see conversation history for the exact reasoning):** two
+static-scan tests required the literal source string
+`current_phase=state.get("phase")` at the `decide_phase()` call site inside
+`reflect_or_continue` (unchanged from before this phase — an initial
+refactor pass had renamed the call-site argument to a local variable and
+was reverted). Four tests asserted `final_state["phase"] == "priv_esc"`/
+`"credential"` after termination; these were updated to assert
+`phase == "done"` + `termination_phase == "<actual phase>"` once the
+`phase`-always-`"done"`-on-termination design was adopted (a deliberate
+improvement, not an accidental regression — `apex_host/eval/metrics.py`
+was updated in the same pass so `reached_phase` still reports correctly).
+One synthetic-engagement test's expected turn count and outcome were
+corrected after discovering the new `StallTracker`'s `no_actionable_task`
+detector legitimately fires one turn before the priv_esc budget would have
+exhausted in that specific fixture (both mechanisms independently prevent
+the same infinite loop; the faster one wins, which is correct, not a bug).
+
+**Explicitly not changed:** no exploitation, privilege-escalation,
+persistence, or shell-access capability was added anywhere in this phase.
+Docker, Compose, VPN, and GitHub Actions were not touched. No branch was
+created; no commit or push was made as part of this phase's work.
+
+**Validation (clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest -q` (full) | **3857 passed** (3719 baseline after Phase 12A/12B + regression fixes, + 138 new Phase 12C tests), 53 pre-existing warnings — no regressions |
+| Focused: `test_phase12c_outcomes.py` | 138 passed |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy` | Success — 149 source files |
+| `python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `python -m apex_tool_service --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Remaining known limitations (documented, not defects — see
+`docs/engagement-outcomes.md` §12 for the full list):** `StallTracker` and
+`GlobalPlanner`'s budget counters do not survive a checkpoint resume (both
+live in `OrchestrationDeps`, mirroring the pre-existing, accepted
+`GlobalPlanner._spent` persistence model). `goal_completed` is not
+reachable through the current `GlobalPlanner` logic (kept for
+forward-compatibility). The `cancelled` terminal episode is best-effort —
+exact in-flight phase/turn is not recoverable without a configured
+checkpointer at that call site, so it records `phase="unknown"`,
+`turn=-1`. A single transient EKG-read failure during
+`reflect_or_continue`'s peek degrades gracefully rather than terminating
+immediately (matches memfabric's graceful-degradation philosophy); a
+*persistent* read failure surfaces indirectly via the stall detector rather
+than as an immediate `memory_failure`.
+
+### Phase 13 — Privilege Escalation Planning Framework ✓ COMPLETE
+
+**Full design document:** [`docs/privilege-escalation-planning.md`](docs/privilege-escalation-planning.md)
+(10 sections). This entry is a summary and progress record; that document
+is authoritative.
+
+**Scope:** a **planning framework, not privilege escalation.** Before this
+phase, `PrivEscPlanner` ran the same `searchsploit <service> <version>`
+query against up to 3 services every single turn with no memory of what it
+had already searched — the generic `TaskDispatcher` duplicate gate silently
+absorbed the repeats until the Phase 12C stall detector eventually
+terminated the phase, several noisy turns later, with nothing structured
+to show for it. Phase 13 gives the phase real organization: every
+investigation becomes a structured `PrivilegeOpportunity` record, the
+planner never repeats an investigation it has already recorded, and it
+returns a deliberate "enumeration exhausted" signal instead of relying on
+the stall detector by accident.
+
+**Opportunity model (`apex_host/types.py`):** `OpportunityCategory` (16
+members — the 14 the task brief suggested, plus `vulnerable_service` for
+searchsploit hits and `none` for "searched, nothing found"),
+`OpportunityConfidence` (`none`/`low`/`medium`/`high`, with
+`as_float()`/`from_score()` for deterministic ranking),
+`PrivilegeEnumerationStatus` (`not_started`/`running`/
+`opportunities_found`/`exhausted`/`elevated_access_validated` — the last a
+documented, currently-unreachable future capability, mirroring the
+`EngagementOutcome.goal_completed` precedent from Phase 12C),
+`PrivilegeOpportunityEvidence` (bounded ≤200-char excerpt — titles/labels
+only, never exploit code), `PrivilegeOpportunity`, `PrivilegeEscalationState`.
+
+**Scope boundary — no new live enumeration against the target (deliberate,
+documented, not an oversight):** the task brief's example enumeration list
+(sudo configuration, mounted filesystems, SUID inventory, ...) describes
+post-shell investigation commands. Building a new mechanism to run those
+against the target would mean opening a new authenticated session and
+executing commands — a materially new, more sensitive execution surface
+than Phase 12B's narrowly-scoped `SSHExecutor`/`FTPExecutor` (one fixed
+`id`/`whoami` validation command only). Given the task brief's own explicit
+"NOT privilege escalation" framing and its long do-not list, this phase
+deliberately does not add that capability. Instead it reuses two
+already-safe mechanisms:
+
+1. **`searchsploit`** (unchanged mechanism, now opportunity-aware) — a
+   local exploit-db title lookup, zero target interaction. Results now
+   parse into a `priv_esc_opportunity` EKG node
+   (`apex_host/parsers/priv_esc_parser.py::parse_searchsploit`) instead of
+   a generic, unstructured `KnowledgeEntry` blob. Confidence scales with
+   hit count (medium for 1–2, high for 3+); no-hit results still record
+   the attempt (`category=none`) so the same service/version is never
+   re-searched.
+2. **Analytical derivation** (new — zero network, zero subprocess) —
+   `apex_host/planners/priv_esc_opportunities.py::derive_analytical_opportunities`
+   reasons over EKG data earlier phases already captured: `access_state`
+   node evidence text (the redacted `id` command output from Phase 12B SSH
+   credential validation) is mined for `docker` (high confidence — a
+   well-documented escalation vector) and `sudo`/`wheel`/`admin` (medium
+   confidence — group membership alone doesn't guarantee sudo rules) group
+   hints. Deliberately does not attempt kernel-version/SUID/cron/
+   capabilities analytically — no reliable existing EKG data source exists
+   for those without new live enumeration.
+
+**Zero-network bridge executor:** since a planner may only return
+`TaskSpec`s (memfabric Invariant 7 — no direct `MemoryAPI` writes),
+analytical candidates need a minimal executor to cross into the standard
+`parse_observation → apply_deltas` pipeline. `PrivEscAnalysisExecutor`
+(`apex_host/agents/priv_esc_analysis_executor.py`) performs **no I/O of any
+kind** — it echoes the planner's already-computed fields into an `Episode`.
+Routed by `TaskDispatcher` via the synthetic tool name `priv_esc_analyze`,
+exactly like the Phase 12B protocol executors. A new policy rule,
+`check_bounded_priv_esc_enumeration` (`apex_host/policy/rules.py`), gives
+both `searchsploit` and `priv_esc_analyze` an explicit, named "approved"
+audit-trail entry.
+
+**Duplicate prevention and exhaustion:** before emitting any task,
+`_PrivEscDeterministic.plan()` reconstructs already-recorded opportunities
+from the subgraph (`opportunities_from_subgraph`) and skips any candidate
+whose computed ID already exists — one attempt per opportunity, mirroring
+`CredentialPlanner`'s per-protocol invariant. Up to 3 new candidates per
+turn (analytical first, then searchsploit), ranked deterministically by
+`rank_opportunities()` (confidence descending, category-priority tie-break,
+then ID — never insertion order). Once every candidate is already recorded,
+the planner returns an explicit exhaustion `AbandonSignal`. The two
+original pre-Phase-13 abandon messages are preserved byte-for-byte for the
+cases they originally covered.
+
+**Real bug found and fixed during manual end-to-end verification:** the
+first implementation left searchsploit-sourced `priv_esc_opportunity` nodes
+with no edge back into the graph. Since `MemoryAPI.get_subgraph()` performs
+a bounded traversal from the `host` anchor, an orphaned node is invisible
+to it — which silently broke both the planner's own dedup check
+(`opportunities_from_subgraph` only sees nodes reachable in the subgraph
+it's given) and the report's opportunity count. Fixed by adding a
+`host → priv_esc_opportunity` `indicates` edge for the searchsploit path
+(analytical opportunities already had one, via their source `access_state`
+node). Re-verified after the fix with a real synthetic engagement run
+through the compiled graph: all opportunities appeared correctly in both
+EKG traversal and the rendered report.
+
+**`ApexGraphState` gained five new fields** (`privilege_state`,
+`privilege_summary`, `opportunity_ids`, `attempted_opportunities`,
+`enumeration_complete`), refreshed inside `make_priv_esc_node`
+(`apex_host/orchestration/dispatch_node.py`) via a fresh subgraph read after
+dispatch. Known limitation: this refresh happens before
+`parse_observation`/`write_memory` run for the same turn, so the state
+snapshot is always exactly one turn stale relative to that turn's own new
+opportunities — acceptable for the live in-engagement view, but **not**
+used for the final report, which instead derives every privilege-escalation
+field directly from the final subgraph at report-build time.
+
+**`RunReport` gained eight new fields** (`privilege_state`,
+`privilege_opportunity_count`, `privilege_categories`,
+`privilege_attempted_count`, `privilege_exhausted_count`,
+`privilege_remaining_count`, `privilege_enumeration_complete`,
+`privilege_recommendations`), all derived from
+`rank_opportunities(opportunities_from_subgraph(subgraph))` — never the
+possibly-stale state snapshot. `format_text()` gained a "Privilege
+Escalation Summary" section (shown only when opportunities exist);
+`to_json_dict()` gained a `"privilege_escalation"` block.
+
+**New node/edge types documented in §12.8:** `priv_esc_opportunity` node,
+`indicates` edge.
+
+**Files changed (new):** `apex_host/parsers/priv_esc_parser.py`,
+`apex_host/planners/priv_esc_opportunities.py`,
+`apex_host/agents/priv_esc_analysis_executor.py`,
+`docs/privilege-escalation-planning.md`,
+`tests/apex_host/test_phase13_priv_esc_planning.py` (88 tests).
+
+**Files changed (modified):** `apex_host/types.py` (opportunity model),
+`apex_host/graph_ids.py` (`priv_esc_opportunity_id`, `indicates_edge_id`),
+`apex_host/planners/priv_esc_planner.py` (full rewrite of
+`_PrivEscDeterministic.plan()` — dedup, ranking, exhaustion, analytical +
+searchsploit candidates), `apex_host/execution/dispatcher.py`
+(`priv_esc_analyze` routing + `_run_priv_esc_analysis`),
+`apex_host/policy/rules.py` (`check_bounded_priv_esc_enumeration`),
+`apex_host/orchestration/builder.py` (constructs + wires
+`PrivEscAnalysisExecutor`), `apex_host/orchestration/parsing_node.py`
+(`parser=="priv_esc"` routing for both producers),
+`apex_host/orchestration/dispatch_node.py` (`make_priv_esc_node` privilege-
+state refresh), `apex_host/graph_state.py` (five new fields),
+`apex_host/runtime.py` + `apex_host/eval/run_synthetic_machine.py` (new
+state-field initialization), `apex_host/eval/report.py` (eight new
+`RunReport` fields, text/JSON surfacing), `README.md`.
+
+**Explicitly not changed:** no exploitation, reverse shell, Metasploit
+integration, persistence, flag capture, file upload/download, or malware
+download was added anywhere in this phase. Docker, Compose, VPN, and
+GitHub Actions were not touched. No branch was created; no commit or push
+was made as part of this phase's work.
+
+**Validation (clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest -q` (full) | **3948 passed** (3860 baseline after Phase 12C + 88 new Phase 13 tests), 53 pre-existing warnings — no regressions |
+| Focused: `test_phase13_priv_esc_planning.py` | 88 passed |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy` | Success — 152 source files |
+| `python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `python -m apex_tool_service --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Remaining known limitations (documented, not defects — see
+`docs/privilege-escalation-planning.md` §10 for the full list):** no new
+live enumeration against the target (deliberate scope boundary). Analytical
+derivation covers exactly two categories (`docker`, `sudo`) — the only ones
+with a reliable existing EKG data source; the remaining 12 suggested
+categories are fully modeled but never populated by this phase's own code.
+`ApexGraphState`'s live privilege fields are one turn stale relative to the
+same turn's own new opportunities (the final report is not affected).
+`elevated_access_validated` is unreachable by design. No new live command
+execution, persistent session, or privilege escalation of any kind was
+added or performed — `access_state` remains the engagement's only success
+signal.
+
+### Phase 13B — Safe Privilege Enumeration & Evidence Collection ✓ COMPLETE
+
+**Full design document:** [`docs/privilege-enumeration.md`](docs/privilege-enumeration.md)
+(12 sections). This entry is a summary and progress record; that document
+is authoritative.
+
+**Scope:** lift Phase 13A's own documented "no new live enumeration against
+the target" boundary — and only that boundary — by adding a small, fixed
+set of harmless, read-only enumeration commands executed over the SAME
+already-validated SSH session Phase 12B's `SSHExecutor` uses to prove a
+credential works. Still **not** privilege escalation: no exploit execution,
+no privilege escalation performed, no payload/reverse-shell generation, no
+Metasploit, no file upload/download, no flag capture, no persistence, no
+write of any kind to the target. Every command in the fixed allowlist is
+read-only.
+
+**Why this reuses SSH instead of `ToolBackend`:** `apex_host/tools/backend.py`'s
+`ToolBackend` runs a local binary from the APEX/Kali machine *against* the
+network target — it has no notion of "run this command inside an
+already-authenticated remote shell." Enumeration commands like `sudo -n -l`
+only make sense executed *on* the target, which requires the same kind of
+session Phase 12B's `SSHExecutor` already established and had reviewed for
+safety — not a new, more permissive execution channel. See
+`docs/privilege-enumeration.md` §2 for the full rationale.
+
+**Supported enumeration (`apex_host/planners/priv_esc_opportunities.py::ENUM_COMMANDS`
+— the single shared source of truth for both the planner and the executor):**
+`identity` (`id`), `os_info` (`cat /etc/os-release`), `kernel_version`
+(`uname -a`), `sudo_l` (`sudo -n -l`), `suid` (`find / -xdev -perm -4000
+-type f 2>/dev/null`), `capabilities` (`getcap -r / 2>/dev/null`), `mounts`
+(`mount`), `cron` (`crontab -l 2>/dev/null`), `service_info` (`systemctl
+list-units --type=service --no-pager 2>/dev/null`). Windows parsers
+(`whoami /priv`, `whoami /groups`, `systeminfo`, service/scheduled-task/
+registry inspection) exist in `apex_host/parsers/priv_esc_parser.py` as
+**planning support only** — no executor in this codebase ever runs a
+Windows enumeration command live (no WinRM/PSRemoting channel exists).
+
+**Evidence model (`apex_host/types.py`):** `EvidenceCategory` (one member
+per supported command family, plus six `windows_*` planning-support
+members), `PrivilegeEvidence` (`id`, `category`, `source_command`,
+`confidence`, `extracted_facts` — a plain JSON-serialisable dict, never
+exploit code or a secret — `raw_excerpt`, `timestamp`),
+`PrivilegeEnumerationProgress` (`commands_completed`, `commands_failed`,
+`commands_parsed`, `evidence_count`, `opportunities_created`). A **failed**
+enumeration command never produces an evidence node at all —
+`parsing_node.py` checks the tool result's own `error` field before
+calling `parse_enumeration()`, so failures are tracked only via the
+existing `error_episodes` mechanism, never as a misleading empty-output
+evidence node.
+
+**Deterministic parsers (no LLM anywhere), all in
+`apex_host/parsers/priv_esc_parser.py`:** `parse_sudo_output`,
+`parse_suid_output` (flags a small, well-known GTFOBins-flavored subset as
+"interesting", excluding a benign allowlist), `parse_capabilities_output`,
+`parse_mount_output` (flags NFS mounts), `parse_cron_output`,
+`parse_identity_output` (docker/sudo-group hints), `parse_kernel_output`,
+`parse_os_info_output`, `parse_service_info_output`, plus six
+`parse_windows_*` planning-support functions. Every extractor is bounded
+(`_MAX_LIST_ENTRIES = 50`) and degrades gracefully on empty/malformed
+input — never raises.
+
+**Opportunity generation:** `_opportunities_from_facts()` maps extracted
+facts to opportunities — `sudo` (nopasswd/all_all rule), `suid` (one per
+interesting binary), `capabilities` (one per interesting entry),
+`mounted_filesystem` (NFS mounts), `cron` (low confidence — existence
+alone), `docker`/`sudo` (from `identity`'s group-membership facts).
+`kernel_version`/`os_info`/`service_info` never produce an opportunity —
+informational only. Discriminators are namespaced with an `enum-` prefix
+(`enum-sudo-rules`, `enum-suid-{path}`, `enum-docker-group`, ...) so they
+can never collide with Phase 13A's searchsploit/analytical discriminator
+scheme, even when both describe a similar underlying signal (docker-group
+membership can legitimately be recorded once via 13A's `id`-output
+analytical path and once via this phase's own `identity` command — two
+independently-verified, non-duplicate pieces of evidence).
+
+**Graph shape:** `host --collects--> priv_esc_evidence --produces-->
+priv_esc_opportunity --recommends--> priv_esc_recommendation`. New node
+types `priv_esc_evidence`/`priv_esc_recommendation`, new edge types
+`collects`/`produces`/`recommends` (documented in §12.8 above). All IDs
+built by canonical functions in `apex_host/graph_ids.py`
+(`priv_esc_evidence_id`, `priv_esc_recommendation_id`, `collects_edge_id`,
+`produces_edge_id`, `recommends_edge_id`) — content-addressed on
+`target`+`command_key`, so re-running the same command upserts the same
+evidence node rather than creating a duplicate.
+
+**`PrivEscEnumExecutor` (`apex_host/agents/priv_esc_enum_executor.py`)**
+mirrors `SSHExecutor`'s safety model exactly: fixed allowlist only (a task
+selects a `command_key`; the command STRING always comes from
+`ENUM_COMMANDS`, never free-form task params), one command/one
+connection/per call, no persistent session, no file transfer, no port
+forwarding, dry-run returns a synthetic and deliberately unremarkable
+result (never fabricates a NOPASSWD rule or SUID hit), stateless across
+calls, password never logged/stored/in exception text. Unlike
+`SSHExecutor`'s credential-validation path, a non-zero exit status is NOT
+treated as failure (several enumeration commands legitimately exit
+non-zero while producing safe, useful stdout) — only a genuine
+connection/auth/protocol failure is a real failure.
+
+**Planner integration (`apex_host/planners/priv_esc_planner.py`):**
+`_PrivEscDeterministic` now accepts optional `username_candidates`/
+`password_candidates` — the SAME credentials already validated in the
+credential phase (Phase 12B); enumeration never guesses or brute-forces.
+Gated on all three: (1) an `access_state` node with `service == "ssh"`
+already exists, (2) credentials configured, (3) at least one `command_key`
+not yet recorded (`already_run_commands`). Fixed, deterministic ordering
+(`identity, os_info, kernel_version, sudo_l, suid, capabilities, mounts,
+cron, service_info`) — cheap/informational first, then higher-signal, then
+the rest. Up to 3 enumeration tasks per turn, sharing and prioritized
+within the existing `_MAX_PRIV_ESC_TASKS` per-turn cap from Phase 13A. Once
+every command is recorded, falls through unchanged to the Phase 13A
+analytical/searchsploit logic and finally to the exhaustion
+`AbandonSignal`. Two new abandon messages cover "SSH access proven but no
+credentials configured" without changing any pre-existing Phase 13A
+message text.
+
+**Dispatcher/policy wiring:** `TaskDispatcher` routes `tool ==
+"priv_esc_enum"` to a dedicated `_run_priv_esc_enum()` — never through
+`run_command_fn`/`ToolBackend`. `check_bounded_priv_esc_enumeration`
+(`apex_host/policy/rules.py`) extended to cover `priv_esc_enum`, with an
+additional check that the requested `command_key` is in the fixed
+allowlist `_PRIV_ESC_ENUM_COMMAND_KEYS` (sourced from the same
+`ENUM_COMMANDS` table) — a task requesting an unrecognised key is
+**blocked** before it ever reaches an executor.
+
+**`RunReport` gained a "Privilege Enumeration Summary" section** (eight new
+fields: `enum_commands_completed`, `enum_commands_failed`,
+`enum_evidence_count`, `enum_evidence_categories`, `enum_new_opportunities`,
+`enum_duplicate_opportunities_avoided`, `enum_completeness`), shown only
+when at least one enumeration command was ever attempted. Every field
+except `enum_commands_failed` (which has no EKG representation — a failed
+command produces no node) is derived directly from the final subgraph, not
+from the possibly-stale state snapshot. `enum_duplicate_opportunities_avoided`
+is a real, observed count from `state["duplicate_actions"]` filtered to
+`phase == "priv_esc"`. `to_json_dict()` gained a `"privilege_enumeration"`
+block.
+
+**Files changed (new):** `apex_host/agents/priv_esc_enum_executor.py`,
+`docs/privilege-enumeration.md`,
+`tests/apex_host/test_phase13b_priv_esc_enumeration.py` (107 tests).
+
+**Files changed (modified):** `apex_host/types.py` (`EvidenceCategory`,
+`PrivilegeEvidence`, `PrivilegeEnumerationProgress`), `apex_host/graph_ids.py`
+(`priv_esc_evidence_id`, `priv_esc_recommendation_id`, `collects_edge_id`,
+`produces_edge_id`, `recommends_edge_id`), `apex_host/parsers/priv_esc_parser.py`
+(nine deterministic Linux extractors + six Windows planning-support
+extractors + `parse_enumeration`), `apex_host/planners/priv_esc_opportunities.py`
+(`ENUM_COMMANDS`, `already_run_commands`, `evidence_from_subgraph`,
+`build_enumeration_progress`, enumeration counters in
+`privilege_state_fields`), `apex_host/planners/priv_esc_planner.py`
+(enumeration-task emission, dedup, ordering, port/username derivation),
+`apex_host/execution/dispatcher.py` (`priv_esc_enum` routing +
+`_run_priv_esc_enum`), `apex_host/policy/rules.py`
+(`check_bounded_priv_esc_enumeration` extended), `apex_host/orchestration/builder.py`
+(constructs + wires `PrivEscEnumExecutor`), `apex_host/orchestration/dependencies.py`
+(passes credentials to `PrivEscPlanner`), `apex_host/orchestration/parsing_node.py`
+(`parser=="priv_esc_enum"` routing, error-aware skip), `apex_host/eval/report.py`
+(eight new `RunReport` fields, text/JSON surfacing), `README.md`.
+
+**Explicitly not changed:** no exploitation, reverse shell, Metasploit
+integration, persistence, flag capture, file upload/download, malware
+download, or any Windows-live-execution channel was added anywhere in this
+phase. Docker, Compose, VPN, and GitHub Actions were not touched. No branch
+was created; no commit or push was made as part of this phase's work.
+
+**Validation (clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest -q` (full) | **4056 passed**, 53 pre-existing warnings — no regressions |
+| Focused: `test_phase13b_priv_esc_enumeration.py` | 107 passed |
+| Focused: `test_phase13_priv_esc_planning.py` (regression) | 88 passed, unchanged |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy` | Success |
+| `python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `python -m apex_tool_service --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Remaining known limitations (documented, not defects — see
+`docs/privilege-enumeration.md` §12 for the full list):** Linux only,
+executed — Windows parsers exist but no executor runs them live. Fixed,
+non-configurable command set — the allowlist itself is the safety
+boundary. One SSH connection per command (up to nine separate bounded
+sessions across an engagement) — deliberate, not a missed optimization.
+`enum_commands_failed` has no EKG representation (derived from
+`error_episodes` instead). No SSH key-based enumeration (password only,
+mirrors Phase 12B). No new live command execution beyond the fixed nine
+commands, no privilege escalation, no persistence, no payload of any kind
+was added or performed — `access_state` remains the engagement's only
+success signal.

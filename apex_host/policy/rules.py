@@ -26,12 +26,15 @@ read from MemoryAPI, and never touch the filesystem.
 7. ``check_safe_recon_allowed``       — explicit approval for nmap/nc/curl on target
 8. ``check_bounded_credential_validation`` — explicit approval (or a defense-
    in-depth block) for telnet_access/ssh_access/ftp_access tasks (Phase 12B)
+9. ``check_bounded_priv_esc_enumeration`` — explicit approval for
+   searchsploit/priv_esc_analyze planning tasks (Phase 13)
 """
 from __future__ import annotations
 
 import re
 from typing import TYPE_CHECKING
 
+from apex_host.planners.priv_esc_opportunities import ENUM_COMMANDS as _ENUM_COMMANDS
 from apex_host.policy.models import PolicyDecision, PolicyStatus
 
 if TYPE_CHECKING:
@@ -95,6 +98,26 @@ _CREDENTIAL_VALIDATION_TOOLS: frozenset[str] = frozenset({
 # independent check at the policy boundary, not a replacement for the
 # executor's own allowlist.
 _CREDENTIAL_VALIDATION_COMMANDS: frozenset[str] = frozenset({"id", "whoami", "PWD", "NOOP"})
+
+# Phase 13 — privilege-escalation planning tasks. ``priv_esc_analyze`` is a
+# zero-network, zero-subprocess task that only echoes an already-computed
+# analytical signal (see apex_host/agents/priv_esc_analysis_executor.py);
+# ``searchsploit`` is an existing, unchanged local exploit-db lookup with no
+# target interaction at all. ``priv_esc_enum`` (Phase 13B) is a bounded,
+# read-only enumeration command over an already-validated SSH session (see
+# apex_host/agents/priv_esc_enum_executor.py) — checked further below
+# against a fixed command_key allowlist. None of the three ever executes an
+# exploit.
+_PRIV_ESC_PLANNING_TOOLS: frozenset[str] = frozenset({
+    "priv_esc_analyze", "searchsploit", "priv_esc_enum",
+})
+
+# Phase 13B — the only enumeration command_keys a priv_esc_enum task may
+# request. Mirrors the credential-validation pattern above: this is a
+# second, independent check at the policy boundary on top of
+# PrivEscEnumExecutor's own identical allowlist (both are sourced from the
+# same table in apex_host/planners/priv_esc_opportunities.py::ENUM_COMMANDS).
+_PRIV_ESC_ENUM_COMMAND_KEYS: frozenset[str] = frozenset(_ENUM_COMMANDS)
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +370,73 @@ def check_bounded_credential_validation(
     )
 
 
+def check_bounded_priv_esc_enumeration(
+    task: "TaskSpec",
+    policy: "ScopePolicy",
+    config: "ApexConfig",
+) -> PolicyDecision | None:
+    """Explicit approval for privilege-escalation *planning* tasks (Phase 13).
+
+    Covers ``searchsploit`` (an existing, unchanged local exploit-db lookup
+    — no target interaction at all), ``priv_esc_analyze`` (a zero-network,
+    zero-subprocess task that only echoes an already-computed analytical
+    signal — see ``apex_host/agents/priv_esc_analysis_executor.py``), and
+    (Phase 13B) ``priv_esc_enum`` (a bounded, read-only enumeration command
+    over an already-validated SSH session — see
+    ``apex_host/agents/priv_esc_enum_executor.py``). None of the three ever
+    executes an exploit or contacts the target beyond what earlier phases
+    already established; this rule exists for audit-trail clarity (mirrors
+    ``check_safe_recon_allowed``/``check_bounded_credential_validation``),
+    not because any of them is otherwise unsafe — all three would also pass
+    through the default-allow fallthrough with no rule at all.
+
+    For ``priv_esc_enum`` specifically, the requested ``command_key`` (read
+    from either the ``command_key`` param or the task's first ``args``
+    token, mirroring how the planner encodes it) must be in the fixed
+    read-only allowlist ``_PRIV_ESC_ENUM_COMMAND_KEYS`` — defense in depth
+    on top of ``PrivEscEnumExecutor``'s own identical allowlist; a task that
+    somehow requested an unrecognised key is blocked here before it ever
+    reaches an executor or opens a connection.
+
+    Returns ``None`` (no opinion) for any other tool so a mistaken future
+    reuse of this rule for a real exploitation tool has no effect — approval
+    is scoped exactly to the three known-safe tool names above.
+    """
+    tool = str(task.params.get("tool", "")).strip().lower()
+    if tool not in _PRIV_ESC_PLANNING_TOOLS:
+        return None
+
+    raw_target = str(task.params.get("target", "")).strip()
+    if raw_target not in policy.allowed_targets:
+        return None  # fall through; check_target_in_scope already blocked this
+
+    if tool == "priv_esc_enum":
+        args = [str(a) for a in task.params.get("args", [])]
+        command_key = str(task.params.get("command_key") or (args[0] if args else "")).strip()
+        if command_key not in _PRIV_ESC_ENUM_COMMAND_KEYS:
+            return PolicyDecision(
+                status=PolicyStatus.blocked,
+                rule_name="bounded_priv_esc_enumeration",
+                reason=(
+                    f"priv_esc_enum requested command_key {command_key!r} which is "
+                    f"outside the fixed read-only allowlist {sorted(_PRIV_ESC_ENUM_COMMAND_KEYS)}"
+                ),
+                task_tool=tool,
+                task_target=raw_target,
+            )
+
+    return PolicyDecision(
+        status=PolicyStatus.approved,
+        rule_name="bounded_priv_esc_enumeration",
+        reason=(
+            f"tool {tool!r} is a non-executing privilege-escalation planning "
+            f"task against assigned target {raw_target!r}"
+        ),
+        task_tool=tool,
+        task_target=raw_target,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Ordered rule registry used by PolicyAdvisor
 # ---------------------------------------------------------------------------
@@ -362,4 +452,5 @@ ALL_RULES: tuple[_RuleFn, ...] = (
     check_require_review,
     check_safe_recon_allowed,
     check_bounded_credential_validation,
+    check_bounded_priv_esc_enumeration,
 )
