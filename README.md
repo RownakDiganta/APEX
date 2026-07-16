@@ -508,8 +508,8 @@ No inline f-strings are permitted in parsers.
 | `host_id(ip)` | `"host:{ip}"` | `"host:10.0.0.1"` |
 | `service_id(host, port, proto)` | `"service:{host}:{port}/{proto}"` | `"service:10.0.0.1:22/tcp"` |
 | `tech_id(host, name)` | `"tech:{host}:{slug}"` | `"tech:10.0.0.1:openssh"` |
-| `credential_id(host, user)` | `"credential:{host}:{user}"` | `"credential:10.0.0.1:root"` |
-| `access_state_id(host, user)` | `"access_state:{host}:{user}"` | `"access_state:10.0.0.1:root"` |
+| `credential_id(host, user, protocol="")` | `"credential:{host}:{user}[:{protocol}]"` | `"credential:10.0.0.1:root"` (Telnet, unchanged) / `"credential:10.0.0.1:root:ssh"` |
+| `access_state_id(host, user, protocol="")` | `"access_state:{host}:{user}[:{protocol}]"` | `"access_state:10.0.0.1:root:ssh"` |
 | `endpoint_id(url)` | `"endpoint:{normalized_url}"` | `"endpoint:http://host/login"` |
 | `auth_flow_id(url)` | `"auth_flow:{normalized_url}"` | `"auth_flow:http://host/login"` |
 
@@ -642,6 +642,19 @@ source for payload knowledge. It reads an external, host-supplied payload
 repository at runtime and stages chunks via `MemoryAPI.propose_knowledge()` —
 nothing is promoted until the Reflector clears the staging gate (`memfabric`
 Invariant 4 is never bypassed).
+
+**Bounded credential validation (Phase 12B):** APEX can prove — never
+guess — that an operator-supplied credential pair works, over Telnet, SSH,
+or FTP. Each protocol gets exactly one bounded login attempt per
+engagement (no brute force, no credential spraying); a successful
+validation is the engagement's terminal success signal (`access_state` in
+the EKG). SSH uses [Paramiko](https://www.paramiko.org/) with agent
+forwarding and local key discovery disabled; FTP uses the standard
+library's `ftplib` in passive mode. Both run only a single fixed harmless
+command afterward (`id`/`whoami` for SSH, `PWD`/`NOOP` for FTP) and close
+the connection immediately — no file transfer, no persistent session, no
+privilege escalation. Full design, safety model, and test strategy:
+[`docs/credential-validation.md`](docs/credential-validation.md).
 
 **Safety**: `ApexConfig.dry_run` defaults to `True`. Every command execution
 path goes through `apex_host/tools/runner.py`, which checks
@@ -1021,7 +1034,7 @@ python -m apex_host.eval.run_htb_local \
 | `tool 'nmap' not found in PATH` | nmap not installed | `brew install nmap` |
 | `tool 'ffuf' not found in PATH` | ffuf not installed | `brew install ffuf` |
 | `AbandonSignal: no web-capable tools` | curl not in `allowed_tools` | `curl` is in the default list; confirm `ApexConfig.allowed_tools` |
-| `AbandonSignal: no credentials configured` | telnet cap found but no `--username` | Pass `--username <user> --password <pass>` |
+| `AbandonSignal: no credentials configured` | a telnet/SSH/FTP capability was found but no `--username` | Pass `--username <user> --password <pass>` |
 | Dry-run report shows no EKG nodes | Parser received synthetic output | Expected — dry-run nmap output is not valid nmap XML; use `--no-dry-run` for real parsing |
 
 ### 6. Run the test suite

@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from apex_host.policy.models import PolicyDecision
+from apex_host.security.redaction import REDACTED_PLACEHOLDER
 
 
 def make_pd_entry(
@@ -28,11 +29,24 @@ def make_pd_entry(
 
 
 def task_info(task: Any) -> dict[str, Any] | None:
-    """Convert a TaskSpec to the minimal dict stored in state['current_task']."""
+    """Convert a TaskSpec to the minimal dict stored in state['current_task'].
+
+    Phase 12B: ``state['current_task']`` is public, checkpoint-persisted
+    ``ApexGraphState`` — CredentialPlanner's telnet/ssh/ftp TaskSpecs
+    necessarily carry the plaintext password in ``task.params["password"]``
+    (the executor needs it to authenticate), but that value must never
+    reach serialized state. The ``params`` dict is copied and any
+    ``"password"`` key is masked by name — a simple, bulletproof
+    key-based guard, not a duplicate of the substring-based redaction
+    logic ``apex_host.security.redaction`` centralizes (P8-S06).
+    """
     if task is None:
         return None
+    params = dict(task.params)
+    if "password" in params:
+        params["password"] = REDACTED_PLACEHOLDER
     return {
         "id": task.id,
         "executor_domain": task.executor_domain,
-        "params": task.params,
+        "params": params,
     }

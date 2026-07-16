@@ -98,6 +98,15 @@ class RunReport:
     backend_usage: dict[str, int] = field(default_factory=dict)
     timed_out_count: int = 0
 
+    # Phase 12B — credential-validation summary, populated from
+    # state["credential_validation_log"]. credential_attempts_by_protocol
+    # counts every telnet/ssh/ftp attempt per protocol; credential_outcome_counts
+    # breaks every attempt down by error_category (includes "success"). Never
+    # contains a password — see apex_host/orchestration/memory_node.py.
+    credential_attempts_by_protocol: dict[str, int] = field(default_factory=dict)
+    credential_outcome_counts: dict[str, int] = field(default_factory=dict)
+    credential_validation_entries: list[dict[str, Any]] = field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # Status helper
@@ -239,6 +248,20 @@ def build_report(
         if entry.get("timed_out"):
             timed_out_count += 1
 
+    # Phase 12B: credential-validation summary (attempted / authenticated /
+    # rejected / timed out / connection failed / protocol error — never a
+    # password; entries themselves already never contain one).
+    raw_cred_log = list(final_state.get("credential_validation_log") or [])
+    credential_attempts_by_protocol: dict[str, int] = {}
+    credential_outcome_counts: dict[str, int] = {}
+    for entry in raw_cred_log:
+        protocol = str(entry.get("protocol", "unknown"))
+        credential_attempts_by_protocol[protocol] = (
+            credential_attempts_by_protocol.get(protocol, 0) + 1
+        )
+        category = str(entry.get("error_category", "unknown"))
+        credential_outcome_counts[category] = credential_outcome_counts.get(category, 0) + 1
+
     return RunReport(
         target=config.target,
         mode="dry-run" if config.dry_run else "live",
@@ -275,6 +298,9 @@ def build_report(
         duplicate_action_entries=raw_dup,
         backend_usage=backend_usage,
         timed_out_count=timed_out_count,
+        credential_attempts_by_protocol=credential_attempts_by_protocol,
+        credential_outcome_counts=credential_outcome_counts,
+        credential_validation_entries=raw_cred_log,
     )
 
 
@@ -435,6 +461,16 @@ def format_text(report: RunReport) -> str:
             lines.append(f"  {name:<20}: {count}")
         lines.append(f"  {'timed_out':<20}: {report.timed_out_count}")
 
+    # Credential Validation summary (Phase 12B — shown only when at least
+    # one telnet/ssh/ftp attempt occurred this run; never shows a password)
+    if report.credential_attempts_by_protocol:
+        lines.append("\nCredential Validation")
+        for protocol, count in sorted(report.credential_attempts_by_protocol.items()):
+            lines.append(f"  {protocol:<20}: {count} attempt(s)")
+        lines.append("  Outcomes:")
+        for category, count in sorted(report.credential_outcome_counts.items()):
+            lines.append(f"    {category:<24}: {count}")
+
     # Duplicate Actions (shown only when any tasks were skipped)
     if report.duplicate_action_count > 0:
         lines.append("\nDuplicate Actions Skipped")
@@ -508,6 +544,11 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
         "execution_backend": {
             "usage": report.backend_usage,
             "timed_out_count": report.timed_out_count,
+        },
+        "credential_validation": {
+            "attempts_by_protocol": report.credential_attempts_by_protocol,
+            "outcome_counts": report.credential_outcome_counts,
+            "entries": report.credential_validation_entries,
         },
     }
 

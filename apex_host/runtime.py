@@ -204,6 +204,7 @@ class ApexRuntime:
             "completed_fingerprints": [],
             "execution_backend_log": [],
             "diagnostic_events": [],
+            "credential_validation_log": [],
         }
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": run_id},

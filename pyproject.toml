@@ -21,6 +21,15 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.27",
     "httpx>=0.27",
+    # Phase 12B — apex_host/agents/ssh_executor.py imports this directly for
+    # bounded, one-attempt SSH credential validation. ftplib (stdlib) covers
+    # FTP, so no equivalent third-party FTP dependency was needed. Paramiko
+    # is the de facto standard, actively-maintained pure-Python SSH client
+    # library — chosen over shelling out to the system `ssh` binary so the
+    # executor can disable agent forwarding, local key discovery, and
+    # keyboard-interactive fallback precisely and in-process (see
+    # docs/credential-validation.md "SSH host-key behavior").
+    "paramiko>=3.4",
 ]
 
 [dependency-groups]
@@ -31,6 +40,7 @@ dev = [
     "ruff>=0.6",
     "types-networkx",
     "types-PyYAML",
+    "types-paramiko",
 ]
 
 [tool.hatch.build.targets.wheel]

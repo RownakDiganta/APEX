@@ -46,6 +46,8 @@ from apex_host.planning.fingerprint import task_fingerprint
 
 if TYPE_CHECKING:
     from apex_host.agents.browser_executor import BrowserExecutor
+    from apex_host.agents.ftp_executor import FTPExecutor
+    from apex_host.agents.ssh_executor import SSHExecutor
     from apex_host.agents.telnet_executor import TelnetExecutor
     from apex_host.config import ApexConfig
     from apex_host.policy import PolicyAdvisor
@@ -103,6 +105,60 @@ def _make_blocked_result(
     return d
 
 
+def _credential_result_to_tr(
+    task: TaskSpec,
+    result: Any,
+    tool: str,
+    target: str,
+    parser: str,
+    phase: str,
+) -> tuple[dict[str, Any], ExecutionDisposition]:
+    """Shared tool-result-dict builder for SSHExecutor/FTPExecutor results
+    (Phase 12B). Never includes the password — ``result.episode.data`` never
+    contains it (see ``apex_host/agents/ssh_executor.py`` /
+    ``ftp_executor.py``).
+
+    Disposition mapping:
+    - ``success`` -> EXECUTED_SUCCESS.
+    - ``error_category == "auth_rejected"`` -> EXECUTED_VALID_NEGATIVE (a
+      clean, definitive "wrong credentials" signal — never retried/repaired,
+      matching TelnetExecutor's own success/valid-negative split).
+    - Anything else (connection failure, any timeout, protocol error, or the
+      harmless validation command itself failing after a successful login)
+      -> EXECUTED_FAILURE, distinct from a clean auth rejection.
+    """
+    ep_data = result.episode.data
+    success = bool(ep_data.get("success", False))
+    error_category = str(ep_data.get("error_category", ""))
+    if success:
+        disposition = ExecutionDisposition.EXECUTED_SUCCESS
+    elif error_category == "auth_rejected":
+        disposition = ExecutionDisposition.EXECUTED_VALID_NEGATIVE
+    else:
+        disposition = ExecutionDisposition.EXECUTED_FAILURE
+
+    error_detail = str(ep_data.get("error_detail") or "")
+    tr: dict[str, Any] = {
+        "task_id": task.id, "tool": tool, "args": [],
+        "target": target, "parser": parser,
+        "stdout": str(ep_data.get("response_summary", "")), "stderr": "",
+        "returncode": 0 if success else 1,
+        "dry_run": bool(ep_data.get("dry_run", False)),
+        "error": error_detail or None, "phase": phase,
+        "username": str(ep_data.get("username", "")),
+        "port": str(ep_data.get("port", "")),
+        "proto": "tcp",
+        "protocol": str(ep_data.get("protocol", "")),
+        "success": success,
+        "authenticated": bool(ep_data.get("authenticated", False)),
+        "operation": str(ep_data.get("operation", "")),
+        "response_summary": str(ep_data.get("response_summary", "")),
+        "error_category": error_category,
+        "timed_out": bool(ep_data.get("timed_out", False)),
+    }
+    return tr, disposition
+
+
 class TaskDispatcher:
     """Single entry point for all executor invocations in the APEX graph.
 
@@ -120,6 +176,8 @@ class TaskDispatcher:
         run_command_fn: Callable[["ToolCommand", "ApexConfig"], Awaitable["ToolResult"]],
         telnet_executor: "TelnetExecutor | None" = None,
         browser_executor: "BrowserExecutor | None" = None,
+        ssh_executor: "SSHExecutor | None" = None,
+        ftp_executor: "FTPExecutor | None" = None,
     ) -> None:
         self._advisor = advisor
         self._registry = task_registry
@@ -127,6 +185,8 @@ class TaskDispatcher:
         self._run_command_fn = run_command_fn
         self._telnet_executor = telnet_executor
         self._browser_executor = browser_executor
+        self._ssh_executor = ssh_executor
+        self._ftp_executor = ftp_executor
 
     async def dispatch(
         self,
@@ -308,6 +368,10 @@ class TaskDispatcher:
                 tr_dict, disposition = await self._run_browser(task, context, args, target, parser, phase)
             elif tool == "telnet_access":
                 tr_dict, disposition = await self._run_telnet(task, context, args, target, parser, phase)
+            elif tool == "ssh_access":
+                tr_dict, disposition = await self._run_ssh(task, context, args, target, parser, phase)
+            elif tool == "ftp_access":
+                tr_dict, disposition = await self._run_ftp(task, context, args, target, parser, phase)
             else:
                 tr_dict, disposition = await self._run_command(task, context, args, target, parser, phase)
         except asyncio.CancelledError:
@@ -478,6 +542,50 @@ class TaskDispatcher:
             "proto": "tcp",
         }
         return tr, disposition
+
+    async def _run_ssh(
+        self,
+        task: TaskSpec,
+        context: ExecutionContext,
+        args: list[str],
+        target: str,
+        parser: str,
+        phase: str,
+    ) -> tuple[dict[str, Any], ExecutionDisposition]:
+        """Run an ssh_access task via SSHExecutor."""
+        if self._ssh_executor is None:
+            tr: dict[str, Any] = {
+                "task_id": task.id, "tool": "ssh_access", "args": [],
+                "target": target, "parser": parser, "stdout": "",
+                "stderr": "", "returncode": 1, "dry_run": context.dry_run,
+                "error": "ssh executor not configured", "phase": phase,
+            }
+            return tr, ExecutionDisposition.TOOL_UNAVAILABLE
+
+        result = await self._ssh_executor.run(task, context.evidence)
+        return _credential_result_to_tr(task, result, "ssh_access", target, parser, phase)
+
+    async def _run_ftp(
+        self,
+        task: TaskSpec,
+        context: ExecutionContext,
+        args: list[str],
+        target: str,
+        parser: str,
+        phase: str,
+    ) -> tuple[dict[str, Any], ExecutionDisposition]:
+        """Run an ftp_access task via FTPExecutor."""
+        if self._ftp_executor is None:
+            tr: dict[str, Any] = {
+                "task_id": task.id, "tool": "ftp_access", "args": [],
+                "target": target, "parser": parser, "stdout": "",
+                "stderr": "", "returncode": 1, "dry_run": context.dry_run,
+                "error": "ftp executor not configured", "phase": phase,
+            }
+            return tr, ExecutionDisposition.TOOL_UNAVAILABLE
+
+        result = await self._ftp_executor.run(task, context.evidence)
+        return _credential_result_to_tr(task, result, "ftp_access", target, parser, phase)
 
     async def _run_browser(
         self,
