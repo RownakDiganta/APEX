@@ -685,3 +685,94 @@ class WorkflowRecommendation:
     text: str
     category: str
     priority: OpportunityConfidence
+
+
+# ---------------------------------------------------------------------------
+# Adaptive learning, reflection & experience replay model (Phase 16)
+# ---------------------------------------------------------------------------
+#
+# These types back a DETERMINISTIC EXPERIENCE REPLAY framework only — never
+# machine learning. Nothing here trains a model, computes gradients, or
+# makes a probabilistic prediction; every "learning rule" is a fixed,
+# hand-written, pure function over counted repetitions. Nothing here
+# executes an exploit, escalates privileges, or performs any live action.
+# See docs/experience-replay.md.
+
+
+class ExperienceCategory(str, Enum):
+    """What kind of situation this Experience records.
+
+    Mirrors ``WorkflowStatus``/``WebOpportunityCategory``/
+    ``OpportunityCategory`` in spirit: every member is a *classification* of
+    already-observed engagement history, never something APEX itself acts on
+    directly.
+    """
+    successful_workflow = "successful_workflow"
+    failed_workflow = "failed_workflow"
+    abandoned_workflow = "abandoned_workflow"
+    repeated_planner_mistake = "repeated_planner_mistake"
+    repeated_browser_finding = "repeated_browser_finding"
+    repeated_privilege_opportunity = "repeated_privilege_opportunity"
+    repeated_credential_outcome = "repeated_credential_outcome"
+    # Reserved for forward compatibility — never produced by this phase's
+    # own code (mirrors OpportunityCategory.none's precedent).
+    none = "none"
+
+
+@dataclass(slots=True)
+class Experience:
+    """One structured, non-executable record of what happened during a
+    past engagement (or repeatedly within the current one), reusable by a
+    future engagement against a similar context.
+
+    Stored in the EKG as an ``experience`` node (see
+    ``apex_host/graph_ids.py::experience_id`` and
+    ``apex_host/planners/experience_replay.py``) — this dataclass is the
+    in-planner/report view reconstructed from that node's props, never a
+    second, independent store (memfabric Invariant 1).
+
+    ``occurrence_count`` is incremented each time the SAME experience
+    (same target+category+discriminator) is re-derived by a later
+    engagement's reflection pass — this is the "replay" mechanism: a
+    content-addressed upsert, not a remembered Python object. ``confidence``
+    is adjusted deterministically by ``apply_learning_rule()`` as
+    ``occurrence_count`` grows — see docs/experience-replay.md "Learning
+    rules" for the fixed, hand-written adjustment table (never a trained
+    model, never a probability estimate).
+    """
+    id: str
+    category: ExperienceCategory
+    target: str
+    # discriminator: the raw (un-slugged) value distinguishing this
+    # experience from others in the same category for the same target —
+    # e.g. a workflow key, a "tool:phase" pair, or a protocol name. Kept
+    # explicit (rather than re-parsed from `context` or `id`) so graph
+    # materialization can link an experience back to the specific EKG
+    # node (e.g. a `workflow`) it describes without any text-parsing.
+    discriminator: str
+    context: str
+    evidence_excerpt: str
+    outcome: str
+    recommendation: str
+    confidence: OpportunityConfidence
+    occurrence_count: int
+    first_seen: str
+    last_seen: str
+
+
+@dataclass(slots=True)
+class ReflectionSummary:
+    """A snapshot of one engagement's end-of-run reflection pass —
+    ``apex_host.planners.experience_replay.derive_experiences_from_engagement``'s
+    own bookkeeping, not itself the source of truth (the persisted
+    ``experience`` EKG nodes are). Captured once, at reflection time,
+    because "created vs. reused" is inherently a point-in-time delta that
+    cannot be recomputed later from the final EKG alone (documented
+    exception to the "report always re-derives from final EKG" convention
+    — see docs/experience-replay.md §6)."""
+    target: str
+    experiences_created: int = 0
+    experiences_reused: int = 0
+    replay_hits: int = 0
+    repeated_failures: int = 0
+    improved_recommendations: tuple[str, ...] = ()

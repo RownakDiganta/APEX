@@ -1715,3 +1715,43 @@ Workflow Summary
 Full design, the dependency graph, the session model, and current
 limitations:
 [`docs/workflow-orchestration.md`](docs/workflow-orchestration.md).
+
+## Adaptive Learning, Reflection & Experience Replay
+
+This is **deterministic experience replay, not machine learning.** There is
+no model, no training loop, no gradient, no probability estimate. Every
+"learning rule" is a fixed, hand-written lookup-table adjustment
+(`apply_learning_rule`) keyed on how many times a pattern has recurred
+across engagements — the same input always produces the same output.
+
+At the end of every engagement (once, after `graph.ainvoke()` returns —
+never per-turn), `ApexRuntime.run()` reads the final EKG plus the final
+`ApexGraphState` and derives (or updates, via replay) structured
+`experience` nodes from five sources: terminal workflow status (Phase 15),
+duplicate planner tasks, recurring web/privilege-escalation opportunity
+categories (Phase 13/14), and failed credential validations (Phase 12B).
+Re-deriving the same experience on a later engagement (content-addressed on
+`target`+`category`+`discriminator`) upserts the same node and increments
+its `occurrence_count` — that increment, and the confidence adjustment that
+follows it, **is** the replay mechanism; there is no remembered Python
+object, no cache, and no second store.
+
+```
+Learning Summary
+  Experiences          : 1 (repeated_planner_mistake=1)
+  Reflection pass      : created=0 reused=1 replay_hits=1 repeated_failures=0
+  Recommendations:
+    tool 'nmap' re-planned in phase 'recon' after already completing (seen 2x); recommend avoiding this duplicate action in future engagements.
+```
+
+**No automatic planner override.** None of `ReconPlanner`/`WebPlanner`/
+`BrowserPlanner`/`CredentialPlanner`/`PrivEscPlanner`/`GlobalPlanner` import
+`experience_replay` — enforced by a static scan test and a behavioral proof
+that attaching experience nodes to a subgraph never changes what
+`GlobalPlanner` decides. Experiences are attached to "planner context" only
+by being reachable from the same host-anchored EKG subgraph every planner
+already reads; nothing reads them automatically.
+
+Full design, the reflection engine, the replay algorithm, ranking rules,
+and current limitations:
+[`docs/experience-replay.md`](docs/experience-replay.md).

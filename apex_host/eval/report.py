@@ -68,6 +68,10 @@ from apex_host.planners.workflow_orchestration import (
     rank_workflows,
     workflow_recommendations_from_workflows,
 )
+from apex_host.planners.experience_replay import (
+    experiences_from_subgraph,
+    rank_experiences,
+)
 
 if TYPE_CHECKING:
     from memfabric.types import SubgraphView
@@ -258,6 +262,27 @@ class RunReport:
     reasoning_chains: list[dict[str, Any]] = field(default_factory=list)
     # Up to 5 advisory recommendation strings — never an executable command.
     workflow_recommendations: list[str] = field(default_factory=list)
+
+    # Phase 16 — adaptive learning / experience-replay summary. The
+    # experience listing/count/category-breakdown fields are derived
+    # directly from the final subgraph at report-build time (same
+    # convention as every other Phase 13-15 section above). Only
+    # ``learning_experiences_created``/``learning_experiences_reused``/
+    # ``learning_replay_hits`` are an exception — a point-in-time
+    # before/after delta computed once by the reflection pass itself
+    # (apex_host.runtime.ApexRuntime.run()) and threaded through via
+    # ``final_state["learning_summary"]``, mirroring the documented
+    # ``enum_duplicate_opportunities_avoided`` exception in Phase 13B —
+    # a single post-hoc EKG snapshot cannot recover a delta.
+    learning_experience_count: int = 0
+    learning_experience_categories: dict[str, int] = field(default_factory=dict)
+    learning_experiences_created: int = 0
+    learning_experiences_reused: int = 0
+    learning_replay_hits: int = 0
+    learning_repeated_failures: int = 0
+    # Up to 5 advisory recommendation strings from the highest-ranked
+    # experiences — never an executable command, never overrides a planner.
+    learning_recommendations: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +599,22 @@ def build_report(
         wr.text for wr in workflow_recommendations_from_workflows(ranked_workflows)
     ][:5]
 
+    # Phase 16: adaptive learning / experience-replay summary. The listing
+    # is derived directly from the FINAL subgraph (the reflection pass in
+    # ApexRuntime.run() already wrote experience/experience_recommendation
+    # nodes back through MemoryAPI before this report is built). Only the
+    # created/reused/replay-hit counts come from the one-shot
+    # final_state["learning_summary"] delta — see the RunReport field
+    # docstring above for why that specific exception exists.
+    ranked_experiences = rank_experiences(experiences_from_subgraph(subgraph))
+    learning_experience_categories: dict[str, int] = {}
+    for exp in ranked_experiences:
+        learning_experience_categories[exp.category.value] = (
+            learning_experience_categories.get(exp.category.value, 0) + 1
+        )
+    learning_recommendations = [exp.recommendation for exp in ranked_experiences][:5]
+    learning_summary = dict(final_state.get("learning_summary") or {})
+
     return RunReport(
         target=config.target,
         mode="dry-run" if config.dry_run else "live",
@@ -655,6 +696,13 @@ def build_report(
         active_sessions=active_sessions,
         reasoning_chains=reasoning_chains,
         workflow_recommendations=workflow_recommendations,
+        learning_experience_count=len(ranked_experiences),
+        learning_experience_categories=learning_experience_categories,
+        learning_experiences_created=int(learning_summary.get("experiences_created", 0) or 0),
+        learning_experiences_reused=int(learning_summary.get("experiences_reused", 0) or 0),
+        learning_replay_hits=int(learning_summary.get("replay_hits", 0) or 0),
+        learning_repeated_failures=int(learning_summary.get("repeated_failures", 0) or 0),
+        learning_recommendations=learning_recommendations,
     )
 
 
@@ -838,6 +886,27 @@ def format_text(report: RunReport) -> str:
         if report.workflow_recommendations:
             lines.append("  Recommendations:")
             for rec in report.workflow_recommendations:
+                lines.append(f"    {rec[:160]}")
+
+    # Learning Summary (Phase 16 — shown only when at least one experience
+    # exists; a target with no repeated patterns or terminal workflow
+    # outcome shows nothing here). Deterministic reflection/replay output
+    # only — advisory guidance for a human operator, never an executable
+    # action and never an automatic planner override.
+    if report.learning_experience_count:
+        lines.append("\nLearning Summary")
+        cat_detail = ", ".join(
+            f"{cat}={count}" for cat, count in sorted(report.learning_experience_categories.items())
+        )
+        lines.append(f"  Experiences          : {report.learning_experience_count} ({cat_detail or 'none'})")
+        lines.append(
+            f"  Reflection pass      : created={report.learning_experiences_created} "
+            f"reused={report.learning_experiences_reused} replay_hits={report.learning_replay_hits} "
+            f"repeated_failures={report.learning_repeated_failures}"
+        )
+        if report.learning_recommendations:
+            lines.append("  Recommendations:")
+            for rec in report.learning_recommendations:
                 lines.append(f"    {rec[:160]}")
 
     # Phase summary
@@ -1111,6 +1180,15 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
             "active_sessions": report.active_sessions,
             "reasoning_chains": report.reasoning_chains,
             "recommendations": report.workflow_recommendations,
+        },
+        "learning": {
+            "experience_count": report.learning_experience_count,
+            "experience_categories": report.learning_experience_categories,
+            "experiences_created": report.learning_experiences_created,
+            "experiences_reused": report.learning_experiences_reused,
+            "replay_hits": report.learning_replay_hits,
+            "repeated_failures": report.learning_repeated_failures,
+            "recommendations": report.learning_recommendations,
         },
     }
 

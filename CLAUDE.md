@@ -982,6 +982,8 @@ it becomes a staged `KnowledgeEntry` at confidence 0.25–0.3.
 | `workflow_step` (Phase 15) | One ordered step within a workflow | `name`, `status`, `description`, `workflow_id` |
 | `session` (Phase 15) | A planning-object view of a browser/credential/SSH/FTP/Telnet session — never a live, executable session APEX holds open | `kind`, `status`, `detail` |
 | `workflow_recommendation` (Phase 15) | Advisory text for a human operator summarizing one workflow's state — never a command APEX itself would run | `text`, `category`, `priority`, `workflow_id` |
+| `experience` (Phase 16) | A structured, non-executable record of what happened in a past (or repeatedly within the current) engagement — content-addressed on target+category+discriminator so replay is an upsert, never a duplicate | `category`, `target`, `discriminator`, `context`, `evidence_excerpt`, `outcome`, `recommendation`, `confidence`, `occurrence_count` |
+| `experience_recommendation` (Phase 16) | Advisory text for a human operator derived from one experience — never a command APEX itself would run and never an automatic planner override | `text`, `category`, `priority`, `experience_id` |
 
 | Edge type | Meaning |
 |---|---|
@@ -989,10 +991,10 @@ it becomes a staged `KnowledgeEntry` at confidence 0.25–0.3.
 | `runs` | service → tech, endpoint → tech |
 | `requires` | endpoint → auth_flow |
 | `contains` | endpoint → form, endpoint → token, endpoint → endpoint (Phase 14: discovered-but-unvisited link); (Phase 15) workflow → workflow_step |
-| `indicates` (Phase 13) | host/access_state → priv_esc_opportunity (evidence that produced the opportunity); (Phase 14) endpoint → web_opportunity; (Phase 15) host → workflow, host → session, workflow_step → session |
+| `indicates` (Phase 13) | host/access_state → priv_esc_opportunity (evidence that produced the opportunity); (Phase 14) endpoint → web_opportunity; (Phase 15) host → workflow, host → session, workflow_step → session; (Phase 16) host → experience, experience → workflow (only when the workflow node is confirmed present in the same batch's known_node_ids) |
 | `collects` (Phase 13B) | host → priv_esc_evidence |
 | `produces` (Phase 13B) | priv_esc_evidence → priv_esc_opportunity |
-| `recommends` (Phase 13B) | priv_esc_opportunity → priv_esc_recommendation; (Phase 15) workflow → workflow_recommendation |
+| `recommends` (Phase 13B) | priv_esc_opportunity → priv_esc_recommendation; (Phase 15) workflow → workflow_recommendation; (Phase 16) experience → experience_recommendation |
 
 #### Parser routing (in `apex_host/graph.py` `parse_observation`)
 
@@ -6852,3 +6854,231 @@ per-turn `workflow_summary` state field is one-turn-stale (the final
 report is unaffected). No new live command execution, no exploit, no
 payload, no persistence, no flag capture was added or performed —
 `access_state` remains the engagement's only success signal.
+
+### Phase 16 — Adaptive Learning, Reflection & Experience Replay ✓ COMPLETE
+
+**Full design document:** [`docs/experience-replay.md`](docs/experience-replay.md)
+(12 sections). This entry is a summary and progress record; that document
+is authoritative.
+
+**Scope:** **deterministic experience replay, not machine learning.** No
+model, no training loop, no gradient, no probability estimate. Every
+"learning rule" is a fixed, hand-written lookup-table adjustment
+(`apply_learning_rule`) over a counted number of cross-engagement
+repetitions (`occurrence_count`) — the same input always produces the same
+output. Does not execute a command, drive a tool, upload a payload,
+generate a reverse shell, use Metasploit, establish persistence, or
+capture a flag. Adds a reflective, advisory layer over already-existing
+Phase 12B/13/14/15 planning data, nothing more.
+
+**Experience model (`apex_host/types.py`):** `ExperienceCategory`
+(`successful_workflow`/`failed_workflow`/`abandoned_workflow`/
+`repeated_planner_mistake`/`repeated_browser_finding`/
+`repeated_privilege_opportunity`/`repeated_credential_outcome`/`none` —
+the last reserved for forward compatibility, mirroring
+`OpportunityCategory.none`'s precedent), `Experience` (`id`, `category`,
+`target`, `discriminator`, `context`, `evidence_excerpt`, `outcome`,
+`recommendation`, `confidence`, `occurrence_count`, `first_seen`,
+`last_seen`), `ReflectionSummary` (`target`, `experiences_created`,
+`experiences_reused`, `replay_hits`, `repeated_failures`,
+`improved_recommendations`). `discriminator` is stored explicitly (never
+re-parsed from the human-readable `context` string) — an early draft tried
+`context.split("'")[1]` to recover a workflow key for graph linking and
+was deliberately abandoned before any test was written, in favor of an
+explicit field, consistent with this codebase's canonical-ID discipline.
+
+**Reflection engine (`apex_host/planners/experience_replay.py::derive_experiences_from_engagement`):**
+a pure function, `(target, subgraph, final_state) -> list[Experience]`,
+composing five already-existing reasoning outputs — no new EKG scanning
+logic was invented: Phase 15 workflow terminal status (`completed` →
+`successful_workflow`, `blocked`/`stalled` → `failed_workflow`,
+`abandoned` → `abandoned_workflow`; `running` skipped, no terminal
+outcome yet), duplicate `(tool, phase)` planner tasks from
+`final_state["duplicate_actions"]` → `repeated_planner_mistake`, Phase 14
+web-opportunity categories recurring `>= 2` times → `repeated_browser_finding`,
+Phase 13/13B privilege-opportunity categories recurring `>= 2` times →
+`repeated_privilege_opportunity`, Phase 12B failed (never successful)
+credential validations per protocol → `repeated_credential_outcome`.
+
+**Learning rules — the fixed confidence-adjustment table
+(`apply_learning_rule`):** `occurrence_count <= 1` → no adjustment.
+Otherwise, a fixed `0.15`-per-repetition step, direction fixed per
+category: `repeated_planner_mistake`/`repeated_privilege_opportunity`/
+`successful_workflow` reinforce UP (a persistent duplicate/opportunity/
+success signal gets *more* confident with repetition);
+`repeated_browser_finding`/`repeated_credential_outcome`/`failed_workflow`/
+`abandoned_workflow` reinforce DOWN (a recurring dead-end/failure gets
+*less* confident) — matching the task brief's own four rule examples
+exactly. Score is clamped to `[0.0, 1.0]` and mapped back through
+`OpportunityConfidence.from_score()`. `0.15` is a fixed constant, never a
+fitted/learned parameter — same convention as memfabric's own Reflector
+`decay_factor`/`skill_prior` config constants.
+
+**Replay algorithm — retrieve, rank, attach (never overwrite):**
+`experiences_from_subgraph(subgraph)` reconstructs every `Experience` from
+`experience`-typed EKG nodes (the "retrieve" step — there is no separate
+experience store; the EKG node IS the record, memfabric Invariant 1).
+`rank_experiences(experiences)` sorts by `(-confidence, category_priority,
+id)` — confidence descending, then a fixed category-priority tie-break,
+then experience ID ascending — never random, never insertion-order
+dependent. "Attach to planner context" happens purely by writing
+`experience`/`experience_recommendation` nodes into the SAME host-anchored
+EKG subgraph every planner already reads — no planner is modified to
+consult them (see "No automatic planner override" below).
+
+**The replay mechanism itself is a content-addressed upsert, not a
+remembered object:** `experience_id(target, category, discriminator)`
+(`apex_host/graph_ids.py`) is stable across engagements sharing the same
+`MemoryAPI`. `_make_experience()` looks up that ID among the subgraph's
+existing experiences; found → `occurrence_count` increments and confidence
+is recomputed via `apply_learning_rule`; not found → starts fresh at
+`occurrence_count=1`. Verified directly through the REAL `ApexRuntime.run()`
+entry point (not just unit tests against synthetic subgraphs): running the
+same dry-run engagement twice against the same runtime produced ONE
+`experience` node whose `occurrence_count` went `1 → 2`, with
+`learning_summary` correctly reporting
+`{experiences_created: 0, experiences_reused: 1, replay_hits: 1}` on the
+second run.
+
+**No automatic planner override (the core safety property of this
+phase):** enforced two ways. (1) Static scan — none of
+`recon_planner.py`/`web_planner.py`/`browser_planner.py`/
+`credential_planner.py`/`priv_esc_planner.py`/`global_planner.py` import
+`experience_replay`, and `experience_replay.py` never imports a
+`*_planner.py` module either (only the pure reasoning-helper modules
+`priv_esc_opportunities`/`web_opportunities`/`workflow_orchestration`).
+(2) Behavioral proof — attaching `experience` nodes (even with a high
+`occurrence_count`) to a subgraph's node-type set does not change what
+`GlobalPlanner.decide_phase()` returns for identical
+`node_types_seen`/`turn_count` input.
+
+**Reflection pass timing — once per engagement, a deliberate departure
+from the Phase 14/15 per-turn refresh convention:** `learning_summary` is
+populated exactly once, in `apex_host.runtime.ApexRuntime.run()`,
+immediately after `graph.ainvoke()` returns and immediately after
+memfabric's own `ReflectorWorker.run_once()` pass (mirroring that
+Reflector's own once-per-engagement timing). Workflow terminal status is
+only meaningful once the engagement's real `completed`/`outcome` values
+are known — a mid-engagement reflection pass would be premature, the same
+reasoning already applied to Phase 15's report-time (not live-state)
+workflow-summary re-derivation. Wrapped in its own `try/except` — a
+failure here is logged and never masks the engagement's own result.
+
+**Graph shape — no new edge types needed:** `indicates` (host →
+experience; experience → workflow, conditionally) and `recommends`
+(experience → experience_recommendation — the SAME edge type Phase
+13B/15 already use for their own `*_recommendation` nodes) were already
+generic enough to reuse. The `host → experience` edge is load-bearing
+(orphan prevention, the identical class of bug Phase 13/14/15 each hit and
+fixed) — verified via a real end-to-end dry-run engagement through
+`ApexRuntime.run()`, not just assumed. The `experience → workflow` link
+edge is added ONLY when the caller supplies `known_node_ids` (the caller's
+own already-fetched subgraph node-id set) AND the target workflow node's
+ID is actually present in it — protecting against
+`MemoryAPI.put_edge()`'s dangling-edge rejection (P8-I05) for a workflow
+node that is written in a separate batch (Phase 15's own per-turn sync),
+never in the same batch as the reflection pass's own writes. Omitting
+`known_node_ids` (the default) simply skips this one edge — safe by
+construction, never a partial-batch failure.
+
+**Why created/reused/replay_hits cannot be re-derived from the final EKG
+alone (the one deliberate exception to "always re-derive from the final
+EKG"):** a final EKG snapshot only shows the CURRENT `occurrence_count`
+per experience — it cannot tell you, after the fact, whether THIS
+engagement's reflection pass created the node or merely incremented an
+already-existing counter. `ReflectionSummary` captures this point-in-time
+delta once, inside the reflection pass itself (comparing a "before"
+snapshot taken at the start of the pass against its "after" output), and
+is threaded through via `final_state["learning_summary"]` — the same
+documented exception class already established for Phase 13B's
+`enum_duplicate_opportunities_avoided`.
+
+**`ApexGraphState` gained one new field** (`learning_summary` — dict with
+`experiences_created`, `experiences_reused`, `replay_hits`,
+`repeated_failures`, `improved_recommendations`; populated exactly once,
+post-engagement, unlike `workflow_summary`/`web_session_state`'s per-turn
+refresh).
+
+**`RunReport` gained seven new fields** (`learning_experience_count`,
+`learning_experience_categories`, `learning_experiences_created`,
+`learning_experiences_reused`, `learning_replay_hits`,
+`learning_repeated_failures`, `learning_recommendations`). The experience
+listing/count/category-breakdown fields are re-derived directly from the
+final subgraph (same convention as every other Phase 13-15 section); only
+the created/reused/replay-hit counts come from
+`final_state["learning_summary"]`, per the documented exception above.
+`format_text()` gained a "Learning Summary" section (shown only when at
+least one experience exists). `to_json_dict()` gained a `"learning"`
+block.
+
+**New node/edge types documented in §12.8:** `experience`,
+`experience_recommendation` nodes; no new edge types (full reuse of
+`indicates`/`recommends`).
+
+**Real end-to-end verification performed:** a synthetic dry-run engagement
+run twice through the real `ApexRuntime.run()` (not `build_apex_graph`
+called directly) against the same in-memory `MemoryAPI`. First run
+produced one `repeated_planner_mistake` experience node
+(`occurrence_count=1`), correctly reachable from `host` via `indicates`,
+with a linked `experience_recommendation` node via `recommends`, and
+`learning_summary = {experiences_created: 1, experiences_reused: 0,
+replay_hits: 0, ...}`. Second run against the SAME runtime found the SAME
+node (same content-addressed ID), incremented `occurrence_count` to `2`,
+adjusted confidence upward accordingly, and reported
+`{experiences_created: 0, experiences_reused: 1, replay_hits: 1, ...}`.
+`build_report`/`format_text`/`to_json_dict` were also verified directly
+against this real run's final state and subgraph, confirming the Learning
+Summary section and JSON block render correctly.
+
+**Files changed (new):** `apex_host/planners/experience_replay.py`,
+`docs/experience-replay.md`,
+`tests/apex_host/test_phase16_experience_replay.py` (53 tests).
+
+**Files changed (modified):** `apex_host/types.py` (`ExperienceCategory`/
+`Experience`/`ReflectionSummary`), `apex_host/graph_ids.py`
+(`experience_id`, `experience_recommendation_id`),
+`apex_host/graph_state.py` (`learning_summary` field), `apex_host/runtime.py`
+(post-engagement reflection pass, wrapped in `try/except`, after the
+memfabric Reflector call) + `apex_host/eval/run_synthetic_machine.py` (new
+state-field initialization), `apex_host/eval/report.py` (seven new
+`RunReport` fields, text/JSON surfacing), `README.md`.
+
+**Explicitly not changed:** no exploit execution, payload upload, reverse
+shell, Metasploit usage, persistence, or flag capture was added anywhere
+in this phase. No planner (`GlobalPlanner`/`ReconPlanner`/`WebPlanner`/
+`BrowserPlanner`/`CredentialPlanner`/`PrivEscPlanner`) was modified or made
+to import `experience_replay` — verified by static scan and a behavioral
+proof that experience-node presence never changes `GlobalPlanner`'s
+output. Docker, Compose, VPN, and GitHub Actions were not touched. No
+branch was created; no commit or push was made as part of this phase's
+work.
+
+**Validation (clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest -q` (full) | **4255 passed** (53 new Phase 16 tests), 53 pre-existing warnings — no regressions |
+| Focused: `test_phase16_experience_replay.py` | 53 passed |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy` | Success — 158 source files |
+| `python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `python -m apex_tool_service --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Remaining known limitations (documented, not defects — see
+`docs/experience-replay.md` §12 for the full list):** exactly five fixed
+reflection sources (workflow terminal status, duplicate planner tasks,
+recurring web/priv-esc opportunity categories, failed credential
+outcomes) — adding a new source means editing
+`derive_experiences_from_engagement`, not a config change. A single fixed
+`0.15` confidence step for every reinforce-up/down category, no
+per-category tuning. No cross-target generalization — experience IDs are
+scoped to `target`, so nothing learned against one machine is
+automatically applied to a different one (CLAUDE.md §13.8/§13.9). The
+"before" snapshot for `learning_summary`'s created/reused delta uses a
+shallow (`depth=2`) subgraph read, matching the memfabric Reflector's own
+context depth. No new live command execution, no exploit, no payload, no
+persistence, no flag capture was added or performed — `access_state`
+remains the engagement's only success signal.

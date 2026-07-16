@@ -167,6 +167,22 @@ class ApexGraphState(TypedDict):
     # possibly-stale live snapshot — same convention as `privilege_summary`
     # and `web_session_state` above.
     workflow_summary: dict[str, Any]
+    # Phase 16 — adaptive learning / experience-replay summary. UNLIKE
+    # `web_session_state`/`workflow_summary` above, this is populated
+    # EXACTLY ONCE, by `apex_host.runtime.ApexRuntime.run()` after the
+    # engagement graph completes (memfabric's own Reflector runs once per
+    # engagement too — this mirrors that timing, not the per-turn refresh
+    # pattern). Every node simply omits this key until then, so it starts
+    # as `{}` and is only ever overwritten at the very end. Derived VIEW
+    # over `experience`/`experience_recommendation` EKG nodes — never a
+    # second, independent store (memfabric Invariant 1). Shape:
+    # {experiences_created, experiences_reused, replay_hits,
+    # repeated_failures, improved_recommendations (list[str])}. The final
+    # report re-derives the experience listing independently from the
+    # complete final EKG (apex_host.eval.report.build_report); this field
+    # supplies only the point-in-time before/after deltas that cannot be
+    # recovered from a single post-hoc EKG snapshot.
+    learning_summary: dict[str, Any]
 
 
 CompiledApexGraph = Any
