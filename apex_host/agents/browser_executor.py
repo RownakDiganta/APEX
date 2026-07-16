@@ -37,13 +37,17 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 _JS_FORMS = """
-Array.from(document.forms).map(f => ({
-    action: f.action || '',
-    method: (f.method || 'GET').toUpperCase(),
-    fields: Array.from(f.elements)
-        .filter(el => el.name)
-        .map(el => el.name)
-}))
+Array.from(document.forms).map(f => {
+    const els = Array.from(f.elements).filter(el => el.name);
+    return {
+        action: f.action || '',
+        method: (f.method || 'GET').toUpperCase(),
+        fields: els.map(el => el.name),
+        field_types: Object.fromEntries(
+            els.map(el => [el.name, (el.type || 'text').toLowerCase()])
+        ),
+    };
+})
 """.strip()
 
 _JS_TOKENS = """
@@ -69,6 +73,10 @@ Array.from(document.querySelectorAll('a[href]'))
 
 _JS_HAS_PASSWORD = (
     "document.querySelector('input[type=\"password\"]') !== null"
+)
+
+_JS_HAS_FAVICON = (
+    "document.querySelector('link[rel~=\"icon\"]') !== null"
 )
 
 
@@ -106,6 +114,14 @@ class BrowserExecutor:
             "tokens": obs.tokens,
             "auth_hints": obs.auth_hints,
             "links": obs.links,
+            # Phase 14 additions — see apex_host/types.py::BrowserObservation
+            # for the "no secret leakage" rationale on cookies/headers.
+            "html_snippet": obs.html_snippet,
+            "status": obs.status,
+            "headers": obs.headers,
+            "cookies": obs.cookies,
+            "final_url": obs.final_url,
+            "favicon_present": obs.favicon_present,
         }
         episode = Episode(
             agent=self.domain,
@@ -123,15 +139,33 @@ class BrowserExecutor:
         return ExecutorResult(task_id=task.id, episode=episode)
 
     def _synthetic_observation(self, url: str) -> BrowserObservation:
-        """Plausible login-page snapshot — no network, safe in dry-run mode."""
+        """Plausible login-page snapshot — no network, safe in dry-run mode.
+
+        Deliberately unremarkable beyond the pre-existing login-form/CSRF
+        signal this fixture has always carried: no fabricated technology
+        header, no fabricated backup file, no fabricated directory listing —
+        a dry-run engagement demonstrates the full parsing/opportunity
+        pipeline without manufacturing findings that didn't come from a
+        real page (mirrors the same discipline Phase 13B's
+        ``PrivEscEnumExecutor`` dry-run output follows).
+        """
         return BrowserObservation(
             url=url,
             html_snippet="<html><body><!-- dry-run: no real page fetched --></body></html>",
             title="(dry-run) Login",
-            forms=[{"action": "/login", "method": "POST", "fields": ["username", "password"]}],
+            forms=[{
+                "action": "/login", "method": "POST",
+                "fields": ["username", "password"],
+                "field_types": {"username": "text", "password": "password"},
+            }],
             tokens=["csrf_token"],
             auth_hints=["password-field"],
             links=[f"{url}/login", f"{url}/admin"],
+            status="200",
+            headers={"Server": "(dry-run)"},
+            cookies=[{"name": "session_id", "http_only": True, "secure": False}],
+            final_url="",
+            favicon_present=False,
         )
 
     async def _real_observation(self, url: str) -> BrowserObservation:
@@ -150,17 +184,32 @@ class BrowserExecutor:
             )
             try:
                 page = await browser.new_page()
-                await page.goto(url, timeout=timeout_ms)
+                response = await page.goto(url, timeout=timeout_ms)
                 title = await page.title()
                 html = await page.content()
                 forms: list[dict[str, Any]] = await page.evaluate(_JS_FORMS)
                 tokens: list[str] = await page.evaluate(_JS_TOKENS)
                 links: list[str] = await page.evaluate(_JS_LINKS)
                 has_password: bool = await page.evaluate(_JS_HAS_PASSWORD)
+                has_favicon: bool = await page.evaluate(_JS_HAS_FAVICON)
+                raw_cookies = await page.context.cookies()
+                final_url = page.url
+                status = str(response.status) if response is not None else ""
+                headers: dict[str, str] = dict(response.headers) if response is not None else {}
             finally:
                 await browser.close()
 
         auth_hints: list[str] = ["password-field"] if has_password else []
+        # Cookie NAME/flags only — never the value (P8-S06-style secret
+        # discipline: a session cookie value is credential-shaped material).
+        cookies: list[dict[str, Any]] = [
+            {
+                "name": str(c.get("name", "")),
+                "http_only": bool(c.get("httpOnly", False)),
+                "secure": bool(c.get("secure", False)),
+            }
+            for c in raw_cookies
+        ]
         return BrowserObservation(
             url=url,
             html_snippet=html[:2000],
@@ -169,4 +218,9 @@ class BrowserExecutor:
             tokens=tokens,
             auth_hints=auth_hints,
             links=links,
+            status=status,
+            headers=headers,
+            cookies=cookies,
+            final_url=final_url if final_url and final_url != url else "",
+            favicon_present=bool(has_favicon),
         )

@@ -247,8 +247,16 @@ class TestBrowserExecutorDryRun:
         )
         parsed = BrowserParser().parse_observation(obs, target=_URL)
         endpoints = [n for n in parsed.node_deltas if n.type == "endpoint"]
-        assert len(endpoints) == 1
+        # Phase 14: the visited page is always the first endpoint node
+        # emitted, marked browsed=True; same-origin discovered-but-unvisited
+        # links (the synthetic obs's /login and /admin) now also become
+        # endpoint nodes (browsed=False) — this is the "session model" data
+        # BrowserPlanner reads to avoid ever revisiting an identical page.
+        assert len(endpoints) >= 1
         assert endpoints[0].props["url"] == _URL
+        assert endpoints[0].props["browsed"] is True
+        for ep in endpoints[1:]:
+            assert ep.props["browsed"] is False
 
     async def test_dry_run_obs_feeds_browser_parser_producing_auth_flow_node(self) -> None:
         config = ApexConfig(target=_TARGET, dry_run=True)

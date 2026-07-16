@@ -741,7 +741,10 @@ class TestDependencies:
         assert "repair_engine" in names
 
     def test_deps03_build_planners_returns_four_phases(self) -> None:
-        """DEPS-03: build_planners returns a dict with all four phase keys."""
+        """DEPS-03: build_planners returns a dict with all four ApexPhase keys,
+        plus the Phase 14 "browser" entry (a distinct graph node from
+        web_agent, but not itself an ApexPhase — see
+        apex_host.orchestration.dependencies.build_planners docstring)."""
         from apex_host.orchestration.dependencies import build_planners
         config = _make_config()
         registry = ToolRegistry.from_config(config)
@@ -749,6 +752,7 @@ class TestDependencies:
         expected = {
             ApexPhase.recon.value, ApexPhase.web.value,
             ApexPhase.credential.value, ApexPhase.priv_esc.value,
+            "browser",
         }
         assert set(planners.keys()) == expected
 

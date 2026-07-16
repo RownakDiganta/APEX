@@ -80,6 +80,19 @@ class BrowserObservation:
     """A snapshot of what BrowserExecutor saw on a page.
 
     In dry_run mode this is synthesised, never produced by a real browser.
+
+    Phase 14 additions (all additive — existing callers that only ever set
+    the original seven fields are unaffected): ``status``/``headers``
+    support deterministic technology detection (see
+    ``apex_host/parsers/tech_detector.py``); ``cookies`` is deliberately
+    name/flag-only — **never** a cookie value, mirroring this project's
+    "no secret leakage" discipline (see ``apex_host.security.redaction`` and
+    Phase 12B's credential handling); ``final_url`` is set only when a live
+    fetch followed a redirect chain that landed somewhere different from
+    ``url`` (``url`` always stays the originally requested address, so
+    session/visited-URL dedup logic never has to reconcile two identities
+    for the same request); ``favicon_present`` is a bare observational flag,
+    not an opportunity.
     """
     url: str
     html_snippet: str
@@ -88,6 +101,110 @@ class BrowserObservation:
     auth_hints: list[str] = field(default_factory=list)
     tokens: list[str] = field(default_factory=list)
     links: list[str] = field(default_factory=list)
+    status: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    # Each entry: {"name": str, "http_only": bool, "secure": bool} — never a
+    # cookie value.
+    cookies: list[dict[str, Any]] = field(default_factory=list)
+    final_url: str = ""
+    favicon_present: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Web exploitation planning model (Phase 14)
+# ---------------------------------------------------------------------------
+#
+# These types back a PLANNING/REASONING framework only — organizing browser
+# observations, detecting technology and form structure deterministically,
+# and surfacing structured, non-executable opportunities for a human
+# operator. Nothing here executes an exploit, submits a form, uploads a
+# payload, or performs SQL injection / XSS / CSRF of any kind. See
+# docs/web-planning.md.
+
+
+class WebOpportunityCategory(str, Enum):
+    """Planning labels only — never an executable action.
+
+    Mirrors ``OpportunityCategory`` (privilege-escalation planning, Phase
+    13) in spirit: every member is a *classification* a human operator
+    would use to decide what to investigate next, never something APEX
+    itself acts on.
+    """
+    authentication_portal = "authentication_portal"
+    admin_panel = "admin_panel"
+    upload_functionality = "upload_functionality"
+    search_functionality = "search_functionality"
+    directory_listing = "directory_listing"
+    api_endpoint = "api_endpoint"
+    robots_entry = "robots_entry"
+    backup_file = "backup_file"
+    default_page = "default_page"
+    # Reserved for a future capability if this taxonomy is ever extended by
+    # a category with no reliable deterministic detector yet — mirrors
+    # OpportunityCategory.none's "searched, nothing found" precedent.
+    none = "none"
+
+
+@dataclass(slots=True)
+class WebOpportunityEvidence:
+    """Bounded, secret-free evidence backing one ``WebOpportunity``.
+
+    ``excerpt`` is deliberately short (<=200 chars, enforced by producers)
+    and holds only titles/labels/short markers (e.g. a matched HTML
+    fragment or header value) — never full page content, never a payload,
+    never a cookie/session value.
+    """
+    source: str  # e.g. "form" | "header" | "html" | "url" | "robots_txt"
+    excerpt: str = ""
+    timestamp: str = ""
+
+
+@dataclass(slots=True)
+class WebOpportunity:
+    """One structured, non-executable web-exploitation planning record.
+
+    Stored in the EKG as a ``web_opportunity`` node (see
+    ``apex_host/graph_ids.py::web_opportunity_id`` and
+    ``apex_host/parsers/browser_parser.py``) — this dataclass is the
+    in-planner/report view reconstructed from that node's props, never a
+    second, independent storage format (memfabric Invariant 1).
+    """
+    id: str
+    category: WebOpportunityCategory
+    confidence: "OpportunityConfidence"
+    evidence: WebOpportunityEvidence
+    description: str
+    recommended_next_action: str
+    first_seen: str
+    last_seen: str
+
+
+@dataclass(slots=True)
+class WebSessionState:
+    """A snapshot view over browser session/reasoning state for one target —
+    built fresh from the EKG each turn, never itself the source of truth.
+
+    ``login_state`` is derived from the SAME success signal every other
+    phase uses (an ``access_state`` node) — never a second, independent
+    notion of "logged in".
+    """
+    target: str
+    pages_visited: int = 0
+    forms_discovered: int = 0
+    technologies_detected: int = 0
+    opportunities: tuple["WebOpportunity", ...] = ()
+    login_state: str = "anonymous"  # "anonymous" | "authenticated"
+
+    @property
+    def opportunity_count(self) -> int:
+        return len(self.opportunities)
+
+    @property
+    def categories(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for o in self.opportunities:
+            counts[o.category.value] = counts.get(o.category.value, 0) + 1
+        return counts
 
 
 @dataclass(slots=True)

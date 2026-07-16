@@ -266,6 +266,21 @@ def priv_esc_opportunity_id(target: str, category: str, discriminator: str) -> s
     return f"priv_esc_opportunity:{target}:{category}:{_slug(discriminator)}"
 
 
+def web_opportunity_id(target: str, category: str, discriminator: str) -> str:
+    """Canonical ID for a web-exploitation-planning opportunity node (Phase 14).
+
+    Mirrors ``priv_esc_opportunity_id`` exactly — ``discriminator``
+    distinguishes multiple opportunities in the same category for the same
+    target (e.g. a URL path slug for ``admin_panel``, a form-URL slug for
+    ``authentication_portal``), so the ID is stable and dedup-safe across
+    turns/reruns.
+
+    >>> web_opportunity_id("10.10.10.80", "admin_panel", "http://10.10.10.80/admin")
+    'web_opportunity:10.10.10.80:admin_panel:http-10-10-10-80-admin'
+    """
+    return f"web_opportunity:{target}:{category}:{_slug(discriminator)}"
+
+
 def priv_esc_evidence_id(target: str, command_key: str, port: str = "") -> str:
     """Canonical ID for a privilege-enumeration evidence node (Phase 13B).
 

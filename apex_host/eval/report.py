@@ -55,6 +55,12 @@ from apex_host.planners.priv_esc_opportunities import (
     opportunities_from_subgraph,
     rank_opportunities,
 )
+from apex_host.planners.web_opportunities import (
+    opportunities_from_subgraph as web_opportunities_from_subgraph,
+    rank_opportunities as rank_web_opportunities,
+    technologies_from_subgraph,
+    visited_urls_from_subgraph,
+)
 
 if TYPE_CHECKING:
     from memfabric.types import SubgraphView
@@ -201,6 +207,24 @@ class RunReport:
     # True once every command in ENUM_COMMANDS has been recorded as evidence
     # for this target — never True if enumeration never started.
     enum_completeness: bool = False
+
+    # Phase 14 — web exploitation planning & browser reasoning summary. All
+    # derived directly from the final subgraph (never from the possibly
+    # one-turn-stale state["web_session_state"] snapshot) except
+    # web_duplicate_pages_avoided, which has no EKG representation (a
+    # duplicate-skipped browse task produces no node at all).
+    web_pages_visited: int = 0
+    web_forms_discovered: int = 0
+    web_technologies_detected: int = 0
+    web_technology_names: list[str] = field(default_factory=list)
+    web_authentication_portals: int = 0
+    web_opportunity_count: int = 0
+    web_opportunity_categories: dict[str, int] = field(default_factory=dict)
+    web_duplicate_pages_avoided: int = 0
+    # Up to 5 recommended_next_action strings from the highest-ranked
+    # web opportunities — advisory text for a human operator, never an
+    # executable action APEX itself would take.
+    web_recommendations: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +489,24 @@ def build_report(
     enum_completed_keys = already_run_commands(subgraph)
     enum_completeness = bool(enum_completed_keys) and set(ENUM_COMMANDS).issubset(enum_completed_keys)
 
+    # Phase 14: web exploitation planning & browser reasoning summary.
+    # Derived directly from the FINAL subgraph — never from
+    # final_state["web_session_state"] (refreshed one turn early, same
+    # staleness caveat as Phase 13's privilege_summary).
+    web_pages_visited = len(visited_urls_from_subgraph(subgraph))
+    web_forms_discovered = sum(1 for n in subgraph.nodes if n.type == "form")
+    web_technologies = technologies_from_subgraph(subgraph)
+    web_technology_names = sorted({t["name"] for t in web_technologies if t.get("name")})
+    ranked_web_opportunities = rank_web_opportunities(web_opportunities_from_subgraph(subgraph))
+    web_opportunity_categories: dict[str, int] = {}
+    for web_o in ranked_web_opportunities:
+        web_opportunity_categories[web_o.category.value] = web_opportunity_categories.get(web_o.category.value, 0) + 1
+    web_authentication_portals = web_opportunity_categories.get("authentication_portal", 0)
+    web_duplicate_pages_avoided = sum(
+        1 for d in raw_dup if d.get("tool") == "browser"
+    )
+    web_recommendations = [web_o.recommended_next_action for web_o in ranked_web_opportunities][:5]
+
     return RunReport(
         target=config.target,
         mode="dry-run" if config.dry_run else "live",
@@ -527,6 +569,15 @@ def build_report(
         enum_new_opportunities=enum_new_opportunities,
         enum_duplicate_opportunities_avoided=enum_duplicate_opportunities_avoided,
         enum_completeness=enum_completeness,
+        web_pages_visited=web_pages_visited,
+        web_forms_discovered=web_forms_discovered,
+        web_technologies_detected=len(web_technologies),
+        web_technology_names=web_technology_names,
+        web_authentication_portals=web_authentication_portals,
+        web_opportunity_count=len(ranked_web_opportunities),
+        web_opportunity_categories=web_opportunity_categories,
+        web_duplicate_pages_avoided=web_duplicate_pages_avoided,
+        web_recommendations=web_recommendations,
     )
 
 
@@ -654,6 +705,27 @@ def format_text(report: RunReport) -> str:
         lines.append(f"  New opportunities  : {report.enum_new_opportunities}")
         lines.append(f"  Duplicates avoided : {report.enum_duplicate_opportunities_avoided}")
         lines.append(f"  Enumeration done   : {'Yes' if report.enum_completeness else 'No'}")
+
+    # Web Summary (Phase 14 — shown only when the browser visited at least
+    # one page; a target that never reached browser-based inspection shows
+    # nothing here). Browser reasoning/planning output only — never
+    # reflects an executed form submission, injection, or exploit.
+    if report.web_pages_visited:
+        lines.append("\nWeb Summary")
+        lines.append(f"  Pages visited        : {report.web_pages_visited}")
+        lines.append(f"  Forms discovered     : {report.web_forms_discovered}")
+        tech_detail = ", ".join(report.web_technology_names) or "none"
+        lines.append(f"  Technologies detected: {tech_detail}")
+        lines.append(f"  Authentication portals: {report.web_authentication_portals}")
+        cat_detail = ", ".join(
+            f"{cat}={count}" for cat, count in sorted(report.web_opportunity_categories.items())
+        )
+        lines.append(f"  Potential opportunities: {report.web_opportunity_count} ({cat_detail or 'none'})")
+        lines.append(f"  Duplicate pages avoided: {report.web_duplicate_pages_avoided}")
+        if report.web_recommendations:
+            lines.append("  Recommendations:")
+            for rec in report.web_recommendations:
+                lines.append(f"    {rec[:160]}")
 
     # Phase summary
     phase_table: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
@@ -903,6 +975,17 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
             "new_opportunities": report.enum_new_opportunities,
             "duplicate_opportunities_avoided": report.enum_duplicate_opportunities_avoided,
             "enumeration_complete": report.enum_completeness,
+        },
+        "web_planning": {
+            "pages_visited": report.web_pages_visited,
+            "forms_discovered": report.web_forms_discovered,
+            "technologies_detected": report.web_technologies_detected,
+            "technology_names": report.web_technology_names,
+            "authentication_portals": report.web_authentication_portals,
+            "opportunity_count": report.web_opportunity_count,
+            "opportunity_categories": report.web_opportunity_categories,
+            "duplicate_pages_avoided": report.web_duplicate_pages_avoided,
+            "recommendations": report.web_recommendations,
         },
     }
 

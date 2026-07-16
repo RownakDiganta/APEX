@@ -1632,3 +1632,46 @@ Privilege Enumeration Summary
 Full design, the evidence model, every supported command and parser, and
 current limitations:
 [`docs/privilege-enumeration.md`](docs/privilege-enumeration.md).
+
+## Web Exploitation Planning & Browser Reasoning
+
+The browser subsystem is an **intelligent planning component, not a web
+exploitation tool.** `BrowserPlanner` reasons about a website — what pages
+exist, what forms they contain, what technology they run, and what a human
+operator might want to investigate next — and never submits a form, never
+injects a payload, never performs SQL injection/XSS/CSRF, and never
+uploads a file.
+
+Every page visit produces a structured observation: page title, forms
+(with per-field type — text/password/file/hidden/search), technologies
+(deterministically detected from headers, HTML markers, and URL patterns —
+Apache, nginx, IIS, PHP, ASP.NET, Django, Flask, Express, WordPress,
+Joomla, Drupal — no fingerprinting tool), cookies (names only, never
+values), redirects, and a favicon flag. `BrowserPlanner` tracks a **session
+model** reconstructed from the EKG each turn — which pages have already
+been browsed, which same-origin discovered links remain unvisited — so it
+never revisits an identical page. Visit priority: the site's base URL,
+then `robots.txt`, then `sitemap.xml`, then the highest-priority
+discovered-but-unvisited link (admin/login/api-like paths first).
+
+Structured, non-executable `web_opportunity` findings are derived from
+what was observed — a login form becomes an `authentication_portal`
+opportunity, an admin-like URL becomes `admin_panel`, a file-upload form
+becomes `upload_functionality`, a `robots.txt` `Disallow:` entry becomes
+`robots_entry`, a directory listing or default install page is flagged,
+and so on — each with a human-readable `recommended_next_action`, never a
+command APEX itself would run.
+
+```
+Web Summary
+  Pages visited        : 4
+  Forms discovered     : 2
+  Technologies detected: nginx, PHP
+  Authentication portals: 1
+  Potential opportunities: 3 (admin_panel=1, authentication_portal=1, backup_file=1)
+  Duplicate pages avoided: 0
+```
+
+Full design, the session model, technology detection, opportunity
+generation, and current limitations:
+[`docs/web-planning.md`](docs/web-planning.md).

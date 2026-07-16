@@ -70,12 +70,17 @@ def parse_single_result(
         fallback_title = "(dry-run)" if tool_result.get("dry_run") else ""
         obs = BrowserObservation(
             url=str(obs_dict.get("url", fallback_url)),
-            html_snippet="",
+            html_snippet=str(obs_dict.get("html_snippet", "")),
             title=str(obs_dict.get("title", fallback_title)),
             forms=list(obs_dict.get("forms", [])),
             tokens=list(obs_dict.get("tokens", [])),
             auth_hints=list(obs_dict.get("auth_hints", [])),
             links=list(obs_dict.get("links", [])),
+            status=str(obs_dict.get("status", "")),
+            headers=dict(obs_dict.get("headers", {})),
+            cookies=list(obs_dict.get("cookies", [])),
+            final_url=str(obs_dict.get("final_url", "")),
+            favicon_present=bool(obs_dict.get("favicon_present", False)),
         )
         obs_target = str(obs_dict.get("url", fallback_url))
         parsed = _BROWSER_PARSER.parse_observation(obs, target=obs_target, source="browser")

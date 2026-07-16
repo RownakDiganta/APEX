@@ -59,7 +59,15 @@ def build_planners(
     llm_guard: "LLMPolicyGuard | None" = None,
     llm_gateway: "LLMGateway | None" = None,
 ) -> dict[str, "Planner"]:
-    """Construct the four phase-planner instances for an engagement."""
+    """Construct the phase-planner instances for an engagement.
+
+    Includes a ``"browser"`` entry (Phase 14) alongside the four
+    ``ApexPhase``-keyed entries — ``make_browser_node`` looks this up by the
+    plain string key ``"browser"`` since the browser agent is a distinct
+    graph node from ``web_agent`` even though both execute during the
+    ``web`` phase (see ``apex_host/orchestration/routing.py``).
+    """
+    from apex_host.planners.browser_planner import BrowserPlanner
     from apex_host.planners.credential_planner import CredentialPlanner
     from apex_host.planners.priv_esc_planner import PrivEscPlanner
     from apex_host.planners.recon_planner import ReconPlanner
@@ -106,4 +114,5 @@ def build_planners(
             password_candidates=config.password_candidates,
             **_kwargs(),
         ),
+        "browser": BrowserPlanner(config.target, registry, **_kwargs()),
     }
