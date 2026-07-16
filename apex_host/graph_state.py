@@ -155,6 +155,18 @@ class ApexGraphState(TypedDict):
     # technologies_detected, opportunity_count, categories (dict[str,int]),
     # login_state ("anonymous"|"authenticated")}.
     web_session_state: dict[str, Any]
+    # Phase 15 — multi-step exploitation orchestration summary. Refreshed
+    # every turn inside `reflect_or_continue` (apex_host.orchestration
+    # .continuation_node) from a fresh EKG read, using the SAME subgraph
+    # already fetched for termination evaluation (no extra read). Derived
+    # VIEW over workflow/workflow_step/session EKG nodes — never a second,
+    # independent store (memfabric Invariant 1). Shape:
+    # {workflow_count, status_counts (dict[str,int]), active_session_count}.
+    # The final report re-derives independently from the complete final
+    # EKG (apex_host.eval.report.build_report) rather than trusting this
+    # possibly-stale live snapshot — same convention as `privilege_summary`
+    # and `web_session_state` above.
+    workflow_summary: dict[str, Any]
 
 
 CompiledApexGraph = Any

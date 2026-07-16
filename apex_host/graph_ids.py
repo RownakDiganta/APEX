@@ -395,9 +395,65 @@ def produces_edge_id(from_node_id: str, to_node_id: str) -> str:
 
 
 def recommends_edge_id(from_node_id: str, to_node_id: str) -> str:
-    """Canonical ID for a 'recommends' edge (priv_esc_opportunity → priv_esc_recommendation, Phase 13B).
+    """Canonical ID for a 'recommends' edge (priv_esc_opportunity → priv_esc_recommendation, Phase 13B;
+    also reused unchanged for workflow → workflow_recommendation, Phase 15 —
+    see ``workflow_recommendation_id``).
 
     >>> recommends_edge_id("priv_esc_opportunity:10.0.0.1:sudo:x", "priv_esc_recommendation:priv_esc_opportunity:10.0.0.1:sudo:x")
     'recommends:priv_esc_opportunity:10.0.0.1:sudo:x:priv_esc_recommendation:priv_esc_opportunity:10.0.0.1:sudo:x'
     """
     return f"recommends:{from_node_id}:{to_node_id}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 15 — multi-step exploitation orchestration node IDs
+#
+# No new edge-ID builders were needed for Phase 15: ``indicates_edge_id``
+# (host/step → workflow/session/opportunity), ``contains_edge_id``
+# (workflow → workflow_step), and ``recommends_edge_id`` (workflow →
+# workflow_recommendation, above) were already generic enough to reuse —
+# mirrors the same "don't fragment the graph" discipline Phase 14 applied
+# to node types. See docs/workflow-orchestration.md.
+# ---------------------------------------------------------------------------
+
+def workflow_id(target: str, workflow_key: str) -> str:
+    """Canonical ID for a workflow node (Phase 15).
+
+    Content-addressed on ``target``+``workflow_key`` only (never on step
+    state) — re-deriving the same workflow always upserts the same node.
+
+    >>> workflow_id("10.10.10.14", "credential_to_privesc")
+    'workflow:10.10.10.14:credential_to_privesc'
+    """
+    return f"workflow:{target}:{workflow_key}"
+
+
+def workflow_step_id(workflow_node_id: str, step_name: str) -> str:
+    """Canonical ID for a workflow_step node, scoped to its parent workflow.
+
+    >>> workflow_step_id("workflow:10.10.10.14:credential_to_privesc", "validate_credentials")
+    'workflow_step:workflow:10.10.10.14:credential_to_privesc:validate_credentials'
+    """
+    return f"workflow_step:{workflow_node_id}:{step_name}"
+
+
+def session_id(target: str, kind: str, discriminator: str = "") -> str:
+    """Canonical ID for a session node (a planning object only — never a
+    live, executable session APEX holds open).
+
+    >>> session_id("10.10.10.14", "ssh")
+    'session:10.10.10.14:ssh'
+    >>> session_id("10.10.10.14", "ssh", "root")
+    'session:10.10.10.14:ssh:root'
+    """
+    suffix = f":{_slug(discriminator)}" if discriminator else ""
+    return f"session:{target}:{kind}{suffix}"
+
+
+def workflow_recommendation_id(workflow_node_id: str) -> str:
+    """Canonical ID for a workflow_recommendation node — one per workflow (1:1).
+
+    >>> workflow_recommendation_id("workflow:10.10.10.14:credential_to_privesc")
+    'workflow_recommendation:workflow:10.10.10.14:credential_to_privesc'
+    """
+    return f"workflow_recommendation:{workflow_node_id}"

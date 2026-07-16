@@ -978,17 +978,21 @@ it becomes a staged `KnowledgeEntry` at confidence 0.25–0.3.
 | `priv_esc_evidence` (Phase 13B) | One completed+parsed read-only enumeration command's output | `category`, `source_command`, `command_key`, `confidence`, `extracted_facts`, `raw_excerpt` |
 | `priv_esc_recommendation` (Phase 13B) | Advisory text for a human operator, one per opportunity — never an executable command | `text`, `category`, `priority`, `opportunity_id` |
 | `web_opportunity` (Phase 14) | A non-executable web-exploitation planning record — never an exploit/payload | `category`, `confidence`, `description`, `recommended_next_action`, `evidence_source`, `evidence_excerpt` |
+| `workflow` (Phase 15) | An explicit, reified multi-step reasoning chain — never an executable action | `key`, `objective`, `prerequisites`, `status`, `confidence`, `completed_steps`, `blocked_steps`, `failed_steps`, `next_candidate`, `completion_percentage` |
+| `workflow_step` (Phase 15) | One ordered step within a workflow | `name`, `status`, `description`, `workflow_id` |
+| `session` (Phase 15) | A planning-object view of a browser/credential/SSH/FTP/Telnet session — never a live, executable session APEX holds open | `kind`, `status`, `detail` |
+| `workflow_recommendation` (Phase 15) | Advisory text for a human operator summarizing one workflow's state — never a command APEX itself would run | `text`, `category`, `priority`, `workflow_id` |
 
 | Edge type | Meaning |
 |---|---|
 | `exposes` | host → service, host → endpoint |
 | `runs` | service → tech, endpoint → tech |
 | `requires` | endpoint → auth_flow |
-| `contains` | endpoint → form, endpoint → token, endpoint → endpoint (Phase 14: discovered-but-unvisited link) |
-| `indicates` (Phase 13) | host/access_state → priv_esc_opportunity (evidence that produced the opportunity); (Phase 14) endpoint → web_opportunity |
+| `contains` | endpoint → form, endpoint → token, endpoint → endpoint (Phase 14: discovered-but-unvisited link); (Phase 15) workflow → workflow_step |
+| `indicates` (Phase 13) | host/access_state → priv_esc_opportunity (evidence that produced the opportunity); (Phase 14) endpoint → web_opportunity; (Phase 15) host → workflow, host → session, workflow_step → session |
 | `collects` (Phase 13B) | host → priv_esc_evidence |
 | `produces` (Phase 13B) | priv_esc_evidence → priv_esc_opportunity |
-| `recommends` (Phase 13B) | priv_esc_opportunity → priv_esc_recommendation |
+| `recommends` (Phase 13B) | priv_esc_opportunity → priv_esc_recommendation; (Phase 15) workflow → workflow_recommendation |
 
 #### Parser routing (in `apex_host/graph.py` `parse_observation`)
 
@@ -6675,3 +6679,176 @@ lines are). One page visited per turn — deliberate, bounded pacing.
 `state["duplicate_actions"]` instead). No form submission, no payload, no
 privilege escalation of any kind was added or performed — `access_state`
 remains the engagement's only success signal.
+
+### Phase 15 — Multi-Step Exploitation Orchestration ✓ COMPLETE
+
+**Full design document:** [`docs/workflow-orchestration.md`](docs/workflow-orchestration.md)
+(9 sections). This entry is a summary and progress record; that document
+is authoritative.
+
+**Scope:** a **reasoning-and-coordination framework, not an exploitation
+engine.** Reifies the dependency ordering `GlobalPlanner` already enforces
+(recon → web → credential → priv_esc) into an explicit, inspectable,
+persisted `Workflow`/`Session`/`WorkflowRecommendation` model. Does not
+execute an exploit, upload a payload, generate a reverse shell, use
+Metasploit, establish persistence, or capture a flag. Does not add a new
+engagement phase or a new agent node that dispatches tasks — every
+existing planner continues to plan and dispatch exactly as before; Phase
+15 adds a synthesis step alongside the existing turn loop that describes
+what is already happening, using only already-existing EKG data.
+
+**Workflow model (`apex_host/types.py`):** `WorkflowStepStatus`
+(`pending`/`completed`/`blocked`/`failed`), `WorkflowStatus`
+(`running`/`blocked`/`completed`/`abandoned`/`stalled`), `WorkflowStep`
+(`name`, `status`, `description`), `Workflow` (`id`, `key`, `objective`,
+`prerequisites`, `steps`, `status`, `confidence`, plus properties
+`current_step`/`completed_steps`/`blocked_steps`/`failed_steps`/
+`pending_steps`/`next_candidate`/`completion_percentage`). `SessionKind`
+(`browser`/`credential`/`ssh`/`ftp`/`telnet`), `SessionStatus`
+(`active`/`attempted`/`inactive`), `Session` (a planning object only —
+never a live executable session), `WorkflowRecommendation` (advisory text,
+never a command APEX itself would run).
+
+**Two fixed, deterministic workflow templates**
+(`apex_host/planners/workflow_orchestration.py::WORKFLOW_TEMPLATES`),
+matching the task brief's own two action-chain examples exactly:
+`credential_to_privesc` (prerequisites host+service; steps
+discover_login → validate_credentials → enumerate_privilege →
+generate_recommendations) and `web_discovery_to_opportunity`
+(prerequisites host+endpoint; steps discover_form → inspect_technology →
+identify_opportunity). A template is only included when its prerequisites
+are already present in the EKG — not "not started", simply not applicable
+yet.
+
+**Structural dependency enforcement — the core of the "later stages
+cannot begin until prerequisites exist" requirement:** `_evaluate_steps()`
+walks a workflow's steps in order; once any step is not `completed`,
+every subsequent step is unconditionally `blocked` — its own completion
+condition is never even evaluated. Only `validate_credentials` has a real
+"failed" signal (a `credential` node exists for a (username, protocol)
+pair with no matching `access_state` — a genuine negative result, mirrors
+Phase 12B's one-attempt-per-protocol design); the web-discovery chain's
+steps are only ever `pending`/`completed`/`blocked` (no meaningful "failed"
+concept exists there — documented limitation, not an oversight).
+
+**Workflow-level status precedence:** all steps completed → `completed`;
+any step `failed` → `blocked`; engagement outcome already one of Phase
+12C's three stall values → `stalled`; engagement completed without this
+workflow finishing → `abandoned`; else → `running`. Reuses Phase 12C's own
+`EngagementOutcome` stall taxonomy rather than reinventing stall detection
+at the workflow level.
+
+**Why no "resume" logic was needed:** a workflow's step statuses are
+computed fresh, every time, from whatever EKG evidence currently exists —
+never from remembered/imperative history. Because memfabric's episodic log
+is append-only (Invariant 2) and working-memory nodes are only ever
+upserted, never deleted (Invariant 3), evidence for an already-completed
+step can never disappear — a workflow that reached `completed` is
+structurally incapable of reverting on re-derivation. "Avoid restarting
+completed chains" is satisfied by construction, not a special case —
+verified by `TestResumedChains` in the test suite.
+
+**Sessions (`derive_sessions_from_subgraph`):** browser session active
+when any `endpoint` node has `browsed=True`; credential/ssh/ftp/telnet
+sessions active when a matching `access_state` exists, `attempted` when
+only a `credential` node exists with no matching `access_state`. `detail`
+never contains a password or cookie value.
+
+**No new edge types needed:** `indicates` (host/step → workflow/session),
+`contains` (workflow → workflow_step), and `recommends` (workflow →
+workflow_recommendation — the SAME edge type Phase 13B introduced for
+`priv_esc_opportunity → priv_esc_recommendation`) were already generic
+enough to reuse — mirrors Phase 14's "reuse existing node/edge types,
+don't fragment the graph" discipline exactly. The `host → workflow`/
+`host → session` `indicates` edges are load-bearing (orphan prevention,
+the identical class of bug Phase 13/14 each hit and fixed) — verified via
+a real end-to-end dry-run engagement through the compiled graph during
+this phase's own development, not just assumed.
+
+**Orchestration wiring:** `apex_host/orchestration/continuation_node.py::reflect_or_continue`
+(the node that already runs at the end of every turn) now also derives
+`Workflow`/`Session` objects from the SAME subgraph snapshot it already
+fetched for its own termination peek (no extra EKG read), materializes them
+into node/edge deltas (`build_workflow_graph_deltas`), persists them via
+one `MemoryAPI.apply_deltas()` transactional batch, and refreshes
+`ApexGraphState["workflow_summary"]`. Wrapped in `try/except` — a failed
+sync degrades gracefully and never affects the termination decision. The
+live per-turn sync always uses `engagement_completed=False`; the final
+report re-derives independently with the REAL final
+`engagement_completed`/`engagement_outcome` values, so `abandoned`/
+`stalled` classification in the report is always accurate — same
+convention Phase 13/14 established for `privilege_summary`/
+`web_session_state`.
+
+**`ApexGraphState` gained one new field** (`workflow_summary` — dict with
+`workflow_count`, `status_counts`, `active_session_count`).
+
+**`RunReport` gained ten new fields** (`workflow_count`,
+`workflows_completed`, `workflows_blocked`, `workflows_running`,
+`workflows_stalled`, `workflows_abandoned`, `workflow_completion_percentage`,
+`active_sessions`, `reasoning_chains`, `workflow_recommendations`), all
+derived from the final subgraph with the real engagement completion/outcome
+values. `format_text()` gained a "Workflow Summary" section (shown only
+when at least one workflow's prerequisites were met), reusing the
+EXISTING `report.planner_decisions` field (Phase 5) for its "Planner
+decisions" line rather than duplicating that mechanism. `to_json_dict()`
+gained a `"workflow_orchestration"` block.
+
+**New node/edge types documented in §12.8:** `workflow`, `workflow_step`,
+`session`, `workflow_recommendation` nodes; no new edge types (full reuse
+of `indicates`/`contains`/`recommends`).
+
+**Real end-to-end verification performed:** a synthetic dry-run engagement
+(seeded `host` + an SSH `service` node with its `exposes` edge) was run
+through the real compiled graph. It produced `workflow`/`workflow_step`/
+`workflow_recommendation` nodes, correctly reachable from `host`, with
+`ApexGraphState["workflow_summary"]` populated correctly
+(`{"workflow_count": 1, "status_counts": {"running": 1}, ...}`).
+
+**Files changed (new):** `apex_host/planners/workflow_orchestration.py`,
+`docs/workflow-orchestration.md`,
+`tests/apex_host/test_phase15_workflow_orchestration.py` (46 tests).
+
+**Files changed (modified):** `apex_host/types.py` (`WorkflowStepStatus`/
+`WorkflowStatus`/`SessionKind`/`SessionStatus`/`WorkflowStep`/`Workflow`/
+`Session`/`WorkflowRecommendation`), `apex_host/graph_ids.py`
+(`workflow_id`, `workflow_step_id`, `session_id`, `workflow_recommendation_id`),
+`apex_host/graph_state.py` (`workflow_summary` field),
+`apex_host/orchestration/continuation_node.py` (workflow/session sync +
+state refresh), `apex_host/runtime.py` + `apex_host/eval/run_synthetic_machine.py`
+(new state-field initialization), `apex_host/eval/report.py` (ten new
+`RunReport` fields, text/JSON surfacing), `README.md`.
+
+**Explicitly not changed:** no exploit execution, payload upload, reverse
+shell, Metasploit usage, persistence, or flag capture was added anywhere in
+this phase. No new engagement phase or task-dispatching agent node was
+added — `GlobalPlanner`/`ReconPlanner`/`WebPlanner`/`BrowserPlanner`/
+`CredentialPlanner`/`PrivEscPlanner`/`TaskDispatcher` are all byte-for-byte
+unchanged in their planning/dispatch behavior. Docker, Compose, VPN, and
+GitHub Actions were not touched. No branch was created; no commit or push
+was made as part of this phase's work.
+
+**Validation (clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest -q` (full) | **4201 passed** (4155 baseline + 46 new Phase 15 tests), 53 pre-existing warnings — no regressions |
+| Focused: `test_phase15_workflow_orchestration.py` | 46 passed |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy` | Success — 157 source files |
+| `python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `python -m apex_tool_service --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Remaining known limitations (documented, not defects — see
+`docs/workflow-orchestration.md` §9 for the full list):** the
+web-discovery chain has no "failed" signal (only `validate_credentials`
+does). Exactly two hardcoded workflow templates — not configurable.
+`stalled` classification borrows the engagement-level Phase 12C outcome
+rather than independently detecting workflow-level stagnation. The live
+per-turn `workflow_summary` state field is one-turn-stale (the final
+report is unaffected). No new live command execution, no exploit, no
+payload, no persistence, no flag capture was added or performed —
+`access_state` remains the engagement's only success signal.

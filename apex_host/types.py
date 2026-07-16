@@ -531,3 +531,157 @@ class PrivilegeEnumerationProgress:
     @property
     def commands_attempted(self) -> int:
         return self.commands_completed + self.commands_failed
+
+
+# ---------------------------------------------------------------------------
+# Multi-step exploitation orchestration model (Phase 15)
+# ---------------------------------------------------------------------------
+#
+# These types back a REASONING AND COORDINATION framework only — reifying
+# the dependency ordering GlobalPlanner already enforces (recon -> web ->
+# credential -> priv_esc) into an explicit, inspectable, reportable
+# "Workflow" model, tracking which planning-object "sessions" exist, and
+# synthesizing advisory recommendations. Nothing here executes an exploit,
+# uploads a payload, generates a reverse shell, uses Metasploit, establishes
+# persistence, or captures a flag. See docs/workflow-orchestration.md.
+
+
+class WorkflowStepStatus(str, Enum):
+    """One step's status within a Workflow — derived purely from EKG
+    evidence, never from imperative/remembered history (see
+    ``apex_host.planners.workflow_orchestration`` module docstring for why
+    this makes "resuming" and "never restarting a completed chain"
+    automatic rather than something that needs its own tracking logic)."""
+    pending = "pending"      # not yet reached, or reached but not yet satisfied
+    completed = "completed"  # satisfied by existing EKG evidence
+    blocked = "blocked"      # a prerequisite step failed, or hasn't completed yet
+    failed = "failed"        # attempted (evidence of the attempt exists) and did not succeed
+
+
+class WorkflowStatus(str, Enum):
+    """A workflow's overall status — see
+    ``apex_host.planners.workflow_orchestration.derive_workflows_from_subgraph``
+    for the exact precedence rules."""
+    running = "running"
+    blocked = "blocked"
+    completed = "completed"
+    abandoned = "abandoned"
+    stalled = "stalled"
+
+
+class SessionKind(str, Enum):
+    """Which planning-object "session" this record describes. These are
+    NEVER live, executable sessions APEX holds open — they are derived,
+    read-only reconstructions of what earlier phases already recorded
+    (browser page visits, SSH/FTP/Telnet credential validation results)."""
+    browser = "browser"
+    credential = "credential"
+    ssh = "ssh"
+    ftp = "ftp"
+    telnet = "telnet"
+
+
+class SessionStatus(str, Enum):
+    """A session's status — ``active`` means validated/confirmed evidence
+    exists (e.g. an ``access_state`` node); ``attempted`` means an attempt
+    was recorded but not confirmed (e.g. a ``credential`` node with no
+    matching ``access_state``); ``inactive`` means no evidence of any kind."""
+    active = "active"
+    attempted = "attempted"
+    inactive = "inactive"
+
+
+@dataclass(slots=True)
+class WorkflowStep:
+    """One step in a ``Workflow`` — a named, ordered unit of reasoning
+    progress, never an executable action APEX performs on its own."""
+    name: str
+    status: WorkflowStepStatus
+    description: str
+
+
+@dataclass(slots=True)
+class Workflow:
+    """One structured, non-executable multi-step reasoning chain.
+
+    Stored in the EKG as a ``workflow`` node with one ``workflow_step``
+    node per step (see ``apex_host/graph_ids.py`` and
+    ``apex_host/planners/workflow_orchestration.py``) — this dataclass is
+    the in-planner/report view reconstructed from those nodes, never a
+    second, independent store (memfabric Invariant 1).
+    """
+    id: str
+    key: str
+    objective: str
+    prerequisites: tuple[str, ...]
+    steps: tuple[WorkflowStep, ...]
+    status: WorkflowStatus
+    confidence: OpportunityConfidence
+    first_seen: str
+    last_seen: str
+
+    @property
+    def completed_steps(self) -> list[str]:
+        return [s.name for s in self.steps if s.status is WorkflowStepStatus.completed]
+
+    @property
+    def blocked_steps(self) -> list[str]:
+        return [s.name for s in self.steps if s.status is WorkflowStepStatus.blocked]
+
+    @property
+    def failed_steps(self) -> list[str]:
+        return [s.name for s in self.steps if s.status is WorkflowStepStatus.failed]
+
+    @property
+    def pending_steps(self) -> list[str]:
+        return [s.name for s in self.steps if s.status is WorkflowStepStatus.pending]
+
+    @property
+    def current_step(self) -> str:
+        """The first non-completed step — "" once every step is completed."""
+        for s in self.steps:
+            if s.status is not WorkflowStepStatus.completed:
+                return s.name
+        return ""
+
+    @property
+    def next_candidate(self) -> str:
+        """The single actionable next step — the first ``pending`` step.
+
+        "" when nothing is actionable right now (either the workflow is
+        fully ``completed``, or it is ``blocked`` on a ``failed`` step with
+        nothing left to attempt automatically)."""
+        pending = self.pending_steps
+        return pending[0] if pending else ""
+
+    @property
+    def completion_percentage(self) -> float:
+        if not self.steps:
+            return 0.0
+        return round(100.0 * len(self.completed_steps) / len(self.steps), 1)
+
+
+@dataclass(slots=True)
+class Session:
+    """A planning-object view of one credential/browser session — never a
+    live, executable session APEX holds open. Stored in the EKG as a
+    ``session`` node."""
+    id: str
+    kind: SessionKind
+    target: str
+    status: SessionStatus
+    detail: str
+    first_seen: str
+    last_seen: str
+
+
+@dataclass(slots=True)
+class WorkflowRecommendation:
+    """Advisory text for a human operator summarizing one workflow's
+    current state — never a command or payload APEX itself would run.
+    Stored in the EKG as a ``workflow_recommendation`` node."""
+    id: str
+    workflow_id: str
+    text: str
+    category: str
+    priority: OpportunityConfidence

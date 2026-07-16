@@ -61,6 +61,13 @@ from apex_host.planners.web_opportunities import (
     technologies_from_subgraph,
     visited_urls_from_subgraph,
 )
+from apex_host.planners.workflow_orchestration import (
+    derive_sessions_from_subgraph,
+    derive_workflows_from_subgraph,
+    rank_sessions,
+    rank_workflows,
+    workflow_recommendations_from_workflows,
+)
 
 if TYPE_CHECKING:
     from memfabric.types import SubgraphView
@@ -225,6 +232,32 @@ class RunReport:
     # web opportunities — advisory text for a human operator, never an
     # executable action APEX itself would take.
     web_recommendations: list[str] = field(default_factory=list)
+
+    # Phase 15 — multi-step exploitation orchestration summary. Every field
+    # is derived directly from the final subgraph at report-build time
+    # (never from the possibly-one-turn-stale state["workflow_summary"]
+    # snapshot), using the REAL final engagement_completed/engagement_outcome
+    # values so abandoned/stalled classification is always accurate — unlike
+    # the live per-turn sync, which can never know in advance which turn
+    # terminates the engagement.
+    workflow_count: int = 0
+    workflows_completed: int = 0
+    workflows_blocked: int = 0
+    workflows_running: int = 0
+    workflows_stalled: int = 0
+    workflows_abandoned: int = 0
+    # Average completion_percentage across all applicable workflows; 0.0
+    # when no workflow's prerequisites were ever met this engagement.
+    workflow_completion_percentage: float = 0.0
+    # One entry per session: {"kind", "status", "detail"} — never a
+    # password/cookie value (see apex_host.types.Session).
+    active_sessions: list[dict[str, Any]] = field(default_factory=list)
+    # One entry per applicable workflow: {"workflow", "objective", "status",
+    # "steps": [{"name", "status"}, ...]} — the full reasoning chain for
+    # transparency/audit, not just the summary counts above.
+    reasoning_chains: list[dict[str, Any]] = field(default_factory=list)
+    # Up to 5 advisory recommendation strings — never an executable command.
+    workflow_recommendations: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -507,6 +540,40 @@ def build_report(
     )
     web_recommendations = [web_o.recommended_next_action for web_o in ranked_web_opportunities][:5]
 
+    # Phase 15: multi-step exploitation orchestration summary. Uses the
+    # REAL final completed/outcome values (unlike the live per-turn sync in
+    # continuation_node.py, which cannot know in advance which turn will
+    # terminate the engagement) so abandoned/stalled classification here is
+    # always accurate.
+    ranked_workflows = rank_workflows(
+        derive_workflows_from_subgraph(
+            config.target, subgraph,
+            engagement_completed=bool(final_state["completed"]),
+            engagement_outcome=resolved_outcome.value,
+        )
+    )
+    ranked_sessions = rank_sessions(derive_sessions_from_subgraph(config.target, subgraph))
+    workflow_status_counts: dict[str, int] = {}
+    for wf in ranked_workflows:
+        workflow_status_counts[wf.status.value] = workflow_status_counts.get(wf.status.value, 0) + 1
+    workflow_completion_percentage = (
+        round(sum(wf.completion_percentage for wf in ranked_workflows) / len(ranked_workflows), 1)
+        if ranked_workflows else 0.0
+    )
+    active_sessions = [
+        {"kind": s.kind.value, "status": s.status.value, "detail": s.detail} for s in ranked_sessions
+    ]
+    reasoning_chains = [
+        {
+            "workflow": wf.key, "objective": wf.objective, "status": wf.status.value,
+            "steps": [{"name": s.name, "status": s.status.value} for s in wf.steps],
+        }
+        for wf in ranked_workflows
+    ]
+    workflow_recommendations = [
+        wr.text for wr in workflow_recommendations_from_workflows(ranked_workflows)
+    ][:5]
+
     return RunReport(
         target=config.target,
         mode="dry-run" if config.dry_run else "live",
@@ -578,6 +645,16 @@ def build_report(
         web_opportunity_categories=web_opportunity_categories,
         web_duplicate_pages_avoided=web_duplicate_pages_avoided,
         web_recommendations=web_recommendations,
+        workflow_count=len(ranked_workflows),
+        workflows_completed=workflow_status_counts.get("completed", 0),
+        workflows_blocked=workflow_status_counts.get("blocked", 0),
+        workflows_running=workflow_status_counts.get("running", 0),
+        workflows_stalled=workflow_status_counts.get("stalled", 0),
+        workflows_abandoned=workflow_status_counts.get("abandoned", 0),
+        workflow_completion_percentage=workflow_completion_percentage,
+        active_sessions=active_sessions,
+        reasoning_chains=reasoning_chains,
+        workflow_recommendations=workflow_recommendations,
     )
 
 
@@ -725,6 +802,42 @@ def format_text(report: RunReport) -> str:
         if report.web_recommendations:
             lines.append("  Recommendations:")
             for rec in report.web_recommendations:
+                lines.append(f"    {rec[:160]}")
+
+    # Workflow Summary (Phase 15 — shown only when at least one workflow's
+    # prerequisites were ever met; a target that never reached any
+    # workflow's prerequisites shows nothing here). Reasoning/coordination
+    # output only — never reflects an executed exploit or payload.
+    if report.workflow_count:
+        lines.append("\nWorkflow Summary")
+        lines.append(
+            f"  Workflows            : {report.workflow_count} "
+            f"(completed={report.workflows_completed}, blocked={report.workflows_blocked}, "
+            f"running={report.workflows_running}, stalled={report.workflows_stalled}, "
+            f"abandoned={report.workflows_abandoned})"
+        )
+        lines.append(f"  Completion           : {report.workflow_completion_percentage}%")
+        if report.active_sessions:
+            sess_detail = ", ".join(f"{s['kind']}={s['status']}" for s in report.active_sessions)
+            lines.append(f"  Active sessions      : {sess_detail}")
+        planner_decisions = report.planner_decisions
+        det_count = sum(1 for d in planner_decisions if d.get("planner_model") == "deterministic")
+        llm_count = len(planner_decisions) - det_count
+        lines.append(
+            f"  Planner decisions    : {len(planner_decisions)} "
+            f"(deterministic={det_count}, llm={llm_count})"
+        )
+        if report.reasoning_chains:
+            lines.append("  Reasoning chains:")
+            for chain in report.reasoning_chains:
+                steps_str = " -> ".join(
+                    f"[{s['name']}]" if s["status"] != "completed" else s["name"]
+                    for s in chain["steps"]
+                )
+                lines.append(f"    {chain['workflow']} ({chain['status']}): {steps_str}")
+        if report.workflow_recommendations:
+            lines.append("  Recommendations:")
+            for rec in report.workflow_recommendations:
                 lines.append(f"    {rec[:160]}")
 
     # Phase summary
@@ -986,6 +1099,18 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
             "opportunity_categories": report.web_opportunity_categories,
             "duplicate_pages_avoided": report.web_duplicate_pages_avoided,
             "recommendations": report.web_recommendations,
+        },
+        "workflow_orchestration": {
+            "workflow_count": report.workflow_count,
+            "completed": report.workflows_completed,
+            "blocked": report.workflows_blocked,
+            "running": report.workflows_running,
+            "stalled": report.workflows_stalled,
+            "abandoned": report.workflows_abandoned,
+            "completion_percentage": report.workflow_completion_percentage,
+            "active_sessions": report.active_sessions,
+            "reasoning_chains": report.reasoning_chains,
+            "recommendations": report.workflow_recommendations,
         },
     }
 
