@@ -34,6 +34,12 @@ from apex_host.orchestration.outcome import (
 )
 from apex_host.orchestration.terminal_episode import terminal_state_fields, write_terminal_episode
 from apex_host.planners.capabilities import capabilities_from_subgraph
+from apex_host.planners.workflow_orchestration import (
+    build_workflow_graph_deltas,
+    derive_sessions_from_subgraph,
+    derive_workflows_from_subgraph,
+    workflow_summary_fields,
+)
 from apex_host.types import ApexPhase
 
 if TYPE_CHECKING:
@@ -72,6 +78,25 @@ def make_continuation_node(deps: "OrchestrationDeps") -> Any:
             # eventually produces a duplicate_task_stall termination rather
             # than spinning silently until max_turns.
             logger.warning("reflect_or_continue: EKG peek failed: %s", exc)
+
+        # Phase 15: reify GlobalPlanner's existing dependency ordering into
+        # explicit, persisted workflow/session/recommendation EKG data,
+        # reusing the SAME subgraph snapshot above (no extra read). A failed
+        # sync degrades gracefully — it never affects termination decisions,
+        # and the final report re-derives independently from the complete
+        # final EKG regardless of whether this per-turn sync ever ran (see
+        # docs/workflow-orchestration.md).
+        workflow_fields: dict[str, Any] = {}
+        if subgraph is not None:
+            try:
+                workflows = derive_workflows_from_subgraph(state["target"], subgraph)
+                sessions = derive_sessions_from_subgraph(state["target"], subgraph)
+                wf_nodes, wf_edges = build_workflow_graph_deltas(state["target"], workflows, sessions)
+                if wf_nodes:
+                    await deps.api.apply_deltas(nodes=wf_nodes, edges=wf_edges)
+                workflow_fields = workflow_summary_fields(state["target"], subgraph)
+            except Exception as exc:
+                logger.debug("reflect_or_continue: workflow sync failed: %s", exc)
 
         has_access_state = "access_state" in node_types_seen
 
@@ -135,6 +160,7 @@ def make_continuation_node(deps: "OrchestrationDeps") -> Any:
                     return {
                         "turn_count": turn_count, "completed": False,
                         "phase": next_phase_value, "repair_count": 0,
+                        **workflow_fields,
                     }
 
         # --- Terminating this turn: write the one canonical episode. ---
@@ -149,6 +175,7 @@ def make_continuation_node(deps: "OrchestrationDeps") -> Any:
             "turn_count": turn_count, "completed": True,
             "phase": ApexPhase.done.value, "repair_count": 0,
         }
+        result.update(workflow_fields)
         result.update(terminal_state_fields(decision))
         return result
 

@@ -1675,3 +1675,43 @@ Web Summary
 Full design, the session model, technology detection, opportunity
 generation, and current limitations:
 [`docs/web-planning.md`](docs/web-planning.md).
+
+## Multi-Step Exploitation Orchestration
+
+The `Workflow` model is a **reasoning-and-coordination layer, not an
+exploitation engine.** It reifies the dependency ordering `GlobalPlanner`
+already enforces (recon → web → credential → priv_esc) into an explicit,
+inspectable, persisted model — it does not execute an exploit, upload a
+payload, generate a reverse shell, use Metasploit, establish persistence,
+or capture a flag.
+
+Two fixed, deterministic workflow templates track the two action chains
+this phase was built around:
+
+```
+credential_to_privesc:          discover_login -> validate_credentials -> enumerate_privilege -> generate_recommendations
+web_discovery_to_opportunity:    discover_form -> inspect_technology -> identify_opportunity
+```
+
+Each step's status (`pending`/`completed`/`blocked`/`failed`) is computed
+fresh from whatever EKG evidence currently exists — never from remembered
+history — so a workflow can never "un-complete" or restart; once any step
+isn't completed, every step after it is structurally `blocked`, which is
+exactly how "later stages cannot begin until prerequisites exist" is
+enforced at the reasoning layer. `Session` records (browser/credential/
+SSH/FTP/Telnet) are **planning objects only**, reconstructed from evidence
+earlier phases already collected — never a live session APEX holds open.
+
+```
+Workflow Summary
+  Workflows            : 2 (completed=0, blocked=1, running=1, stalled=0, abandoned=0)
+  Completion           : 42.9%
+  Active sessions      : ssh=active, browser=active
+  Planner decisions    : 12 (deterministic=10, llm=2)
+  Reasoning chains:
+    credential_to_privesc (blocked): discover_login -> [validate_credentials] -> [enumerate_privilege] -> [generate_recommendations]
+```
+
+Full design, the dependency graph, the session model, and current
+limitations:
+[`docs/workflow-orchestration.md`](docs/workflow-orchestration.md).

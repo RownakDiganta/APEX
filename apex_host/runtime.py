@@ -215,6 +215,7 @@ class ApexRuntime:
             "attempted_opportunities": [],
             "enumeration_complete": False,
             "web_session_state": {},
+            "workflow_summary": {},
         }
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": run_id},
