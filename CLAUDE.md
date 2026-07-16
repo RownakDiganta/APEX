@@ -977,14 +977,15 @@ it becomes a staged `KnowledgeEntry` at confidence 0.25–0.3.
 | `priv_esc_opportunity` (Phase 13) | A non-executable privilege-escalation planning record — never a payload | `category`, `confidence`, `description`, `recommended_next_action`, `attempted`, `attempt_count`, `exhausted`, `source_tool` |
 | `priv_esc_evidence` (Phase 13B) | One completed+parsed read-only enumeration command's output | `category`, `source_command`, `command_key`, `confidence`, `extracted_facts`, `raw_excerpt` |
 | `priv_esc_recommendation` (Phase 13B) | Advisory text for a human operator, one per opportunity — never an executable command | `text`, `category`, `priority`, `opportunity_id` |
+| `web_opportunity` (Phase 14) | A non-executable web-exploitation planning record — never an exploit/payload | `category`, `confidence`, `description`, `recommended_next_action`, `evidence_source`, `evidence_excerpt` |
 
 | Edge type | Meaning |
 |---|---|
 | `exposes` | host → service, host → endpoint |
 | `runs` | service → tech, endpoint → tech |
 | `requires` | endpoint → auth_flow |
-| `contains` | endpoint → form, endpoint → token |
-| `indicates` (Phase 13) | host/access_state → priv_esc_opportunity (evidence that produced the opportunity) |
+| `contains` | endpoint → form, endpoint → token, endpoint → endpoint (Phase 14: discovered-but-unvisited link) |
+| `indicates` (Phase 13) | host/access_state → priv_esc_opportunity (evidence that produced the opportunity); (Phase 14) endpoint → web_opportunity |
 | `collects` (Phase 13B) | host → priv_esc_evidence |
 | `produces` (Phase 13B) | priv_esc_evidence → priv_esc_opportunity |
 | `recommends` (Phase 13B) | priv_esc_opportunity → priv_esc_recommendation |
@@ -6464,3 +6465,213 @@ mirrors Phase 12B). No new live command execution beyond the fixed nine
 commands, no privilege escalation, no persistence, no payload of any kind
 was added or performed — `access_state` remains the engagement's only
 success signal.
+
+### Phase 14 — Web Exploitation Planning & Browser Reasoning ✓ COMPLETE
+
+**Full design document:** [`docs/web-planning.md`](docs/web-planning.md)
+(11 sections). This entry is a summary and progress record; that document
+is authoritative.
+
+**Scope:** transform the browser subsystem from a single-page,
+hardcoded-URL executor into an intelligent planning component. Before this
+phase, `browser_agent` requested `state["target"]` — the exact same URL —
+on every single turn, so a second turn could only ever re-request an
+already-completed fingerprint and be silently duplicate-skipped; there was
+no technology detection, no structured opportunity model, and discovered
+links were captured in the episode but never persisted as EKG data a
+future turn could act on. Still **not** a web exploitation tool: no form is
+ever submitted, no payload is generated, no SQL injection/XSS/CSRF is ever
+performed, no file is uploaded, no login is attempted.
+
+**Design decision — reuse existing node types, don't fragment the graph:**
+the task brief's suggested `host → web_page → form → technology →
+web_opportunity` shape is implemented using the EXISTING `endpoint` (for
+`web_page`) and `tech` (for `technology`) node types — both already
+produced by nmap/curl/ffuf/gobuster/browser parsers and already load-bearing
+for `GlobalPlanner.decide_phase`/`capabilities.py`. Introducing competing
+node types would have fragmented every existing consumer. `web_opportunity`
+is the one genuinely new node type (mirrors `priv_esc_opportunity`, Phase
+13, exactly) — no existing type captured "a non-executable, human-actionable
+web finding".
+
+**`BrowserObservation` (`apex_host/types.py`) gained five additive fields:**
+`status`, `headers` (full dict; only a safe allowlist is ever persisted to
+the EKG), `cookies` (`[{"name","http_only","secure"}]` — **never a
+value**), `final_url` (set only on a redirect), `favicon_present`. Forms
+(`_JS_FORMS` in `browser_executor.py`) now also capture each field's
+`type` attribute (`field_types: {name: type}`) alongside the existing
+`fields` name list — additive; old callers reading only `fields` are
+unaffected. `html_snippet` now actually flows through
+`episode.data["obs"]["html_snippet"]` to `parse_observation` — it was
+previously hardcoded to `""` in `parsing_node.py`, silently disabling all
+HTML-based detection through the real pipeline; this is fixed.
+
+**Session model — no separate stored session object (memfabric Invariant
+6: executors are stateless).** Reconstructed as a view from the EKG each
+turn (`apex_host/planners/web_opportunities.py`):
+- `visited_urls_from_subgraph()` — `endpoint` nodes with `browsed=True`
+  (set only by `BrowserParser` on an actual navigation, never by a passive
+  curl/ffuf/gobuster discovery).
+- `select_unvisited_endpoints()` — same-origin, not-yet-browsed `endpoint`
+  nodes (created from `obs.links`, bounded at 20, same-origin filtered —
+  the browser must never be planned to navigate off-target based on a
+  discovered external link), ranked deterministically: interesting-keyword
+  priority (admin/login/api/...), then path depth, then URL alphabetical.
+- `build_web_session_state()` — `login_state` reuses the SAME
+  `access_state`-node success signal every other phase already relies on.
+
+**`BrowserPlanner` (`apex_host/planners/browser_planner.py`, new)**
+follows the identical `_<Name>Deterministic` + thin-wrapper convention as
+every other domain planner (§15.2). Visit priority per turn (exactly one
+page per turn, bounded): (1) base URL — derived from the highest-confidence
+`web_probe` capability, the SAME logic `WebPlanner` already uses; (2)
+`{base}/robots.txt`; (3) `{base}/sitemap.xml`; (4) the highest-priority
+same-origin discovered-but-unvisited endpoint. Once everything is visited,
+returns an explicit `AbandonSignal` instead of silently re-requesting an
+already-visited page.
+
+**`make_browser_node` rewritten** (`apex_host/orchestration/dispatch_node.py`):
+replaced the hand-rolled, hardcoded-URL `TaskSpec` synthesis with
+`_dispatch_tasks(deps, state, deps.phase_planners["browser"],
+single_task=True)` — the SAME shared dispatch helper every other phase
+agent already uses. `"browser"` is registered in `build_planners()`'s
+returned dict alongside the four `ApexPhase`-keyed planners (it is not
+itself an `ApexPhase` — `browser_agent`/`web_agent` are two different
+graph nodes that both execute during the `web` phase).
+
+**Technology detection (`apex_host/parsers/tech_detector.py`, new)** — pure,
+deterministic, no fingerprinting tool. Three channels merged with
+highest-confidence-per-name winning: HTTP headers (0.85 — Apache/nginx/
+IIS/Flask via `Server`, PHP/ASP.NET/Express via `X-Powered-By`, ASP.NET via
+`X-AspNet-Version`, PHP/ASP.NET/Django/Express via `Set-Cookie` NAME
+patterns only, Drupal via `X-Generator`), HTML markers (0.6 — WordPress/
+Joomla/Drupal path fragments + generator meta tag, Django via
+`csrfmiddlewaretoken`), URL patterns (0.4 — `.php`, `.aspx`,
+`/wp-admin`, `/administrator`).
+
+**Secret handling — caught and fixed during this phase's own test-writing:**
+`tech_detector`'s Set-Cookie-based findings originally stored the RAW
+`Set-Cookie` header value (including the actual session/CSRF value) as the
+`TechFinding.excerpt`, which then landed verbatim in a `tech` node's EKG
+props. Fixed: the excerpt for a cookie-name-pattern match is now a fixed,
+redacted description (e.g. `"Set-Cookie name pattern: PHPSESSID"`), never
+the header itself. Additionally, `endpoint.headers` only ever persists a
+five-name allowlist (`server`, `x-powered-by`, `content-type`,
+`x-aspnet-version`, `x-generator`) — `Set-Cookie` is excluded outright —
+and `endpoint.cookie_names` stores names only, never values.
+
+**Opportunity generation** — derived inline inside
+`BrowserParser.parse_observation()` from facts already extracted for that
+page visit (mirrors `priv_esc_parser.py`'s `_opportunities_from_facts`
+style): login form → `authentication_portal` (high); admin-like URL path
+→ `admin_panel` (medium); upload-type form field → `upload_functionality`
+(medium); search-type form field/action → `search_functionality` (low);
+`"Index of /"` marker → `directory_listing` (high); API-like URL →
+`api_endpoint` (low); backup-file-extension link → `backup_file` (medium);
+`robots.txt` `Disallow:` entry (bounded at 10) → `robots_entry` (low);
+known default-install-page marker → `default_page` (low). Every
+opportunity is content-addressed
+(`apex_host/graph_ids.py::web_opportunity_id(target, category,
+discriminator)`) so re-observing the same page/link/marker upserts rather
+than duplicates — no separate "already recorded" planner-side check is
+needed the way Phase 13's `PrivEscPlanner` requires one.
+
+**Real bug found and fixed during this phase's own test-writing (graph
+reachability):** the first implementation never linked a browser-visited
+endpoint node back to its `host` node. Since `MemoryAPI.get_subgraph()`
+performs a bounded host-anchored traversal, this made every browser-visited
+page an orphan — invisible to `BrowserPlanner`'s own visited-page dedup
+check and to the report's page/opportunity counts (the identical class of
+bug Phase 13 hit and fixed for `priv_esc_opportunity` nodes). Fixed by
+adding a `host → endpoint` `exposes` edge for the visited page in
+`BrowserParser.parse_observation()`.
+
+**`ApexGraphState` gained one new field** (`web_session_state` — dict
+holding `pages_visited`/`forms_discovered`/`technologies_detected`/
+`opportunity_count`/`categories`/`login_state`), refreshed inside
+`make_browser_node` via a fresh subgraph read after dispatch — same
+one-turn-stale caveat as Phase 13's `privilege_summary` (the final report
+is not affected, since it always re-derives from the complete final EKG).
+
+**`RunReport` gained nine new fields** (`web_pages_visited`,
+`web_forms_discovered`, `web_technologies_detected`,
+`web_technology_names`, `web_authentication_portals`,
+`web_opportunity_count`, `web_opportunity_categories`,
+`web_duplicate_pages_avoided`, `web_recommendations`), all derived from
+the final subgraph except `web_duplicate_pages_avoided` (no EKG
+representation — derived from `state["duplicate_actions"]` filtered to
+`tool == "browser"`). `format_text()` gained a "Web Summary" section
+(shown only when at least one page was visited); `to_json_dict()` gained a
+`"web_planning"` block.
+
+**New node/edge types documented in §12.8:** `web_opportunity` node; no new
+edge types were needed — `exposes`/`contains`/`runs`/`requires`/`indicates`
+were all already generic enough to reuse for the new relationships
+(`endpoint → endpoint` for discovered links via `contains`, `endpoint →
+web_opportunity` via `indicates`).
+
+**Files changed (new):** `apex_host/parsers/tech_detector.py`,
+`apex_host/planners/web_opportunities.py`,
+`apex_host/planners/browser_planner.py`, `docs/web-planning.md`,
+`tests/apex_host/test_phase14_web_planning.py` (95 tests).
+
+**Files changed (modified):** `apex_host/types.py` (`BrowserObservation`
+fields, `WebOpportunityCategory`/`WebOpportunity`/`WebOpportunityEvidence`/
+`WebSessionState`), `apex_host/graph_ids.py` (`web_opportunity_id`),
+`apex_host/parsers/browser_parser.py` (form field-type detection, tech
+detection, opportunity derivation, link-endpoint creation, `browsed` flag,
+`host → endpoint` exposes edge, safe header/cookie handling),
+`apex_host/agents/browser_executor.py` (richer live/dry-run observation
+collection), `apex_host/orchestration/parsing_node.py` (threads all new
+`BrowserObservation` fields through, fixes the `html_snippet` gap),
+`apex_host/orchestration/dependencies.py` (registers `BrowserPlanner`
+under `"browser"`), `apex_host/orchestration/dispatch_node.py`
+(`make_browser_node` rewritten to use `_dispatch_tasks` +
+`web_session_state_fields` refresh), `apex_host/graph_state.py`
+(`web_session_state` field), `apex_host/runtime.py` +
+`apex_host/eval/run_synthetic_machine.py` (new state-field
+initialization), `apex_host/eval/report.py` (nine new `RunReport` fields,
+text/JSON surfacing), `README.md`.
+
+**Pre-existing tests updated (deliberate, documented — not weakened):**
+`tests/apex_host/test_browser_executor.py`'s dry-run→endpoint-node test now
+expects the visited page plus its discovered-but-unvisited link endpoints
+(previously asserted exactly one endpoint, before link-endpoint creation
+existed — the new behavior is the intentional Phase 14 session-model
+capability); `tests/apex_host/test_phase10_orchestration.py`'s
+`build_planners()` key-set test now includes the new `"browser"` entry.
+
+**Explicitly not changed:** no form submission, no payload generation, no
+SQL injection/XSS/CSRF, no file upload, no login attempt, no exploitation
+of any kind was added anywhere in this phase. Docker, Compose, VPN, and
+GitHub Actions were not touched. No branch was created; no commit or push
+was made as part of this phase's work.
+
+**Validation (clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest -q` (full) | **4154 passed** (4059 baseline + 95 new Phase 14 tests), 53 pre-existing warnings — no regressions |
+| Focused: `test_phase14_web_planning.py` | 95 passed |
+| Focused: `test_browser_executor.py` (regression) | passed, 2 tests updated |
+| Focused: `test_phase10_orchestration.py` (regression) | passed, 1 test updated |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy` | Success — 156 source files |
+| `python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `python -m apex_tool_service --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Remaining known limitations (documented, not defects — see
+`docs/web-planning.md` §11 for the full list):** no live enumeration beyond
+passive browsing (no form submission, no login flow, no injection testing
+— deliberate scope boundary). Technology detection is a fixed,
+non-configurable list of eleven named technologies — no plugin/version
+database, no CVE correlation. `sitemap.xml` is visited like any other page
+but its `<loc>` entries are not parsed (only `robots.txt`'s `Disallow:`
+lines are). One page visited per turn — deliberate, bounded pacing.
+`web_duplicate_pages_avoided` has no EKG representation (derived from
+`state["duplicate_actions"]` instead). No form submission, no payload, no
+privilege escalation of any kind was added or performed — `access_state`
+remains the engagement's only success signal.

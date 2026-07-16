@@ -144,6 +144,17 @@ class ApexGraphState(TypedDict):
     # `exhausted` (see apex_host.planners.priv_esc_opportunities
     # .build_privilege_escalation_state).
     enumeration_complete: bool
+    # Phase 14 — web-exploitation-planning / browser-reasoning summary.
+    # Refreshed every browser_agent turn from a fresh EKG read
+    # (apex_host.orchestration.dispatch_node.make_browser_node); every
+    # other node simply omits this key, so LangGraph's partial-update
+    # semantics preserve the last known snapshot (mirrors
+    # `privilege_summary` above). Derived VIEW over endpoint/form/tech/
+    # web_opportunity EKG nodes — never a second, independent store
+    # (memfabric Invariant 1). Shape: {pages_visited, forms_discovered,
+    # technologies_detected, opportunity_count, categories (dict[str,int]),
+    # login_state ("anonymous"|"authenticated")}.
+    web_session_state: dict[str, Any]
 
 
 CompiledApexGraph = Any

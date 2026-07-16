@@ -36,6 +36,7 @@ from apex_host.graph_state import ApexGraphState
 from apex_host.orchestration.models import task_info
 from apex_host.orchestration.outcome import EngagementOutcome
 from apex_host.planners.priv_esc_opportunities import privilege_state_fields
+from apex_host.planners.web_opportunities import web_session_state_fields
 from apex_host.types import ApexPhase
 
 if TYPE_CHECKING:
@@ -245,45 +246,29 @@ def make_execute_node(deps: "OrchestrationDeps") -> Any:
 
 
 def make_browser_node(deps: "OrchestrationDeps") -> Any:
-    """Return the ``browser_agent`` node.
+    """Return the ``browser_agent`` node bound to the browser planner.
 
-    Unlike other agent nodes, ``browser_agent`` synthesises its own
-    ``TaskSpec`` from state (no planner call) and dispatches via
-    ``TaskDispatcher`` so all gate checks still apply.
+    Phase 14: ``browser_agent`` now goes through ``_dispatch_tasks`` like
+    every other phase agent, calling ``BrowserPlanner`` (registered under
+    the ``"browser"`` key in ``deps.phase_planners`` — see
+    ``apex_host.orchestration.dependencies.build_planners``) instead of
+    synthesising a hardcoded ``TaskSpec`` for ``state["target"]`` on every
+    turn. ``single_task=True`` preserves the pre-Phase-14 "exactly one
+    browse action per turn" behavior. After dispatching, refreshes the
+    ``web_session_state`` field from a fresh EKG read — mirrors the
+    read-after-write "peek" pattern ``make_priv_esc_node`` already uses
+    (Phase 13), scoped only to this node so other phase agents are
+    unaffected. A failed refresh degrades gracefully.
     """
     async def browser_agent(state: "ApexGraphState") -> dict[str, Any]:
-        url = state["target"]
-        if not url.startswith("http://") and not url.startswith("https://"):
-            url = f"http://{url}"
-
-        task = TaskSpec(
-            id=state["run_id"], goal_id=state["run_id"], executor_domain="browser",
-            params={"url": url, "tool": "browser", "target": deps.config.target, "args": []},
-            subgraph_anchor=deps.anchor_id, phase=state["phase"],
+        result = await _dispatch_tasks(
+            deps, state, deps.phase_planners["browser"], single_task=True
         )
-        subgraph = await deps.api.get_subgraph(deps.anchor_id, depth=2)
-        evidence = await deps.api.query(text=state["goal"], subgraph_anchor=deps.anchor_id)
-        ctx = ExecutionContext(
-            run_id=state["run_id"], phase=state["phase"], turn_number=state["turn_count"],
-            evidence_version=None, subgraph=subgraph, evidence=evidence, dry_run=deps.config.dry_run,
-        )
-        dr = await deps.dispatcher.dispatch(task, ctx)
-        pd_entry = dict(dr.audit_metadata.get("policy_decision") or {})
-        tr: dict[str, Any] = dr.tool_result_dict
-        task_dict = {"id": task.id, "executor_domain": "browser", "params": task.params}
-
-        if dr.disposition is ExecutionDisposition.SKIPPED_DUPLICATE:
-            dup = [_dup_entry(task, dr.fingerprint, state["phase"], deps.config.target)]
-            return {
-                "current_task": task_dict, "last_tool_result": None, "tool_results": None,
-                "last_error": "skipped: duplicate browser action", "planner_decisions": [],
-                "policy_decisions": [pd_entry], "duplicate_actions": dup,
-            }
-
-        return {
-            "current_task": task_dict, "last_tool_result": tr, "tool_results": [tr],
-            "last_error": tr.get("error"), "planner_decisions": [],
-            "policy_decisions": [pd_entry],
-        }
+        try:
+            subgraph = await deps.api.get_subgraph(deps.anchor_id, depth=2)
+            result.update(web_session_state_fields(subgraph, target=state["target"]))
+        except Exception as exc:
+            logger.debug("browser_agent: web-session-state summary refresh failed: %s", exc)
+        return result
 
     return browser_agent
