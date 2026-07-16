@@ -83,6 +83,23 @@ def parse_single_result(
         return _BANNER.parse_text(stdout, target=target, source=tool_name, port=port), tool_name
     if parser_name == "access":
         username = str(tool_result.get("username", ""))
+        if tool_name in ("ssh_access", "ftp_access"):
+            # Phase 12B — SSH/FTP results are already classified by the
+            # executor (success/authenticated determined via a typed
+            # exception or protocol response code, never a text heuristic).
+            default_protocol = "ssh" if tool_name == "ssh_access" else "ftp"
+            protocol = str(tool_result.get("protocol", default_protocol)) or default_protocol
+            operation = str(tool_result.get("operation", ""))
+            parsed = _ACCESS.parse_structured(
+                protocol=protocol, target=target, username=username,
+                success=bool(tool_result.get("success", False)),
+                authenticated=bool(tool_result.get("authenticated", False)),
+                port=str(tool_result.get("port", "")),
+                proto=str(tool_result.get("proto", "tcp")),
+                evidence_text=str(tool_result.get("response_summary", "")),
+                proof_type=f"{protocol}_{operation}".strip("_") if operation else protocol,
+            )
+            return parsed, tool_name
         parsed = _ACCESS.parse_text(
             stdout, target=target, username=username,
             source=str(tool_result.get("tool", "telnet_access")),

@@ -95,6 +95,14 @@ class ApexGraphState(TypedDict):
     # An unroutable phase must never disappear silently into END — this
     # field is the durable, checkpoint-visible record of why it stopped.
     diagnostic_events: Annotated[list[dict[str, Any]], operator.add]
+    # Phase 12B: one entry per telnet_access/ssh_access/ftp_access tool_result
+    # written in write_memory, with fields {protocol, target, port, username,
+    # success, authenticated, error_category, timed_out, phase} — never the
+    # password. Lets apex_host/eval/report.py summarize attempted /
+    # authenticated / rejected / timed_out / connection_failed / protocol_error
+    # counts per protocol across the whole run without re-querying the
+    # episodic store. See docs/credential-validation.md "Reporting".
+    credential_validation_log: Annotated[list[dict[str, Any]], operator.add]
 
 
 CompiledApexGraph = Any

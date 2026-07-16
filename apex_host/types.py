@@ -97,3 +97,53 @@ class ApexRunConfig:
     target: str
     start_phase: ApexPhase = ApexPhase.recon
     max_turns: int = 20
+
+
+class CredentialErrorCategory(str, Enum):
+    """Distinguishes why a bounded SSH/FTP credential-validation attempt did
+    or did not succeed (Phase 12B).
+
+    Used by ``apex_host/agents/ssh_executor.py`` and ``ftp_executor.py`` to
+    classify their result before it becomes episode data. TelnetExecutor
+    predates this taxonomy and is intentionally left unchanged (Phase 12A/
+    12B invariant: existing Telnet behavior must remain compatible) — it
+    folds every non-success case into ``Outcome.fundamental``/``fixable``
+    without this finer breakdown.
+    """
+    success = "success"
+    auth_rejected = "auth_rejected"
+    connection_failed = "connection_failed"
+    connect_timeout = "connect_timeout"
+    auth_timeout = "auth_timeout"
+    command_timeout = "command_timeout"
+    protocol_error = "protocol_error"
+    command_failed = "command_failed"
+
+
+@dataclass(slots=True)
+class CredentialValidationResult:
+    """Structured, secret-free outcome of one bounded SSH/FTP credential
+    validation attempt (Phase 12B).
+
+    Built entirely inside the executor's synchronous worker function and
+    never crosses a boundary that could accidentally attach the plaintext
+    password — no field here is ever the credential itself, only whether it
+    worked and why. ``response_summary`` is the bounded, already-truncated
+    harmless-command output (e.g. ``id``'s stdout, or FTP's ``PWD``
+    response) — never raw session/protocol transcript data beyond what the
+    fixed validation operation itself produced.
+    """
+    protocol: str            # "ssh" | "ftp"
+    target: str
+    port: str
+    username: str
+    success: bool             # True only on a fully successful validation
+    authenticated: bool       # True once login succeeded, even if the
+                               # follow-up harmless command itself then failed
+    operation: str             # the fixed harmless validation command/operation run
+    response_summary: str      # bounded, truncated stdout/response text — no secrets
+    error_category: str        # a CredentialErrorCategory value
+    error_detail: str          # human-readable detail — never includes the password
+    duration_seconds: float
+    timed_out: bool
+    executor: str               # "ssh" | "ftp" — identifies which executor produced this

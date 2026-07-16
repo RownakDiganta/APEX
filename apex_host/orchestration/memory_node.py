@@ -35,6 +35,7 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
 
         error_entries: list[dict[str, Any]] = []
         backend_entries: list[dict[str, Any]] = []
+        credential_entries: list[dict[str, Any]] = []
         for tr in results_to_write:
             # F13: skipped-duplicate tasks never executed — skip episode creation.
             if tr.get("skipped_duplicate"):
@@ -80,11 +81,41 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
                     "phase": state["phase"],
                 })
 
+            # Phase 12B: credential-validation audit log — never the password.
+            # ssh_access/ftp_access tool_results carry protocol/success/
+            # authenticated/error_category explicitly (set by
+            # TaskDispatcher._credential_result_to_tr). telnet_access
+            # predates that shape (Phase 12A invariant: unchanged), so its
+            # entry is derived best-effort from the fields it does have.
+            tool_name = str(tr.get("tool", ""))
+            if tool_name in ("telnet_access", "ssh_access", "ftp_access"):
+                success = bool(tr.get("success", o == Outcome.success))
+                default_protocol = {
+                    "telnet_access": "telnet", "ssh_access": "ssh", "ftp_access": "ftp",
+                }[tool_name]
+                protocol = str(tr.get("protocol") or default_protocol)
+                error_category = str(
+                    tr.get("error_category") or ("success" if success else "unknown")
+                )
+                credential_entries.append({
+                    "protocol": protocol,
+                    "target": str(tr.get("target", "")),
+                    "port": str(tr.get("port", "")),
+                    "username": str(tr.get("username", "")),
+                    "success": success,
+                    "authenticated": bool(tr.get("authenticated", success)),
+                    "error_category": error_category,
+                    "timed_out": bool(tr.get("timed_out", False)),
+                    "phase": state["phase"],
+                })
+
         result: dict[str, Any] = {}
         if error_entries:
             result["error_episodes"] = error_entries
         if backend_entries:
             result["execution_backend_log"] = backend_entries
+        if credential_entries:
+            result["credential_validation_log"] = credential_entries
         return result
 
     return write_memory

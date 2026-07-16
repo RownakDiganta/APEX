@@ -2,20 +2,49 @@
 # Deterministic credential-phase planner with an optional PlanningEngine LLM seam.
 """Deterministic credential-phase planner with optional LLM backend.
 
-``_CredentialDeterministic`` contains the original rule-based logic — three
-paths, in order:
+``_CredentialDeterministic`` contains the original rule-based logic — for
+each configured credential pair, at most ONE bounded login task is emitted
+per turn, chosen deterministically across three protocols:
 
-1. ``access_validate_telnet`` capability found AND credentials configured:
-   Emit exactly ONE bounded telnet-login task. No looping, no credential
-   stuffing. Credentials must come from explicit operator config (never
-   guessed autonomously).
+1. A protocol capability (``access_validate_telnet`` / ``_ssh`` / ``_ftp``)
+   is present AND credentials are configured AND that protocol has not
+   already been attempted for this target/username: emit exactly ONE
+   bounded login task for the highest-priority such protocol (see
+   ``_PROTOCOL_ORDER`` below). No looping, no credential stuffing, no
+   trying every protocol in one turn.
 
-2. ``access_validate_telnet`` capability found but NO credentials:
-   Return AbandonSignal with a helpful message directing the operator to
-   supply --username / --password flags.
+2. At least one protocol capability is present but no credentials are
+   configured: AbandonSignal directing the operator to supply
+   --username / --password.
 
-3. No telnet capability: fall back to a curl HEAD probe against a known
-   auth_flow endpoint, or abandon if none exists.
+3. Every available protocol capability has already been attempted (a
+   credential node already exists for each): AbandonSignal — the one-attempt
+   invariant applies per protocol, not just to the phase as a whole.
+
+4. No protocol capability at all: fall back to a passive curl HEAD probe
+   against a known auth_flow endpoint (unchanged since before Phase 12B),
+   or abandon if none exists.
+
+Deterministic protocol ordering (Phase 12B)
+--------------------------------------------
+``_PROTOCOL_ORDER = ("telnet", "ssh", "ftp")`` is a fixed, documented
+priority — never randomized, never based on service *discovery order* (which
+is not guaranteed stable across runs). Telnet is checked first purely for
+historical/backward-compatibility reasons (it was the only protocol before
+Phase 12B and its existing behavior must remain unchanged when it is the
+only capability present). When multiple services exist for the *same*
+protocol (e.g. two SSH ports), the lowest port number is chosen — also
+deterministic, no randomness. See docs/credential-validation.md "Planner
+integration" for the full rationale and test coverage.
+
+Per-protocol duplicate guard (Phase 12B)
+------------------------------------------
+Each protocol tracks its own "already attempted" state independently by
+inspecting existing ``credential`` nodes' ``protocol`` prop (set by
+``AccessParser`` — see ``apex_host/graph_ids.py``'s ``credential_id``
+docstring for why SSH/FTP credential-node IDs embed the protocol). A failed
+SSH attempt therefore never blocks an unrelated FTP attempt, or vice versa —
+each protocol's one-attempt invariant is enforced separately.
 
 ``CredentialPlanner`` is the public thin wrapper: when a ``model_router`` is
 provided it constructs a ``PlanningEngine`` and routes through it; otherwise
@@ -31,11 +60,12 @@ from memfabric.types import (
     ClaimDependency,
     EvidenceBundle,
     Goal,
+    Node,
     SubgraphView,
     TaskSpec,
 )
 
-from apex_host.planners.capabilities import capabilities_from_subgraph
+from apex_host.planners.capabilities import Capability, capabilities_from_subgraph
 from apex_host.planning.models import PlanDecision
 from apex_host.tools.registry import ToolRegistry
 from apex_host.types import ApexPhase
@@ -46,6 +76,56 @@ if TYPE_CHECKING:
     from apex_host.planning.budget import LLMBudgetTracker
     from apex_host.planning.engine import PlanningEngine
     from apex_host.policy.llm_guard import LLMPolicyGuard
+
+# Fixed, documented, deterministic protocol priority — see module docstring.
+_PROTOCOL_ORDER: tuple[str, ...] = ("telnet", "ssh", "ftp")
+
+_PROTOCOL_CAPABILITY: dict[str, str] = {
+    "telnet": "access_validate_telnet",
+    "ssh": "access_validate_ssh",
+    "ftp": "access_validate_ftp",
+}
+
+_PROTOCOL_TASK_TOOL: dict[str, str] = {
+    "telnet": "telnet_access",
+    "ssh": "ssh_access",
+    "ftp": "ftp_access",
+}
+
+_PROTOCOL_DEFAULT_PORT: dict[str, str] = {"telnet": "23", "ssh": "22", "ftp": "21"}
+
+
+def _protocol_already_attempted(
+    subgraph_nodes: "list[Node]", target: str, protocol: str, username: str
+) -> bool:
+    """True when a credential node already exists for *protocol* against
+    *target*/*username*.
+
+    Matching is protocol-scoped so one protocol's attempt (successful or
+    failed) never blocks another protocol's attempt against the same
+    target/username — see the module docstring "Per-protocol duplicate
+    guard". Telnet matches both the historical, protocol-tag-free node
+    shape (``props`` has no ``protocol`` key at all — the shape produced by
+    ``AccessParser.parse_text`` when called with the pre-Phase-12B default,
+    and by any credential node built directly rather than through the
+    parser) and the real pipeline's own ``protocol="telnet_access"`` value,
+    preserving Telnet's exact pre-Phase-12B behavior. SSH/FTP only match
+    their own explicit protocol tag.
+    """
+    for n in subgraph_nodes:
+        if n.type != "credential":
+            continue
+        if str(n.props.get("target", "")) != target:
+            continue
+        if str(n.props.get("username", "")) != username:
+            continue
+        node_protocol = str(n.props.get("protocol", "")).lower()
+        if protocol == "telnet":
+            if node_protocol == "" or "telnet" in node_protocol:
+                return True
+        elif protocol in node_protocol:
+            return True
+    return False
 
 
 class _CredentialDeterministic:
@@ -71,71 +151,109 @@ class _CredentialDeterministic:
         """True when at least one username and one password are configured."""
         return bool(self._usernames) and bool(self._passwords)
 
+    def _build_task(
+        self, goal: Goal, protocol: str, cap: Capability, username: str, password: str
+    ) -> TaskSpec:
+        """Build the single bounded login TaskSpec for *protocol*.
+
+        Identical params shape across all three protocols (only ``tool`` and
+        the default port differ) — the dedicated executor for each protocol
+        (``TelnetExecutor`` / ``SSHExecutor`` / ``FTPExecutor``) reads the
+        same ``target``/``port``/``username``/``password`` keys.
+        """
+        return TaskSpec(
+            id=new_id(),
+            goal_id=goal.id,
+            executor_domain="credential",
+            params={
+                "tool": _PROTOCOL_TASK_TOOL[protocol],
+                "target": self._target,
+                "port": cap.port or _PROTOCOL_DEFAULT_PORT[protocol],
+                "username": username,
+                "password": password,
+                "parser": "access",
+            },
+            subgraph_anchor=goal.anchor_node,
+            phase=goal.phase,
+            # Login reads port and service from the capability's source node.
+            claim_dependencies=(
+                ClaimDependency(node_id=cap.source_node_id, field_name="port"),
+                ClaimDependency(node_id=cap.source_node_id, field_name="service"),
+            ),
+        )
+
     async def plan(
         self, goal: Goal, subgraph: SubgraphView, evidence: EvidenceBundle
     ) -> list[TaskSpec] | AbandonSignal:
         caps = capabilities_from_subgraph(subgraph)
-        telnet_caps = [c for c in caps if c.name == "access_validate_telnet"]
+        caps_by_protocol: dict[str, list[Capability]] = {p: [] for p in _PROTOCOL_ORDER}
+        for c in caps:
+            for protocol, cap_name in _PROTOCOL_CAPABILITY.items():
+                if c.name == cap_name:
+                    caps_by_protocol[protocol].append(c)
 
-        if telnet_caps:
-            # Loop guard: if a credential node already exists for this
-            # target+username, a login attempt has already been recorded.
-            # Do not repeat — the one-attempt invariant is enforced here.
-            if self._usernames:
-                username0 = self._usernames[0]
-                already_attempted = any(
-                    n.type == "credential"
-                    and str(n.props.get("target", "")) == self._target
-                    and str(n.props.get("username", "")) == username0
-                    for n in subgraph.nodes
-                )
-                if already_attempted:
+        any_protocol_cap = any(caps_by_protocol[p] for p in _PROTOCOL_ORDER)
+
+        if any_protocol_cap:
+            if not self._usernames or not self._passwords:
+                # Preserve the exact, tested message when telnet is (one of)
+                # the available capabilities; generalize only when telnet is
+                # not involved at all (a pure SSH/FTP-only target).
+                if caps_by_protocol["telnet"]:
                     return AbandonSignal(
                         reason=(
-                            f"telnet credential already recorded for "
-                            f"{username0}@{self._target}; "
-                            "not repeating (one-attempt invariant)"
+                            "access_validate_telnet capability present but no credentials configured; "
+                            "pass --username and --password to attempt a bounded login validation"
                         )
                     )
-
-            if not self._usernames or not self._passwords:
                 return AbandonSignal(
                     reason=(
-                        "access_validate_telnet capability present but no credentials configured; "
-                        "pass --username and --password to attempt a bounded login validation"
+                        "a credential-validation capability is present but no credentials "
+                        "configured; pass --username and --password to attempt a bounded "
+                        "login validation"
                     )
                 )
-            cap = telnet_caps[0]
-            username = self._usernames[0]
-            password = self._passwords[0]
-            return [
-                TaskSpec(
-                    id=new_id(),
-                    goal_id=goal.id,
-                    executor_domain="credential",
-                    params={
-                        "tool": "telnet_access",
-                        "target": self._target,
-                        "port": cap.port or "23",
-                        "username": username,
-                        "password": password,
-                        "parser": "access",
-                    },
-                    subgraph_anchor=goal.anchor_node,
-                    phase=goal.phase,
-                    # Telnet login reads port and service from the capability node.
-                    claim_dependencies=(
-                        ClaimDependency(
-                            node_id=cap.source_node_id, field_name="port"
-                        ),
-                        ClaimDependency(
-                            node_id=cap.source_node_id, field_name="service"
-                        ),
-                    ),
-                )
-            ]
 
-        # No telnet capability — fall back to a passive curl HEAD probe.
+            username0 = self._usernames[0]
+            password0 = self._passwords[0]
+
+            # Deterministic ordering: telnet, then ssh, then ftp (see module
+            # docstring). Within one protocol, lowest port number first.
+            for protocol in _PROTOCOL_ORDER:
+                protocol_caps = caps_by_protocol[protocol]
+                if not protocol_caps:
+                    continue
+                # Loop guard: this protocol's own one-attempt invariant —
+                # a failed/successful SSH attempt never blocks FTP, and
+                # vice versa (see _protocol_already_attempted).
+                if _protocol_already_attempted(subgraph.nodes, self._target, protocol, username0):
+                    continue
+                cap = sorted(
+                    protocol_caps,
+                    key=lambda c: int(c.port) if c.port.isdigit() else 0,
+                )[0]
+                return [self._build_task(goal, protocol, cap, username0, password0)]
+
+            # Every protocol with a capability has already been attempted.
+            attempted = ", ".join(p for p in _PROTOCOL_ORDER if caps_by_protocol[p])
+            if caps_by_protocol["telnet"] and not caps_by_protocol["ssh"] and not caps_by_protocol["ftp"]:
+                # Single-protocol (telnet-only) case: preserve the exact,
+                # tested pre-Phase-12B message text.
+                return AbandonSignal(
+                    reason=(
+                        f"telnet credential already recorded for "
+                        f"{username0}@{self._target}; "
+                        "not repeating (one-attempt invariant)"
+                    )
+                )
+            return AbandonSignal(
+                reason=(
+                    f"credential already recorded for {username0}@{self._target} on every "
+                    f"available protocol ({attempted}); not repeating (one-attempt invariant)"
+                )
+            )
+
+        # No protocol capability at all — fall back to a passive curl HEAD probe.
         if self._registry.get("curl") is None:
             return AbandonSignal(
                 reason="no access_validate_telnet capability and curl not available in allowed_tools"

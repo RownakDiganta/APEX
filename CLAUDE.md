@@ -5698,3 +5698,212 @@ exists yet, and package visibility has not been checked. `docs/github-actions.md
 debugged, no Cap/Meow workflow was modified, no target-specific
 exploitation logic was added, and no live HTB engagement was run —
 entirely out of scope for this phase and untouched.
+
+---
+
+## 23. Application Repair Roadmap — Phase 12
+
+Separate from the Infrastructure Migration Roadmap (§22) and the Reviewer
+Remediation Program (§21): this track fixes defects in the APEX
+*application logic* surfaced by the HTB Exploitation Workflow Diagnostic
+Report — why APEX, with working infrastructure, still could not reliably
+progress through an HTB engagement. "Phase 12" numbering is independent of
+both §21's and §22's phase counters.
+
+### Phase 12A — State Machine Correctness (R1) ✓ COMPLETE
+
+Fixed the three confirmed state-machine bugs from the diagnostic report,
+without adding any new exploitation capability:
+
+- **Bug A (credential-phase budget oscillation):** `GlobalPlanner.decide_phase()`
+  keyed budget-exhaustion forcing off the single-call `current_phase`
+  argument, which only matched the exhausted phase on one call — the next
+  turn's `current_phase` was already the peeked-forward phase, so forcing
+  silently stopped applying and the engagement oscillated back into the
+  just-exhausted phase forever. Fixed by checking every budget-tracked
+  phase's own persistent `_spent` counter on every call, independent of
+  `current_phase`.
+- **Bug B (`auth_flow` treated as `access_state`):** `_select_phase()` let a
+  bare `auth_flow` node (a login page merely *discovered*) skip the
+  credential phase the same way a validated `access_state` did. Fixed —
+  only `access_state` gates the credential→priv_esc transition now.
+- **Bug E (silent `END` on an unroutable phase):** `route_after_global_plan`
+  used `PHASE_NODE.get(phase, END)` — any phase not in the 4-entry
+  dispatch map (e.g. the still-unreachable `ApexPhase.exploit`/`lateral`)
+  disappeared into `END` with no diagnostic trail. Fixed with a new
+  `unknown_phase_agent` node (`apex_host/orchestration/diagnostics_node.py`)
+  that appends a diagnostic `Episode`, records a new
+  `ApexGraphState.diagnostic_events` entry, sets `last_error`, and
+  terminates cleanly.
+
+**Files changed:** `apex_host/planners/global_planner.py`,
+`apex_host/orchestration/routing.py`,
+`apex_host/orchestration/diagnostics_node.py` (new),
+`apex_host/orchestration/builder.py`, `apex_host/graph_state.py`,
+`apex_host/runtime.py`, `apex_host/eval/run_synthetic_machine.py`, plus
+test fixes for behavior that had encoded the bugs themselves (three
+pre-existing tests asserted the pre-fix, buggy expectations and were
+corrected, not weakened) and a new `tests/apex_host/test_phase12a_state_machine.py`
+(12 tests). **Validation:** full suite passed (3590 tests at the time),
+`ruff`/`mypy` clean, CLI smoke and diff checks clean. No exploitation,
+SSH/FTP, privilege escalation, or infrastructure changes were made in this
+phase — see Phase 12B below for SSH/FTP.
+
+### Phase 12B — Bounded SSH/FTP Credential Validation ✓ COMPLETE
+
+**Full design document:** [`docs/credential-validation.md`](docs/credential-validation.md)
+(21 required sections). This entry is a summary and progress record; that
+document is authoritative.
+
+**Scope:** Phase 12A fixed the state machine; it did not fix the fact that
+the credential phase could only ever validate Telnet, which almost no real
+HTB service exposes. Phase 12B adds `SSHExecutor`
+(`apex_host/agents/ssh_executor.py`, Paramiko) and `FTPExecutor`
+(`apex_host/agents/ftp_executor.py`, stdlib `ftplib`) so APEX can produce
+its existing `access_state` success signal on realistic services, without
+crossing into exploitation.
+
+**Binding invariants (all verified by dedicated tests):**
+
+1. **One bounded attempt per protocol, ever, per target/username.**
+   `CredentialPlanner` emits at most one task per turn, using only
+   `username_candidates[0]`/`password_candidates[0]` — never a loop over
+   candidates, never every protocol in one turn. A `_protocol_already_attempted()`
+   guard (scoped to `protocol + target + username`, via each credential
+   node's `protocol` prop) prevents re-attempting a protocol that already
+   has a recorded credential node.
+2. **No brute force, no credential spraying, no cracking tools.** No
+   Hydra/Medusa/Ncrack/Metasploit anywhere in the new code (statically
+   verified). No wordlist, no `itertools.product` over candidate pairs.
+3. **Fixed harmless validation actions only.** SSH: `id`/`whoami`
+   (`_ALLOWED_VALIDATION_COMMANDS`). FTP: `PWD`/`NOOP`
+   (`_ALLOWED_VALIDATION_OPERATIONS`). Both allowlists are enforced twice —
+   once inside the executor, once at the policy boundary
+   (`apex_host/policy/rules.py::check_bounded_credential_validation`) —
+   before any executor is ever reached.
+4. **No file transfer, no port forwarding, no persistent session.** Neither
+   executor calls `open_sftp()`/`request_port_forward()`/`invoke_shell()`
+   (SSH) or `RETR`/`STOR`/`DELE`/`MKD`/`RMD`/`RNFR`/`RNTO`/`NLST` (FTP) —
+   statically verified absent from both modules. Every session is closed
+   in a `finally` block on every code path.
+5. **Deterministic protocol ordering, never random.**
+   `_PROTOCOL_ORDER = ("telnet", "ssh", "ftp")` in
+   `apex_host/planners/credential_planner.py` — fixed and documented.
+   Telnet first purely for backward compatibility. Within one protocol,
+   lowest port number wins.
+6. **Cross-protocol isolation.** `apex_host/graph_ids.py::credential_id`/
+   `access_state_id` gained an optional `protocol` parameter (default
+   `""`, preserving Telnet's exact pre-Phase-12B ID format). SSH/FTP pass
+   an explicit `protocol="ssh"`/`"ftp"`, so a failed SSH attempt's nodes
+   can never collide with, or block, an unrelated FTP attempt.
+7. **`access_state` only on true, complete success.** `AccessParser.parse_structured()`
+   (new method; `parse_text` for Telnet is byte-for-byte unchanged) takes
+   an explicit `success`/`authenticated` bool from the executor (SSH/FTP
+   classify definitively via typed exceptions/response codes — no text
+   heuristic). An open port or banner alone never creates `access_state`;
+   authenticating but then having the harmless command itself fail never
+   creates `access_state` either — only a fully successful, executed
+   validation does.
+8. **No secret ever reaches result models, reports, episodes, EKG nodes,
+   logs, exceptions, `repr()`, or serialized state.** Enforced by
+   `CredentialValidationResult` having no password field at all,
+   `secret_hint="[redacted]"` on every credential node, and
+   `error_detail` strings built from fixed messages or `type(exc).__name__`
+   — never `str(exc)` — except FTP's `error_perm` handler, which routes
+   the server's own response text through
+   `apex_host.security.redaction.redact_session_text()` (P8-S06's sole
+   redaction function) before use, in case a server response happens to
+   echo back the submitted password.
+
+**Defect found and fixed during this phase (not previously known):**
+`apex_host/orchestration/models.py::task_info()` echoed `TaskSpec.params`
+verbatim into the public, checkpoint-persisted `ApexGraphState["current_task"]`
+field — including the raw plaintext password for telnet/ssh/ftp tasks. This
+predates Phase 12B (present since Telnet/Phase 12A) but was surfaced by
+this phase's own "never in serialized state" test requirement. Fixed by
+masking any `"password"` key by name before the dict enters state. Verified
+safe against `RepairEngine` — its own LLM output schema
+(`apex_host/planning/repair.py::PlannedTask`) never carries a
+`username`/`password` field, so no working repair functionality depended
+on the raw value being present in `current_task`.
+
+**Dependency added:** `paramiko>=3.4` (runtime — `ssh_executor.py` imports
+it directly) plus `types-paramiko` (dev, for `mypy --strict`). No FTP
+dependency was needed — the standard library's `ftplib` was sufficient. No
+brute-force/cracking library was added. `uv.lock` regenerated
+(`paramiko`, `bcrypt`, `cffi`, `cryptography`, `pynacl`, `invoke`, plus the
+`types-paramiko` stub — 8 new packages).
+
+**Files changed (new):** `apex_host/agents/ssh_executor.py`,
+`apex_host/agents/ftp_executor.py`, `docs/credential-validation.md`,
+`tests/apex_host/test_ssh_executor.py` (29 tests),
+`tests/apex_host/test_ftp_executor.py` (27 tests),
+`tests/apex_host/test_credential_planner_multiprotocol.py` (17 tests),
+`tests/apex_host/test_dispatcher_credential_protocols.py` (15 tests),
+`tests/apex_host/test_access_parser_structured.py` (14 tests),
+`tests/apex_host/test_credential_validation_security.py` (19 tests) —
+121 new tests total.
+
+**Files changed (modified):** `apex_host/graph_ids.py` (optional
+`protocol` param, Telnet-compatible default), `apex_host/types.py`
+(`CredentialErrorCategory`, `CredentialValidationResult`),
+`apex_host/parsers/access_parser.py` (`parse_structured()`, `parse_text`
+untouched), `apex_host/planners/credential_planner.py` (multi-protocol
+`_CredentialDeterministic.plan()`, deterministic ordering, per-protocol
+duplicate guard), `apex_host/planners/capabilities.py` (docstring only —
+capability derivation itself was already correct, now documented as
+consumed rather than a placeholder), `apex_host/execution/dispatcher.py`
+(`ssh_executor`/`ftp_executor` constructor params, `_run_ssh`/`_run_ftp`,
+shared `_credential_result_to_tr` disposition mapping),
+`apex_host/orchestration/builder.py` (executor construction + wiring),
+`apex_host/orchestration/parsing_node.py` (routes `ssh_access`/
+`ftp_access` to `parse_structured`), `apex_host/orchestration/memory_node.py`
+(new `credential_validation_log` accumulation), `apex_host/orchestration/models.py`
+(password-redaction fix above), `apex_host/graph_state.py` (new
+`credential_validation_log` additive field), `apex_host/policy/rules.py`
+(`check_bounded_credential_validation` rule), `apex_host/config.py` (six
+new timeout fields: `ssh_connect_timeout_seconds`, `ssh_auth_timeout_seconds`,
+`ssh_command_timeout_seconds`, `ftp_connect_timeout_seconds`,
+`ftp_login_timeout_seconds`, `ftp_command_timeout_seconds` — no new
+credential fields; `--username`/`--password` are reused unchanged across
+all three protocols), `apex_host/eval/report.py` (three new additive
+`RunReport` fields + text/JSON surfacing), `apex_host/runtime.py` +
+`apex_host/eval/run_synthetic_machine.py` (new state-field initialization),
+`README.md`, `pyproject.toml`/`uv.lock`.
+
+**Explicitly not changed:** `apex_host/agents/telnet_executor.py` (byte-for-byte
+unchanged — the phase's own hard requirement), Docker, Compose, VPN,
+GitHub Actions, GHCR, `apex_tool_service` — SSH/FTP validation runs
+entirely inside the APEX process via Python libraries, never through the
+Kali Tool API or `RemoteToolBackend`, so no infrastructure change was
+needed or made.
+
+**Validation (clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass — 8 new packages |
+| `uv run pytest -q` (full) | **3713 passed** (3590 baseline + 121 new + 2 net from Phase 12A test renames), 53 pre-existing warnings — no regressions |
+| Focused: SSH executor | 29 passed |
+| Focused: FTP executor | 27 passed |
+| Focused: CredentialPlanner (multi-protocol) | 17 passed |
+| Focused: Dispatcher (SSH/FTP routing) | 15 passed |
+| Focused: AccessParser/memory + full-graph | 14 passed |
+| Focused: Security invariants | 19 passed |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy` | Success — 146 source files |
+| `python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `python -m apex_tool_service --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Remaining known limitations (documented, not defects):** Telnet/SSH/FTP
+only — no RDP/WinRM/SMB/database credential validation. One credential
+pair per protocol per engagement — no rotation. Password authentication
+only for SSH — no key-based auth (no key-reference model existed in the
+repository's authorized configuration surface to extend). The duplicate
+guard is scoped to `protocol + target + username`, not port-sensitive — a
+documented, deliberate consistency choice with Telnet's own original,
+tested scoping. No privilege escalation, payload execution, flag capture,
+or persistent shell access was added — `access_state` remains the
+engagement's terminal success signal, exactly as it was before this phase.

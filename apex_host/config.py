@@ -161,6 +161,22 @@ class ApexConfig:
     # parser_timeout_seconds: maximum wall-clock time for a parser call.
     parser_timeout_seconds: float = 10.0
     # ---------------------------------------------------------------------------
+    # Phase 12B — bounded SSH/FTP credential-validation timeouts
+    # (apex_host/agents/ssh_executor.py, apex_host/agents/ftp_executor.py;
+    #  docs/credential-validation.md "Timeout behavior")
+    # ---------------------------------------------------------------------------
+    # Each pair bounds one phase of the single bounded login attempt: the
+    # TCP connect, the authentication exchange, and the one fixed harmless
+    # validation command/operation run afterward. All three are summed (plus
+    # a small fixed margin) into one outer asyncio.wait_for ceiling inside
+    # the executor as a second, independent safety net.
+    ssh_connect_timeout_seconds: float = 10.0
+    ssh_auth_timeout_seconds: float = 10.0
+    ssh_command_timeout_seconds: float = 10.0
+    ftp_connect_timeout_seconds: float = 10.0
+    ftp_login_timeout_seconds: float = 10.0
+    ftp_command_timeout_seconds: float = 10.0
+    # ---------------------------------------------------------------------------
     # Infra Phase 2/4 — tool-execution backend selection
     # (docs/tool-execution-architecture.md; docs/remote-tool-backend.md;
     #  apex_host/tools/backend.py; apex_host/tools/remote_backend.py)

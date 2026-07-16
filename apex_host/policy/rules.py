@@ -9,7 +9,8 @@ Each public rule function has the signature:
 Return ``None`` to indicate the rule passes (no violation).  Return a
 ``PolicyDecision`` to indicate a binding outcome (``blocked`` or
 ``needs_human_review``).  Returning ``approved`` from a rule is reserved for
-the explicit safe-recon acknowledgement rule only.
+the explicit safe-recon / bounded-credential-validation acknowledgement
+rules only.
 
 Rules are pure functions with no side-effects.  They never call tools, never
 read from MemoryAPI, and never touch the filesystem.
@@ -23,6 +24,8 @@ read from MemoryAPI, and never touch the filesystem.
 5. ``check_no_sensitive_data``        — block sensitive file reads
 6. ``check_require_review``           — flag tasks needing human review
 7. ``check_safe_recon_allowed``       — explicit approval for nmap/nc/curl on target
+8. ``check_bounded_credential_validation`` — explicit approval (or a defense-
+   in-depth block) for telnet_access/ssh_access/ftp_access tasks (Phase 12B)
 """
 from __future__ import annotations
 
@@ -77,6 +80,21 @@ _SENSITIVE_PATHS: tuple[str, ...] = (
 _SAFE_RECON_TOOLS: frozenset[str] = frozenset({
     "nmap", "nc", "netcat", "curl", "python3",
 })
+
+# Phase 12B — bounded, one-attempt credential-validation task tools. Each is
+# routed by TaskDispatcher to its own dedicated executor (TelnetExecutor /
+# SSHExecutor / FTPExecutor) — never through the generic run_command_fn path.
+_CREDENTIAL_VALIDATION_TOOLS: frozenset[str] = frozenset({
+    "telnet_access", "ssh_access", "ftp_access",
+})
+
+# The only harmless commands/operations a credential-validation task may
+# request. Mirrors the allowlists inside SSHExecutor/FTPExecutor themselves
+# (apex_host/agents/ssh_executor.py::_ALLOWED_VALIDATION_COMMANDS,
+# ftp_executor.py::_ALLOWED_VALIDATION_OPERATIONS) — this is a second,
+# independent check at the policy boundary, not a replacement for the
+# executor's own allowlist.
+_CREDENTIAL_VALIDATION_COMMANDS: frozenset[str] = frozenset({"id", "whoami", "PWD", "NOOP"})
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +282,71 @@ def check_safe_recon_allowed(
     return None
 
 
+def check_bounded_credential_validation(
+    task: "TaskSpec",
+    policy: "ScopePolicy",
+    config: "ApexConfig",
+) -> PolicyDecision | None:
+    """Explicit approval for bounded, one-attempt credential-validation tasks
+    (Phase 12B: telnet_access / ssh_access / ftp_access).
+
+    This rule runs after every blocking rule (destructive-command, scope,
+    attacking-infrastructure, password-list, sensitive-data) and after
+    ``check_require_review`` — those already enforce "limited to the
+    configured authorized target" and "no wordlist/brute-force flags" for
+    these tools exactly as they do for any other tool, since credential
+    tasks carry the same ``target``/``args`` params. This rule adds one more,
+    credential-validation-specific check on top: the requested validation
+    ``command``/``operation`` (if the task specifies one) must be in the
+    fixed harmless allowlist — never an arbitrary string. This is defense in
+    depth on top of SSHExecutor's/FTPExecutor's own identical allowlists;
+    a task that somehow requested something else is blocked here before it
+    ever reaches an executor.
+
+    Returns ``approved`` (not merely ``None``) for a passing credential task
+    so the policy audit log records *why* it was approved — the same
+    transparency ``check_safe_recon_allowed`` provides for recon tools.
+    This rule never approves brute-force/spraying behavior: it does not
+    change the fact that CredentialPlanner itself only ever emits exactly
+    one task per protocol per turn (see
+    ``apex_host/planners/credential_planner.py``) — this rule cannot make an
+    unsafe planner safe, it only classifies tasks the planner already
+    produced safely.
+    """
+    tool = str(task.params.get("tool", "")).strip().lower()
+    if tool not in _CREDENTIAL_VALIDATION_TOOLS:
+        return None
+
+    raw_target = str(task.params.get("target", "")).strip()
+    requested_command = str(
+        task.params.get("command") or task.params.get("operation") or ""
+    ).strip()
+
+    if requested_command and requested_command not in _CREDENTIAL_VALIDATION_COMMANDS:
+        return PolicyDecision(
+            status=PolicyStatus.blocked,
+            rule_name="bounded_credential_validation",
+            reason=(
+                f"credential-validation tool {tool!r} requested command/operation "
+                f"{requested_command!r} which is outside the fixed harmless allowlist "
+                f"{sorted(_CREDENTIAL_VALIDATION_COMMANDS)}"
+            ),
+            task_tool=tool,
+            task_target=raw_target,
+        )
+
+    return PolicyDecision(
+        status=PolicyStatus.approved,
+        rule_name="bounded_credential_validation",
+        reason=(
+            f"tool {tool!r} is a bounded, one-attempt credential-validation task "
+            f"against assigned target {raw_target!r}"
+        ),
+        task_tool=tool,
+        task_target=raw_target,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Ordered rule registry used by PolicyAdvisor
 # ---------------------------------------------------------------------------
@@ -278,4 +361,5 @@ ALL_RULES: tuple[_RuleFn, ...] = (
     check_no_sensitive_data,
     check_require_review,
     check_safe_recon_allowed,
+    check_bounded_credential_validation,
 )

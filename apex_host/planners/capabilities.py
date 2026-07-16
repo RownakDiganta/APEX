@@ -16,9 +16,9 @@ Capability names
 service_probe           Open service on a probeworthy port with no protocol match.
 web_probe               HTTP/HTTPS service or known endpoint — ffuf/curl applicable.
 browser_observe         HTTP/HTTPS service — Playwright/browser applicable.
-access_validate_telnet  Telnet service — login prompt accessible.
-access_validate_ssh     SSH service — auth surface present (placeholder).
-access_validate_ftp     FTP service — auth surface present (placeholder).
+access_validate_telnet  Telnet service — login prompt accessible; consumed by CredentialPlanner + TelnetExecutor.
+access_validate_ssh     SSH service — auth surface present; consumed by CredentialPlanner + SSHExecutor (Phase 12B).
+access_validate_ftp     FTP service — auth surface present; consumed by CredentialPlanner + FTPExecutor (Phase 12B).
 exploit_research        Service with a known version string — searchsploit applicable.
 """
 from __future__ import annotations

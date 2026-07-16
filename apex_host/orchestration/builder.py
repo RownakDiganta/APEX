@@ -131,13 +131,16 @@ def build_apex_graph(
     Policy approval in ``TaskDispatcher.dispatch()`` runs identically
     regardless of which backend is supplied — this parameter only replaces
     *how* an already-approved generic command executes, never whether it is
-    approved. ``TelnetExecutor`` and ``BrowserExecutor`` are unaffected by
-    ``tool_backend`` entirely — they are wired into ``TaskDispatcher``
-    through their own dedicated constructor parameters and are never routed
-    through ``run_command_fn`` (see ``docs/remote-tool-backend.md``
-    "Generic versus interactive routing").
+    approved. ``TelnetExecutor``, ``BrowserExecutor``, and (Phase 12B)
+    ``SSHExecutor``/``FTPExecutor`` are all unaffected by ``tool_backend``
+    entirely — each is wired into ``TaskDispatcher`` through its own
+    dedicated constructor parameter and is never routed through
+    ``run_command_fn`` (see ``docs/remote-tool-backend.md`` "Generic versus
+    interactive routing" and ``docs/credential-validation.md``).
     """
     from apex_host.agents.browser_executor import BrowserExecutor
+    from apex_host.agents.ftp_executor import FTPExecutor
+    from apex_host.agents.ssh_executor import SSHExecutor
     from apex_host.agents.telnet_executor import TelnetExecutor
     from apex_host.execution.dispatcher import TaskDispatcher
     from apex_host.execution.registry import TaskRegistry
@@ -160,6 +163,12 @@ def build_apex_graph(
     )
     telnet_executor = TelnetExecutor(config)
     browser_executor = BrowserExecutor(config)
+    # Phase 12B — dedicated protocol executors, routed by TaskDispatcher
+    # exactly like TelnetExecutor/BrowserExecutor (never through the generic
+    # ToolBackend/run_command_fn path; see docs/credential-validation.md
+    # "Planner integration").
+    ssh_executor = SSHExecutor(config)
+    ftp_executor = FTPExecutor(config)
     repair_engine = RepairEngine(
         model_router=model_router, allowed_tools=config.allowed_tools,
         target=config.target, dry_run=config.dry_run,
@@ -170,6 +179,7 @@ def build_apex_graph(
         advisor=advisor, task_registry=task_registry, config=config,
         run_command_fn=run_command_fn,
         telnet_executor=telnet_executor, browser_executor=browser_executor,
+        ssh_executor=ssh_executor, ftp_executor=ftp_executor,
     )
     _max_repair = getattr(config, "max_repair_attempts", 1)
 

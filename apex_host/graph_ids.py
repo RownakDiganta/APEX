@@ -148,22 +148,40 @@ def tech_id(host_addr: str, tech_name: str) -> str:
     return f"tech:{host_addr}:{tech_slug(tech_name)}"
 
 
-def credential_id(target: str, username: str) -> str:
+def credential_id(target: str, username: str, protocol: str = "") -> str:
     """Canonical ID for a credential node.
+
+    ``protocol`` is optional and defaults to ``""`` so existing Telnet call
+    sites (``apex_host/parsers/access_parser.py::AccessParser.parse_text``)
+    are byte-for-byte unchanged — this preserves Phase 12A/pre-Phase-12B EKG
+    IDs and every test that hardcodes them. Phase 12B's SSH/FTP validation
+    path (``AccessParser.parse_structured``) passes an explicit ``protocol``
+    (``"ssh"`` / ``"ftp"``) so a credential node for one protocol never
+    collides with, or is mistaken for, a node from a different protocol —
+    a failed SSH attempt must never look like an unrelated FTP attempt.
 
     >>> credential_id("10.10.10.14", "root")
     'credential:10.10.10.14:root'
+    >>> credential_id("10.10.10.14", "root", protocol="ssh")
+    'credential:10.10.10.14:root:ssh'
     """
-    return f"credential:{target}:{username}"
+    suffix = f":{protocol}" if protocol else ""
+    return f"credential:{target}:{username}{suffix}"
 
 
-def access_state_id(target: str, username: str) -> str:
+def access_state_id(target: str, username: str, protocol: str = "") -> str:
     """Canonical ID for an access_state node.
+
+    See ``credential_id`` for why ``protocol`` is optional and defaults to
+    ``""`` (Telnet backward compatibility).
 
     >>> access_state_id("10.10.10.14", "root")
     'access_state:10.10.10.14:root'
+    >>> access_state_id("10.10.10.14", "root", protocol="ssh")
+    'access_state:10.10.10.14:root:ssh'
     """
-    return f"access_state:{target}:{username}"
+    suffix = f":{protocol}" if protocol else ""
+    return f"access_state:{target}:{username}{suffix}"
 
 
 def endpoint_id(url: str) -> str:
