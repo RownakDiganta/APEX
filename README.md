@@ -1755,3 +1755,49 @@ already reads; nothing reads them automatically.
 Full design, the reflection engine, the replay algorithm, ranking rules,
 and current limitations:
 [`docs/experience-replay.md`](docs/experience-replay.md).
+
+## Benchmarking, HTB Evaluation & Run Comparison
+
+This phase makes APEX **measurable, benchmarkable, diagnosable, and
+reproducible** — it adds instrumentation and reporting only. No new
+exploitation capability, and no planner or executor decision logic
+changed: `GlobalPlanner`, every domain planner, and `TaskDispatcher` are
+byte-for-byte unchanged.
+
+`apex_host/eval/benchmark.py::compute_benchmark()` is the single,
+pure function every metric formula lives in — `RunReport` never
+duplicates a computation. Metrics include planner efficiency, duplicate
+avoidance %, browser coverage, credential success rate, privilege
+opportunity density, replay usefulness, average task latency, evidence
+density, and graph growth rate:
+
+```
+Benchmark Summary
+  Total runtime        : 0.148s
+  Planner decisions    : 4
+  Tasks executed       : 1 (skipped: 3)
+  Duplicate avoidance  : 3
+  Engagement outcome   : duplicate_task_stall
+
+Planner Metrics
+  Planner efficiency   : 0.25
+  Duplicate avoidance %: 75.0%
+```
+
+`apex_host/eval/evaluation.py::HTBEvaluation` records what an engagement
+against a named HTB machine objectively observed — `success` is copied
+verbatim from `RunReport.success` (Phase 12C's `validated_access`
+definition), so an engagement with ten services and five web findings but
+no validated credential is recorded exactly as `success=False`. Enable via
+`--htb-machine-name`/`--htb-difficulty`.
+
+`apex_host/eval/comparison.py::compare_reports()` computes a deterministic
+diff between two engagement reports — new/missing findings (matched by
+stable EKG node ID), planner/workflow/timing/opportunity/learning
+differences — either in-process or across two separately-exported JSON
+files via `--compare-with PATH --export-comparison PATH`.
+
+Full design, exact metric formulas, a documented pre-existing
+`PlanningEngine` instrumentation gap this phase worked around (rather than
+patched, to stay in scope), and current limitations:
+[`docs/benchmarking.md`](docs/benchmarking.md).

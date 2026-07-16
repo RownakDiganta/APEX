@@ -1163,7 +1163,13 @@ class TestRunHtbLocalExitCodes:
 
         monkeypatch.setattr(mod, "run_engagement", _fake_run_engagement)
         monkeypatch.setattr(mod.ApexConfig, "from_cli_args", staticmethod(lambda a: config))
-        args = argparse.Namespace(preflight=False, export_graph=None, export_json=None)
+        args = argparse.Namespace(
+            preflight=False, export_graph=None, export_json=None,
+            # Phase 17 — benchmarking/evaluation/comparison flags _async_main
+            # now reads unconditionally after run_engagement() returns.
+            htb_machine_name=None, htb_difficulty=None,
+            compare_with=None, export_benchmark=None, export_comparison=None,
+        )
         code = await mod._async_main(args)
         assert code == expected_code
         del registry

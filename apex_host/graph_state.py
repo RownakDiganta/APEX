@@ -87,6 +87,15 @@ class ApexGraphState(TypedDict):
     # timed out, across the whole run, without re-querying the episodic
     # store. See docs/remote-tool-backend.md "Report fields".
     execution_backend_log: Annotated[list[dict[str, Any]], operator.add]
+    # Phase 17: per-task, real measured wall-clock execution time, one entry
+    # per non-skipped tool_result that carries a genuine "duration_seconds"
+    # value (see apex_host/orchestration/memory_node.py). Fields per entry:
+    # {tool, phase, duration_seconds}. TelnetExecutor (byte-for-byte
+    # unchanged since Phase 12B), BrowserExecutor, and
+    # PrivEscAnalysisExecutor (zero-I/O) never contribute an entry — they
+    # are excluded, never represented with a fabricated zero. Feeds
+    # apex_host/eval/benchmark.py's average-task-latency metric.
+    task_latency_log: Annotated[list[dict[str, Any]], operator.add]
     # Phase 12A (R1, Bug E): one entry per state-machine anomaly the
     # orchestration layer could not route normally — currently populated
     # only by ``unknown_phase_agent`` when GlobalPlanner produces a phase
