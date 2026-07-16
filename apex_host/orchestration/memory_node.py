@@ -47,6 +47,7 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
         error_entries: list[dict[str, Any]] = []
         backend_entries: list[dict[str, Any]] = []
         credential_entries: list[dict[str, Any]] = []
+        latency_entries: list[dict[str, Any]] = []
         for tr in results_to_write:
             # F13: skipped-duplicate tasks never executed — skip episode creation.
             if tr.get("skipped_duplicate"):
@@ -84,6 +85,8 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
                     failure_result["execution_backend_log"] = backend_entries
                 if credential_entries:
                     failure_result["credential_validation_log"] = credential_entries
+                if latency_entries:
+                    failure_result["task_latency_log"] = latency_entries
                 return failure_result
 
             if o != Outcome.success:
@@ -105,6 +108,21 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
                     "backend": backend,
                     "timed_out": bool(tr.get("timed_out", False)),
                     "phase": state["phase"],
+                })
+
+            # Phase 17: task-latency audit log for the benchmarking subsystem
+            # (apex_host/eval/benchmark.py). Only tool_results that carry a
+            # real, measured "duration_seconds" key contribute an entry —
+            # TelnetExecutor (byte-for-byte unchanged since Phase 12B),
+            # BrowserExecutor, and PrivEscAnalysisExecutor (zero-I/O) never
+            # set this key, so they are naturally excluded rather than
+            # contributing a fabricated zero.
+            duration = tr.get("duration_seconds")
+            if duration is not None:
+                latency_entries.append({
+                    "tool": tr.get("tool", tr.get("kind", "unknown")),
+                    "phase": state["phase"],
+                    "duration_seconds": float(duration),
                 })
 
             # Phase 12B: credential-validation audit log — never the password.
@@ -142,6 +160,8 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
             result["execution_backend_log"] = backend_entries
         if credential_entries:
             result["credential_validation_log"] = credential_entries
+        if latency_entries:
+            result["task_latency_log"] = latency_entries
         return result
 
     return write_memory

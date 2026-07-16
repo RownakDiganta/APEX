@@ -7082,3 +7082,199 @@ shallow (`depth=2`) subgraph read, matching the memfabric Reflector's own
 context depth. No new live command execution, no exploit, no payload, no
 persistence, no flag capture was added or performed — `access_state`
 remains the engagement's only success signal.
+
+### Phase 17 — Benchmarking, HTB Evaluation & Run Comparison ✓ COMPLETE
+
+**Full design document:** [`docs/benchmarking.md`](docs/benchmarking.md)
+(9 sections). This entry is a summary and progress record; that document
+is authoritative.
+
+**Scope:** **instrumentation and reporting only — no new engagement
+behavior.** Nothing in this phase executes a command, drives a tool,
+uploads a payload, generates a reverse shell, uses Metasploit, establishes
+persistence, or captures a flag. `GlobalPlanner`, every domain planner
+(`ReconPlanner`/`WebPlanner`/`BrowserPlanner`/`CredentialPlanner`/
+`PrivEscPlanner`), and `TaskDispatcher` are byte-for-byte unchanged in
+their decision logic — this phase measures and reports what those
+components already do, nothing more.
+
+**Three independent, composable pieces:**
+
+1. **Benchmark framework** (`apex_host/eval/benchmark.py`) — pure, no I/O,
+   no MemoryAPI calls, no async (mirrors the "pure reasoning helper"
+   convention of `priv_esc_opportunities.py`/`web_opportunities.py`/
+   `workflow_orchestration.py`/`experience_replay.py`).
+   `compute_benchmark(report, *, total_runtime_seconds=0.0,
+   report_generation_seconds=0.0, task_latency_log=None)` is the single
+   function every metric formula lives in — `RunReport`/`format_text()`/
+   `to_json_dict()` never duplicate a computation, they call this function
+   and render its output.
+2. **HTB evaluation mode** (`apex_host/eval/evaluation.py`) —
+   `HTBEvaluation.success` is copied verbatim from `RunReport.success`
+   (Phase 12C's `is_success_outcome(EngagementOutcome.validated_access)`
+   definition) — never a second, looser definition. `machine_name`/
+   `difficulty` are the only genuinely new, operator-supplied fields
+   (`--htb-machine-name`/`--htb-difficulty`); every other field
+   (`services_discovered`, `credentials_validated`, `web_findings`,
+   `privilege_opportunities`, `final_outcome`) is derived from fields
+   already on `RunReport`.
+3. **Run comparison** (`apex_host/eval/comparison.py`) —
+   `compare_reports(a, b)` computes a deterministic diff (never a fuzzy
+   similarity score) between a baseline and a candidate: new/missing
+   findings matched by stable EKG node ID, plus plain numeric/dict deltas
+   for planner/workflow/timing/opportunity/learning fields. Two input
+   extractors (`comparison_input_from_report`,
+   `comparison_input_from_json_export`) normalise both an in-process
+   `RunReport` and a previously-exported `to_json_dict()` JSON file into
+   the same flat shape, so `compare_reports()` itself never needs to know
+   which shape it received — verified to produce byte-identical output for
+   the same underlying report.
+
+**Metric formulas (all bounded via a single `_ratio(numerator,
+denominator)` helper — `0.0` on a zero/negative denominator, clamped to
+`[0.0, 1.0]`):** `planner_efficiency = tasks_executed /
+planner_decision_count`; `duplicate_avoidance_percentage =
+duplicate_avoidance_count / tasks_selected_total * 100`; `browser_coverage
+= web_pages_visited / endpoint_node_count`; `credential_success_rate =
+credential_successes / credential_attempts`; `privilege_opportunity_density
+= privilege_opportunity_count / total_nodes`; `replay_usefulness =
+learning_replay_hits / learning_experience_count`;
+`average_task_latency_seconds` = mean of `task_latency_log` durations;
+`evidence_density = evidence_node_count / total_nodes` (a fixed set of
+"evidence-bearing" node types — service/tech/endpoint/form/token/
+auth_flow/credential/access_state/priv_esc_opportunity/priv_esc_evidence/
+priv_esc_recommendation/web_opportunity/workflow_recommendation/
+experience/experience_recommendation — `host`/`workflow`/`workflow_step`/
+`session` deliberately excluded as coordination scaffolding, not evidence);
+`graph_growth_rate = total_nodes / turns_used` (or `total_nodes` when
+`turns_used == 0`).
+
+**The task-latency log (new `ApexGraphState` field, purely additive
+instrumentation):** `task_latency_log` (`operator.add` reducer) is
+populated by `apex_host/orchestration/memory_node.py::write_memory` — one
+entry per non-skipped `tool_result` carrying a real, measured
+`duration_seconds` value. `duration_seconds` is threaded into the relevant
+`tool_result` dicts by `apex_host/execution/dispatcher.py` from data the
+executors already compute (`ToolResult.duration_seconds`,
+`SSHExecutor`/`FTPExecutor`/`PrivEscEnumExecutor`'s own
+`episode.data["duration_seconds"]`) — no executor's behavior, return
+value, or decision logic changed, only an already-computed timing value is
+now threaded through. `TelnetExecutor` (byte-for-byte unchanged since
+Phase 12B), `BrowserExecutor`, and `PrivEscAnalysisExecutor` (zero-I/O)
+never set this key and are naturally excluded from every latency-derived
+metric, rather than contributing a fabricated zero.
+
+**Real bug found and worked around, not fixed (documented, out of this
+phase's scope):** investigating a real dry-run engagement's exported
+`planner_decisions` while building this module showed
+`selected_task_count: 0` on every entry — even for turns whose task was
+genuinely dispatched and later duplicate-skipped. Root cause:
+`PlanningEngine._record_fallback()` (`apex_host/planning/engine.py`)
+unconditionally records `selected_task_count=0` for every
+deterministic-fallback `PlanDecision`, at every one of its ~13 call sites,
+because it is called *before* the wrapped deterministic planner's own
+result is known. Since `ApexRuntime.run()` always constructs a real
+(possibly `FakeModelRouter`) `ModelRouter` and always wires every planner
+through `PlanningEngine`, this affects the deterministic-only default mode
+too — the overwhelming majority of real usage — not just LLM-backed runs.
+The pre-existing `RunReport.no_action_count` field (Phase 12C) inherits
+the same gap. Rather than patching `PlanningEngine` (a wide-blast-radius
+change to a heavily-tested, core scheduling component, outside this
+phase's own scope of adding benchmarking instrumentation), this module
+counts real execution evidence directly instead: `tasks_executed =
+len(task_latency_log) + (telnet credential attempts, which never produce
+a task_latency_log entry)`. Verified this avoids double-counting SSH/FTP
+attempts (which DO produce a `task_latency_log` entry) via a dedicated
+regression test.
+
+**`RunReport` gained five new raw fields** (`task_latency_log`,
+`benchmark_total_runtime_seconds`, `benchmark_report_generation_seconds`,
+`evaluation_machine_name`, `evaluation_difficulty`) — deliberately NOT one
+field per computed metric, since every metric is a pure function of
+fields already on `RunReport`, computed on demand by
+`compute_benchmark()`. `build_report()` gained four new optional kwargs
+(`total_runtime_seconds`, `report_generation_seconds`, `htb_machine_name`,
+`htb_difficulty`), all defaulting to values that produce zero-valued,
+non-misleading output when not supplied.
+
+**Reporting:** `format_text()` gained a "Benchmark Summary" plus
+"Performance Metrics"/"Planner Metrics"/"Memory Metrics"/"Learning
+Metrics" sections (shown only when `turns_used > 0`) and an "Evaluation
+Summary" section (shown only when `evaluation_machine_name` is set).
+`to_json_dict()` gained a `"benchmark"` block (always present, never
+`null`) and an `"evaluation"` block (`null` when no machine name was
+supplied — the one deliberate asymmetry with `"benchmark"`).
+
+**CLI wiring (`apex_host/eval/run_htb_local.py`):** `--htb-machine-name`/
+`--htb-difficulty` (evaluation mode), `--compare-with PATH` (loads a
+previously-exported `--export-json` file and compares it against the
+current run, printing a Comparison Summary — a comparison failure is
+logged as a warning and never fails the engagement, matching every other
+advisory surface in this codebase), `--export-comparison PATH` (writes the
+comparison as JSON), `--export-benchmark PATH` (writes the standalone
+benchmark JSON). `total_runtime_seconds` is measured via `time.monotonic()`
+around `run_engagement()`; `report_generation_seconds` via a throwaway
+first `build_report()`+`format_text()` pass (both pure, no I/O, no
+engagement re-run) before the final, fully-informed report is built and
+printed.
+
+**Files changed (new):** `apex_host/eval/benchmark.py`,
+`apex_host/eval/evaluation.py`, `apex_host/eval/comparison.py`,
+`docs/benchmarking.md`,
+`tests/apex_host/test_phase17_benchmarking.py` (62 tests).
+
+**Files changed (modified):** `apex_host/execution/dispatcher.py`
+(`duration_seconds` threaded into `_run_command`/`_credential_result_to_tr`/
+`_run_priv_esc_enum` tool_result dicts — purely additive, no disposition/
+behavior change), `apex_host/orchestration/memory_node.py`
+(`task_latency_log` accumulation), `apex_host/graph_state.py`
+(`task_latency_log` field), `apex_host/runtime.py` +
+`apex_host/eval/run_synthetic_machine.py` (new state-field
+initialization), `apex_host/eval/report.py` (five new `RunReport` fields,
+four new `build_report()` kwargs, Benchmark/Performance/Planner/Memory/
+Learning Metrics + Evaluation Summary text sections, `"benchmark"`/
+`"evaluation"` JSON blocks), `apex_host/eval/run_htb_local.py` (CLI flags,
+wall-clock timing measurement, comparison wiring),
+`tests/apex_host/test_phase6_dispatcher.py` (`_FakeToolResult` test
+fixture gained a `duration_seconds` default field — required once
+`_run_command` began reading it), `README.md`.
+
+**Explicitly not changed:** no exploit execution, payload upload, reverse
+shell, Metasploit usage, persistence, or flag capture was added anywhere
+in this phase. `PlanningEngine`/`GlobalPlanner`/every domain planner/
+`TaskDispatcher`'s decision logic is byte-for-byte unchanged — verified by
+running the full pre-existing test suite unmodified except for the one
+test fixture noted above. Docker, Compose, VPN, and GitHub Actions were
+not touched. No branch was created; no commit or push was made as part of
+this phase's work.
+
+**Validation (clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest -q` (full) | See final validation report — no regressions |
+| Focused: `test_phase17_benchmarking.py` | 62 passed |
+| Focused: `test_phase6_dispatcher.py`, `test_report.py`, `test_htb_local_runner.py`, `test_ssh_executor.py`, `test_ftp_executor.py`, `test_phase13b_priv_esc_enumeration.py`, `test_runtime_backend_wiring.py`, `test_tool_backend.py` (regression) | All passed |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy` | Success — 161 source files |
+| `python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `python -m apex_tool_service --help` | exit 0 |
+| Real end-to-end CLI run (dry-run, `--htb-machine-name`, `--export-json`, `--export-benchmark`, `--compare-with`) | Verified — all sections render correctly, JSON exports round-trip |
+| `git diff --check` | exit 0 |
+
+**Remaining known limitations (documented, not defects — see
+`docs/benchmarking.md` §9 for the full list):** `tasks_executed`
+undercounts Browser-visit and `priv_esc_analyze` tasks (zero measurable
+duration, same exclusion as latency averaging). The `PlanningEngine`
+`selected_task_count` gap is worked around, not fixed — a future phase
+should move `_record_fallback()`'s call site to after the fallback
+planner's result is known. `graph_growth_rate` is a single-run average,
+not a real per-turn growth curve (no historical per-turn snapshot exists
+anywhere in `ApexGraphState`). `total_runtime_seconds`/
+`report_generation_seconds` are `0.0` for any caller that never measures
+them. No CSV export (JSON only, per this phase's own scope). No new
+exploitation, privilege escalation, persistence, or shell-access
+capability was added or performed — `access_state` remains the
+engagement's only success signal.

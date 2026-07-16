@@ -217,6 +217,7 @@ class ApexRuntime:
             "web_session_state": {},
             "workflow_summary": {},
             "learning_summary": {},
+            "task_latency_log": [],
         }
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": run_id},

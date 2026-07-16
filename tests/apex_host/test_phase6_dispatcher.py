@@ -153,6 +153,7 @@ class _FakeToolResult:
     error: str | None = None
     timed_out: bool = False
     backend: str = "local"
+    duration_seconds: float = 0.0
 
 
 def _make_dispatcher(

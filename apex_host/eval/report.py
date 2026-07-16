@@ -72,6 +72,8 @@ from apex_host.planners.experience_replay import (
     experiences_from_subgraph,
     rank_experiences,
 )
+from apex_host.eval.benchmark import compute_benchmark, benchmark_to_json_dict, format_benchmark_text
+from apex_host.eval.evaluation import build_htb_evaluation, evaluation_to_json_dict, format_evaluation_text
 
 if TYPE_CHECKING:
     from memfabric.types import SubgraphView
@@ -284,6 +286,32 @@ class RunReport:
     # experiences — never an executable command, never overrides a planner.
     learning_recommendations: list[str] = field(default_factory=list)
 
+    # Phase 17 — benchmarking subsystem raw inputs. All computed *metrics*
+    # (planner_efficiency, duplicate_avoidance_percentage, browser_coverage,
+    # credential_success_rate, privilege_opportunity_density,
+    # replay_usefulness, average_task_latency_seconds, evidence_density,
+    # graph_growth_rate) are deliberately NOT stored as separate RunReport
+    # fields — they are pure, single-source-of-truth functions of fields
+    # already on this dataclass (see apex_host/eval/benchmark.py), computed
+    # on demand by format_text()/to_json_dict() via
+    # ``compute_benchmark(report, ...)``. Only the two genuinely-external
+    # wall-clock measurements (which nothing on this dataclass can derive)
+    # and the raw per-task latency log are stored here.
+    task_latency_log: list[dict[str, Any]] = field(default_factory=list)
+    benchmark_total_runtime_seconds: float = 0.0
+    benchmark_report_generation_seconds: float = 0.0
+
+    # Phase 17 — HTB evaluation-mode metadata. Operator-supplied, never
+    # inferred from the target IP or EKG content (CLAUDE.md §13.8/§13.9).
+    # Every other HTBEvaluation field (services_discovered,
+    # credentials_validated, web_findings, privilege_opportunities,
+    # final_outcome, success) is derived from fields already on this
+    # dataclass at format_text()/to_json_dict() time — see
+    # apex_host/eval/evaluation.py::build_htb_evaluation. The "Evaluation
+    # Summary" section/JSON block is shown only when machine_name is set.
+    evaluation_machine_name: str = ""
+    evaluation_difficulty: str = ""
+
 
 # ---------------------------------------------------------------------------
 # Canonical outcome resolution
@@ -353,6 +381,10 @@ def build_report(
     seed_results: dict[str, Any] | None = None,
     policy_source: str = "",
     llm_budget: dict[str, Any] | None = None,
+    total_runtime_seconds: float = 0.0,
+    report_generation_seconds: float = 0.0,
+    htb_machine_name: str | None = None,
+    htb_difficulty: str | None = None,
 ) -> RunReport:
     """Build a ``RunReport`` from engagement outputs.
 
@@ -364,6 +396,20 @@ def build_report(
                               derived from ``final_state`` as a best-effort.
         evidence_samples:     Optional list of evidence text snippets; if omitted,
                               extracted from ``final_state["evidence_summary"]``.
+        total_runtime_seconds: Phase 17 — wall-clock seconds for the whole
+                              engagement, measured by the caller (e.g.
+                              ``time.monotonic()`` around ``run_engagement()``).
+                              Defaults to ``0.0`` when not measured.
+        report_generation_seconds: Phase 17 — wall-clock seconds spent
+                              building + formatting this report, measured
+                              by the caller. Defaults to ``0.0``.
+        htb_machine_name:     Phase 17 — operator-supplied HTB machine name.
+                              When set (together with ``htb_difficulty``),
+                              the report gains an "Evaluation Summary"
+                              section/JSON block. Never inferred from the
+                              target or EKG content.
+        htb_difficulty:       Phase 17 — operator-supplied HTB difficulty
+                              label (e.g. "Easy", "Medium").
     """
     phases_reached = sorted({
         str(f.get("phase", "unknown"))
@@ -703,6 +749,11 @@ def build_report(
         learning_replay_hits=int(learning_summary.get("replay_hits", 0) or 0),
         learning_repeated_failures=int(learning_summary.get("repeated_failures", 0) or 0),
         learning_recommendations=learning_recommendations,
+        task_latency_log=list(final_state.get("task_latency_log") or []),
+        benchmark_total_runtime_seconds=total_runtime_seconds,
+        benchmark_report_generation_seconds=report_generation_seconds,
+        evaluation_machine_name=htb_machine_name or "",
+        evaluation_difficulty=htb_difficulty or "",
     )
 
 
@@ -908,6 +959,30 @@ def format_text(report: RunReport) -> str:
             lines.append("  Recommendations:")
             for rec in report.learning_recommendations:
                 lines.append(f"    {rec[:160]}")
+
+    # Benchmark Summary + Performance/Planner/Memory/Learning Metrics
+    # (Phase 17 — shown only when at least one turn ran; an unstarted or
+    # hand-built test fixture shows nothing here). All metric FORMULAS live
+    # in exactly one place, apex_host/eval/benchmark.py::compute_benchmark —
+    # this is a display-only call, never a second computation.
+    if report.turns_used:
+        bench = compute_benchmark(
+            report,
+            total_runtime_seconds=report.benchmark_total_runtime_seconds,
+            report_generation_seconds=report.benchmark_report_generation_seconds,
+            task_latency_log=report.task_latency_log,
+        )
+        lines.append("\n" + format_benchmark_text(bench))
+
+    # Evaluation Summary (Phase 17 — HTB evaluation mode; shown only when
+    # the operator supplied --htb-machine-name). Records what was
+    # objectively observed, never assumes the machine was compromised — see
+    # apex_host/eval/evaluation.py module docstring.
+    if report.evaluation_machine_name:
+        evaluation = build_htb_evaluation(
+            report, machine_name=report.evaluation_machine_name, difficulty=report.evaluation_difficulty,
+        )
+        lines.append("\n" + format_evaluation_text(evaluation))
 
     # Phase summary
     phase_table: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
@@ -1190,6 +1265,15 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
             "repeated_failures": report.learning_repeated_failures,
             "recommendations": report.learning_recommendations,
         },
+        "benchmark": benchmark_to_json_dict(compute_benchmark(
+            report,
+            total_runtime_seconds=report.benchmark_total_runtime_seconds,
+            report_generation_seconds=report.benchmark_report_generation_seconds,
+            task_latency_log=report.task_latency_log,
+        )),
+        "evaluation": evaluation_to_json_dict(build_htb_evaluation(
+            report, machine_name=report.evaluation_machine_name, difficulty=report.evaluation_difficulty,
+        )) if report.evaluation_machine_name else None,
     }
 
 

@@ -32,14 +32,23 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
+import time
 
 from memfabric.types import SubgraphView
 
 from apex_host.config import ApexConfig
 from apex_host.config_env import EnvConfigError, load_env_file, merge_env_into_args, merge_log_level
+from apex_host.eval.comparison import (
+    comparison_input_from_json_export,
+    comparison_input_from_report,
+    compare_reports,
+    comparison_to_json_dict,
+    format_comparison_text,
+)
 from apex_host.eval.export_graph import export_ekg
 from apex_host.eval.report import (
     build_report,
@@ -292,6 +301,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "omit this flag to use only real, exported environment variables."
         ),
     )
+    # Phase 17 — benchmarking, HTB evaluation mode, and run comparison.
+    # All three are purely additive reporting features: none of them change
+    # engagement behavior, planner decisions, or task execution.
+    parser.add_argument(
+        "--htb-machine-name", dest="htb_machine_name", default=None, metavar="NAME",
+        help=(
+            "Operator-supplied HTB machine name. When set together with "
+            "--htb-difficulty, the report gains an Evaluation Summary "
+            "section. Never inferred from the target or EKG content."
+        ),
+    )
+    parser.add_argument(
+        "--htb-difficulty", dest="htb_difficulty", default=None, metavar="LEVEL",
+        help="Operator-supplied HTB difficulty label (e.g. Easy, Medium).",
+    )
+    parser.add_argument(
+        "--compare-with", dest="compare_with", default=None, metavar="PATH",
+        help=(
+            "Path to a previously-exported run-report JSON file "
+            "(--export-json output from an earlier run) to deterministically "
+            "compare this run against. Prints a Comparison Summary; use "
+            "--export-comparison to also write it as JSON."
+        ),
+    )
+    parser.add_argument(
+        "--export-benchmark", dest="export_benchmark", metavar="PATH",
+        help="After the run, write the standalone benchmark JSON to this file.",
+    )
+    parser.add_argument(
+        "--export-comparison", dest="export_comparison", metavar="PATH",
+        help="With --compare-with, write the comparison JSON to this file.",
+    )
     return parser.parse_args(argv)
 
 
@@ -321,12 +362,18 @@ async def _async_main(args: argparse.Namespace) -> int:
         print("\nAll allowed tools found.")
         return 0
 
+    # Phase 17: wall-clock runtime measurement — the ONLY way to know how
+    # long an engagement actually took (ApexGraphState tracks turn counts,
+    # never real elapsed time — see apex_host/eval/benchmark.py module
+    # docstring "Why timing is an external input").
+    engagement_start = time.monotonic()
     try:
         runtime, final_state, seed_results = await run_engagement(config)
     except Exception as exc:  # noqa: BLE001 - surface as a deterministic operational-failure exit code
         logger.error("engagement failed to run: %s", exc)
         print(f"error: engagement failed: {exc}", file=sys.stderr)
         return exit_code_for(EngagementOutcome.internal_error)
+    total_runtime_seconds = time.monotonic() - engagement_start
 
     subgraph = await runtime.api.get_subgraph(f"host:{config.target}", depth=10)
 
@@ -339,13 +386,63 @@ async def _async_main(args: argparse.Namespace) -> int:
         policy_source = "unknown"
 
     llm_budget = runtime.last_budget.to_dict() if runtime.last_budget is not None else None
+    # Phase 17: measure report-build+format time on a throwaway first pass,
+    # then rebuild once more so the printed/exported report itself reports
+    # an accurate report_generation_seconds. Both build_report() calls are
+    # pure (no I/O, no engagement re-run) — the cost of the extra pass is
+    # negligible relative to the engagement itself.
+    report_start = time.monotonic()
+    _timing_report = build_report(
+        final_state, subgraph, config,
+        seed_results=seed_results,
+        policy_source=policy_source,
+        llm_budget=llm_budget,
+        total_runtime_seconds=total_runtime_seconds,
+        htb_machine_name=args.htb_machine_name,
+        htb_difficulty=args.htb_difficulty,
+    )
+    format_text(_timing_report)
+    report_generation_seconds = time.monotonic() - report_start
+
     report = build_report(
         final_state, subgraph, config,
         seed_results=seed_results,
         policy_source=policy_source,
         llm_budget=llm_budget,
+        total_runtime_seconds=total_runtime_seconds,
+        report_generation_seconds=report_generation_seconds,
+        htb_machine_name=args.htb_machine_name,
+        htb_difficulty=args.htb_difficulty,
     )
     print(format_text(report))
+
+    if args.compare_with:
+        try:
+            with open(args.compare_with, encoding="utf-8") as fh:
+                baseline_json = json.load(fh)
+            baseline_input = comparison_input_from_json_export(baseline_json)
+            candidate_input = comparison_input_from_report(report)
+            comparison = compare_reports(baseline_input, candidate_input)
+            print("\n" + format_comparison_text(comparison))
+            if args.export_comparison:
+                with open(args.export_comparison, "w", encoding="utf-8") as fh:
+                    json.dump(comparison_to_json_dict(comparison), fh, indent=2, default=str)
+                print(f"Comparison exported to {args.export_comparison}")
+        except Exception as exc:  # noqa: BLE001 - comparison is advisory, never fatal
+            logger.warning("run comparison failed (non-fatal): %s", exc)
+            print(f"warning: could not compare with {args.compare_with!r}: {exc}", file=sys.stderr)
+
+    if args.export_benchmark:
+        from apex_host.eval.benchmark import benchmark_to_json_dict, compute_benchmark
+        bench = compute_benchmark(
+            report,
+            total_runtime_seconds=report.benchmark_total_runtime_seconds,
+            report_generation_seconds=report.benchmark_report_generation_seconds,
+            task_latency_log=report.task_latency_log,
+        )
+        with open(args.export_benchmark, "w", encoding="utf-8") as fh:
+            json.dump(benchmark_to_json_dict(bench), fh, indent=2, default=str)
+        print(f"Benchmark exported to {args.export_benchmark}")
 
     if args.export_graph:
         from apex_host.eval.export_graph import write_json

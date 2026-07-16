@@ -157,6 +157,9 @@ def _credential_result_to_tr(
         "response_summary": str(ep_data.get("response_summary", "")),
         "error_category": error_category,
         "timed_out": bool(ep_data.get("timed_out", False)),
+        # Phase 17: real, measured wall-clock validation time (set by
+        # SSHExecutor/FTPExecutor — see apex_host/eval/benchmark.py).
+        "duration_seconds": float(ep_data.get("duration_seconds", 0.0) or 0.0),
     }
     return tr, disposition
 
@@ -505,6 +508,12 @@ class TaskDispatcher:
             # execution was terminated by its own timeout. See
             # docs/remote-tool-backend.md "Report fields".
             "timed_out": result.timed_out, "backend": result.backend,
+            # Phase 17: real, measured wall-clock execution time — feeds the
+            # benchmarking subsystem's average-task-latency metric (see
+            # apex_host/eval/benchmark.py). Always present on this path
+            # (ToolResult.duration_seconds is populated for every backend,
+            # including dry-run, where it is ~0).
+            "duration_seconds": result.duration_seconds,
         }
         return tr, disposition
 
@@ -680,6 +689,9 @@ class TaskDispatcher:
             "command_key": str(ep_data.get("command_key", "")),
             "source_command": str(ep_data.get("source_command", "")),
             "category": str(ep_data.get("category", "")),
+            # Phase 17: real, measured wall-clock enumeration-command time
+            # (set by PrivEscEnumExecutor — see apex_host/eval/benchmark.py).
+            "duration_seconds": float(ep_data.get("duration_seconds", 0.0) or 0.0),
         }
         disposition = (
             ExecutionDisposition.EXECUTED_SUCCESS if success
