@@ -116,6 +116,14 @@ class BoundedReadResult:
         A short, transport-identifying string for audit/metrics purposes
         only (e.g. ``"ssh_cat"``, ``"http_get"``) — never used by any
         caller to branch on transport type.
+    timed_out:
+        True when the read did not complete within the configured
+        timeout (Phase 22) — a distinct, structured signal from a remote
+        service's own timeout detection, kept separate from ``error`` so
+        callers never need to substring-match error text to detect a
+        timeout. Defaults ``False`` for backward compatibility with
+        adapters (SSH, Direct File Read) that only ever encoded timeout
+        information in ``error`` text.
     """
 
     connected: bool
@@ -126,6 +134,7 @@ class BoundedReadResult:
     bytes_received: int = 0
     truncated: bool = False
     method: str = ""
+    timed_out: bool = False
 
 
 class FlagReadCapability(Protocol):
@@ -771,20 +780,35 @@ class BoundedCommandCapabilityAdapter:
 
 class ToolBackendCommandReadStrategy:
     """The one concrete, real ``BoundedCommandReadStrategy`` reference
-    implementation (Phase 21) — wraps an existing, already-safety-gated
+    implementation (Phase 21; refactored in Phase 22 to prefer a dedicated
+    bounded-read backend method) — wraps an existing, already-safety-gated
     ``apex_host.tools.backend.ToolBackend`` (local or remote) rather than
     launching a child process directly, so this file never becomes a
     second command-execution entry point (CLAUDE.md §13.6).
 
-    Issues exactly one fixed, non-configurable command per call:
-    ``cat -- <path>`` as an argv list (``["--", path]``) — never a shell
-    string, never any operator/LLM-controlled flag. ``cat`` must be present
-    in ``ApexConfig.allowed_tools`` (an optional tool, not enabled by
-    default — see ``apex_host/tools/registry.py``) or the underlying
-    ``ToolBackend`` rejects it via ``apex_host.tools.safety.check_command``
-    and this strategy maps that rejection to
-    ``execution_context_unavailable`` rather than letting the exception
-    escape uncaught.
+    Phase 22 — the PREFERRED path: when the injected *backend* implements
+    ``apex_host.tools.backend.BoundedFileReadBackend`` (checked via a real,
+    checked ``isinstance()`` test against a ``@runtime_checkable`` Protocol,
+    never blind duck-typing), this strategy calls
+    ``backend.read_bounded_file(target, path, ...)`` directly — it no
+    longer submits ``cat -- <path>`` through the backend's generic
+    ``execute()`` method at all in this case. The fixed argv construction
+    now lives inside each backend's own ``read_bounded_file()``
+    implementation (``LocalToolBackend``: still ``cat -- <path>`` via its
+    own trusted ``execute()`` call; ``RemoteToolBackend``: the tool
+    service's dedicated ``POST /v1/bounded-file-read`` operation, which
+    constructs the fixed argv server-side — see
+    ``apex_tool_service/executor.py::execute_bounded_file_read``).
+
+    FALLBACK path (preserved for backward compatibility with test doubles
+    that implement only ``execute()``, e.g. a minimal fake ``ToolBackend``
+    used in unit tests): when *backend* does NOT implement
+    ``BoundedFileReadBackend``, this strategy falls back to its original
+    Phase 21 behavior — ``backend.execute("cat", ["--", path], ...)`` —
+    unchanged. This is the ONLY place ``cat`` is still submitted through a
+    generic ``execute()`` call from this strategy; every real backend
+    shipped in this codebase (``DryRunToolBackend``, ``LocalToolBackend``,
+    ``RemoteToolBackend``) implements the preferred path.
 
     Dry-run is honored transitively and redundantly: ``UserFlagExecutor``
     already short-circuits before ever resolving an adapter when
@@ -798,12 +822,29 @@ class ToolBackendCommandReadStrategy:
 
     _FIXED_TOOL: str = "cat"
 
-    def __init__(self, *, backend: "ToolBackend") -> None:
+    def __init__(self, *, backend: "ToolBackend", target: str = "") -> None:
         self._backend = backend
+        self._target = target
 
     async def read_file(
         self, path: str, *, timeout_seconds: float, max_output_bytes: int,
     ) -> BoundedReadResult:
+        from apex_host.tools.backend import BoundedFileReadBackend
+
+        if isinstance(self._backend, BoundedFileReadBackend):
+            return await self._backend.read_bounded_file(
+                self._target, path, timeout_seconds=timeout_seconds, max_output_bytes=max_output_bytes,
+            )
+        return await self._read_file_via_generic_execute(
+            path, timeout_seconds=timeout_seconds, max_output_bytes=max_output_bytes,
+        )
+
+    async def _read_file_via_generic_execute(
+        self, path: str, *, timeout_seconds: float, max_output_bytes: int,
+    ) -> BoundedReadResult:
+        """FALLBACK path (Phase 21 behavior, unchanged) — used only when
+        *backend* does not implement ``BoundedFileReadBackend`` (e.g. a
+        minimal test double implementing only ``execute()``)."""
         result = await self._backend.execute(self._FIXED_TOOL, ["--", path], timeout_seconds=timeout_seconds)
         success = result.returncode == 0 and not result.timed_out
         output = result.stdout if success else ""

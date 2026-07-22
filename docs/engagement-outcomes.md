@@ -468,3 +468,11 @@ wrong, but the run is over."
 - **No new exploitation, privilege-escalation, persistence, or
   shell-access capability was added or changed by this phase.** Phase 12C
   is purely about how an engagement reports its own end state.
+
+> **Note (Phase 22):** Phase 22 (see `docs/user-flag-objective.md` §19)
+> completed the live remote runtime path for the `remote_command` access
+> capability (a dedicated `apex_tool_service` bounded-file-read operation).
+> It made no change to `EngagementOutcome`, `evaluate_termination()`, or
+> any value in the table above — `user_flag_verified` remains the sole
+> success outcome regardless of which capability/transport produced the
+> verified evidence.

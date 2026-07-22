@@ -36,6 +36,16 @@ ENV_MAX_STDIN_BYTES = "APEX_TOOL_SERVICE_MAX_STDIN_BYTES"
 ENV_MAX_STDOUT_BYTES = "APEX_TOOL_SERVICE_MAX_STDOUT_BYTES"
 ENV_MAX_STDERR_BYTES = "APEX_TOOL_SERVICE_MAX_STDERR_BYTES"
 
+# Phase 22 — dedicated bounded-file-read operation (POST /v1/bounded-file-read).
+# Deliberately separate from the generic-tool limits above: this operation
+# has its own, narrower ceilings and its own target-authorization/basename
+# allowlists, since it is a structurally different (and more restrictive)
+# capability than the generic allowlisted-tool endpoint.
+ENV_BOUNDED_READ_MAX_BYTES = "APEX_TOOL_SERVICE_BOUNDED_READ_MAX_BYTES"
+ENV_BOUNDED_READ_TIMEOUT = "APEX_TOOL_SERVICE_BOUNDED_READ_TIMEOUT"
+ENV_ALLOWED_FLAG_BASENAMES = "APEX_TOOL_SERVICE_ALLOWED_FLAG_BASENAMES"
+ENV_AUTHORIZED_CIDRS = "APEX_TOOL_SERVICE_AUTHORIZED_CIDRS"
+
 # Safe, non-secret defaults. Every limit here is a ceiling/floor chosen to be
 # generous enough for the allowlisted tools (apex_tool_service/allowlist.py)
 # while bounding worst-case resource use. None of these are secrets.
@@ -50,6 +60,30 @@ _DEFAULT_MAX_TOTAL_ARGUMENT_BYTES = 4096
 _DEFAULT_MAX_STDIN_BYTES = 65_536
 _DEFAULT_MAX_STDOUT_BYTES = 1_048_576
 _DEFAULT_MAX_STDERR_BYTES = 1_048_576
+
+# Phase 22 defaults — deliberately narrow. `_DEFAULT_BOUNDED_READ_MAX_BYTES`
+# and `_DEFAULT_BOUNDED_READ_TIMEOUT_SECONDS` are the service-side HARD
+# ceilings — a caller-requested value is always clamped to
+# min(requested, this ceiling), never the other way around.
+# `_DEFAULT_ALLOWED_FLAG_BASENAMES` intentionally contains only "user.txt" —
+# do not widen this default to arbitrary filenames or system paths.
+# `_DEFAULT_AUTHORIZED_CIDRS` mirrors `ApexConfig.htb_route_cidr`'s own
+# established default (the standard HTB lab network range) — not a single
+# hardcoded machine IP, and always operator-overridable.
+_DEFAULT_BOUNDED_READ_MAX_BYTES = 4096
+_DEFAULT_BOUNDED_READ_TIMEOUT_SECONDS = 10.0
+_DEFAULT_ALLOWED_FLAG_BASENAMES: tuple[str, ...] = ("user.txt",)
+_DEFAULT_AUTHORIZED_CIDRS: tuple[str, ...] = ("10.129.0.0/16",)
+
+
+def _parse_csv(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    """Parse a comma-separated env var into a tuple of stripped, non-empty
+    entries. ``None``/empty -> *default* (never an empty tuple silently
+    disabling a required allowlist)."""
+    if not raw or not raw.strip():
+        return default
+    entries = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return entries or default
 
 
 @dataclass(slots=True, frozen=True)
@@ -68,6 +102,10 @@ class ServiceSettings:
     max_stdin_bytes: int = _DEFAULT_MAX_STDIN_BYTES
     max_stdout_bytes: int = _DEFAULT_MAX_STDOUT_BYTES
     max_stderr_bytes: int = _DEFAULT_MAX_STDERR_BYTES
+    bounded_read_max_bytes: int = _DEFAULT_BOUNDED_READ_MAX_BYTES
+    bounded_read_timeout_seconds: float = _DEFAULT_BOUNDED_READ_TIMEOUT_SECONDS
+    allowed_flag_basenames: tuple[str, ...] = _DEFAULT_ALLOWED_FLAG_BASENAMES
+    authorized_cidrs: tuple[str, ...] = _DEFAULT_AUTHORIZED_CIDRS
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "ServiceSettings":
@@ -96,6 +134,16 @@ class ServiceSettings:
             max_stdin_bytes=int(e.get(ENV_MAX_STDIN_BYTES, _DEFAULT_MAX_STDIN_BYTES)),
             max_stdout_bytes=int(e.get(ENV_MAX_STDOUT_BYTES, _DEFAULT_MAX_STDOUT_BYTES)),
             max_stderr_bytes=int(e.get(ENV_MAX_STDERR_BYTES, _DEFAULT_MAX_STDERR_BYTES)),
+            bounded_read_max_bytes=int(
+                e.get(ENV_BOUNDED_READ_MAX_BYTES, _DEFAULT_BOUNDED_READ_MAX_BYTES)
+            ),
+            bounded_read_timeout_seconds=float(
+                e.get(ENV_BOUNDED_READ_TIMEOUT, _DEFAULT_BOUNDED_READ_TIMEOUT_SECONDS)
+            ),
+            allowed_flag_basenames=_parse_csv(
+                e.get(ENV_ALLOWED_FLAG_BASENAMES), _DEFAULT_ALLOWED_FLAG_BASENAMES
+            ),
+            authorized_cidrs=_parse_csv(e.get(ENV_AUTHORIZED_CIDRS), _DEFAULT_AUTHORIZED_CIDRS),
         )
 
     def to_safe_dict(self) -> dict[str, object]:
@@ -112,5 +160,9 @@ class ServiceSettings:
             "max_stdin_bytes": self.max_stdin_bytes,
             "max_stdout_bytes": self.max_stdout_bytes,
             "max_stderr_bytes": self.max_stderr_bytes,
+            "bounded_read_max_bytes": self.bounded_read_max_bytes,
+            "bounded_read_timeout_seconds": self.bounded_read_timeout_seconds,
+            "allowed_flag_basenames": list(self.allowed_flag_basenames),
+            "authorized_cidrs": list(self.authorized_cidrs),
             "token_configured": self.token is not None,
         }

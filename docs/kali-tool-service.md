@@ -545,4 +545,145 @@ Docker-socket-based control of a Kali container remains explicitly
 rejected as an architecture choice, unless a later, explicit design
 decision accepts that risk in writing — see
 `docs/tool-execution-architecture.md` §16 and §18 for the full reasoning,
+
+---
+
+## 19. Dedicated bounded-file-read operation (Phase 22)
+
+**Status:** implemented. Full client-and-design detail lives in
+`docs/user-flag-objective.md` §19 (the authoritative document for this
+feature) and `docs/remote-tool-backend.md` §9 (the client counterpart).
+This section documents only the SERVER side that lives in this package.
+
+Before this phase, the only way to read a file through this service was
+`POST /v1/execute` with `{"tool": "cat", ...}` — and `cat` has never been
+in `ALLOWED_TOOLS` (§6), by deliberate design: that endpoint accepts
+free-form `arguments`, so allowlisting `cat` there would grant an
+unrestricted arbitrary-file-read primitive to any authenticated caller.
+This phase adds a **structurally separate** operation instead of widening
+that allowlist.
+
+### 19.1 `POST /v1/bounded-file-read`
+
+A new route, authenticated with the exact same bearer-token mechanism as
+`/v1/execute` (§7) — never public, never exempt. Request/response models
+(`ReadBoundedFileRequest`/`ReadBoundedFileResponse`, `apex_tool_service/
+models.py`) are entirely separate from `ExecuteRequest`/`ExecuteResponse`
+and have no `tool`/`arguments`/`command`/`argv`/`executable`/`shell` field
+— `ConfigDict(extra="forbid")` rejects any such field at the schema layer
+before any handler code runs.
+
+Request fields: `target`, `path`, `timeout_seconds` (optional — falls back
+to `settings.bounded_read_timeout_seconds`), `max_output_bytes` (optional
+— falls back to `settings.bounded_read_max_bytes`), `dry_run` (defaults to
+`false`). Response fields: `ok`, `output`, `error_code`,
+`sanitized_error`, `return_code`, `bytes_received`, `oversized`,
+`timed_out`, `duration_ms`, `method`.
+
+### 19.2 Independent target authorization
+
+`validation.py::validate_target_authorized(target, *, authorized_cidrs)`
+requires `target` to parse as an IP address falling within at least one
+of `ServiceSettings.authorized_cidrs` (env `
+APEX_TOOL_SERVICE_AUTHORIZED_CIDRS`, default `10.129.0.0/16` — the
+standard HTB lab range, mirroring `ApexConfig.htb_route_cidr`'s own
+default). This is genuinely independent of `apex_host`'s own policy gate
+(`check_bounded_user_flag_verification`) — this package still imports
+neither `apex_host` nor `memfabric` (§15), so it cannot simply trust a
+claim the caller makes; it re-derives authorization from its own
+configuration.
+
+### 19.3 Independent path validation
+
+`validation.py::validate_bounded_path(path, *, allowed_basenames)` mirrors
+`apex_host.verification.user_flag.is_bounded_candidate_path`'s exact
+character-set/traversal/basename rules — duplicated, not imported (this
+package's established independence convention), with a dedicated parity
+test (`tests/apex_tool_service/test_bounded_file_read.py::
+TestPathValidatorParity`) proving the two independently-written validators
+reach identical accept/reject decisions across the same adversarial input
+set (traversal, wildcards, shell metacharacters, control characters, NUL,
+oversized paths). `ServiceSettings.allowed_flag_basenames` (env `
+APEX_TOOL_SERVICE_ALLOWED_FLAG_BASENAMES`, default `user.txt` only) is the
+sole source of approved filenames — the path's directory portion may vary
+(subject to the charset/traversal rules), but its basename must be in this
+allowlist.
+
+### 19.4 Fixed argv, never caller-controlled
+
+`executor.py::execute_bounded_file_read()` is the one function that
+performs the read. The executable (`cat`) and the `--` separator are
+Python constants inside this trusted module — never a request field,
+`ServiceSettings` value, or environment variable:
+
+```python
+argv = ["cat", "--", path]          # path is the only variable component
+proc = await asyncio.create_subprocess_exec(*argv, ...)   # never shell=True
+```
+
+This is the second `asyncio.create_subprocess_exec` call site in this
+package (the first is `execute_tool()`'s, used by `/v1/execute`) — both
+remain confined to `executor.py`, so `test_exactly_one_subprocess_creation_
+call_site`'s actual assertion (`all(name == "executor.py" ...)` — not an
+exact count of one) still holds.
+
+Output is read incrementally in bounded chunks; the moment more than
+`max_output_bytes` (after applying `min(requested, settings.
+bounded_read_max_bytes)`) would be received, the process is terminated and
+**everything collected so far is discarded** — the response is
+`output=""`, `oversized=True`, never a truncated prefix. stderr is read
+(bounded) only to classify a non-zero exit into a fixed category
+(`file_not_found`/`permission_denied`/`invalid_path`/`process_failed`) and
+is then discarded — the raw stderr text is never returned, logged, or
+persisted.
+
+### 19.5 Timeout/byte-limit resolution
+
+`validation.py::resolve_bounded_read_limits(requested_timeout_seconds,
+requested_max_output_bytes, settings)` clamps each caller-supplied value
+to `min(requested, service_hard_limit)` and rejects (never silently
+coerces) invalid values: `None` timeout falls back to the configured
+default; non-numeric, NaN, infinite, or non-positive timeouts are
+rejected; non-integer or non-positive byte caps are rejected.
+
+### 19.6 Dry-run (service-side, defense in depth)
+
+`ReadBoundedFileRequest.dry_run=true` short-circuits before
+`execute_bounded_file_read()` is ever called — the route returns
+`{"ok": false, "error_code": "dry_run", ...}` directly. This is
+independent of, and in addition to, `apex_host`'s own two dry-run layers
+(`UserFlagExecutor`, `RemoteToolBackend`) — see `docs/user-flag-objective.md`
+§19.9 for the full three-layer picture.
+
+### 19.7 Generic-endpoint isolation preserved
+
+`cat` remains absent from `ALLOWED_TOOLS` (§6) — unchanged by this phase.
+`POST /v1/execute` with `{"tool": "cat", "arguments": ["/etc/passwd"]}` or
+`{"tool": "cat", "arguments": ["--", "/home/user/user.txt"]}` both still
+return the same "tool not in the server allowlist" rejection as before —
+proven by `TestGenericEndpointIsolation` in the new test file.
+
+### 19.8 Audit logging
+
+`audit.py::log_bounded_read_accepted`/`log_bounded_read_result` log only
+bounded, non-sensitive metadata: correlation ID, `target`, the candidate's
+basename (already drawn from a small approved list), `ok`, `error_code`,
+`bytes_received`, `oversized`, `timed_out`, `duration_seconds`. Raw file
+content and raw stderr are never passed to any logging call.
+
+### 19.9 Health endpoint
+
+`GET /health` gained one additional boolean field, `bounded_file_read:
+true` — a static capability flag, not a live check. It does not read any
+file, validate any path, or expose the configured allowlist/CIDRs/basenames.
+
+### 19.10 Tests
+
+`tests/apex_tool_service/test_bounded_file_read.py` (79 tests) — request
+model schema, authentication, independent path/target validation (with
+the parity test against `apex_host`), real subprocess execution against
+temporary files (never a real HTB target or real flag), generic-endpoint
+isolation, output/error sanitization, limit resolution, service-side
+dry-run, health, and architecture scans (no `shell=True`, no `/bin/sh -c`,
+no `bash -c`, no arbitrary-command fields on the new models).
 unchanged by this phase.

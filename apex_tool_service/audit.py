@@ -30,8 +30,12 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from typing import TYPE_CHECKING
 
 from apex_tool_service.models import ExecuteResponse
+
+if TYPE_CHECKING:
+    from apex_tool_service.executor import BoundedFileReadResult
 
 logger = logging.getLogger("apex_tool_service.audit")
 
@@ -79,3 +83,38 @@ def log_validation_rejected(correlation_id: str, detail: str) -> None:
 def log_auth_failure(correlation_id: str, status: str) -> None:
     """Log an authentication failure. NEVER pass the Authorization header value here."""
     logger.warning("auth_failure id=%s status=%s", correlation_id, status)
+
+
+# ---------------------------------------------------------------------------
+# Phase 22 — dedicated bounded-file-read audit logging
+# (POST /v1/bounded-file-read). Same "never log the sensitive content"
+# discipline as above: the file's raw content is never passed to any
+# function in this section, only bounded metadata.
+# ---------------------------------------------------------------------------
+
+
+def log_bounded_read_accepted(
+    correlation_id: str, target: str, basename: str, timeout_seconds: float, max_output_bytes: int,
+) -> None:
+    """Log that a bounded-file-read request passed auth+authorization+
+    validation and is about to execute. Only the approved basename is
+    logged, never the full path — the basename is already drawn from a
+    small, operator-configured allowlist and is not sensitive."""
+    logger.info(
+        "bounded_read_accepted id=%s target=%s basename=%s timeout_seconds=%.1f max_output_bytes=%d",
+        correlation_id, target, basename, timeout_seconds, max_output_bytes,
+    )
+
+
+def log_bounded_read_result(
+    correlation_id: str, target: str, basename: str, result: "BoundedFileReadResult",
+) -> None:
+    """Log a bounded-file-read outcome. Never logs ``result.output`` —
+    only its byte length and the sanitized error category."""
+    logger.info(
+        "bounded_read_complete id=%s target=%s basename=%s ok=%s error_code=%s "
+        "return_code=%s bytes_received=%d oversized=%s timed_out=%s duration_seconds=%.3f",
+        correlation_id, target, basename, result.ok, result.error_code or "",
+        result.return_code, result.bytes_received, result.oversized, result.timed_out,
+        result.duration_seconds,
+    )

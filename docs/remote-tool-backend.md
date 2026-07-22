@@ -416,3 +416,70 @@ no real network socket.
   Meow-specific diagnosis, deterministic Meow tests, and authorized live
   Meow validation are all still entirely unimplemented.** This phase is
   the APEX-side HTTP client only.
+
+---
+
+## 9. `read_bounded_file()` — the dedicated bounded-read method (Phase 22)
+
+Before Phase 22, the only way `RemoteToolBackend` could read a file was
+`execute("cat", ["--", path])` — routed through the generic `/v1/execute`
+contract described in §5. Since `cat` was never in `apex_tool_service`'s
+`ALLOWED_TOOLS` (`docs/kali-tool-service.md` §6, unchanged), this path
+always failed against a real deployed service. Phase 22 adds a genuinely
+new client method, `RemoteToolBackend.read_bounded_file(target, path, *,
+timeout_seconds, max_output_bytes) -> BoundedReadResult`
+(`apex_host/runtime_registry.py::BoundedReadResult`), calling a
+STRUCTURALLY SEPARATE service operation, `POST /v1/bounded-file-read`
+(`docs/kali-tool-service.md` §19) — never the generic `/v1/execute`.
+
+### 9.1 Request/response shape
+
+The client POSTs a small, fixed-field JSON body — `{"target": ...,
+"path": ..., "timeout_seconds": ..., "max_output_bytes": ...}` — never a
+`tool`/`arguments`/`command` field. The same `Authorization: Bearer
+<token>` header as `execute()` is reused. The response is mapped through
+`_map_bounded_read_response()`, which validates
+`_REQUIRED_BOUNDED_READ_RESPONSE_FIELDS` (`ok`, `output`, `bytes_received`,
+`oversized`, `timed_out`) are present with correct types before building a
+`BoundedReadResult` — a malformed/incomplete response is rejected the same
+way `_map_response()` already rejects one for `execute()`.
+
+### 9.2 Dry-run
+
+`read_bounded_file()` checks `self._config.dry_run` first, exactly like
+`execute()`, and delegates to `DryRunToolBackend(self._config).
+read_bounded_file(...)` without ever opening a socket.
+
+### 9.3 Transport-failure mapping
+
+Reuses the identical taxonomy as `execute()`: `httpx.ConnectTimeout`/
+`ReadTimeout` → a timed-out `BoundedReadResult` (`timed_out=True`);
+`httpx.ConnectError`/other `httpx.RequestError` → a connection-failure
+result; a non-`200` HTTP status → an HTTP-error result. None of these
+paths ever log the response body.
+
+### 9.4 `ToolBackendCommandReadStrategy` now prefers this method
+
+`apex_host/runtime_registry.py::ToolBackendCommandReadStrategy.read_file()`
+checks `isinstance(self._backend, BoundedFileReadBackend)`
+(`apex_host/tools/backend.py`, a separate `@runtime_checkable` Protocol)
+— when the injected backend supports it (as `RemoteToolBackend`,
+`LocalToolBackend`, and `DryRunToolBackend` all now do), the strategy
+calls `backend.read_bounded_file(...)` directly and NEVER constructs a
+generic `cat -- <path>` `execute()` call for that backend. A test double
+implementing only `execute()` still works unchanged via the preserved
+fallback path — this is why zero Phase 21 tests needed modification.
+
+### 9.5 Tests
+
+`tests/apex_host/test_phase22_remote_bounded_file_read.py` (41 tests)
+covers the client method (dedicated endpoint, structured body, token
+handling, malformed-response rejection, timeout/connection-error mapping,
+no-output-logging), the strategy's preferred-path selection, policy
+gating at both layers, and — the key end-to-end proof — a full synthetic
+engagement using `remote_command` alone (no SSH, no Direct File Read)
+reaching `EngagementOutcome.user_flag_verified` through a REAL, in-process
+`apex_tool_service` FastAPI app (`httpx.ASGITransport`, no Docker, no real
+socket, no HTB target).
+
+Full design detail: `docs/user-flag-objective.md` §19.

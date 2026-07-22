@@ -730,6 +730,28 @@ report generator again needed **zero changes** — the abstraction's
 extension contract now holds for a third, structurally different adapter.
 Full design: [`docs/user-flag-objective.md`](docs/user-flag-objective.md) §18.
 
+**Live remote bounded-file-read (Phase 22):** completes the real, live
+runtime path for the `remote_command` capability against the Kali tool
+service. `apex_tool_service` gained a **structurally separate** operation,
+`POST /v1/bounded-file-read`, rather than widening its generic
+`/v1/execute` allowlist to include `cat` (which would grant an
+unrestricted arbitrary-file-read primitive to any authenticated caller).
+The service constructs the fixed `cat -- <validated-path>` argv
+internally — the caller supplies only `target`/`path`/bounds, never a
+`tool`/`arguments`/`command`/`shell` field (schema-enforced). Independent
+target-authorization and path-allowlist checks run on BOTH sides
+(`apex_host` and `apex_tool_service` never share code — the service still
+imports neither `apex_host` nor `memfabric`), oversized output is
+discarded completely rather than truncated, and three independent
+dry-run layers (`UserFlagExecutor`, `RemoteToolBackend`, and the
+service's own request field) each prevent process execution. A new
+`BoundedFileReadBackend` Protocol seam on `ToolBackend`, plus a preferred-
+path rewrite of `ToolBackendCommandReadStrategy` with a fallback for old
+test doubles, meant every pre-existing Phase 18–21 test passed unchanged.
+Full design: [`docs/user-flag-objective.md`](docs/user-flag-objective.md)
+§19, [`docs/kali-tool-service.md`](docs/kali-tool-service.md) §19,
+[`docs/remote-tool-backend.md`](docs/remote-tool-backend.md) §9.
+
 **Safety**: `ApexConfig.dry_run` defaults to `True`. Every command execution
 path goes through `apex_host/tools/runner.py`, which checks
 `apex_host/tools/safety.py` first (allowlist + unconditional destructive-

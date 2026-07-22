@@ -62,6 +62,10 @@ async def test_health_does_not_expose_env_or_internal_paths() -> None:
     async with client_for(app) as client:
         r = await client.get("/health")
     body = r.json()
-    assert set(body.keys()) == {"status", "service", "tools"}
+    # Phase 22 — "bounded_file_read" is a static capability flag only (the
+    # endpoint exists); it never reads a file, validates a path, or exposes
+    # allowed paths/basenames/executables.
+    assert set(body.keys()) == {"status", "service", "tools", "bounded_file_read"}
+    assert isinstance(body["bounded_file_read"], bool)
     for value in body["tools"].values():
         assert isinstance(value, bool)

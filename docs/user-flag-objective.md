@@ -1715,3 +1715,363 @@ or reach a checkpoint, episode, report, or experience record.
   planner bug that introduces a differently-named forbidden field would
   not be caught by this specific check (though it would still need to
   pass `is_bounded_candidate_path` and every other existing rule).
+
+## 19. Live Remote Bounded File Read Through the Kali Tool Service (Phase 22)
+
+Phase 21 shipped the full `local_shell`/`remote_command`/`web_command`
+capability abstraction, but `remote_command`'s only real strategy
+(`ToolBackendCommandReadStrategy`) submitted its fixed `cat -- <path>` read
+through `ToolBackend.execute()` — a generic call. For `RemoteToolBackend`
+this meant POSTing `{"tool": "cat", "arguments": ["--", path]}` to
+`apex_tool_service`'s existing `/v1/execute` endpoint, where `cat` has
+never been (and, deliberately, should never be) in `ALLOWED_TOOLS` —
+adding it there would let ANY caller of the generic endpoint read ANY file
+the service process can see, using ONLY the existing shell-metacharacter/
+control-character checks as protection — far too broad a capability to
+grant just to unblock one narrow, already-safe operation. A live remote
+bounded-command read therefore could not complete.
+
+This phase adds a **dedicated, structurally separate** bounded-file-read
+operation to `apex_tool_service` — never by widening the generic
+allowlist — and wires `RemoteToolBackend`/`ToolBackendCommandReadStrategy`
+to use it. **This phase does not add vulnerability discovery, payload
+generation, reverse-shell creation, or persistence** — it only completes
+the runtime path for an already-validated bounded command-read capability.
+
+### 19.1 Why not just add `cat` to `ALLOWED_TOOLS`
+
+`ALLOWED_TOOLS` governs `POST /v1/execute` — a caller there supplies
+`arguments` freely (any argv tokens that pass the existing shell-
+metacharacter/control-character checks). Adding `cat` would mean any
+authenticated caller of that endpoint could read `cat <arbitrary-path>` —
+an unrestricted arbitrary-file-read primitive, with no path allowlist, no
+target-authorization check, and no basename restriction. The **dedicated**
+`POST /v1/bounded-file-read` operation this phase adds instead never
+accepts a `tool`/`arguments`/`command` field at all
+(`ReadBoundedFileRequest`'s `model_config = ConfigDict(extra="forbid")`
+rejects any such field by schema alone) — the caller supplies only
+`target`/`path`/bounds, and the SERVICE constructs the fixed
+`["cat", "--", validated_path]` argv internally, after its own independent
+target-authorization and path-allowlist checks. `cat` remains absent from
+`ALLOWED_TOOLS` — proven by a dedicated test
+(`test_no_generic_cat_allowance_added`).
+
+### 19.2 The dedicated service operation
+
+```
+POST /v1/bounded-file-read
+Authorization: Bearer <token>          (same bearer-token auth as /v1/execute)
+
+{
+  "target": "10.129.1.5",
+  "path": "/home/application/user.txt",
+  "timeout_seconds": 10,
+  "max_output_bytes": 4096,
+  "dry_run": false
+}
+```
+
+`ReadBoundedFileRequest`/`ReadBoundedFileResponse`
+(`apex_tool_service/models.py`) are structurally separate Pydantic models
+from `ExecuteRequest`/`ExecuteResponse` — there is no `tool`, `arguments`,
+`stdin`, `command`, `argv`, `executable`, or `shell` field anywhere on the
+request model, and none may ever be added (enforced by
+`test_no_arbitrary_command_fields_in_bounded_request_model`, which asserts
+the exact field set). The response carries `ok`, `output`, `error_code`,
+`sanitized_error`, `return_code`, `bytes_received`, `oversized`,
+`timed_out`, `duration_ms`, `method` — `output` is the ONLY field that may
+ever carry file content, and it is populated only on `ok=True`.
+
+Order of operations inside the route handler (`apex_tool_service/app.py::
+read_bounded_file`), mirroring `/v1/execute`'s own discipline exactly: (1)
+bearer-token auth (503 if unconfigured, 401 if invalid — same
+`check_bearer_token` function, unmodified); (2) request-schema validation;
+(3) target authorization; (4) path validation; (5) limit resolution
+(`min(requested, service_hard_limit)`); (6) dry-run short-circuit; (7)
+execution; (8) sanitized audit log; (9) response. Ordinary read failures
+(file not found, permission denied, oversized, timeout) all return HTTP
+`200` with `ok=false` — exactly like `/v1/execute`'s "ordinary command
+failure is data, not an HTTP error" convention — only auth failures
+(`401`/`503`) and validation failures (`400`) are non-`200`.
+
+### 19.3 Target authorization (independent, service-side)
+
+`validate_target_authorized(target, *, authorized_cidrs)`
+(`apex_tool_service/validation.py`) requires `target` to be a
+syntactically valid IP address falling within at least one configured
+CIDR (`ServiceSettings.authorized_cidrs`, env `
+APEX_TOOL_SERVICE_AUTHORIZED_CIDRS`, default `10.129.0.0/16` — mirroring
+`ApexConfig.htb_route_cidr`'s own established default, the standard HTB
+lab network range). This naturally rejects loopback, link-local, the cloud
+metadata endpoint (`169.254.169.254`), and unrelated private/public
+networks by default, since none of them fall within `10.129.0.0/16` unless
+an operator has explicitly reconfigured `authorized_cidrs` to include them
+(e.g. `127.0.0.0/8` for local testing) — there is no separate hardcoded
+blocklist to bypass or maintain. This is a genuinely independent
+authorization check, not a weaker parallel to `apex_host`'s own policy
+gate: `apex_tool_service` still has no import of `apex_host`/`memfabric`
+anywhere (unchanged from Infra Phase 3) and still has no concept of
+"engagement" — it validates the request against its OWN configured scope,
+in addition to (never instead of) `apex_host`'s
+`check_bounded_user_flag_verification` policy rule running first, entirely
+on the `apex_host` side, before the HTTP request is even sent.
+
+### 19.4 Path validation (independent, service-side, with parity tests)
+
+`validate_bounded_path(path, *, allowed_basenames)`
+(`apex_tool_service/validation.py`) mirrors
+`apex_host.verification.user_flag.is_bounded_candidate_path`'s exact
+invariants — same charset regex (absolute path, conservative character
+set, bounded to 254 characters), same `..`-traversal rejection, same
+approved-basename requirement (`ServiceSettings.allowed_flag_basenames`,
+env `APEX_TOOL_SERVICE_ALLOWED_FLAG_BASENAMES`, default `user.txt` only —
+never widened to arbitrary filenames or system paths). This is a
+DUPLICATED, not shared, validator — `apex_tool_service` still never
+imports `apex_host` (§7/§15 of `docs/kali-tool-service.md`) — and a
+dedicated parity test
+(`TestPathValidatorParity::test_apex_host_and_service_validators_agree`,
+parametrized across the same adversarial inputs: traversal, wildcards,
+shell metacharacters, newlines, NUL bytes, oversized paths) proves the two
+validators reach identical accept/reject decisions.
+
+### 19.5 Fixed argv construction (the core safety property)
+
+`apex_tool_service/executor.py::execute_bounded_file_read` is the
+function that actually launches the read. The fixed executable
+(`_BOUNDED_READ_EXECUTABLE = "cat"`) and the `--` separator are Python
+constants inside this trusted module — never a request field, a
+`ServiceSettings` value, or an environment variable. The ONLY caller-
+supplied input is the already-validated `path`, substituted into the argv
+list as its own separate argument:
+
+```python
+argv = ["cat", "--", path]
+proc = await asyncio.create_subprocess_exec(*argv, ...)   # never shell=True
+```
+
+This is the second (and last) `asyncio.create_subprocess_exec` call site
+in `apex_tool_service` — both remain confined to `executor.py`
+(`test_exactly_one_subprocess_creation_call_site`'s own assertion is
+`all(name == "executor.py" ...)`, not an exact count, so this addition
+does not weaken that invariant). Output is read incrementally, in small
+chunks, stopping the instant more than `max_output_bytes` has been
+received — never buffering an unbounded amount of data before checking
+the limit. **Oversized output is discarded completely**: the function
+returns `output=""` with `oversized=True`, never a truncated prefix — the
+adapter/executor's identical "never partially accept" invariant, now also
+enforced service-side. stderr is captured (bounded, generously) only to
+classify a non-zero exit into a stable category
+(`file_not_found`/`permission_denied`/`invalid_path`/`process_failed`) via
+`_classify_stderr()` — the raw stderr text itself is discarded immediately
+after classification and never returned, logged, or persisted anywhere.
+
+### 19.6 `ToolBackend` — a narrow, checked capability seam
+
+`apex_host/tools/backend.py` gained a SEPARATE Protocol,
+`BoundedFileReadBackend` (`@runtime_checkable`, one method:
+`read_bounded_file(target, path, *, timeout_seconds, max_output_bytes) ->
+BoundedReadResult`) — not an addition to the existing `ToolBackend`
+Protocol, since not every backend needs this narrower capability.
+`ToolBackendCommandReadStrategy.read_file()` checks support via
+`isinstance(backend, BoundedFileReadBackend)` — a real, checked capability
+test against a `@runtime_checkable` Protocol, never blind duck-typing.
+
+All three real backends implement it:
+
+- **`DryRunToolBackend.read_bounded_file()`** — returns a deterministic,
+  synthetic, never-executed result UNCONDITIONALLY (never delegates to
+  `execute()`, unlike its own `execute()` method, which still runs
+  `check_command()` even in dry-run — a bounded file read has no
+  equivalent "was this approved" concern, so making this depend on an
+  unrelated tool-allowlist entry would undermine this backend's whole
+  purpose as an unconditional safe backstop).
+- **`LocalToolBackend.read_bounded_file()`** — reuses the existing trusted
+  `execute("cat", ["--", path])` path (local execution is the operator's
+  own machine, not a shared multi-tenant service, so the "do not widen a
+  shared allowlist" concern that motivates the dedicated remote endpoint
+  does not apply here; `cat` must still be in `ApexConfig.allowed_tools`,
+  an optional, not-default tool).
+- **`RemoteToolBackend.read_bounded_file()`** — calls the new dedicated
+  `POST /v1/bounded-file-read` operation (§19.2), never `/v1/execute`.
+
+A FALLBACK path is preserved in `ToolBackendCommandReadStrategy` for test
+doubles that implement only `execute()` (e.g. a minimal fake `ToolBackend`
+used across the Phase 21 test suite) — when the injected backend does NOT
+implement `BoundedFileReadBackend`, the strategy falls back to its
+original Phase 21 behavior byte-for-byte. This is why every pre-existing
+Phase 21 test continued to pass unmodified.
+
+### 19.7 `RemoteToolBackend.read_bounded_file()` — client implementation
+
+Mirrors `execute()`'s own structure closely: dry-run short-circuit first
+(delegates to `DryRunToolBackend.read_bounded_file()`, never touching the
+network); POSTs a structured `{target, path, timeout_seconds,
+max_output_bytes}` body (never a command/argv/executable field) to
+`{base_url}/v1/bounded-file-read`; the same `Authorization: Bearer <token>`
+header as `/v1/execute`; the same client-side timeout margin
+(`_CLIENT_TIMEOUT_MARGIN_SECONDS`) strategy; the same transport-failure
+taxonomy (connect timeout, read timeout, connect error, generic
+`RequestError`) — all mapped to a `BoundedReadResult` (not a `ToolResult`
+— a structurally distinct return type with its own required-field
+validation, `_REQUIRED_BOUNDED_READ_RESPONSE_FIELDS`). A malformed/missing-
+field response is rejected the same way `_map_response()` already rejects
+one for the generic path. `connected` is `True` for every well-formed
+response except `error_code == "backend_unavailable"` (the one case where
+the service could not even attempt the read) — a failed-but-engaged read
+(file not found, permission denied, oversized) still counts as
+`connected=True`, mirroring `ToolBackendCommandReadStrategy`'s own
+established "connected unless the mechanism itself never engaged"
+convention. Never logs the response body/output — only a bounded,
+sanitized failure message on the error paths.
+
+`BoundedReadResult` (`apex_host/runtime_registry.py`) gained one new,
+additive, backward-compatible field: `timed_out: bool = False` — a
+distinct, structured signal from the server's own explicit timeout
+detection, kept separate from `error` so callers never need to substring-
+match error text to detect a timeout.
+
+### 19.8 Policy — unchanged, re-verified at both layers
+
+`check_bounded_user_flag_verification()` (`apex_host/policy/rules.py`)
+needed no change for this phase — it already blocks an off-scope target
+before `UserFlagExecutor` is ever reached, entirely on the `apex_host`
+side, regardless of which capability type or transport would have serviced
+the (now-blocked) request. This phase adds a dedicated test proving the
+SAME guarantee holds independently at the SERVICE layer too — an
+unauthorized-target `POST /v1/bounded-file-read` request never reaches
+`asyncio.create_subprocess_exec` (`test_blocked_request_never_reaches_
+subprocess_on_service`), and a `dry_run: true` request never does either
+(`test_dry_run_never_calls_subprocess`).
+
+### 19.9 Dry-run — defense in depth at three layers
+
+1. `UserFlagExecutor` still short-circuits before ever resolving an
+   adapter when `config.dry_run` is `True` (unchanged since Phase 18).
+2. `RemoteToolBackend.read_bounded_file()` checks `config.dry_run` first
+   and delegates to `DryRunToolBackend.read_bounded_file()` without ever
+   touching the network (unchanged pattern from `execute()`).
+3. **New this phase:** `ReadBoundedFileRequest.dry_run` — an independent,
+   service-side mirror. When `true`, the service returns
+   `{"ok": false, "error_code": "dry_run", ...}` without ever calling
+   `execute_bounded_file_read()` — proven by a test that monkeypatches
+   `asyncio.create_subprocess_exec` to raise if called at all, then sends
+   `dry_run: true` and confirms it is never invoked.
+
+### 19.10 Error categories
+
+`apex_tool_service`'s stable `error_code` vocabulary:
+`backend_unavailable`, `timeout`, `oversized_output`, `file_not_found`,
+`permission_denied`, `invalid_path`, `process_failed`, `dry_run` — each
+mapped to a fixed, generic `sanitized_error` phrase
+(`apex_host/app.py::_ERROR_CODE_MESSAGES`), never derived from raw
+stderr/exception text. `apex_host`'s own `RemoteToolBackend` layers its
+own transport-level categories on top (`could not connect...`, `... timed
+out`, `response missing required field(s): ...`) for failures that never
+reached the service at all.
+
+### 19.11 Logging and secret handling
+
+Never logged, anywhere in the new code: raw file content/output (neither
+service-side `audit.py::log_bounded_read_result` nor client-side
+`RemoteToolBackend` ever pass `output`/response body to a log call), raw
+stderr (discarded immediately after `_classify_stderr()` categorizes it),
+the bearer token (reuses the exact same `check_bearer_token`/
+`log_auth_failure` discipline as `/v1/execute`). Audit log fields are
+bounded metadata only: correlation ID, `target`, the candidate's basename
+(already drawn from a small, approved allowlist — not sensitive), `ok`,
+`error_code`, `bytes_received`, `oversized`, `timed_out`,
+`duration_seconds`. The full path (not just the basename) is never logged.
+
+### 19.12 Reporting — unchanged
+
+"Capability used: Remote Command" (`capability_type_label`, unchanged
+since Phase 21) continues to render exactly as before — this phase adds
+no new report field, no raw command/path/output surfacing. The existing
+"Bounded Command Summary" section and its seven metrics
+(`bounded_command_*`) already counted `remote_command` attempts/successes/
+timeouts/oversized responses generically via `bounded_command_log`
+(populated from the `user_flag_verify` tool_result, which is identical in
+shape regardless of which capability type or transport produced it) — no
+change was needed there either.
+
+### 19.13 Tests
+
+`tests/apex_tool_service/test_bounded_file_read.py` (79 tests) — request
+model, authentication, path/target security (with the apex_host parity
+test), process safety (real subprocess execution against temp files —
+argv exactly `["cat", "--", path]`, oversized-output discarded, stderr
+never returned), generic-endpoint isolation (`cat` still rejected on
+`/v1/execute` with or without `--`), output/error sanitization, limit
+resolution, service-side dry-run, health, and architecture scans.
+
+`tests/apex_host/test_phase22_remote_bounded_file_read.py` (41 tests) —
+`RemoteToolBackend.read_bounded_file()` unit tests (dedicated route,
+structured body, token handling, malformed-response rejection, timeout
+mapping, no output logging), strategy integration (preferred path used,
+generic `execute()` never called for a `BoundedFileReadBackend`-supporting
+backend), policy (blocked-at-both-layers, dry-run-never-subprocess),
+**a full synthetic engagement proving `remote_command` alone — no SSH, no
+Direct File Read — reaches `EngagementOutcome.user_flag_verified` through
+a REAL, in-process `apex_tool_service` app** (via `httpx.ASGITransport`,
+no Docker, no real socket, no HTB), a matching negative suite (service
+unavailable, unauthorized, invalid candidate, not found, permission
+denied, oversized, malformed response — all non-success, non-zero exit),
+and architecture scans.
+
+### 19.14 Docker/Compose
+
+`compose.yaml`'s `kali` service gained four new environment variables
+(`APEX_TOOL_SERVICE_BOUNDED_READ_MAX_BYTES`,
+`APEX_TOOL_SERVICE_BOUNDED_READ_TIMEOUT`,
+`APEX_TOOL_SERVICE_ALLOWED_FLAG_BASENAMES`,
+`APEX_TOOL_SERVICE_AUTHORIZED_CIDRS`), each `${VAR:-default}`-interpolated
+with the default matching `ServiceSettings`'s own real implementation
+default — overridable via `.env`, zero behavior change for an operator who
+does not edit it. No Dockerfile change was needed — `cat` is part of
+`coreutils`, already present in the Kali image (a base-system package,
+never explicitly installed or removed) since Infra Phase 6; only the
+*application-layer* allowlist gap (§19.1) needed fixing, not anything at
+the container/image level. `compose.htb.yaml` needed no changes — it
+overrides only `network_mode`/`APEX_TOOL_SERVICE_URL`, not the `kali`
+service's other environment variables, which continue to merge in
+unchanged from the base file.
+
+### 19.15 Known limitations (additive to §15/§16.12/§17.18/§18.13)
+
+- No server-side rate limiting on the new endpoint (same pre-existing
+  limitation as `/v1/execute` — see `docs/kali-tool-service.md` §16).
+- `authorized_cidrs`/`allowed_flag_basenames` are service-wide, not
+  per-caller — there is still exactly one configured bearer token and no
+  multi-tenant scoping (unchanged limitation from Infra Phase 3).
+- The dedicated endpoint's own `dry_run` field (§19.9) is independent of,
+  and does not read from, `apex_host`'s `ApexConfig.dry_run` — an operator
+  driving the service directly (bypassing `apex_host` entirely) must set
+  it explicitly per request if that defense-in-depth layer matters to
+  them.
+- `web_command` continues to share `DirectFileReadCapabilityAdapter`/the
+  `/v1/execute`-adjacent HTTP mechanism from Phase 20/21, unchanged by
+  this phase — this phase's new dedicated endpoint and
+  `BoundedFileReadBackend` seam apply to `local_shell`/`remote_command`
+  only.
+- No Docker Compose integration test in the default `pytest` suite spins
+  up a REAL container and calls the new endpoint over a real socket — the
+  "real remote path" proof in this phase's test suite uses
+  `httpx.ASGITransport` against the real, unmodified `apex_tool_service`
+  FastAPI app in-process (no Docker), which exercises the identical
+  request/response contract and code paths a real container would, but
+  does not itself prove container networking/health/build correctness
+  (those remain covered by the separate, pre-existing Infra Phase 6/7
+  Docker test suite and manual `docker compose` verification).
+
+> **Correction (Phase 22, live remote path):** the first limitation listed
+> above ("`remote_command`'s real-world backend requires `cat` to be
+> independently allowlisted in `apex_tool_service/allowlist.py`") described
+> the state of the codebase as it existed at the end of Phase 21 and is
+> left in place per this file's append-only correction convention, not
+> rewritten. **It is no longer the reason a live remote bounded-command
+> read cannot complete.** Phase 22 (§19 below) resolves this properly —
+> not by adding `cat` to the generic allowlist, but by giving
+> `apex_tool_service` a dedicated, narrower `POST /v1/bounded-file-read`
+> operation that never touches `ALLOWED_TOOLS` at all. `RemoteToolBackend`
+> (and therefore `remote_command`) now completes a real bounded file read
+> through the actual Kali tool service.
