@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Awaitable, Callable, Protocol, runtime_checkable
 
+from apex_host.runtime_registry import BoundedReadResult
 from apex_host.tools.remote_backend import RemoteToolBackend
 from apex_host.tools.safety import check_command
 from apex_host.types import ToolCommand, ToolResult
@@ -45,6 +46,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ToolBackend",
     "ToolExecutionResult",
+    "BoundedFileReadBackend",
     "DryRunToolBackend",
     "LocalToolBackend",
     "RemoteToolBackend",
@@ -53,6 +55,11 @@ __all__ = [
     "select_runtime_backend",
     "to_run_command_fn",
 ]
+
+#: Phase 22 — the one fixed executable a ``read_bounded_file()``
+#: implementation backed by a generic ``execute()`` call may ever request.
+#: Never operator/task-controlled — see ``_execute_bounded_read_via_cat``.
+_BOUNDED_READ_TOOL = "cat"
 
 # ToolBackend.execute() returns a ToolResult. The architecture-document
 # pseudocode calls this ``ToolExecutionResult`` — this alias documents that
@@ -103,6 +110,67 @@ class ToolBackend(Protocol):
     ) -> ToolExecutionResult: ...
 
 
+@runtime_checkable
+class BoundedFileReadBackend(Protocol):
+    """Narrow, OPTIONAL capability seam (Phase 21/22) for a backend that can
+    perform one dedicated, structured bounded-file-read operation — never a
+    generalization of ``ToolBackend.execute()``'s broader "run any
+    allowlisted tool" capability.
+
+    Deliberately a SEPARATE Protocol from ``ToolBackend``, not an addition
+    to it: not every ``ToolBackend`` needs to implement this (a backend that
+    only ever runs `nmap`/`curl`-style recon tools has no reason to grow a
+    file-read method), and forcing every backend to implement unsafe or
+    irrelevant behavior would violate the "narrow protocol, only what's
+    needed" discipline this codebase follows elsewhere (e.g.
+    ``BoundedCommandReadStrategy`` in ``apex_host/runtime_registry.py``).
+
+    Callers must check support via ``isinstance(backend,
+    BoundedFileReadBackend)`` — a real, checked capability test (this
+    Protocol is ``@runtime_checkable``), never blind duck-typing (e.g.
+    ``hasattr(backend, "read_bounded_file")`` alone, which would also match
+    an unrelated object that happens to define a same-named method with a
+    different contract).
+
+    ``target`` exists so a remote implementation (``RemoteToolBackend``) can
+    bind the read to an authorized-target check on the SERVER side —
+    local/dry-run implementations accept it for interface parity but do not
+    need to use it (there is no remote target-authorization concern for a
+    read that happens on the same machine already running this process).
+    """
+
+    async def read_bounded_file(
+        self, target: str, path: str, *, timeout_seconds: float, max_output_bytes: int,
+    ) -> BoundedReadResult: ...
+
+
+def _execute_result_to_bounded_read(result: ToolResult) -> BoundedReadResult:
+    """Map a generic ``ToolResult`` (from an ``execute("cat", ["--", path])``
+    call) onto a ``BoundedReadResult`` — shared by ``DryRunToolBackend`` and
+    ``LocalToolBackend``'s own ``read_bounded_file()`` implementations.
+    Identical mapping logic to what ``apex_host.runtime_registry
+    .ToolBackendCommandReadStrategy`` used to perform itself before Phase 22
+    moved "construct the fixed cat -- path invocation" down into each
+    backend's own dedicated method.
+    """
+    success = result.returncode == 0 and not result.timed_out
+    output = result.stdout if success else ""
+    error: str | None = None
+    if result.timed_out:
+        error = "timeout: bounded command read timed out"
+    elif not success:
+        error = (result.error or result.stderr or "non-zero exit")[:200]
+    return BoundedReadResult(
+        connected=not result.timed_out,
+        output=output,
+        error=error,
+        return_code=result.returncode,
+        bytes_received=len(output.encode("utf-8", errors="replace")),
+        truncated=False,
+        method=f"cmd_{result.backend or 'local'}",
+    )
+
+
 class DryRunToolBackend:
     """Never executes a process. Deterministic, synthetic, offline.
 
@@ -145,6 +213,38 @@ class DryRunToolBackend:
             duration_seconds=0.0,
             dry_run=True,
             backend="dry-run",
+        )
+
+    async def read_bounded_file(
+        self, target: str, path: str, *, timeout_seconds: float, max_output_bytes: int,
+    ) -> BoundedReadResult:
+        """Never performs a real read — returns a deterministic, synthetic,
+        never-executed result unconditionally (satisfies
+        ``BoundedFileReadBackend`` for interface parity with the other
+        backends).
+
+        Deliberately does NOT delegate to ``self.execute()`` (unlike
+        ``LocalToolBackend.read_bounded_file()``): ``execute()`` still runs
+        ``check_command()`` even in dry-run (so a disallowed/destructive
+        *generic* command is still flagged as a configuration problem), but
+        a bounded file read has no equivalent "was this approved" concern —
+        the operation's shape is fixed and safe regardless of
+        ``ApexConfig.allowed_tools``. This backend's entire purpose is to be
+        an unconditional safe backstop (docs/remote-tool-backend.md §4) —
+        making it depend on an unrelated tool-allowlist entry would
+        undermine that guarantee for an operator who only ever configured
+        the ``remote_command``/``web_command`` capability path (which never
+        needs local ``cat`` allowlisting at all).
+        """
+        logger.info("dry-run backend: bounded file read of an approved candidate path")
+        return BoundedReadResult(
+            connected=True,
+            output="[dry-run] would read bounded candidate path",
+            error=None,
+            return_code=0,
+            bytes_received=0,
+            truncated=False,
+            method="dry-run",
         )
 
 
@@ -196,6 +296,28 @@ class LocalToolBackend:
             timeout_seconds=int(timeout_seconds or self._config.max_command_seconds),
         )
         return await run_command(cmd, self._config)
+
+    async def read_bounded_file(
+        self, target: str, path: str, *, timeout_seconds: float, max_output_bytes: int,
+    ) -> BoundedReadResult:
+        """Local execution reuses the existing trusted ``execute()`` path
+        (``cat -- <path>``, a fixed, non-caller-controlled argv) — this is
+        the operator's own machine, not a shared multi-tenant service, so
+        the "do not add unrestricted cat to a shared allowlist" concern
+        that motivates ``RemoteToolBackend``'s dedicated endpoint does not
+        apply here. ``cat`` must still be present in
+        ``ApexConfig.allowed_tools`` (an optional, not-default tool — see
+        ``apex_host/tools/registry.py``) or ``check_command`` rejects it,
+        which this method maps to a bounded, sanitized error rather than
+        letting the exception escape.
+        """
+        try:
+            result = await self.execute(_BOUNDED_READ_TOOL, ["--", path], timeout_seconds=timeout_seconds)
+        except ValueError as exc:
+            return BoundedReadResult(
+                connected=False, output="", error=f"execution_context_unavailable: {type(exc).__name__}",
+            )
+        return _execute_result_to_bounded_read(result)
 
 
 def select_tool_backend(config: "ApexConfig") -> ToolBackend:

@@ -51,6 +51,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from apex_host.runtime_registry import BoundedReadResult
 from apex_host.tools.safety import check_command
 from apex_host.types import ToolCommand, ToolResult
 
@@ -60,7 +61,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _EXECUTE_PATH = "/v1/execute"
+# Phase 22 — the dedicated bounded-file-read operation's own endpoint,
+# entirely separate from the generic /v1/execute path above. This is NOT
+# "run 'cat' through the generic tool endpoint" — it is a structurally
+# different, narrower request/response contract (see
+# apex_tool_service/models.py::ReadBoundedFileRequest/Response) that never
+# touches apex_tool_service's ALLOWED_TOOLS allowlist at all.
+_READ_BOUNDED_FILE_PATH = "/v1/bounded-file-read"
 _ENV_TOKEN = "APEX_TOOL_SERVICE_TOKEN"
+
+_REQUIRED_BOUNDED_READ_RESPONSE_FIELDS: dict[str, type | tuple[type, ...]] = {
+    "ok": bool,
+    "output": str,
+    "bytes_received": int,
+    "oversized": bool,
+    "timed_out": bool,
+}
 # How much longer than the requested remote timeout the *client* waits before
 # giving up — generous enough that the service's own SIGTERM-then-grace
 # timeout handling (docs/kali-tool-service.md §8) can produce a structured
@@ -216,6 +232,127 @@ class RemoteToolBackend:
             return self._transport_failure(cmd, start, f"tool service request failed: {_safe_exc_text(exc)}")
 
         return self._map_response(cmd, response, start)
+
+    # ------------------------------------------------------------------
+    # Phase 22 — dedicated bounded-file-read operation
+    # ------------------------------------------------------------------
+
+    async def read_bounded_file(
+        self, target: str, path: str, *, timeout_seconds: float, max_output_bytes: int,
+    ) -> BoundedReadResult:
+        """Call the tool service's dedicated ``POST /v1/bounded-file-read``
+        operation — never the generic ``/v1/execute`` endpoint, and never
+        represented as ``execute("cat", ["--", path])``. The fixed
+        ``cat -- <path>`` argv is constructed entirely inside
+        ``apex_tool_service`` (see ``apex_tool_service/executor.py
+        ::execute_bounded_file_read``) — this client sends only the
+        structured ``{target, path, timeout_seconds, max_output_bytes}``
+        fields, never a command/argv/executable field.
+
+        Same dry-run defense in depth as ``execute()``: ``config.dry_run``
+        is checked first and, if true, delegates to
+        ``DryRunToolBackend.read_bounded_file()`` without ever touching the
+        network.
+        """
+        if self._config.dry_run:
+            from apex_host.tools.backend import DryRunToolBackend
+
+            return await DryRunToolBackend(self._config).read_bounded_file(
+                target, path, timeout_seconds=timeout_seconds, max_output_bytes=max_output_bytes,
+            )
+
+        client_timeout = float(timeout_seconds) + _CLIENT_TIMEOUT_MARGIN_SECONDS
+        body = {
+            "target": target,
+            "path": path,
+            "timeout_seconds": float(timeout_seconds),
+            "max_output_bytes": int(max_output_bytes),
+        }
+        headers = {"Authorization": f"Bearer {self._token}"}
+        url = f"{self._base_url}{_READ_BOUNDED_FILE_PATH}"
+
+        client = self._get_client()
+        try:
+            response = await client.post(url, json=body, headers=headers, timeout=client_timeout)
+        except httpx.ConnectTimeout:
+            return self._bounded_read_transport_failure("connection to tool service timed out")
+        except httpx.ReadTimeout:
+            return self._bounded_read_transport_failure(
+                "tool service did not respond within the client timeout", timed_out=True,
+            )
+        except httpx.ConnectError as exc:
+            return self._bounded_read_transport_failure(
+                f"could not connect to tool service: {_safe_exc_text(exc)}"
+            )
+        except httpx.TimeoutException as exc:
+            return self._bounded_read_transport_failure(f"tool service request timed out: {_safe_exc_text(exc)}")
+        except httpx.RequestError as exc:
+            return self._bounded_read_transport_failure(f"tool service request failed: {_safe_exc_text(exc)}")
+
+        return self._map_bounded_read_response(response)
+
+    def _bounded_read_transport_failure(self, message: str, *, timed_out: bool = False) -> BoundedReadResult:
+        logger.warning("remote bounded-file-read transport failure: %s", message)
+        # Never log/echo the target or path here beyond what the caller's
+        # own audit logging already handles — this message is a fixed,
+        # bounded transport-failure description only.
+        return BoundedReadResult(connected=False, output="", error=message, timed_out=timed_out, method="remote")
+
+    def _map_bounded_read_response(self, response: httpx.Response) -> BoundedReadResult:
+        if response.status_code != 200:
+            detail = self._extract_detail(response)
+            message = f"tool service returned HTTP {response.status_code}"
+            if detail:
+                message = f"{message}: {detail}"
+            logger.warning("remote bounded-file-read HTTP error: status=%s", response.status_code)
+            return BoundedReadResult(connected=False, output="", error=message[:500], method="remote")
+
+        try:
+            data = response.json()
+        except ValueError:
+            return self._malformed_bounded_read_result("response body is not valid JSON")
+        if not isinstance(data, dict):
+            return self._malformed_bounded_read_result("response body is not a JSON object")
+
+        missing = [f for f in _REQUIRED_BOUNDED_READ_RESPONSE_FIELDS if f not in data]
+        if missing:
+            return self._malformed_bounded_read_result(
+                f"response missing required field(s): {', '.join(sorted(missing))}"
+            )
+        wrong_type = [
+            f for f, expected in _REQUIRED_BOUNDED_READ_RESPONSE_FIELDS.items()
+            if not isinstance(data.get(f), expected)
+        ]
+        if wrong_type:
+            return self._malformed_bounded_read_result(
+                f"response field(s) have unexpected type: {', '.join(sorted(wrong_type))}"
+            )
+
+        error_code = data.get("error_code")
+        sanitized_error = data.get("sanitized_error")
+        error = str(sanitized_error) if sanitized_error else (str(error_code) if error_code else None)
+        # "backend_unavailable" is the one error_code that means the service
+        # could not even attempt the read (the fixed executable is missing
+        # on its own host) — every other outcome (including a failed read
+        # such as file_not_found/permission_denied/oversized_output) means
+        # the service DID engage with the request, mirroring
+        # ToolBackendCommandReadStrategy's own "connected unless the
+        # mechanism itself never engaged" convention.
+        connected = str(error_code or "") != "backend_unavailable"
+        return BoundedReadResult(
+            connected=connected,
+            output=str(data["output"]),
+            error=error,
+            return_code=data.get("return_code"),
+            bytes_received=int(data["bytes_received"]),
+            truncated=bool(data["oversized"]),
+            method=str(data.get("method") or "bounded_file_read"),
+            timed_out=bool(data["timed_out"]),
+        )
+
+    def _malformed_bounded_read_result(self, message: str) -> BoundedReadResult:
+        logger.warning("remote bounded-file-read returned a malformed response: %s", message)
+        return BoundedReadResult(connected=False, output="", error=message, method="remote")
 
     # ------------------------------------------------------------------
     # Response mapping

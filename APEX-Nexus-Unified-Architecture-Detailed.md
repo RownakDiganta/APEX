@@ -430,6 +430,24 @@ being a single‑purpose Error‑Path feature and becomes a system‑wide proper
 > and the report generator again required zero changes — the abstraction's
 > design promise now holds for a third, structurally different adapter.
 > See `docs/user-flag-objective.md` §18 for the full design.
+>
+> **Live remote bounded-file-read note (added post-Phase-22 — `CLAUDE.md`
+> §23 "Phase 22"):** Phase 21's `remote_command` adapter could not
+> complete a live read against a real Kali tool-service container, because
+> its only strategy submitted the fixed `cat -- <path>` read through the
+> service's GENERIC `/v1/execute` contract, where `cat` was deliberately
+> never allowlisted (allowlisting it there would grant an unrestricted
+> arbitrary-file-read primitive to any authenticated caller). Phase 22
+> resolves this without widening that allowlist: `apex_tool_service`
+> gained a dedicated, structurally separate `POST /v1/bounded-file-read`
+> operation that constructs the fixed argv internally and accepts only
+> `target`/`path`/bounds — never a `tool`/`arguments`/`command`/`shell`
+> field. `RemoteToolBackend` gained a matching dedicated client method, and
+> `ToolBackendCommandReadStrategy` now calls it directly via a checked
+> `BoundedFileReadBackend` capability seam. `ObjectivePlanner`,
+> `UserFlagExecutor`, `ObjectiveParser`, and the report generator required
+> zero changes yet again. See `docs/user-flag-objective.md` §19 for the
+> full design.
 
 - **Same benchmark as the paper:** the 42 HTB machines; headline metric is the
   71.4% (30/42) success rate — under this implementation, "success" per

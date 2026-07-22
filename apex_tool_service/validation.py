@@ -17,12 +17,25 @@ stack detail.
 """
 from __future__ import annotations
 
+import ipaddress
+import math
+import re
+
 from apex_tool_service.allowlist import is_allowed, resolve_binary
 from apex_tool_service.settings import ServiceSettings
 
 # Matches apex_host/tools/safety.py::_SHELL_OPERATORS (duplicated on purpose — see module docstring).
 _SHELL_OPERATORS: tuple[str, ...] = (";", "&&", "||", "|", ">>", ">", "<", "$(", "`")
 _CONTROL_CHARS: tuple[str, ...] = ("\n", "\r", "\x00")
+
+# Phase 22 — mirrors (duplicated on purpose, same rationale as
+# `_SHELL_OPERATORS` above: this package never imports `apex_host`)
+# `apex_host.verification.user_flag._PATH_CHAR_RE` / `is_bounded_candidate_path`
+# EXACTLY: absolute path, conservative charset, bounded length. A dedicated
+# parity test (`tests/apex_tool_service/test_bounded_file_read.py`) proves
+# the two validators agree on the same set of inputs — keep this regex in
+# sync with `apex_host/verification/user_flag.py` if that one ever changes.
+_BOUNDED_PATH_RE = re.compile(r"^/[A-Za-z0-9_./\-]{1,254}$")
 
 
 class RequestValidationError(Exception):
@@ -118,3 +131,108 @@ def resolve_timeout(timeout_seconds: float | None, settings: ServiceSettings) ->
             f"max_timeout_seconds={settings.max_timeout_seconds}"
         )
     return float(timeout_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Phase 22 — dedicated bounded-file-read validation (POST /v1/bounded-file-read).
+#
+# Independent of everything above: this operation does not go through
+# `resolve_and_validate_tool`/`ALLOWED_TOOLS` at all — it is a structurally
+# different, narrower capability with its own validation surface.
+# ---------------------------------------------------------------------------
+
+
+def validate_bounded_path(path: str, *, allowed_basenames: tuple[str, ...]) -> str:
+    """Validate *path* as a bounded candidate file-read target.
+
+    Mirrors ``apex_host.verification.user_flag.is_bounded_candidate_path``'s
+    invariants exactly (absolute POSIX path, conservative charset, no ``..``
+    traversal segment, approved basename) — this service performs this
+    check independently rather than trusting apex_host's own validation,
+    since a caller must never be trusted to have already validated (defense
+    in depth). Returns the validated path unchanged, or raises
+    ``RequestValidationError``.
+    """
+    if not path or not isinstance(path, str):
+        raise RequestValidationError("'path' must be a non-empty string")
+    if _BOUNDED_PATH_RE.match(path) is None:
+        raise RequestValidationError(
+            "'path' must be an absolute POSIX path using only a conservative "
+            "character set, bounded to 254 characters"
+        )
+    if ".." in path.split("/"):
+        raise RequestValidationError("'path' must not contain a '..' traversal segment")
+    basename = path.rsplit("/", 1)[-1]
+    if not basename or basename not in allowed_basenames:
+        raise RequestValidationError(
+            f"basename {basename!r} is not in the server's allowed_flag_basenames"
+        )
+    return path
+
+
+def validate_target_authorized(target: str, *, authorized_cidrs: tuple[str, ...]) -> str:
+    """Validate that *target* is a well-formed IP address falling within at
+    least one of *authorized_cidrs*.
+
+    Rejects: missing/empty target, a malformed (non-IP, hostname, URL-like)
+    target, and any syntactically valid IP that does not fall within a
+    configured CIDR — this naturally rejects loopback, link-local, cloud
+    metadata endpoints (``169.254.169.254``), and unrelated private/public
+    networks by default, since none of them fall within the default
+    ``10.129.0.0/16`` HTB lab range unless an operator has explicitly
+    reconfigured ``authorized_cidrs`` to include them (e.g. for local
+    testing) — there is no separate hardcoded blocklist to bypass or
+    maintain.
+    """
+    if not target or not isinstance(target, str):
+        raise RequestValidationError("'target' must be a non-empty string")
+    try:
+        address = ipaddress.ip_address(target.strip())
+    except ValueError:
+        raise RequestValidationError(f"'target' {target!r} is not a well-formed IP address") from None
+    for cidr in authorized_cidrs:
+        try:
+            network = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            continue  # a malformed configured CIDR is skipped, never crashes the request
+        if address in network:
+            return target
+    raise RequestValidationError(
+        f"'target' {target!r} is not within any authorized CIDR {list(authorized_cidrs)!r}"
+    )
+
+
+def resolve_bounded_read_limits(
+    requested_timeout_seconds: float | None,
+    requested_max_output_bytes: int | None,
+    settings: ServiceSettings,
+) -> tuple[float, int]:
+    """Return the effective ``(timeout_seconds, max_output_bytes)`` for a
+    bounded-file-read request: ``min(requested, service_hard_limit)`` for
+    each, never the other way around. Rejects malformed requested values
+    (zero, negative, NaN, infinity, non-integer byte cap) rather than
+    silently coercing them.
+    """
+    if requested_timeout_seconds is None:
+        timeout_seconds = settings.bounded_read_timeout_seconds
+    else:
+        if not isinstance(requested_timeout_seconds, (int, float)) or isinstance(
+            requested_timeout_seconds, bool
+        ):
+            raise RequestValidationError("'timeout_seconds' must be a number")
+        if math.isnan(requested_timeout_seconds) or math.isinf(requested_timeout_seconds):
+            raise RequestValidationError("'timeout_seconds' must be finite")
+        if requested_timeout_seconds <= 0:
+            raise RequestValidationError("'timeout_seconds' must be positive")
+        timeout_seconds = min(float(requested_timeout_seconds), settings.bounded_read_timeout_seconds)
+
+    if requested_max_output_bytes is None:
+        max_output_bytes = settings.bounded_read_max_bytes
+    else:
+        if not isinstance(requested_max_output_bytes, int) or isinstance(requested_max_output_bytes, bool):
+            raise RequestValidationError("'max_output_bytes' must be an integer")
+        if requested_max_output_bytes <= 0:
+            raise RequestValidationError("'max_output_bytes' must be positive")
+        max_output_bytes = min(requested_max_output_bytes, settings.bounded_read_max_bytes)
+
+    return timeout_seconds, max_output_bytes

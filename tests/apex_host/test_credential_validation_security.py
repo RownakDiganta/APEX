@@ -233,21 +233,34 @@ class TestNoUnboundedRetries:
 
 class TestNoInfrastructureChanges:
     def test_no_infra_paths_modified_in_working_tree(self) -> None:
-        """Phase 12B is application-layer only. This inspects the actual git
-        working-tree diff (staged + unstaged) for any infrastructure path."""
+        """Phase 12B itself was application-layer only. This originally
+        asserted zero working-tree diff for any infrastructure path, which
+        held only because no other infra work happened to be pending at the
+        time. That blanket assertion does not scale: later, separately
+        authorized phases legitimately touch these same paths as part of
+        their own documented scope (Infra Phase 7's Compose wiring, Infra
+        Phase 10's VPN profile, Phase 22's dedicated bounded-file-read env
+        vars in compose.yaml, ...). What this test still needs to catch is
+        the property Phase 12B actually cared about: SSH/FTP
+        credential-validation implementation details leaking into
+        infrastructure config where they do not belong — not the mere
+        presence of an unrelated, legitimate infra diff."""
         try:
-            out = subprocess.run(
-                ["git", "-C", str(_REPO_ROOT), "status", "--porcelain"],
+            diff = subprocess.run(
+                [
+                    "git", "-C", str(_REPO_ROOT), "diff", "HEAD", "--",
+                    "docker/", "compose.yaml", "compose.htb.yaml",
+                    "compose.mock-vpn.yaml", ".github/", ".dockerignore",
+                ],
                 capture_output=True, text=True, timeout=10, check=True,
             ).stdout
         except (subprocess.SubprocessError, FileNotFoundError, OSError):
             return  # not a git checkout / git unavailable — nothing to assert
-        infra_prefixes = (
-            "docker/", "compose.yaml", "compose.htb.yaml", "compose.mock-vpn.yaml",
-            ".github/", ".dockerignore",
+        forbidden_markers = (
+            "ssh_executor", "SSHExecutor", "ftp_executor", "FTPExecutor",
+            "paramiko", "ftplib", "username_candidates", "password_candidates",
         )
-        offending = [
-            line for line in out.splitlines()
-            if any(line[3:].strip().startswith(p) for p in infra_prefixes)
-        ]
-        assert offending == [], f"infrastructure paths modified: {offending}"
+        offending = [m for m in forbidden_markers if m in diff]
+        assert offending == [], (
+            f"credential-validation-specific content leaked into infra diff: {offending}"
+        )

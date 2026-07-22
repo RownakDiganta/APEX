@@ -378,7 +378,7 @@ def _register_bounded_command_adapter(
     allowed_filenames = frozenset(getattr(config, "user_flag_candidate_filenames", None) or [])
     try:
         backend = select_runtime_backend(config)
-        strategy = ToolBackendCommandReadStrategy(backend=backend)
+        strategy = ToolBackendCommandReadStrategy(backend=backend, target=target)
         primitive = BoundedCommandReadPrimitive(
             capability_id=cap.capability_id,
             strategy=strategy,
