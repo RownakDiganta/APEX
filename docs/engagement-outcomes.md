@@ -476,3 +476,18 @@ wrong, but the run is over."
 > any value in the table above — `user_flag_verified` remains the sole
 > success outcome regardless of which capability/transport produced the
 > verified evidence.
+
+> **Note (Phase 23):** Phase 23 (see `docs/user-flag-objective.md` §20)
+> added a new `objective_reopened: bool = False` parameter to
+> `GlobalPlanner.decide_phase()` — when a validated, runtime-active
+> capability is automatically derived after the objective phase was
+> already exhausted (`"failed"` status or budget exhaustion), the phase
+> ladder now routes back to `objective` instead of proceeding to
+> `priv_esc`/`done`. This can extend how long an engagement stays active
+> before reaching `evaluate_termination()`'s `phase_budget_exhausted`/
+> `max_turns_exhausted` outcomes, but changes nothing about the outcome
+> MODEL itself: `EngagementOutcome`, its precedence order, and
+> `user_flag_verified` as the sole success outcome are all unchanged.
+> `StallTracker`'s own stagnant-fingerprint detection is unaffected — a
+> reopened objective phase that is genuinely making progress (a new
+> capability, a new candidate path) does not look stagnant to it.

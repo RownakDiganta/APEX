@@ -2075,3 +2075,437 @@ unchanged from the base file.
 > operation that never touches `ALLOWED_TOOLS` at all. `RemoteToolBackend`
 > (and therefore `remote_command`) now completes a real bounded file read
 > through the actual Kali tool service.
+
+## 20. Structured Automatic Capability Derivation (Phase 23)
+
+**Status:** implemented. This section documents the deterministic
+capability-evidence discovery pipeline in `apex_host/capabilities/` — the
+mechanism that lets a validated execution result automatically produce an
+`AccessCapability` (§16) without the operator manually seeding one every
+time. **This is not autonomous vulnerability discovery.** It does not
+teach APEX to discover SQL injection, XSS, command injection, or arbitrary
+file read from scratch, does not generate exploit payloads, and does not
+trust an LLM's own claim as evidence. It closes one narrower architectural
+gap: a validated execution result already proves a capability exists —
+this pipeline makes that fact deterministically flow into the same
+`AccessCapability` records `ObjectivePlanner` already consumes, instead of
+requiring the operator to have already known and pre-configured it.
+
+### 20.1 Terminology
+
+Three terms are used precisely and never interchangeably:
+
+- **`CapabilityObservation`** — something merely observed (an open port, an
+  HTTP 200, a discovered-but-untested credential). May be weak or
+  incomplete. Cannot itself create a capability. This codebase has no
+  dataclass for it — it is simply whatever signal a caller chooses NOT to
+  turn into evidence, because it fails the acceptance bar below.
+- **`CapabilityEvidence`** (`apex_host/capabilities/evidence.py`) —
+  structured, validated proof. Has an accepted `evidence_type`. May be
+  evaluated by a `CapabilityProvider`.
+- **`CapabilityDerivationDecision`** (`apex_host/capabilities/decisions.py`)
+  — a deterministic provider result: `accepted`, `rejected`, `duplicate`,
+  `updated`, `runtime_unavailable`, or one of two reserved-for-forward-
+  compatibility statuses (`superseded`, `expired`).
+- **`AccessCapability`** (`apex_host/types.py`, unchanged since the access-
+  capability refactor, §16) — persistent, sanitized capability metadata.
+  This is what the pipeline ultimately writes to the EKG, via
+  `CapabilityParser` — the same authoritative writer §16 already
+  established, never bypassed.
+
+### 20.2 Baseline before this phase — where AccessCapability was created
+
+Only two paths existed:
+
+1. `CapabilityParser.derive_ssh_capability()` — called inline from
+   `apex_host/orchestration/parsing_node.py`'s `parse_single_result()`
+   immediately after a real, successful SSH login (`AccessParser
+   .parse_structured` had already validated it). The one genuinely
+   parser-driven, automatic path.
+2. `CapabilityParser.derive_direct_file_read_capability()`/
+   `derive_command_capability()` — called ONLY from
+   `apex_host/orchestration/capability_seed.py`'s two `seed_*` functions,
+   both 100% operator-attested, startup-only.
+
+There was no automatic/parser-driven path for direct-file-read,
+`local_shell`, `remote_command`, or `web_command` — every one of those
+required the operator to already know a working request/strategy shape
+existed. That remains the reality after this phase for those four
+families' *runtime activation* (see §20.9) — what changes is that ALL
+FIVE families now share one common, deterministic derivation pipeline,
+and SSH gains no new automatic trigger beyond the one it already had
+(just relocated behind the same pipeline).
+
+### 20.3 The pipeline
+
+```
+Executor or validated runtime operation
+    -> CapabilityEvidence
+    -> CapabilityDiscoveryEngine.discover()
+        -> validate_evidence()              (central, family-agnostic gate)
+        -> CapabilityProvider.evaluate()    (pure, one per family)
+        -> CapabilityDerivationDecision
+        -> CapabilityParser.derive_*()      (the sole metadata writer)
+        -> MemoryAPI.apply_deltas()         (the ONLY graph write in this package)
+        -> runtime_resolution.register_capability_adapter()
+    -> CapabilityRuntimeRegistry adapter (when resolvable)
+    -> ObjectivePlanner (unchanged — still just reads AccessCapability records)
+```
+
+Insertion point: `apex_host/orchestration/parsing_node.py`'s existing
+`parse_observation` node, once per turn, immediately after that turn's
+normal per-tool_result parse+`apply_deltas` loop — not a new LangGraph
+node. This mirrors the SSH inline-derivation precedent exactly (evidence
+naturally arises as a byproduct of the same "turn a tool result into graph
+deltas" step parsing already performs) and satisfies "insert capability
+discovery after structured parsing/validation and before the next global
+planning decision" (`global_plan` runs at the START of the next turn).
+
+### 20.4 `CapabilityEvidence` — the evidence model
+
+Immutable (`@dataclass(frozen=True, slots=True)`). Never contains a
+password, private key, bearer token, cookie value, raw command/HTTP
+output, or a raw flag-like value — `validate_evidence()` scans
+`sanitized_attributes`' KEYS (never values) against a fixed forbidden-key
+set (`password`, `token`, `raw_output`, `flag_value`, ...) before any
+provider ever sees it.
+
+Key fields: `evidence_id`, `evidence_type`, `capability_family`,
+`target_host_id`, `source_task_id`, `principal`, `validation_method`,
+`confidence`, `timestamp`, `runtime_reference_id` (opaque, non-secret —
+see §20.9), `runtime_generation`, `sanitized_attributes`, `is_dry_run`.
+
+### 20.5 Evidence types
+
+`CapabilityEvidenceType` (`apex_host/capabilities/evidence.py`):
+`SSH_AUTHENTICATED_COMMAND`, `DIRECT_FILE_READ_VALIDATED`,
+`LOCAL_COMMAND_VALIDATED`, `REMOTE_COMMAND_VALIDATED`,
+`WEB_COMMAND_VALIDATED`, `RUNTIME_SESSION_CONFIRMED` (reserved — no
+current provider consumes it standalone), `OPERATOR_ATTESTED` (the
+pre-existing `--username`/`--password`-equivalent trust boundary, now
+routed through this same pipeline — see §20.10). No member is ever named
+after a vulnerability or a machine (no `SQLI_SUCCESS`, no
+`ACADEMY_ADMIN`) — evidence describes WHAT KIND OF PROOF was produced,
+never how a target-specific weakness was found.
+
+### 20.6 Central evidence validation
+
+`validate_evidence()` is the ONE place these are enforced, so no provider
+re-implements any of them: missing target, unsupported/mismatched
+evidence-type-vs-family pairing, confidence below the universal floor
+(0.6), a rejected validation method (`http_200`, `llm_claim`,
+`credentials_found`, `admin_access`, `payload_attempted`, `banner_only`,
+`port_open` — an HTTP 200 alone, an LLM's own assertion, or a mere
+credential/admin-access/payload-attempt record is NEVER sufficient
+evidence), a raw secret/output/flag field smuggled into
+`sanitized_attributes`, dry-run evidence (rejected unconditionally — a
+dry-run result can never derive a live capability), a malformed negative
+`runtime_generation`, and (opt-in, `ApexConfig
+.capability_evidence_ttl_seconds`, default `0.0` = disabled) evidence
+older than the configured TTL.
+
+### 20.7 Provider interface and the five providers
+
+`CapabilityProvider` (`apex_host/capabilities/providers.py`) — pure
+functions from evidence to decision. Providers **never** write
+`MemoryAPI`, **never** mutate `CapabilityRuntimeRegistry`, **never** open
+a network connection, **never** invoke a tool, and **never** call an
+LLM — enforced by a static architecture-scan test in addition to
+construction (no such object is reachable from a provider's narrow
+arguments).
+
+- **`SSHCapabilityProvider`** — accepts only `SSH_AUTHENTICATED_COMMAND`
+  (or `OPERATOR_ATTESTED` for the `ssh_command` family) evidence with a
+  non-empty principal and confidence ≥ 0.85. Rejects: discovered-but-
+  untested credentials, an open port 22, a banner, a failed login (none
+  of these ever produce this evidence type in the first place).
+- **`DirectFileReadCapabilityProvider`** — reuses
+  `CapabilityParser`'s own pre-existing `_ACCEPTED_VALIDATION_METHODS`/
+  `_MIN_DIRECT_FILE_READ_CONFIDENCE` (0.6) — the same acceptance authority
+  §17 already established, not duplicated.
+- **`LocalCommandCapabilityProvider`** / **`RemoteCommandCapabilityProvider`**
+  — share acceptance logic (`_BoundedCommandProviderBase`) since both are
+  serviced by the same `BoundedCommandCapabilityAdapter` at the runtime
+  layer (§18); differ only in accepted `evidence_type`/`capability_family`.
+  Reuse `_ACCEPTED_COMMAND_VALIDATION_METHODS`/
+  `_MIN_COMMAND_CAPABILITY_CONFIDENCE` (0.6) from `CapabilityParser`.
+- **`WebCommandCapabilityProvider`** — accepts evidence on its own merits
+  (metadata can always be derived), but returns
+  `CapabilityDerivationStatus.runtime_unavailable` whenever no
+  `runtime_reference_id` is present — **honestly reporting** that no
+  current mechanism activates a `web_command` runtime adapter from
+  automatically-produced evidence alone (its adapter still requires an
+  operator-fixed HTTP request shape — see §20.9). Never fakes runtime
+  availability.
+
+`DEFAULT_PROVIDERS` is a stable, ordered tuple — never a set/dict-
+iteration-order dependency.
+
+### 20.8 Identity, deduplication, and confidence merging
+
+Capability identity is UNCHANGED from §16:
+`access_capability_id(target, capability_type, principal)` — content-
+addressed, never a function of any secret value. Re-deriving the same
+identity always upserts the same node.
+
+Provenance: each capability node's `metadata.evidence_provenance` is a
+bounded list (capped at 20 entries) of contributing `evidence_id`s.
+Replaying an evidence_id already present → `duplicate` status, confidence
+**unchanged**. New, different evidence for an already-known identity →
+`updated` status, confidence merged via **`new = max(existing, incoming)`**
+— documented, deterministic, never a hidden average, never lowers a
+validated capability because weaker duplicate evidence arrived, never
+raises confidence by replaying identical evidence twice.
+
+**A subtlety this phase had to resolve:** memfabric's own epistemic-
+conflict invariant (CLAUDE.md §1.3 — "two high-confidence claims that
+disagree are never silently overwritten") means a bare re-upsert with a
+DIFFERENT confidence/metadata value for an already-high-confidence field
+legitimately raises an open `Conflict`, blocking the plain upsert. Rather
+than fighting that invariant (which exists for good reason — see §1), the
+discovery engine, after every successful batch write, checks for and
+immediately auto-resolves any resulting open conflict via `MemoryAPI
+.auto_resolve_conflict()` — the substrate's own documented default policy
+("higher confidence wins, tie → higher logical_version"). This achieves
+exactly the `max(existing, incoming)` merge rule this section documents,
+through the correct, substrate-endorsed mechanism, never a second,
+competing merge implementation that bypasses the conflict model.
+
+### 20.9 Runtime reference resolution — metadata vs. runtime availability
+
+`apex_host/capabilities/runtime_resolution.py` contains the ONE
+implementation of "construct + register a runtime adapter for a validated
+`AccessCapability`" — relocated verbatim from
+`apex_host/orchestration/dispatch_node.py`'s former private functions
+(`_register_ssh_adapter`/`_register_direct_file_read_adapter`/
+`_register_bounded_command_adapter`), which dispatch_node.py now imports
+and calls, so both the pre-existing per-turn `make_objective_node`
+registration loop and the new discovery engine share one implementation —
+never two.
+
+**Registration still requires `ApexConfig` fields matched by principal**
+(the operator's configured credentials/request-shape/strategy) — evidence
+carries a `runtime_reference_id` field for forward compatibility with a
+future resolver design where an executor holds a reusable runtime object,
+but no CURRENT concrete resolver consumes it: SSH/DFR/bounded-command
+adapters are all reconstructed fresh from `ApexConfig` each time, exactly
+matching the pre-existing per-turn registration behavior. This is why
+`local_shell`/`remote_command`/`web_command` capabilities can gain
+METADATA automatically (a decision is `accepted`) while remaining
+`runtime_unavailable` until the operator has ALSO configured the matching
+`bounded_command_*`/`direct_file_read_*` fields — the distinction between
+"a validated capability exists" and "a runtime adapter is registered for
+it" (`AccessCapability.runtime_available`) is preserved exactly as §16/§17
+established.
+
+`CapabilityRuntimeRegistry` remains the sole runtime source of truth.
+`runtime_available` on the EKG node is written back as an advisory mirror
+only, at confidence 0.5 (deliberately below `conflict_confidence_floor`),
+exactly matching the pre-existing `make_objective_node` write-back
+discipline.
+
+### 20.10 Capability lifecycle
+
+`apex_host/capabilities/lifecycle.py` — a PURE, derived view, never a
+second stored source of truth. `CapabilityLifecycleState`: `candidate`
+(not validated — never actually produced, since `CapabilityParser` only
+ever materializes `validated=True` nodes), `active` (validated + runtime
+adapter registered), `unavailable` (validated, no runtime adapter). Three
+further members (`validated`, `expired`, `revoked`, `superseded`) are
+reserved for forward compatibility — matching this codebase's own
+repeated "documented but not yet produced" convention (e.g.
+`EngagementOutcome.goal_completed`, `PrivilegeEnumerationStatus
+.elevated_access_validated`) — no current code path assigns them, since
+nothing in this phase revokes a capability or expires one after creation
+(`capability_evidence_ttl_seconds` governs EVIDENCE staleness at
+validation time, before a capability is ever created, not retroactive
+capability expiry).
+
+### 20.11 Objective reopening (the "reopening the objective" gap)
+
+Before this phase, once `GlobalPlanner._select_phase` decided the
+objective was `"failed"` (globally exhausted across every THEN-known
+capability) or the objective phase's own turn budget was exhausted, the
+phase ladder routed to `priv_esc` and NEVER revisited `objective` again —
+even if a brand-new, validated, runtime-active capability appeared later
+(e.g. discovered automatically from evidence produced during priv_esc/web
+enumeration).
+
+`apex_host.planners.objective.objective_reopening_eligible(subgraph,
+target, objective_type)` (pure, no I/O) closes this gap generically — no
+transport-specific logic: it returns `True` whenever the objective is not
+`"verified"` AND at least one validated+`runtime_available` capability's
+`capability_id` has NEVER appeared in `attempted_capability_paths`. A
+capability that has never been given a chance is, by definition, new —
+`ObjectivePlanner`'s own `_select_capability` will find at least one
+untried candidate for it the moment the objective phase runs again.
+
+`GlobalPlanner.decide_phase()` gained an `objective_reopened: bool = False`
+parameter (default preserves all prior behavior). When `True`, it
+overrides BOTH the `"failed"`-status skip and the exhausted-budget skip —
+never the `"verified"` terminal check, which is always checked first.
+`apex_host/orchestration/planning_node.py` (`global_plan`, the real
+per-turn decision) and `continuation_node.py` (`reflect_or_continue`'s
+peek) both compute this value from the SAME already-fetched subgraph — no
+extra `MemoryAPI` read.
+
+**Old failed `(capability_id, candidate_path)` pairs are never deleted** —
+`objective_attempted_capability_pairs` (§17) is untouched; reopening only
+ever creates NEW pairs for the newly-available capability's own untried
+candidates, never retries an already-failed pair. Duplicate evidence
+replay never introduces a new `capability_id`, so it can never spuriously
+reopen the objective.
+
+### 20.12 Operator seed migration
+
+`apex_host/orchestration/capability_seed.py`'s two `seed_*` functions no
+longer call `CapabilityParser.derive_*` directly — they construct an
+`OPERATOR_ATTESTED` `CapabilityEvidence` and call
+`run_capability_discovery()`, the SAME pipeline every automatically-
+derived capability now goes through. `OPERATOR_ATTESTED` evidence carries
+no evidence-type-implied family (unlike e.g. `SSH_AUTHENTICATED_COMMAND`,
+which only ever means `ssh_command`), so the engine routes it to the
+correct provider by `capability_family` alone, via each provider's
+`accepted_capability_families` property.
+
+Seeding runs BEFORE the engagement graph starts (`ApexRuntime.run()`), so
+no real `CapabilityRuntimeRegistry` exists yet — attempting registration
+against a throwaway instance would write a misleading
+`runtime_available=True` the real, per-engagement registry does not back.
+`CapabilityDiscoveryContext.attempt_runtime_registration=False` (seeding's
+own explicit opt-out) skips registration entirely, leaving
+`runtime_available=False` exactly as `CapabilityParser.derive_*` already
+defaulted it — the pre-existing per-turn `make_objective_node` loop
+performs the real registration on the first objective turn regardless,
+exactly as it did before this phase.
+
+A regression test (`tests/apex_host/test_phase20_direct_file_read_capability.py`,
+`test_phase21_bounded_command_capability.py`, both unmodified) proves the
+resulting EKG node metadata is unchanged (modulo the new, additive
+`evidence_provenance`/`runtime_generation` bookkeeping keys) from the
+pre-Phase-23 direct-call path.
+
+### 20.13 Replay and reflection
+
+Replay of identical evidence is idempotent — the SAME `evidence_id`
+reprocessed produces `duplicate` status and changes nothing.
+`CapabilityRuntimeRegistry` is never restored from persistence — it is
+always constructed fresh per engagement (unchanged since §16), so a
+capability's `runtime_available=True` EKG claim from a PRIOR engagement is
+never trusted as proof a runtime adapter exists NOW; every engagement
+re-resolves registration from scratch via the SAME
+`runtime_resolution.register_capability_adapter()` call. Discovery never
+touches the episodic store (no `append_episode` call anywhere in
+`apex_host/capabilities/`) — episodic append-only immutability (memfabric
+Invariant 2) is entirely unaffected.
+
+### 20.14 Redaction and secret boundaries
+
+Everything §16's redaction discipline already established remains
+unchanged: `AccessCapability` has no field for a password, cookie, bearer
+token, SSH session, shell object, or socket. This phase adds one more
+guarantee at the EVIDENCE layer: `validate_evidence()` rejects any
+`sanitized_attributes` KEY drawn from a fixed forbidden set (`password`,
+`token`, `raw_output`, `flag`, `session`, ...) before a provider ever sees
+it — a defense-in-depth check on top of the discipline every evidence
+PRODUCER (e.g. `ssh_capability_evidence_for_result()`) already follows by
+construction (never populating such a key in the first place).
+
+### 20.15 Reporting and metrics
+
+`ApexGraphState.capability_discovery_log` — one accumulated
+`CapabilityDiscoveryResult.to_dict()` entry per turn that emitted at least
+one piece of evidence. `apex_host/eval/report.py` gained a "Capability
+Discovery Summary" section (shown only when at least one evidence item was
+ever evaluated) and a `"capability_discovery"` JSON block: evidence
+evaluated/accepted/rejected/duplicate, capabilities derived/updated,
+runtime adapters registered, validated-but-unavailable, provider failures.
+Never reports raw evidence, raw output, raw canaries, passwords, cookies,
+tokens, exact command strings, sensitive URLs, raw flags, or runtime
+handles. **Capability derivation is never itself a benchmark success
+condition** — verified user flag (`EngagementOutcome.user_flag_verified`)
+remains the only exit-code-0 outcome, entirely unaffected by this phase.
+
+### 20.16 Configuration
+
+Three new `ApexConfig` fields, all with safe defaults: `capability_discovery_enabled`
+(default `True` — discovery only ever processes already-validated
+structured evidence and cannot execute anything itself, so it is safe to
+leave on, unlike every `*_operator_attested` flag which gates a genuinely
+sensitive capability from being seeded at all), `capability_evidence_ttl_seconds`
+(default `0.0` — disabled; no current evidence source produces evidence
+worth rejecting on age alone), `capability_discovery_max_evidence_per_cycle`
+(default `50` — a hard per-turn ceiling, mirroring this codebase's
+established "bounded batch" convention). No CLI flags were added for
+these three — they are advanced/internal tuning knobs, not operator-facing
+safety toggles.
+
+### 20.17 Extension rule for a future provider
+
+Adding a new capability family's automatic derivation requires only: (1)
+a new `CapabilityEvidenceType` member (never named after a vulnerability
+or machine); (2) a new `CapabilityProvider` implementing pure
+`evaluate()`; (3) one more entry in `DEFAULT_PROVIDERS`; (4) an evidence-
+emission function at whatever real executor/parser call site organically
+produces the qualifying signal (mirrors `ssh_capability_evidence_for_result()`).
+It must NEVER require touching `ObjectivePlanner`, `UserFlagExecutor`,
+`ObjectiveParser`, `verify_user_flag()`, or the report generator's
+capability-oriented rendering — the SAME extension guarantee §16
+established for a new `AccessCapabilityType` now extends to how that
+type's capability gets discovered in the first place, not just how it's
+represented once discovered.
+
+### 20.18 Tests
+
+`tests/apex_host/test_phase23_capability_discovery.py` (179 tests) covers:
+evidence model, evidence types, central validation, provider protocol, all
+five providers individually, the discovery engine, identity/deduplication,
+runtime resolution, lifecycle, objective reopening, operator-seed
+migration, `CapabilityParser` integration, orchestration wiring, replay,
+persistence/redaction, and architecture scans (memfabric unchanged, no
+machine names, no hardcoded flags, no `shell=True`, no arbitrary execute
+API, no LLM authority in providers, no provider writes `MemoryAPI` or
+mutates the runtime registry, `ObjectivePlanner`/`UserFlagExecutor`/
+`ObjectiveParser` remain transport-independent, `verify_user_flag()`
+remains the sole verifier, `dry_run` defaults `True`,
+`user_flag_verified` remains the sole benchmark-success outcome). All
+pre-existing Phase 18–22 tests pass unchanged except two small, legitimate
+updates (a stale `GlobalPlanner.decide_phase` monkeypatch stub gained the
+new `objective_reopened` parameter; two direct
+`_register_capability_adapter` test call sites were updated to import from
+the new `apex_host.capabilities.runtime_resolution` location with its new
+keyword-argument signature — the relocation this phase performed, not a
+behavior change).
+
+### 20.19 Known limitations
+
+- Only SSH gains a genuinely new, organic, live-executor-produced
+  evidence source in this phase (`ssh_capability_evidence_for_result()`).
+  Direct-file-read/`local_shell`/`remote_command`/`web_command` still
+  require an operator-supplied request/strategy shape before a runtime
+  adapter can ever activate — this phase unifies HOW all five families are
+  derived, it does not add autonomous discovery of a new primitive for
+  the latter four.
+- `WebCommandCapabilityProvider` never reaches `active` lifecycle state
+  from automatically-produced evidence alone (always `runtime_unavailable`
+  without an operator-configured request shape) — honestly reported, never
+  faked.
+- `runtime_generation`/`runtime_reference_id` are accepted, validated
+  fields with no current concrete resolver consuming them — reserved for
+  a future executor-held-session resolver design.
+- Conflict auto-resolution always applies the substrate's DEFAULT policy
+  (higher confidence wins, tie → higher logical_version) — there is no
+  per-capability override; a genuine three-way disagreement between
+  operator attestation and two different live evidence sources still
+  resolves deterministically via that one fixed policy, never a bespoke
+  per-family rule.
+- `repair_node.py`'s own, separate `parse_single_result()` call site (for
+  a repaired task's single result) does not emit capability evidence —
+  only the main per-turn `parse_observation` loop does. A capability
+  derived from a REPAIRED SSH task is not automatically captured; this is
+  a narrow, documented edge case, not the common path.
+- No new exploitation, privilege escalation, persistence, or shell-access
+  capability was added or performed anywhere in this phase. Command
+  execution alone, and access alone, remain non-success — verified user
+  flag remains the only exit-code-0 outcome. `memfabric/` was not
+  modified.

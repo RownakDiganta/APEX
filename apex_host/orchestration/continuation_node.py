@@ -35,7 +35,7 @@ from apex_host.orchestration.outcome import (
 )
 from apex_host.orchestration.terminal_episode import terminal_state_fields, write_terminal_episode
 from apex_host.planners.capabilities import capabilities_from_subgraph
-from apex_host.planners.objective import objective_status_from_subgraph
+from apex_host.planners.objective import objective_reopening_eligible, objective_status_from_subgraph
 from apex_host.planners.workflow_orchestration import (
     build_workflow_graph_deltas,
     derive_sessions_from_subgraph,
@@ -142,12 +142,17 @@ def make_continuation_node(deps: "OrchestrationDeps") -> Any:
                         # F08: pass current_phase so budget force-advance fires
                         # correctly during the inter-turn peek (without
                         # charging the budget counter).
+                        objective_reopened = (
+                            objective_reopening_eligible(subgraph, state["target"], deps.config.objective_type)
+                            if subgraph is not None else False
+                        )
                         next_phase = deps.global_planner.decide_phase(
                             node_types_seen=node_types_seen,
                             turn_count=turn_count,
                             has_web_capability=has_web_peek,
                             current_phase=state.get("phase"),
                             objective_status=objective_status,
+                            objective_reopened=objective_reopened,
                         )
                         next_phase_value = next_phase.value
                     except Exception as exc:

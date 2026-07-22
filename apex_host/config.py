@@ -394,6 +394,29 @@ class ApexConfig:
     # adapter itself (never trusts the verifier's own cap alone).
     bounded_command_max_output_bytes: int = 4096
 
+    # Phase 23 — deterministic, structured capability-derivation pipeline
+    # (see apex_host/capabilities/ and docs/user-flag-objective.md §20).
+    # `capability_discovery_enabled` defaults True: discovery only ever
+    # processes already-validated structured evidence (never executes a
+    # command, opens a connection, or calls an LLM itself — see
+    # apex_host.capabilities.discovery's module docstring), so it is safe
+    # to leave on by default, unlike every *_operator_attested flag above
+    # (which gate a specific, sensitive capability from being seeded at
+    # all). Set False only to fully disable automatic derivation (e.g. for
+    # a test fixture that wants to assert operator-seeding-only behavior).
+    capability_discovery_enabled: bool = True
+    # 0.0 (the default) disables evidence-age expiry entirely — no current
+    # evidence source in this codebase produces stale evidence worth
+    # rejecting on age alone (every live evidence item is emitted and
+    # consumed within the same turn). Set to a positive value to reject
+    # evidence older than this many seconds at validation time (see
+    # apex_host.capabilities.evidence.validate_evidence).
+    capability_evidence_ttl_seconds: float = 0.0
+    # Hard per-turn ceiling on how many CapabilityEvidence items one
+    # discovery cycle processes — bounds worst-case turn latency
+    # regardless of how many tool_results a single turn produced.
+    capability_discovery_max_evidence_per_cycle: int = 50
+
     # Configuration schema version — increment when the config format changes in a
     # backward-incompatible way (new required fields, renamed fields, type changes).
     # Exposed via to_safe_dict() so consumers can detect incompatible changes.
@@ -513,6 +536,9 @@ class ApexConfig:
             "bounded_command_confidence": _g("bounded_command_confidence", 0.7),
             "bounded_command_timeout_seconds": _g("bounded_command_timeout_seconds", 15.0),
             "bounded_command_max_output_bytes": _g("bounded_command_max_output_bytes", 4096),
+            "capability_discovery_enabled": bool(_g("capability_discovery_enabled", True)),
+            "capability_evidence_ttl_seconds": _g("capability_evidence_ttl_seconds", 0.0),
+            "capability_discovery_max_evidence_per_cycle": _g("capability_discovery_max_evidence_per_cycle", 50),
         }
         user_flag_filenames = getattr(args, "user_flag_candidate_filenames", None)
         if user_flag_filenames:

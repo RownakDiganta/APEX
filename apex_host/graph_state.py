@@ -224,6 +224,14 @@ class ApexGraphState(TypedDict):
     # apex_host/eval/report.py's Bounded Command Summary section — mirrors
     # direct_file_read_log's own convention exactly.
     bounded_command_log: Annotated[list[dict[str, Any]], operator.add]
+    # Phase 23 — deterministic capability-discovery audit log. One entry
+    # per turn's ``CapabilityDiscoveryResult.to_dict()`` (see
+    # apex_host.capabilities.discovery), populated in parse_observation
+    # (apex_host.orchestration.parsing_node) whenever at least one piece of
+    # CapabilityEvidence was emitted that turn. Sanitized — never contains
+    # raw evidence content, a secret, or a runtime object. Feeds
+    # apex_host/eval/report.py's Capability Discovery Summary section.
+    capability_discovery_log: Annotated[list[dict[str, Any]], operator.add]
 
 
 CompiledApexGraph = Any

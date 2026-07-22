@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from apex_host.graph_ids import objective_id
+from apex_host.planners.access_capabilities import access_capabilities_from_subgraph
 
 if TYPE_CHECKING:
     from memfabric.types import Node, SubgraphView
@@ -83,6 +84,58 @@ def objective_attempted_capability_pairs(
         if isinstance(entry, (list, tuple)) and len(entry) == 2:
             pairs.append((str(entry[0]), str(entry[1])))
     return pairs
+
+
+def objective_reopening_eligible(subgraph: "SubgraphView", target: str, objective_type: str) -> bool:
+    """True when a newly validated, runtime-active capability exists that
+    the objective has never been given a chance to try (Phase 23 —
+    "Reopening the Objective").
+
+    Generic by construction — no transport-specific logic. Deliberately
+    does NOT attempt to reconstruct which candidate PATHS
+    ``ObjectivePlanner`` would generate for a capability's principal (that
+    candidate-generation logic is ``ObjectivePlanner``'s own concern, not
+    this pure reasoning module's); instead it reasons at the coarser,
+    always-available CAPABILITY level: a validated+runtime-available
+    capability whose ``capability_id`` has never appeared in
+    ``attempted_capability_paths`` at all has, by definition, never been
+    attempted — ``ObjectivePlanner``'s own ``_select_capability`` will find
+    at least one untried candidate for it the moment the objective phase
+    runs again.
+
+    Returns ``False`` once the objective is ``"verified"`` (nothing to
+    reopen — the objective is done). Otherwise returns ``True`` whenever
+    such an unattempted capability exists, regardless of whether the
+    objective's own persisted ``status`` currently reads ``"failed"``
+    (global exhaustion) or ``"in_progress"``/``"pending"`` combined with an
+    already-exhausted per-phase turn budget — both are cases where
+    ``GlobalPlanner._select_phase``'s own organic condition would
+    otherwise skip the objective phase; this function is the signal that
+    overrides that skip. When the objective's own condition would ALREADY
+    route back to ``objective`` (status not failed, budget not exhausted),
+    returning ``True`` here is harmless — it is simply a second path to
+    the same, already-correct conclusion.
+
+    Never deletes or resets ``attempted_capability_paths`` — old failed
+    (capability_id, candidate_path) pairs remain exactly as recorded (see
+    ``objective_attempted_capability_pairs``); only a genuinely new,
+    never-before-seen ``capability_id`` can trigger reopening, so a
+    replayed/duplicate evidence item for an ALREADY-known capability can
+    never spuriously reopen the objective (it would not introduce a new
+    ``capability_id``).
+    """
+    if objective_status_from_subgraph(subgraph, target, objective_type) == "verified":
+        return False
+    attempted_pairs = objective_attempted_capability_pairs(subgraph, target, objective_type)
+    attempted_capability_ids = {capability_id for capability_id, _path in attempted_pairs}
+    for capability in access_capabilities_from_subgraph(subgraph):
+        if (
+            capability.validated
+            and capability.runtime_available
+            and capability.capability_id not in attempted_capability_ids
+        ):
+            return True
+    return False
 
 
 def find_objective_evidence_node(subgraph: "SubgraphView", target: str, objective_type: str) -> "Node | None":

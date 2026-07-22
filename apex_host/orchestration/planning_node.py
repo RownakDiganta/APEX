@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from apex_host.graph_state import ApexGraphState
 from apex_host.planners.capabilities import capabilities_from_subgraph
-from apex_host.planners.objective import objective_status_from_subgraph
+from apex_host.planners.objective import objective_reopening_eligible, objective_status_from_subgraph
 from apex_host.types import ApexPhase
 
 if TYPE_CHECKING:
@@ -34,6 +34,9 @@ def make_global_plan_node(
         objective_status = objective_status_from_subgraph(
             subgraph, deps.config.target, deps.config.objective_type
         )
+        objective_reopened = objective_reopening_eligible(
+            subgraph, deps.config.target, deps.config.objective_type
+        )
 
         phase = deps.global_planner.decide_phase(
             node_types_seen=node_types_seen,
@@ -41,6 +44,7 @@ def make_global_plan_node(
             current_phase=state.get("phase"),
             has_web_capability=has_web,
             objective_status=objective_status,
+            objective_reopened=objective_reopened,
         )
         if phase != ApexPhase.done:
             deps.global_planner.record_turn(phase)

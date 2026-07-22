@@ -442,6 +442,7 @@ class TestBugEUnknownPhaseHandling:
             current_phase: str | None = None,
             has_web_capability: bool = True,
             objective_status: str = "pending",
+            objective_reopened: bool = False,
         ) -> ApexPhase:
             return ApexPhase.exploit
 
