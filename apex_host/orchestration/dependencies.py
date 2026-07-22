@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from apex_host.planning.repair import RepairEngine
     from apex_host.planners.global_planner import GlobalPlanner
     from apex_host.policy.llm_guard import LLMPolicyGuard
+    from apex_host.capabilities.runtime_references import RuntimeReferenceResolver, RuntimeReferenceStore
     from apex_host.runtime_registry import CapabilityRuntimeRegistry
     from apex_host.tools.registry import ToolRegistry
     from memfabric.api import MemoryAPI
@@ -57,6 +58,16 @@ class OrchestrationDeps:
     # planner concern (memfabric Invariant 7 — planners stay pure over
     # subgraph/evidence data only).
     capability_registry: "CapabilityRuntimeRegistry"
+    # Phase 24 — process-local, never-EKG-persisted opaque-reference
+    # bookkeeping layer over capability_registry; one instance per
+    # engagement (identical lifecycle to capability_registry/stall_tracker
+    # — see apex_host/capabilities/runtime_references.py's module
+    # docstring). runtime_reference_resolver composes the store with
+    # capability_registry and is what any future caller resolves a
+    # runtime_reference_id through, rather than re-implementing the
+    # target/type/generation/expiry/revocation checks itself.
+    runtime_reference_store: "RuntimeReferenceStore"
+    runtime_reference_resolver: "RuntimeReferenceResolver"
 
 
 def build_planners(

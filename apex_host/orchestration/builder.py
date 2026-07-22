@@ -43,6 +43,7 @@ from apex_host.orchestration.routing import (
 from apex_host.orchestration.stall import StallTracker
 from apex_host.planners.global_planner import GlobalPlanner
 from apex_host.policy import PolicyAdvisor, load_policy
+from apex_host.capabilities.runtime_references import RuntimeReferenceResolver, RuntimeReferenceStore
 from apex_host.runtime_registry import CapabilityRuntimeRegistry
 from apex_host.tools.registry import ToolRegistry
 
@@ -89,6 +90,8 @@ def build_apex_graph(
     advisor: "PolicyAdvisor | None" = None,
     budget_tracker: "LLMBudgetTracker | None" = None,
     tool_backend: "ToolBackend | None" = None,
+    capability_registry: "CapabilityRuntimeRegistry | None" = None,
+    runtime_reference_store: "RuntimeReferenceStore | None" = None,
 ) -> CompiledApexGraph:
     """Compile and return the APEX engagement StateGraph.
 
@@ -130,6 +133,17 @@ def build_apex_graph(
       lazily-constructed remote backend and care about clean shutdown
       should inject ``tool_backend=`` explicitly instead and manage its
       ``aclose()`` themselves.
+
+    ``capability_registry``/``runtime_reference_store`` (Phase 24): when
+    ``None`` (the default), fresh instances are constructed internally —
+    identical to every pre-Phase-24 caller's behavior. A caller that wants
+    managed lifecycle (able to call ``runtime_reference_store.invalidate_all()``
+    on shutdown, mirroring how ``tool_backend`` is explicitly constructed
+    and closed by ``apex_host.runtime.ApexRuntime.run()``) should construct
+    both explicitly and pass them in; ``ApexRuntime.run()`` does exactly
+    this. ``RuntimeReferenceResolver`` is always built internally from
+    whichever registry/store this function ends up using — it is never a
+    separate parameter.
 
     Policy approval in ``TaskDispatcher.dispatch()`` runs identically
     regardless of which backend is supplied — this parameter only replaces
@@ -186,8 +200,18 @@ def build_apex_graph(
     priv_esc_enum_executor = PrivEscEnumExecutor(config)
     # Access-capability refactor — runtime-only registry of capability_id ->
     # adapter, populated per-turn by make_objective_node (never a planner or
-    # executor concern; see apex_host/runtime_registry.py).
-    capability_registry = CapabilityRuntimeRegistry()
+    # executor concern; see apex_host/runtime_registry.py). Phase 24: may be
+    # supplied by the caller (see this function's docstring); defaults to a
+    # fresh instance, identical to every pre-Phase-24 caller's behavior.
+    if capability_registry is None:
+        capability_registry = CapabilityRuntimeRegistry()
+    # Phase 24 — process-local opaque-reference bookkeeping layer over
+    # capability_registry; constructed fresh per engagement exactly like
+    # capability_registry itself (see apex_host/capabilities/
+    # runtime_references.py's module docstring "Persistence and replay").
+    if runtime_reference_store is None:
+        runtime_reference_store = RuntimeReferenceStore()
+    runtime_reference_resolver = RuntimeReferenceResolver(runtime_reference_store, capability_registry)
     # Phase 18 — bounded, read-only, transport-independent user-flag-
     # objective verification executor (see
     # apex_host/agents/user_flag_executor.py). Resolves capability_id to a
@@ -222,6 +246,8 @@ def build_apex_graph(
         # than in ApexGraphState.
         stall_tracker=StallTracker(),
         capability_registry=capability_registry,
+        runtime_reference_store=runtime_reference_store,
+        runtime_reference_resolver=runtime_reference_resolver,
     )
 
     # Node instantiation

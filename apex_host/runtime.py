@@ -40,7 +40,9 @@ from apex_host.orchestration.capability_seed import (
     seed_bounded_command_capability,
     seed_direct_file_read_capability,
 )
+from apex_host.capabilities.runtime_references import RuntimeReferenceStore
 from apex_host.planning.budget import LLMBudgetTracker
+from apex_host.runtime_registry import CapabilityRuntimeRegistry
 from apex_host.tools.backend import select_runtime_backend
 from apex_host.tools.registry import ToolRegistry
 from apex_host.types import ApexPhase
@@ -58,6 +60,13 @@ class ApexRuntime:
     registry: ToolRegistry
     # Populated by run() after the graph completes; None before the first run.
     last_budget: LLMBudgetTracker | None = None
+    # Phase 24 — constructed explicitly (rather than left to
+    # build_apex_graph()'s own internal default) so aclose() can invalidate
+    # every runtime reference on shutdown, mirroring how tool_backend is
+    # explicitly constructed and closed in run()'s finally block. None
+    # until the first run() call.
+    _capability_registry: CapabilityRuntimeRegistry | None = None
+    _runtime_reference_store: RuntimeReferenceStore | None = None
     # Internal flag to track whether aclose() has already been called.
     _closed: bool = False
 
@@ -70,10 +79,20 @@ class ApexRuntime:
         Phase 7 (P7-I09): provides a clean shutdown path for callers that need
         to release resources (e.g. thread pools, open file handles) after the
         engagement completes or is cancelled.
+
+        Phase 24: also invalidates every live ``RuntimeReference`` (the
+        process-shutdown invalidation trigger — see
+        ``apex_host.capabilities.runtime_references`` module docstring). A
+        runtime restart never resurrects these regardless, but calling this
+        explicitly makes the invalidation observable/auditable rather than
+        relying solely on process exit.
         """
         if self._closed:
             return
         self._closed = True
+        if self._runtime_reference_store is not None:
+            revoked = self._runtime_reference_store.invalidate_all(reason="shutdown")
+            logger.debug("aclose: invalidated %d runtime reference(s)", revoked)
         # Cancel any background tasks that were started but not awaited.
         # Currently ApexRuntime does not start background tasks directly; this
         # hook is provided for future use and ensures the pattern is in place.
@@ -180,6 +199,12 @@ class ApexRuntime:
         # through ApexRuntime.
         tool_backend = select_runtime_backend(self.config)
 
+        # Phase 24 — constructed explicitly (see class docstring on
+        # _capability_registry/_runtime_reference_store) so aclose() can
+        # invalidate every runtime reference on shutdown.
+        self._capability_registry = CapabilityRuntimeRegistry()
+        self._runtime_reference_store = RuntimeReferenceStore()
+
         # Phase 20 — one-time, startup-only, zero-network derivation of an
         # operator-attested direct-file-read access_capability (see
         # apex_host/orchestration/capability_seed.py's module docstring for
@@ -205,6 +230,8 @@ class ApexRuntime:
             model_router=model_router,
             budget_tracker=budget,
             tool_backend=tool_backend,
+            capability_registry=self._capability_registry,
+            runtime_reference_store=self._runtime_reference_store,
         )
         run_id = new_id()
         initial: ApexGraphState = {

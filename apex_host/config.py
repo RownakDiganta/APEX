@@ -417,6 +417,18 @@ class ApexConfig:
     # regardless of how many tool_results a single turn produced.
     capability_discovery_max_evidence_per_cycle: int = 50
 
+    # Phase 24 — 0.0 (the default) disables runtime-reference expiry
+    # entirely: a minted RuntimeReference never expires on its own (it is
+    # still invalidated by generation supersession, explicit revocation,
+    # target change, or process shutdown — see
+    # apex_host.capabilities.runtime_references). Set to a positive value
+    # to bound how long a runtime reference remains resolvable before it
+    # must be re-minted, independent of whether anything else invalidated
+    # it. Conservative by default: no engagement in this codebase today
+    # needs reference expiry, since every reference's lifetime is already
+    # naturally bounded by the engagement's own process lifetime.
+    capability_runtime_reference_ttl_seconds: float = 0.0
+
     # Configuration schema version — increment when the config format changes in a
     # backward-incompatible way (new required fields, renamed fields, type changes).
     # Exposed via to_safe_dict() so consumers can detect incompatible changes.
@@ -539,6 +551,7 @@ class ApexConfig:
             "capability_discovery_enabled": bool(_g("capability_discovery_enabled", True)),
             "capability_evidence_ttl_seconds": _g("capability_evidence_ttl_seconds", 0.0),
             "capability_discovery_max_evidence_per_cycle": _g("capability_discovery_max_evidence_per_cycle", 50),
+            "capability_runtime_reference_ttl_seconds": _g("capability_runtime_reference_ttl_seconds", 0.0),
         }
         user_flag_filenames = getattr(args, "user_flag_candidate_filenames", None)
         if user_flag_filenames:

@@ -776,6 +776,27 @@ rather than writing capability metadata directly. `ObjectivePlanner`,
 **zero changes**. Full design:
 [`docs/user-flag-objective.md`](docs/user-flag-objective.md) §20.
 
+**Runtime reference resolution (Phase 24):** completes the runtime half of
+Phase 23 — a `RuntimeReferenceStore` mints opaque, non-secret handles
+bound to a target/capability_type/generation, and a
+`RuntimeReferenceResolver` validates and resolves them back to a live
+adapter from `CapabilityRuntimeRegistry`, never falling back to a
+mismatched-target adapter and never reconstructing one from persisted
+metadata alone. `CapabilityRuntimeRegistry` gained safe-replacement
+semantics (`replace()`/`unregister()`/`generation_for()`) so a stale
+session (a connection-level failure, detected via a `user_flag_verify`
+result's `connected=False`) is torn down and cleanly re-registered as a
+new generation next turn — never silently reused forever. A shared
+result-processing helper (`parse_result_and_collect_evidence`/
+`apply_parsed_observation`/`run_pending_capability_discovery`) closes the
+one real Phase 23 gap where a repaired `ssh_access` success never emitted
+capability evidence. Neither the reference store nor the registry is ever
+persisted to `ApexGraphState` or a checkpoint — a resumed engagement
+always starts with both empty, by design. `ApexRuntime.aclose()` now
+invalidates every live reference on shutdown. Dry-run guarantee: no
+`RuntimeReference` is ever minted while `config.dry_run=True`. Full
+design: [`docs/user-flag-objective.md`](docs/user-flag-objective.md) §21.
+
 **Safety**: `ApexConfig.dry_run` defaults to `True`. Every command execution
 path goes through `apex_host/tools/runner.py`, which checks
 `apex_host/tools/safety.py` first (allowlist + unconditional destructive-
