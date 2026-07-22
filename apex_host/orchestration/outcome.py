@@ -1,8 +1,8 @@
 # outcome.py
 # Canonical EngagementOutcome model and the pure termination evaluator — the single source of truth for how and why an APEX engagement ends.
-"""Canonical engagement-outcome model (Phase 12C).
+"""Canonical engagement-outcome model (Phase 12C; success redefined in Phase 18).
 
-Before this module, APEX could stop in many different ways that all looked
+Before Phase 12C, APEX could stop in many different ways that all looked
 identical in ``ApexGraphState`` — ``completed=True`` with no indication of
 *why*. This module introduces ``EngagementOutcome`` (an ``Enum``, matching
 this project's established data-shape style — see CLAUDE.md §2, "pydantic
@@ -18,22 +18,32 @@ boolean *from* ``EngagementOutcome`` via ``legacy_status_for()`` and
 ``is_success_outcome()`` — they are projections of this one model, not an
 independent classification.
 
-Success invariant (non-negotiable)
------------------------------------
+Success invariant (non-negotiable) — Phase 18
+-----------------------------------------------
 ``is_success_outcome()`` returns ``True`` for exactly one value:
-``EngagementOutcome.validated_access``. No other outcome — including
-``goal_completed`` — is ever treated as success. This directly enforces
-the requirement that success must continue to mean a validated
-``access_state`` node exists in the EKG; nothing here may invent success.
+``EngagementOutcome.user_flag_verified``. Nothing else — including
+``validated_access`` (a validated ``access_state`` node — an important
+INTERMEDIATE milestone, never independently success) and ``goal_completed``
+— is ever treated as success. See docs/user-flag-objective.md for the full
+rationale: for the selected HTB benchmark, success means verified
+retrieval of the configured objective (``ApexConfig.objective_type``,
+default ``"user_flag"``), never merely reaching a foothold. This is a
+deliberate, confirmed change from Phase 12C's original definition (which
+treated ``validated_access`` as the sole success outcome) — see the
+project's remediation history for how ``validated_access``'s exit code and
+legacy status changed accordingly.
 
 Outcome precedence
 -------------------
 When more than one condition could apply in the same turn, this is the
 binding order (highest precedence first) — see ``evaluate_termination()``:
 
-1. ``validated_access`` — an ``access_state`` node exists. Checked first,
-   unconditionally, so a credential validated on the very last allowed
-   turn is still reported as success, never as an exhaustion outcome.
+1. ``user_flag_verified`` — the configured objective's EKG ``objective``
+   node has ``status == "verified"`` (Phase 18). Checked first,
+   unconditionally, so an objective verified on the very last allowed turn
+   is still reported as success, never as an exhaustion outcome. A
+   validated ``access_state`` alone never satisfies this condition — see
+   ``apex_host.planners.objective.objective_status_from_subgraph``.
 2. An upstream node already produced a definitive terminal outcome this
    turn (``planner_failure``, ``parser_failure``, ``memory_failure``,
    ``unknown_phase``) — the caller (``continuation_node.py``) detects this
@@ -46,6 +56,14 @@ binding order (highest precedence first) — see ``evaluate_termination()``:
    (``GlobalPlanner``) returned ``ApexPhase.done`` for a reason other than
    the hard turn ceiling.
 5. ``max_turns_exhausted`` — the hard turn ceiling.
+
+``validated_access`` is never produced by ``evaluate_termination()`` — a
+validated access_state alone no longer terminates the engagement at all;
+the ``GlobalPlanner`` phase ladder instead routes it toward the
+``objective`` phase (Phase 18). ``validated_access`` remains a member of
+this enum only for the backward-compatible ``_derive_outcome_from_state()``
+fallback in ``apex_host.eval.report`` (a ``final_state`` predating Phase
+12C, which never had ``outcome`` populated at all).
 
 ``cancelled``, ``configuration_failure``, and ``internal_error`` are never
 produced by this evaluator — they can only occur outside the compiled
@@ -69,6 +87,14 @@ class EngagementOutcome(str, Enum):
     """The canonical, exhaustive set of reasons an APEX engagement ends."""
 
     # Success — exactly one value ever means success (is_success_outcome()).
+    # Phase 18: the configured objective (default "user_flag") has been
+    # verified — see apex_host.planners.objective / objective_parser.py.
+    user_flag_verified = "user_flag_verified"
+    # An intermediate milestone — a validated access_state node exists —
+    # NEVER success on its own (Phase 18). Never produced by
+    # evaluate_termination() itself; kept only for the backward-compatible
+    # report fallback (see module docstring and apex_host.eval.report
+    # ._derive_outcome_from_state).
     validated_access = "validated_access"
     # Organic, non-success completion of the phase ladder (see module
     # docstring — not reachable via the current GlobalPlanner logic, kept
@@ -96,13 +122,23 @@ class EngagementOutcome(str, Enum):
 
 
 def is_success_outcome(outcome: "EngagementOutcome") -> bool:
-    """True for exactly one outcome — never invent success."""
-    return outcome is EngagementOutcome.validated_access
+    """True for exactly one outcome — never invent success.
+
+    Phase 18: success means the configured objective (default
+    ``"user_flag"``) has been verified. A validated ``access_state`` alone
+    (``EngagementOutcome.validated_access``) is explicitly NOT success —
+    see module docstring.
+    """
+    return outcome is EngagementOutcome.user_flag_verified
 
 
 # Exit codes (CLI contract — see docs/engagement-outcomes.md "CLI exit codes").
 _EXIT_CODE_FOR_OUTCOME: dict[EngagementOutcome, int] = {
-    EngagementOutcome.validated_access: 0,
+    EngagementOutcome.user_flag_verified: 0,
+    # Phase 18: a validated access_state alone is access-only exhaustion,
+    # not benchmark success — bucketed with the other "nothing went wrong,
+    # but the run did not achieve the objective" outcomes.
+    EngagementOutcome.validated_access: 1,
     EngagementOutcome.goal_completed: 0,
     EngagementOutcome.max_turns_exhausted: 1,
     EngagementOutcome.phase_budget_exhausted: 1,
@@ -135,7 +171,9 @@ def exit_code_for(outcome: "EngagementOutcome") -> int:
 # legacy string (no pre-Phase-12C scenario ever produced it, so introducing
 # it cannot break backward compatibility).
 _LEGACY_STATUS_FOR_OUTCOME: dict[EngagementOutcome, str] = {
-    EngagementOutcome.validated_access: "success",
+    EngagementOutcome.user_flag_verified: "success",
+    # Phase 18: access alone is partial progress, not success.
+    EngagementOutcome.validated_access: "abandoned",
     EngagementOutcome.goal_completed: "abandoned",
     EngagementOutcome.max_turns_exhausted: "stopped_max_turns",
     EngagementOutcome.phase_budget_exhausted: "stopped_max_turns",
@@ -179,7 +217,7 @@ def evaluate_termination(
     *,
     max_turns: int,
     turn_count: int,
-    has_access_state: bool,
+    objective_verified: bool,
     next_phase: str,
     current_phase: str,
     stall: "StallDecision",
@@ -191,11 +229,18 @@ def evaluate_termination(
     No I/O. Safe to unit-test directly with synthetic inputs — this is the
     single reusable decision point that replaces every ad-hoc completion
     check previously scattered across the orchestration package.
+
+    Args:
+        objective_verified: Phase 18 — True when the configured objective's
+            EKG ``objective`` node has ``status == "verified"`` (see
+            ``apex_host.planners.objective.objective_status_from_subgraph``).
+            A validated ``access_state`` alone must NOT be passed here —
+            see module docstring "Success invariant".
     """
-    if has_access_state:
+    if objective_verified:
         return TerminationDecision(
-            terminate=True, outcome=EngagementOutcome.validated_access, success=True,
-            reason="access_state present in the EKG — credential validated",
+            terminate=True, outcome=EngagementOutcome.user_flag_verified, success=True,
+            reason="configured objective verified — evidence recorded in the EKG",
             phase=current_phase, turn=turn_count,
         )
 

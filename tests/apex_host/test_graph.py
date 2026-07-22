@@ -132,14 +132,18 @@ class TestApexGraphExecution:
 
     async def test_phase_progresses_with_seeded_graph_state(self) -> None:
         """With host+endpoint+access_state+service already known, GlobalPlanner
-        should route straight to priv_esc on the very first turn — proving
-        global_plan/route_phase correctly read live EKG state rather than
-        relying on accumulated turn history.
+        should route straight to the objective phase on the very first turn
+        — proving global_plan/route_phase correctly read live EKG state
+        rather than relying on accumulated turn history.
 
         Phase 12A (Bug B fix): this used to seed ``auth_flow`` (a merely
         *discovered* login page) and still expect a priv_esc route — that
         was the bug. Only ``access_state`` (a *validated* login) may skip
-        past the credential phase, so the seed uses ``access_state`` here."""
+        past the credential phase, so the seed uses ``access_state`` here.
+
+        Phase 18: access_state no longer routes straight to priv_esc — it
+        routes to the unresolved objective phase first, and a validated
+        access_state alone is never the terminal success outcome."""
         api = make_api()
         target = "10.0.0.5"
         timestamp = now()
@@ -182,11 +186,15 @@ class TestApexGraphExecution:
 
         # Phase 12C: `phase` always becomes "done" once an engagement
         # terminates (the canonical outcome model) — `termination_phase`
-        # records the phase actually active (priv_esc, dispatched by
+        # records the phase actually active (objective, dispatched by
         # global_plan this same turn from the seeded access_state) when
-        # termination was decided.
+        # termination was decided. Phase 18: no credentials are configured
+        # and the seeded access_state has no ssh protocol, so
+        # ObjectivePlanner abandons every turn — with max_turns=1 the
+        # engagement stops via max_turns_exhausted, never fabricating
+        # success from access alone.
         assert final_state["phase"] == "done"
-        assert final_state["termination_phase"] == "priv_esc"
-        assert final_state["outcome"] == "validated_access"
+        assert final_state["termination_phase"] == "objective"
+        assert final_state["outcome"] == "max_turns_exhausted"
         assert final_state["turn_count"] == 1
         assert final_state["completed"] is True

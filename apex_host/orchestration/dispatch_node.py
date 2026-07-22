@@ -28,20 +28,26 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, Any
 
-from memfabric.types import AbandonSignal, Goal, TaskSpec
+from memfabric.ids import now
+from memfabric.types import AbandonSignal, Goal, Node, TaskSpec
 
 from apex_host.execution.context import ExecutionContext
 from apex_host.execution.dispositions import ExecutionDisposition
 from apex_host.graph_state import ApexGraphState
 from apex_host.orchestration.models import task_info
 from apex_host.orchestration.outcome import EngagementOutcome
+from apex_host.planners.access_capabilities import access_capabilities_from_subgraph
+from apex_host.planners.capabilities import capabilities_from_subgraph
+from apex_host.planners.objective import objective_state_fields
 from apex_host.planners.priv_esc_opportunities import privilege_state_fields
 from apex_host.planners.web_opportunities import web_session_state_fields
-from apex_host.types import ApexPhase
+from apex_host.types import AccessCapabilityType, ApexPhase
 
 if TYPE_CHECKING:
     from apex_host.orchestration.dependencies import OrchestrationDeps
+    from apex_host.types import AccessCapability
     from memfabric.coordination.protocols import Planner
+    from memfabric.types import SubgraphView
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +236,174 @@ def make_priv_esc_node(deps: "OrchestrationDeps") -> Any:
             logger.debug("priv_esc_agent: privilege-state summary refresh failed: %s", exc)
         return result
     return priv_esc_agent
+
+
+def _ssh_port_for_capability(subgraph: "SubgraphView") -> str:
+    """Lowest-port ``access_validate_ssh`` capability's port, or the SSH
+    default. Mirrors the pre-refactor ``objective_planner._ssh_port``
+    helper — relocated here since resolving a runtime connection detail
+    for a capability adapter is an orchestration-layer concern, never a
+    planner concern (memfabric Invariant 7)."""
+    caps = [c for c in capabilities_from_subgraph(subgraph) if c.name == "access_validate_ssh"]
+    if not caps:
+        return "22"
+    return sorted(caps, key=lambda c: int(c.port) if c.port.isdigit() else 22)[0].port or "22"
+
+
+def _register_capability_adapter(
+    deps: "OrchestrationDeps", subgraph: "SubgraphView", target: str, cap: "AccessCapability"
+) -> bool:
+    """Register a runtime adapter for one validated ``AccessCapability`` so
+    ``UserFlagExecutor`` can resolve ``capability_id -> adapter`` this turn.
+    Returns ``True`` iff an adapter was successfully constructed and
+    registered — the caller uses this to keep the EKG node's
+    ``runtime_available`` prop accurate (see ``make_objective_node``).
+
+    Orchestration-layer-only concern: planners stay pure over subgraph/
+    evidence data (memfabric Invariant 7); executors only ever *look up* an
+    already-registered adapter (see ``apex_host/runtime_registry.py``).
+    SSH and direct-file-read (``arbitrary_file_read``/``api_file_read``)
+    have real adapters this phase — an unrecognised ``capability_type`` is
+    silently skipped (forward-compatible: a future capability type simply
+    has no adapter registered, and stays ``runtime_available=False``, until
+    its own registration branch is added here).
+    """
+    if cap.capability_type is AccessCapabilityType.ssh_command:
+        return _register_ssh_adapter(deps, subgraph, target, cap)
+    if cap.capability_type in (AccessCapabilityType.arbitrary_file_read, AccessCapabilityType.api_file_read):
+        return _register_direct_file_read_adapter(deps, target, cap)
+    return False
+
+
+def _register_ssh_adapter(
+    deps: "OrchestrationDeps", subgraph: "SubgraphView", target: str, cap: "AccessCapability"
+) -> bool:
+    usernames = list(getattr(deps.config, "username_candidates", None) or [])
+    passwords = list(getattr(deps.config, "password_candidates", None) or [])
+    # Mirrors CredentialPlanner's own one-credential-pair-per-engagement
+    # invariant: only the first configured pair is ever validated, so only
+    # a capability whose principal matches it can be provisioned here.
+    if not usernames or not passwords or cap.principal != usernames[0]:
+        return False
+    deps.capability_registry.ensure_ssh(
+        cap.capability_id,
+        target=target,
+        port=_ssh_port_for_capability(subgraph),
+        username=cap.principal,
+        password=passwords[0],
+        config=deps.config,
+    )
+    return True
+
+
+def _register_direct_file_read_adapter(
+    deps: "OrchestrationDeps", target: str, cap: "AccessCapability"
+) -> bool:
+    """Construct (from operator-supplied ``ApexConfig`` fields only — never
+    from the capability node's own EKG metadata, which carries no secret)
+    and register a ``DirectFileReadCapabilityAdapter``. Performs NO network
+    I/O — constructing the adapter/primitive is always safe.
+
+    Mirrors ``_register_ssh_adapter``'s principal-matching discipline: only
+    a capability whose principal matches the operator's configured
+    ``direct_file_read_principal`` can be provisioned here.
+    """
+    from apex_host.runtime_registry import DirectFileReadPrimitive
+
+    config = deps.config
+    if not config.direct_file_read_origin or not config.direct_file_read_endpoint_template:
+        return False
+    if cap.principal != config.direct_file_read_principal:
+        return False
+    allowed_filenames = frozenset(getattr(config, "user_flag_candidate_filenames", None) or [])
+    try:
+        primitive = DirectFileReadPrimitive(
+            capability_id=cap.capability_id,
+            target_origin=config.direct_file_read_origin,
+            endpoint_template=config.direct_file_read_endpoint_template,
+            method=config.direct_file_read_method,
+            headers=dict(config.direct_file_read_headers),
+            timeout_seconds=config.direct_file_read_timeout_seconds,
+            max_response_bytes=config.direct_file_read_max_response_bytes,
+            allow_redirects=config.direct_file_read_allow_redirects,
+            allowed_filenames=allowed_filenames,
+        )
+    except ValueError as exc:
+        logger.warning("direct-file-read primitive construction rejected: %s", exc)
+        return False
+    deps.capability_registry.ensure_direct_file_read(cap.capability_id, primitive=primitive)
+    return True
+
+
+def make_objective_node(deps: "OrchestrationDeps") -> Any:
+    """Return the ``objective_agent`` node bound to the objective planner.
+
+    Phase 18: uses ``single_task=True`` to enforce the one-bounded-
+    verification-task-per-turn invariant, mirroring the credential phase's
+    own safety pacing for sensitive session-based operations.
+
+    Access-capability refactor: immediately before dispatching, registers a
+    runtime adapter (``deps.capability_registry``) for every validated
+    ``AccessCapability`` the live EKG currently has, so
+    ``UserFlagExecutor`` can resolve whichever ``capability_id``
+    ``ObjectivePlanner`` selects to a real adapter this turn — this is the
+    ONE place live connection parameters (e.g. an SSH password, a
+    direct-file-read primitive's headers) are ever paired with a
+    ``capability_id``; neither the planner nor the executor itself ever
+    sees them together. After dispatching, refreshes the
+    ``objective_status``/``objective_summary`` state fields from a fresh
+    EKG read — mirrors the read-after-write "peek" pattern
+    ``make_priv_esc_node``/``make_browser_node`` already use (Phase 13/14),
+    scoped only to this node so other phase agents are unaffected. A failed
+    refresh (registration or state-summary) degrades gracefully.
+
+    Phase 20 — registration outcome (success or failure) is written back
+    onto the capability's EKG node as ``runtime_available`` (a plain
+    per-field upsert, memfabric Invariant 3), so the distinction between
+    "a validated capability exists" (metadata) and "a runtime adapter is
+    currently registered for it" (a runtime fact) stays visible in the
+    graph — see ``AccessCapability.runtime_available``'s docstring. Only
+    written when it actually changes, to avoid a needless upsert every
+    turn once a capability's availability has stabilised.
+    """
+    async def objective_agent(state: "ApexGraphState") -> dict[str, Any]:
+        try:
+            pre_subgraph = await deps.api.get_subgraph(deps.anchor_id, depth=2)
+            for cap in access_capabilities_from_subgraph(pre_subgraph):
+                if not cap.validated or deps.capability_registry.has(cap.capability_id):
+                    continue
+                registered = _register_capability_adapter(deps, pre_subgraph, state["target"], cap)
+                if registered != cap.runtime_available:
+                    timestamp = now()
+                    await deps.api.upsert_node(Node(
+                        id=cap.capability_id, type="access_capability",
+                        props={"runtime_available": registered},
+                        # Deliberately BELOW MemoryAPI's conflict_confidence_floor
+                        # (default 0.8): `runtime_available` is a runtime STATUS
+                        # flag re-derived fresh every turn, not an epistemic claim
+                        # two credible sources might genuinely disagree about — a
+                        # capability's own `confidence` (often >= 0.8) would make
+                        # this flip-flopping True/False update collide with the
+                        # ORIGINAL derivation's high-confidence write and spuriously
+                        # open a Conflict record every time availability changes.
+                        # Plain last-writer-wins (by logical_version) is exactly
+                        # the semantics wanted here.
+                        confidence=0.5, source="dispatch_node",
+                        first_seen=timestamp, last_seen=timestamp,
+                    ))
+        except Exception as exc:
+            logger.debug("objective_agent: capability registration failed: %s", exc)
+
+        result = await _dispatch_tasks(
+            deps, state, deps.phase_planners[ApexPhase.objective.value], single_task=True
+        )
+        try:
+            subgraph = await deps.api.get_subgraph(deps.anchor_id, depth=2)
+            result.update(objective_state_fields(subgraph, state["target"], deps.config.objective_type))
+        except Exception as exc:
+            logger.debug("objective_agent: objective-state summary refresh failed: %s", exc)
+        return result
+    return objective_agent
 
 
 def make_execute_node(deps: "OrchestrationDeps") -> Any:

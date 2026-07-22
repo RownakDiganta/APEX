@@ -192,6 +192,122 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "omit this flag to use only real, exported environment variables."
         ),
     )
+    # Phase 18 — user-flag objective and bounded verification. There is
+    # deliberately NO flag that accepts an expected plaintext flag value.
+    parser.add_argument(
+        "--objective-type", dest="objective_type", default=None, metavar="TYPE",
+        help=(
+            "Engagement benchmark-success objective (default: user_flag — "
+            "the only implemented objective). A validated access_state "
+            "alone is never treated as success; see docs/user-flag-objective.md."
+        ),
+    )
+    parser.add_argument(
+        "--user-flag-candidate-filename", dest="user_flag_candidate_filenames",
+        action="append", default=[], metavar="NAME",
+        help="Candidate user-flag filename (repeatable; default: user.txt).",
+    )
+    parser.add_argument(
+        "--user-flag-candidate-root", dest="user_flag_candidate_roots",
+        action="append", default=[], metavar="TEMPLATE",
+        help=(
+            "Candidate root directory template; '{username}' is substituted "
+            "with the already-authenticated SSH username (repeatable; "
+            "default: /home/{username})."
+        ),
+    )
+    parser.add_argument(
+        "--max-user-flag-attempts", dest="max_user_flag_attempts",
+        type=int, default=None, metavar="N",
+        help="Maximum bounded candidate paths attempted per engagement (default: 3).",
+    )
+    parser.add_argument(
+        "--user-flag-max-output-bytes", dest="user_flag_max_output_bytes",
+        type=int, default=None, metavar="N",
+        help="Maximum bytes read per candidate before the verifier rejects it as oversized (default: 4096).",
+    )
+    parser.add_argument(
+        "--user-flag-format-regex", dest="user_flag_verification_regex",
+        default=None, metavar="REGEX",
+        help=(
+            "Override the verifier's expected flag-format regex (shape only "
+            "— never a specific known flag value). Default: a generic "
+            "bounded-token pattern."
+        ),
+    )
+    parser.add_argument(
+        "--user-flag-read-timeout", dest="user_flag_read_timeout_seconds",
+        type=float, default=None, metavar="SECONDS",
+        help=(
+            "Outer defensive timeout ceiling (seconds) for one bounded "
+            "user-flag candidate read, independent of the resolved access "
+            "capability's own internal timeouts (default: 35.0)."
+        ),
+    )
+    # Phase 20 — direct file-read access capability. Every field below
+    # describes a FULLY FIXED, operator-supplied HTTP request shape for a
+    # pre-validated file-read primitive that the operator has ALREADY
+    # manually confirmed through authorized testing (an arbitrary file
+    # read, an LFI, a path-traversal primitive, an authenticated
+    # file-download endpoint, an XSS-assisted workflow that resolves to a
+    # bounded file read, ...) — mirrors --username/--password's own trust
+    # boundary exactly. None of these fields have any effect unless
+    # --direct-file-read-attested is also passed.
+    parser.add_argument(
+        "--direct-file-read-attested", dest="direct_file_read_operator_attested",
+        action="store_true", default=None,
+        help=(
+            "Explicit opt-in: the operator has already manually confirmed "
+            "(through authorized testing) that the configured request shape "
+            "reads files. Required for any of the other --direct-file-read-* "
+            "flags to have any effect (default: False)."
+        ),
+    )
+    parser.add_argument(
+        "--direct-file-read-capability-type", dest="direct_file_read_capability_type",
+        default=None, metavar="TYPE", choices=["arbitrary_file_read", "api_file_read"],
+        help="Capability classification: 'arbitrary_file_read' or 'api_file_read' (default: arbitrary_file_read).",
+    )
+    parser.add_argument(
+        "--direct-file-read-origin", dest="direct_file_read_origin",
+        default=None, metavar="SCHEME://HOST[:PORT]",
+        help="Fixed, authorized origin — no path, no query, no userinfo.",
+    )
+    parser.add_argument(
+        "--direct-file-read-endpoint-template", dest="direct_file_read_endpoint_template",
+        default=None, metavar="TEMPLATE",
+        help="Fixed path+query template with exactly one {path} placeholder, e.g. '/download.php?file={path}'.",
+    )
+    parser.add_argument(
+        "--direct-file-read-method", dest="direct_file_read_method",
+        default=None, metavar="METHOD", choices=["GET", "POST"],
+        help="Fixed HTTP method for the request shape (default: GET).",
+    )
+    parser.add_argument(
+        "--direct-file-read-header", dest="direct_file_read_header",
+        action="append", default=None, metavar="NAME:VALUE",
+        help="Fixed request header (repeatable), e.g. 'Cookie:session=abc123'. Never logged or persisted.",
+    )
+    parser.add_argument(
+        "--direct-file-read-principal", dest="direct_file_read_principal",
+        default=None, metavar="LABEL",
+        help="Identity label this capability is attributed to (e.g. an application username).",
+    )
+    parser.add_argument(
+        "--direct-file-read-max-bytes", dest="direct_file_read_max_response_bytes",
+        type=int, default=None, metavar="N",
+        help="Maximum bounded response size in bytes (default: 4096).",
+    )
+    parser.add_argument(
+        "--direct-file-read-timeout", dest="direct_file_read_timeout_seconds",
+        type=float, default=None, metavar="SECONDS",
+        help="Bounded request timeout in seconds (default: 15.0).",
+    )
+    parser.add_argument(
+        "--direct-file-read-allow-redirects", dest="direct_file_read_allow_redirects",
+        action="store_true", default=None,
+        help="Follow at most one same-origin redirect (default: disabled — be extremely conservative with redirects).",
+    )
     return parser.parse_args(argv)
 
 

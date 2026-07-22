@@ -25,6 +25,7 @@ from apex_host.orchestration.diagnostics_node import make_unknown_phase_node
 from apex_host.orchestration.dispatch_node import (
     make_browser_node,
     make_execute_node,
+    make_objective_node,
     make_priv_esc_node,
     make_recon_node,
     make_web_node,
@@ -42,6 +43,7 @@ from apex_host.orchestration.routing import (
 from apex_host.orchestration.stall import StallTracker
 from apex_host.planners.global_planner import GlobalPlanner
 from apex_host.policy import PolicyAdvisor, load_policy
+from apex_host.runtime_registry import CapabilityRuntimeRegistry
 from apex_host.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
@@ -145,6 +147,7 @@ def build_apex_graph(
     from apex_host.agents.priv_esc_enum_executor import PrivEscEnumExecutor
     from apex_host.agents.ssh_executor import SSHExecutor
     from apex_host.agents.telnet_executor import TelnetExecutor
+    from apex_host.agents.user_flag_executor import UserFlagExecutor
     from apex_host.execution.dispatcher import TaskDispatcher
     from apex_host.execution.registry import TaskRegistry
     from apex_host.planning.repair import RepairEngine
@@ -181,6 +184,16 @@ def build_apex_graph(
     # apex_host/agents/priv_esc_enum_executor.py "Why this reuses
     # SSHExecutor's model instead of ToolBackend").
     priv_esc_enum_executor = PrivEscEnumExecutor(config)
+    # Access-capability refactor — runtime-only registry of capability_id ->
+    # adapter, populated per-turn by make_objective_node (never a planner or
+    # executor concern; see apex_host/runtime_registry.py).
+    capability_registry = CapabilityRuntimeRegistry()
+    # Phase 18 — bounded, read-only, transport-independent user-flag-
+    # objective verification executor (see
+    # apex_host/agents/user_flag_executor.py). Resolves capability_id to a
+    # runtime adapter via capability_registry rather than speaking any
+    # transport (e.g. SSH) directly.
+    user_flag_executor = UserFlagExecutor(config, capability_registry)
     repair_engine = RepairEngine(
         model_router=model_router, allowed_tools=config.allowed_tools,
         target=config.target, dry_run=config.dry_run,
@@ -194,6 +207,7 @@ def build_apex_graph(
         ssh_executor=ssh_executor, ftp_executor=ftp_executor,
         priv_esc_analysis_executor=priv_esc_analysis_executor,
         priv_esc_enum_executor=priv_esc_enum_executor,
+        user_flag_executor=user_flag_executor,
     )
     _max_repair = getattr(config, "max_repair_attempts", 1)
 
@@ -207,6 +221,7 @@ def build_apex_graph(
         # apex_host/orchestration/stall.py for why it lives here rather
         # than in ApexGraphState.
         stall_tracker=StallTracker(),
+        capability_registry=capability_registry,
     )
 
     # Node instantiation
@@ -217,6 +232,7 @@ def build_apex_graph(
     sg.add_node("web_agent", make_web_node(deps))
     sg.add_node("browser_agent", make_browser_node(deps))
     sg.add_node("execute_agent", make_execute_node(deps))
+    sg.add_node("objective_agent", make_objective_node(deps))
     sg.add_node("priv_esc_agent", make_priv_esc_node(deps))
     sg.add_node("parse_observation", make_parsing_node(deps))
     sg.add_node("write_memory", make_memory_node(deps))
@@ -235,12 +251,16 @@ def build_apex_graph(
         {
             "recon_agent": "recon_agent", "web_agent": "web_agent",
             "browser_agent": "browser_agent", "execute_agent": "execute_agent",
+            "objective_agent": "objective_agent",
             "priv_esc_agent": "priv_esc_agent", UNKNOWN_PHASE_NODE: UNKNOWN_PHASE_NODE,
             END: END,
         },
     )
     sg.add_edge(UNKNOWN_PHASE_NODE, END)
-    for _an in ("recon_agent", "web_agent", "browser_agent", "execute_agent", "priv_esc_agent"):
+    for _an in (
+        "recon_agent", "web_agent", "browser_agent", "execute_agent",
+        "objective_agent", "priv_esc_agent",
+    ):
         sg.add_edge(_an, "parse_observation")
     sg.add_edge("parse_observation", "write_memory")
     sg.add_conditional_edges(

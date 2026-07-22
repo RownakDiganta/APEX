@@ -46,6 +46,8 @@ from apex_host.eval.report import build_report, format_text, to_json_dict
 from apex_host.graph_ids import (
     collects_edge_id,
     host_id,
+    indicates_edge_id,
+    objective_id,
     priv_esc_evidence_id,
     produces_edge_id,
     recommends_edge_id,
@@ -1258,6 +1260,20 @@ class TestFullGraphIntegrationEnumeration:
             confidence=0.85, source="ssh", first_seen=ts, last_seen=ts,
         ))
         await api.upsert_edge(Edge(id="e2", from_id=h_id, to_id=access_id, type="exposes", props={}, confidence=0.9, source="t", first_seen=ts, last_seen=ts))
+        # Phase 18's GlobalPlanner routes toward the (default) user_flag
+        # objective phase whenever a validated access_state exists and the
+        # objective is not already "verified"/"failed" — see
+        # apex_host.planners.global_planner._select_phase. Pre-seed a
+        # "failed" objective node so this priv_esc-focused test still
+        # reaches priv_esc_agent directly, exactly as it did before Phase 18
+        # introduced the objective phase.
+        obj_id = objective_id(_TARGET, "user_flag")
+        await api.upsert_node(Node(
+            id=obj_id, type="objective",
+            props={"objective_type": "user_flag", "status": "failed", "target": _TARGET, "attempted_paths": [], "attempt_count": 0},
+            confidence=0.5, source="t", first_seen=ts, last_seen=ts,
+        ))
+        await api.upsert_edge(Edge(id=indicates_edge_id(h_id, obj_id), from_id=h_id, to_id=obj_id, type="indicates", props={}, confidence=0.5, source="t", first_seen=ts, last_seen=ts))
 
         config = ApexConfig(
             target=_TARGET, dry_run=True, max_turns=2,

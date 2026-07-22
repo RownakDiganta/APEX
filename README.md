@@ -647,14 +647,68 @@ Invariant 4 is never bypassed).
 guess — that an operator-supplied credential pair works, over Telnet, SSH,
 or FTP. Each protocol gets exactly one bounded login attempt per
 engagement (no brute force, no credential spraying); a successful
-validation is the engagement's terminal success signal (`access_state` in
-the EKG). SSH uses [Paramiko](https://www.paramiko.org/) with agent
-forwarding and local key discovery disabled; FTP uses the standard
-library's `ftplib` in passive mode. Both run only a single fixed harmless
-command afterward (`id`/`whoami` for SSH, `PWD`/`NOOP` for FTP) and close
-the connection immediately — no file transfer, no persistent session, no
-privilege escalation. Full design, safety model, and test strategy:
-[`docs/credential-validation.md`](docs/credential-validation.md).
+validation produces an `access_state` node in the EKG — an important
+**intermediate milestone**, but (as of Phase 18 below) never by itself the
+engagement's terminal success signal. SSH uses [Paramiko](https://www.paramiko.org/)
+with agent forwarding and local key discovery disabled; FTP uses the
+standard library's `ftplib` in passive mode. Both run only a single fixed
+harmless command afterward (`id`/`whoami` for SSH, `PWD`/`NOOP` for FTP)
+and close the connection immediately — no file transfer, no persistent
+session, no privilege escalation. Full design, safety model, and test
+strategy: [`docs/credential-validation.md`](docs/credential-validation.md).
+
+**User-flag objective and verification (Phase 18):** for the selected HTB
+benchmark, success means **verified retrieval of the user flag** — a
+validated `access_state` is real progress but never, by itself, benchmark
+success. Once a validated `access_state` produces an `access_capability`
+(see below), `GlobalPlanner` routes the engagement toward a new
+`objective` phase (inserted between `credential` and `priv_esc`);
+`ObjectivePlanner` emits one bounded, read-only candidate-file read per
+turn (from a small, operator-configurable set of generic HTB user-flag
+filenames/roots — never a machine-specific value).
+`apex_host.verification.user_flag.verify_user_flag()` — the one
+authoritative verifier — conservatively rejects empty/multiline/oversized/
+malformed candidates and, on success, records only a SHA-256 digest and a
+short redacted display in the EKG (`objective`/`objective_evidence` nodes)
+— the raw flag value is never stored, logged, or reported anywhere. Only
+`EngagementOutcome.user_flag_verified` is ever success
+(`is_success_outcome()`); a validated-access-only run now exits `1`, not
+`0`. Full design: [`docs/user-flag-objective.md`](docs/user-flag-objective.md).
+
+**Access-capability abstraction (Phase 18B):** the objective's access
+mechanism is transport-independent. A validated login produces a generic
+`AccessCapability` record (`apex_host/types.py`) — `ObjectivePlanner`
+selects the best validated capability (never searching for SSH
+specifically), and `UserFlagExecutor` resolves a `capability_id` to a
+runtime adapter via a **runtime-only** `CapabilityRuntimeRegistry`
+(`apex_host/runtime_registry.py`) — live sessions/credentials are never
+stored in `MemoryAPI`/the EKG, only in this in-process, per-engagement
+registry. Adding a new adapter requires only a new adapter class + one
+`CapabilityParser.derive_*` method + one registration branch — never a
+change to the planner, executor, parser, or report generator. Reports show
+`Capability used: SSH Command` (a capability-type **label**, never a
+`"Transport: SSH"` framing). Full design:
+[`docs/user-flag-objective.md`](docs/user-flag-objective.md) §16.
+
+**Direct file read capability (Phase 20):** a second `FlagReadCapability`
+adapter, `DirectFileReadCapabilityAdapter`, lets the User Flag Objective be
+satisfied **without SSH** through a generic, bounded, policy-gated direct
+file-read primitive (arbitrary file read, LFI, path traversal, an
+authenticated file-download endpoint, or an XSS-assisted workflow that
+resolves to a bounded file read). It is not a generic HTTP/SSRF
+executor — `read_bounded_file(path)` is its only method, and every other
+request-shape detail (origin, endpoint template, method, headers, timeout,
+byte cap, redirect policy) is fixed, operator-supplied configuration, never
+task-controlled. The operator confirms, out of band, that a specific
+request shape already reads files (the same trust model as
+`--username`/`--password`); `apex_host/orchestration/capability_seed.py`
+turns that attestation into an `access_capability` EKG node at engagement
+startup, with **no live network operation**. Redirects are disabled by
+default; oversized responses are rejected outright, never partially
+accepted. `ObjectivePlanner`, `UserFlagExecutor`, `ObjectiveParser`, and the
+report generator needed **zero changes** — proof that Phase 18B's
+extension contract holds. Full design:
+[`docs/user-flag-objective.md`](docs/user-flag-objective.md) §17.
 
 **Safety**: `ApexConfig.dry_run` defaults to `True`. Every command execution
 path goes through `apex_host/tools/runner.py`, which checks

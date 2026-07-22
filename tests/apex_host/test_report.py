@@ -421,11 +421,18 @@ def _config_maxturns(max_turns: int = 5) -> "ApexConfig":
 class TestStatusAndCompleteness:
     """Verify that status and completed_successfully reflect the actual run outcome."""
 
-    def test_success_when_access_state_in_ekg(self) -> None:
+    def test_access_state_in_ekg_alone_is_not_success(self) -> None:
+        # Phase 18: a validated access_state is an important intermediate
+        # milestone but is never, by itself, benchmark success — only a
+        # verified objective (EngagementOutcome.user_flag_verified) is.
+        # The legacy fallback (_derive_outcome_from_state, used only when
+        # final_state has no "outcome" key) still classifies access_state
+        # presence as EngagementOutcome.validated_access, which now maps to
+        # legacy status "abandoned", never "success".
         nodes = [_node("host"), _node("access_state")]
         report = build_report(_state(turn_count=3, completed=True), _subgraph(nodes=nodes), _config())
-        assert report.status == "success"
-        assert report.completed_successfully is True
+        assert report.status != "success"
+        assert report.completed_successfully is False
 
     def test_not_successful_when_no_access_state(self) -> None:
         nodes = [_node("host"), _node("service")]
@@ -616,9 +623,18 @@ class TestExecutionBackendSummary:
         text = format_text(report)
         assert "Error Breakdown" not in text
 
-    def test_format_text_success_label_when_access_state(self) -> None:
+    def test_format_text_not_success_label_when_only_access_state(self) -> None:
+        # Phase 18: access_state alone is not success — the "Successful"
+        # header line must read "No", not "Yes".
         nodes = [_node("access_state")]
         report = build_report(_state(completed=True), _subgraph(nodes=nodes), _config())
+        text = format_text(report)
+        assert "Successful : No" in text
+
+    def test_format_text_success_label_when_user_flag_verified(self) -> None:
+        nodes = [_node("access_state")]
+        state = {**_state(completed=True), "outcome": "user_flag_verified"}
+        report = build_report(state, _subgraph(nodes=nodes), _config())  # type: ignore[arg-type]
         text = format_text(report)
         assert "SUCCESS" in text
         assert "Successful : Yes" in text

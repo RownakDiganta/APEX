@@ -375,8 +375,47 @@ being a single‑purpose Error‑Path feature and becomes a system‑wide proper
 
 ## 9. Evaluation plan
 
+> **Success definition (implementation note, added post-Phase-18 —
+> `CLAUDE.md` §23 "Phase 18"):** the general `AccessState(user/root,
+> foothold)` model above is preserved unchanged — a foothold or validated
+> credential remains a real, tracked graph state. For the *selected HTB
+> benchmark* implementation, however, "solving a machine" (and therefore
+> the headline success-rate metric below) is mapped specifically to
+> **verified retrieval of the machine's user flag** — an `AccessState`
+> alone, without a cryptographically confirmed flag read, does not count
+> as a solved machine. See `docs/user-flag-objective.md` for the objective
+> model, verification mechanism, and EKG representation this maps onto.
+>
+> **Access-capability abstraction note (added post-Phase-18B —
+> `CLAUDE.md` §23 "Phase 18B"):** the access mechanism underlying the
+> above is transport-independent, not SSH-specific. A validated login
+> produces a generic `AccessCapability` record (capability TYPE, principal,
+> confidence — never a password or live session, which live only in a
+> runtime-only, non-EKG registry), and the objective-verification flow
+> selects among validated capabilities rather than searching for a
+> specific protocol. The abstraction exists so a future adapter (Telnet, a
+> local shell, a file-read API) requires adding only that adapter, never
+> re-deriving the objective/verification model itself. See
+> `docs/user-flag-objective.md` §16 for the full design.
+>
+> **Direct file read capability note (added post-Phase-20 — `CLAUDE.md`
+> §23 "Phase 20"):** the abstraction note above predicted exactly this — a
+> second capability adapter, `DirectFileReadCapabilityAdapter`, letting the
+> objective be satisfied through a generic, bounded, policy-gated direct
+> file-read primitive (arbitrary file read, LFI, path traversal, an
+> authenticated download endpoint, or an XSS-assisted read) instead of SSH.
+> It is not a general-purpose HTTP client: the adapter's only method takes
+> a bounded candidate path and substitutes it into one fixed,
+> operator-attested request shape — host, port, scheme, endpoint, method,
+> headers, and redirect policy are all configuration, never
+> task-controlled. `ObjectivePlanner`, `UserFlagExecutor`,
+> `ObjectiveParser`, and the report generator required zero changes to
+> support the new adapter, confirming the abstraction's own design promise.
+> See `docs/user-flag-objective.md` §17 for the full design.
+
 - **Same benchmark as the paper:** the 42 HTB machines; headline metric is the
-  71.4% (30/42) success rate.
+  71.4% (30/42) success rate — under this implementation, "success" per
+  machine means a verified user-flag retrieval, not merely a foothold.
 - **Falsifiable claim:** unified memory + graph‑scoped context lifts the **12/42
   machines APEX currently fails** (long‑horizon + JS‑gated), not just the easy
   wins.

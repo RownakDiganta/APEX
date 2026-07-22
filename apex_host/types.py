@@ -21,6 +21,10 @@ class ApexPhase(str, Enum):
     priv_esc = "priv_esc"
     credential = "credential"
     lateral = "lateral"
+    # Phase 18 — pursues the configured engagement objective (default:
+    # "user_flag") once validated access exists. See
+    # docs/user-flag-objective.md.
+    objective = "objective"
     done = "done"
 
 
@@ -758,6 +762,168 @@ class Experience:
     occurrence_count: int
     first_seen: str
     last_seen: str
+
+
+# ---------------------------------------------------------------------------
+# User-flag objective and verification model (Phase 18)
+# ---------------------------------------------------------------------------
+#
+# These types back the benchmark success model described in
+# docs/user-flag-objective.md: a validated `access_state` node is an
+# important intermediate milestone, but it is never independently the
+# engagement's success signal. Success requires a verified `Objective` of
+# type "user_flag" — evidenced by exactly one `ObjectiveEvidenceRecord` per
+# objective, holding a SHA-256 digest and a redacted display string, never
+# the plaintext flag value. See apex_host/verification/user_flag.py for the
+# one authoritative verifier and apex_host/parsers/objective_parser.py for
+# how a verified result becomes these EKG node shapes.
+
+
+class ObjectiveStatus(str, Enum):
+    """Lifecycle of one engagement objective — never collapsed into a single
+    Boolean (CLAUDE.md-equivalent requirement for this phase). ``pending``
+    is never persisted as a node prop; it is the implicit status when no
+    ``objective`` EKG node exists yet for a given target+objective_type
+    (mirrors ``PrivilegeEnumerationStatus.not_started``'s precedent)."""
+    pending = "pending"
+    in_progress = "in_progress"
+    verified = "verified"
+    failed = "failed"
+
+
+@dataclass(slots=True)
+class Objective:
+    """One structured, non-executable engagement objective record.
+
+    Stored in the EKG as an ``objective`` node (see
+    ``apex_host/graph_ids.py::objective_id`` and
+    ``apex_host/parsers/objective_parser.py``) — this dataclass is the
+    in-planner/report view reconstructed from that node's props, never a
+    second, independent store (memfabric Invariant 1). ``attempted_paths``
+    never includes the objective value itself — only the bounded,
+    non-secret candidate filesystem paths already tried.
+    """
+    id: str
+    objective_type: str
+    status: ObjectiveStatus
+    target: str
+    attempted_paths: tuple[str, ...]
+    first_seen: str
+    last_seen: str
+
+
+@dataclass(slots=True)
+class ObjectiveEvidenceRecord:
+    """Structured, secret-free proof that an ``Objective`` was satisfied.
+
+    Stored in the EKG as an ``objective_evidence`` node (see
+    ``apex_host/graph_ids.py::objective_evidence_id``). Deliberately has NO
+    plaintext-value field of any kind — only a SHA-256 digest and a short
+    redacted display string ever leave
+    ``apex_host.verification.user_flag.verify_user_flag()``, so this record
+    cannot leak the underlying value even if mishandled downstream (reports,
+    experience replay, logs).
+    """
+    id: str
+    objective_id: str
+    evidence_type: str
+    verified: bool
+    value_digest: str
+    redacted_value: str
+    source_tool: str
+    source_path: str
+    access_identity: str
+    verification_method: str
+    confidence: str
+    timestamp: str
+    # Which AccessCapability (see below) produced this evidence — "" for a
+    # record predating the capability abstraction. Never a transport-specific
+    # field name (e.g. "ssh_port") — capability_type is the only transport
+    # signal reports/callers should ever branch on.
+    capability_type: str = ""
+    capability_id: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Generic access-capability abstraction (capability refactor)
+# ---------------------------------------------------------------------------
+#
+# The user_flag objective (above) must never hardcode a transport. Before
+# this abstraction, `ObjectivePlanner`/`UserFlagExecutor` searched
+# specifically for a validated SSH `access_state`. `AccessCapability`
+# replaces that: a transport-tagged, non-secret CLASSIFICATION of one proven
+# access mechanism ("this target has a validated ssh_command capability"),
+# reconstructed from EKG node props exactly like every other planning model
+# in this codebase (memfabric Invariant 1 — never a second, independent
+# store). The corresponding LIVE session/credential material is never
+# represented here or anywhere in the EKG — see
+# `apex_host/runtime_registry.py`'s module docstring for where that lives
+# (a runtime-only, in-process registry, never MemoryAPI).
+
+
+class AccessCapabilityType(str, Enum):
+    """A capability TYPE — a classification of *how* a bounded read can be
+    performed, never an exploit type and never itself an executable action.
+
+    Only ``ssh_command`` has a concrete adapter implementation today (see
+    ``apex_host.runtime_registry.SSHCapabilityAdapter``). The remaining
+    members exist so the taxonomy, ranking, and reporting layers are
+    complete and forward-compatible — adding a real adapter for one of them
+    must require touching only the adapter + capability-derivation layer,
+    never the planner, verifier, parser, or report generator (see
+    docs/user-flag-objective.md "Access capability abstraction").
+    """
+    ssh_command = "ssh_command"
+    telnet_command = "telnet_command"
+    web_command = "web_command"
+    local_shell = "local_shell"
+    arbitrary_file_read = "arbitrary_file_read"
+    api_file_read = "api_file_read"
+
+
+@dataclass(slots=True)
+class AccessCapability:
+    """One structured, non-executable record of a proven access mechanism.
+
+    Stored in the EKG as an ``access_capability`` node (see
+    ``apex_host/graph_ids.py::access_capability_id`` and
+    ``apex_host/parsers/capability_parser.py``) — this dataclass is the
+    in-planner/report view reconstructed from that node's props, never a
+    second, independent store (memfabric Invariant 1).
+
+    Deliberately excludes (and must never gain a field for): passwords,
+    cookies, bearer tokens, SSH sessions, shell objects, or sockets — the
+    graph stores metadata only. The live material needed to actually
+    perform a read lives exclusively in the runtime-only
+    ``apex_host.runtime_registry.CapabilityRuntimeRegistry``, keyed by
+    ``capability_id``, and is reconstructed from ``ApexConfig`` at
+    registration time — never round-tripped through the EKG.
+
+    ``runtime_available`` (Phase 20) distinguishes graph METADATA
+    ("a validated capability exists") from a RUNTIME FACT ("a runtime
+    adapter is currently registered for it and can actually be called this
+    turn"). Defaults to ``True`` for backward compatibility with capability
+    nodes predating this field (and with direct unit-test construction) —
+    the orchestration layer (``apex_host.orchestration.dispatch_node
+    ._register_capability_adapter``) explicitly writes ``True``/``False``
+    back onto the EKG node every objective turn once it knows for certain
+    whether an adapter could be constructed (e.g. missing operator
+    credentials/primitive config). A capability the planner selects but the
+    executor cannot actually invoke wastes a bounded attempt and produces a
+    misleading "no adapter" error; a capability with
+    ``runtime_available=False`` is excluded from selection entirely (see
+    ``apex_host.planners.access_capabilities.best_capability_for_objective``)
+    while its metadata remains recorded and visible.
+    """
+    capability_id: str
+    host_id: str
+    capability_type: AccessCapabilityType
+    validated: bool
+    principal: str
+    confidence: float
+    source_task_id: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+    runtime_available: bool = True
 
 
 @dataclass(slots=True)

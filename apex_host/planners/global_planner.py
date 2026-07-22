@@ -51,6 +51,9 @@ _PHASE_GOALS: dict[ApexPhase, str] = {
     ApexPhase.recon: "Perform reconnaissance on {target}",
     ApexPhase.web: "Enumerate web endpoints on {target}",
     ApexPhase.credential: "Probe authentication flows on {target}",
+    # Phase 18 — pursue the configured engagement objective (default:
+    # user_flag) once validated access exists.
+    ApexPhase.objective: "Verify the configured engagement objective on {target}",
     ApexPhase.priv_esc: "Enumerate privilege-escalation surface on {target}",
     ApexPhase.exploit: "Investigate exploitation surface on {target}",
     ApexPhase.lateral: "Investigate lateral-movement surface on {target}",
@@ -63,6 +66,10 @@ _DEFAULT_PHASE_BUDGETS: dict[str, int] = {
     ApexPhase.recon.value: 6,
     ApexPhase.web.value: 5,
     ApexPhase.credential.value: 4,
+    # Phase 18 — bounded budget for user-flag-objective verification turns,
+    # matching credential's own ceiling (a handful of candidate reads is
+    # always enough given max_user_flag_attempts is itself small).
+    ApexPhase.objective.value: 4,
     ApexPhase.priv_esc.value: 4,
     ApexPhase.exploit.value: 4,
     ApexPhase.lateral.value: 4,
@@ -141,6 +148,7 @@ class GlobalPlanner:
         turn_count: int,
         current_phase: str | None = None,
         has_web_capability: bool = True,
+        objective_status: str = "pending",
     ) -> ApexPhase:
         """Return the phase the engagement should run in this turn.
 
@@ -151,15 +159,16 @@ class GlobalPlanner:
            ``current_phase`` — this is the Bug A fix: forcing must survive
            across turns, not just the one call where ``current_phase``
            happens to name the exhausted phase.
-        3. EKG-driven phase selection.
+        3. EKG-driven phase selection (now including the Phase 18 objective
+           gate — see ``_select_phase``).
         4. Phase 12C: if that selection is ``priv_esc`` and priv_esc's own
            budget is exhausted, return ``done`` instead of ``priv_esc`` —
            priv_esc is the last phase in the ladder with nothing further to
-           force-advance into (unlike recon/web/credential, which have a
-           ``_PHASE_COMPLETION_NODE`` entry naming the next phase), so
-           without this check the engagement would keep dispatching
-           ``priv_esc_agent`` every remaining turn until the *global*
-           ``max_turns`` ceiling, wasting the whole remainder of the run.
+           force-advance into (unlike recon/web/credential/objective, which
+           each have a way to force-advance past them), so without this
+           check the engagement would keep dispatching ``priv_esc_agent``
+           every remaining turn until the *global* ``max_turns`` ceiling,
+           wasting the whole remainder of the run.
            ``apex_host.orchestration.outcome.evaluate_termination()``
            classifies this as ``phase_budget_exhausted`` — a distinct,
            reported reason, not a silent ride-out to ``max_turns_exhausted``.
@@ -178,6 +187,15 @@ class GlobalPlanner:
             phase is skipped entirely and the engagement proceeds directly from
             recon to credential.  This avoids wasting web-phase budget on
             targets that have no web surface.
+        objective_status:
+            Phase 18 — the current ``ObjectiveStatus`` value (``"pending"``,
+            ``"in_progress"``, ``"verified"``, or ``"failed"``) for the
+            configured engagement objective, derived by the caller via
+            ``apex_host.planners.objective.objective_status_from_subgraph``.
+            Defaults to ``"pending"`` for callers that have not yet been
+            updated to compute it (never crashes; simply routes to the
+            objective phase once access exists, exactly as if no attempt
+            had been made yet).
         """
         if turn_count >= self._max_turns:
             return ApexPhase.done
@@ -191,13 +209,25 @@ class GlobalPlanner:
             if self.budget_remaining(phase_value) == 0:
                 forced_node_types.add(completion_node)
 
-        selected = self._select_phase(forced_node_types, has_web_capability=has_web_capability)
+        objective_budget_exhausted = self.budget_remaining(ApexPhase.objective.value) == 0
+
+        selected = self._select_phase(
+            forced_node_types,
+            has_web_capability=has_web_capability,
+            objective_status=objective_status,
+            objective_budget_exhausted=objective_budget_exhausted,
+        )
         if selected is ApexPhase.priv_esc and self.budget_remaining(ApexPhase.priv_esc.value) == 0:
             return ApexPhase.done
         return selected
 
     def _select_phase(
-        self, node_types_seen: set[str], *, has_web_capability: bool = True
+        self,
+        node_types_seen: set[str],
+        *,
+        has_web_capability: bool = True,
+        objective_status: str = "pending",
+        objective_budget_exhausted: bool = False,
     ) -> ApexPhase:
         """EKG-driven phase selection.
 
@@ -213,6 +243,34 @@ class GlobalPlanner:
         authenticating, so it must not skip the one phase
         (``CredentialPlanner``/``execute_agent``) capable of ever producing
         ``access_state``.
+
+        Phase 20 — an ``access_state`` node is no longer the ONLY signal
+        that gates past the credential phase.  A validated
+        ``access_capability`` node (e.g. an operator-attested direct-file-
+        read primitive, seeded at engagement startup — see
+        ``apex_host.orchestration.capability_seed``) also satisfies this
+        gate, so a DFR-only engagement (no SSH login ever attempted) can
+        still reach the objective phase once recon/web have run.  Either
+        signal alone is sufficient; neither is required if the other is
+        present.
+
+        Phase 18 — once ``access_state``/``access_capability`` exists, the
+        engagement routes toward the unresolved objective INSTEAD OF being
+        marked done.  Neither is, by itself, terminal:
+
+        - ``objective_status == "verified"``: the objective's own success
+          condition is met.  This is terminal — the engagement returns
+          ``done`` directly, WITHOUT ever routing to ``priv_esc``.  No
+          further exploitation or privilege-escalation work is dispatched
+          once the configured objective has been verified.
+        - ``objective_status`` is ``"pending"``/``"in_progress"`` AND the
+          objective phase's own turn budget is not yet exhausted: route to
+          ``objective`` — this is the actively-pursued, open goal.
+        - Otherwise (``objective_status == "failed"``, or the objective
+          phase's budget ran out without success): fall through to the
+          pre-existing ``priv_esc`` intermediate-milestone phase exactly as
+          before this phase existed, preserving the rest of the phase
+          ladder unchanged.
         """
         if "host" not in node_types_seen:
             return ApexPhase.recon
@@ -220,8 +278,12 @@ class GlobalPlanner:
             return ApexPhase.recon
         if "endpoint" not in node_types_seen and has_web_capability:
             return ApexPhase.web
-        if "access_state" not in node_types_seen:
+        if "access_state" not in node_types_seen and "access_capability" not in node_types_seen:
             return ApexPhase.credential
+        if objective_status == "verified":
+            return ApexPhase.done
+        if objective_status != "failed" and not objective_budget_exhausted:
+            return ApexPhase.objective
         if "service" in node_types_seen:
             return ApexPhase.priv_esc
         return ApexPhase.done

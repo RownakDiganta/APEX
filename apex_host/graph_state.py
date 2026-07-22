@@ -192,6 +192,28 @@ class ApexGraphState(TypedDict):
     # supplies only the point-in-time before/after deltas that cannot be
     # recovered from a single post-hoc EKG snapshot.
     learning_summary: dict[str, Any]
+    # Phase 18 — user-flag objective summary. Refreshed every objective_agent
+    # turn from a fresh EKG read (apex_host.orchestration.dispatch_node
+    # .make_objective_node); every other node simply omits these keys, so
+    # LangGraph's partial-update semantics preserve the last known snapshot
+    # (mirrors `privilege_summary`/`web_session_state`). Derived VIEW over
+    # `objective`/`objective_evidence` EKG nodes — never a second,
+    # independent store (memfabric Invariant 1), and never the plaintext
+    # flag value in any form. objective_status: an ObjectiveStatus value
+    # ("" before the first objective_agent turn, "pending" once one has
+    # run with no objective node yet). objective_summary: {objective_type,
+    # status, attempts}.
+    objective_status: str
+    objective_summary: dict[str, Any]
+    # Phase 20 — direct-file-read attempt audit log. One entry per
+    # user_flag_verify tool_result whose capability_type is a direct-file-
+    # read type (arbitrary_file_read / api_file_read), populated in
+    # write_memory (apex_host.orchestration.memory_node). Fields per entry:
+    # {capability_id, capability_type, candidate_path, connected, verified,
+    # status_code, bytes_received, truncated, error, phase}. Never the raw
+    # candidate output. Feeds apex_host/eval/report.py's Direct File Read
+    # Summary section — mirrors credential_validation_log's own convention.
+    direct_file_read_log: Annotated[list[dict[str, Any]], operator.add]
 
 
 CompiledApexGraph = Any

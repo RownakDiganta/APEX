@@ -25,12 +25,14 @@ from memfabric.types import ParsedObservation, RawObservation
 from apex_host.parsers.access_parser import AccessParser
 from apex_host.parsers.banner_parser import BannerParser
 from apex_host.parsers.browser_parser import BrowserParser
+from apex_host.parsers.capability_parser import CapabilityParser
 from apex_host.parsers.command_parser import CommandParser
 from apex_host.parsers.ffuf_parser import FfufParser
 from apex_host.parsers.gobuster_parser import GobusterParser
 from apex_host.graph_state import ApexGraphState
 from apex_host.orchestration.outcome import EngagementOutcome
 from apex_host.parsers.nmap_parser import NmapParser
+from apex_host.parsers.objective_parser import ObjectiveParser
 from apex_host.parsers.priv_esc_parser import PrivEscParser
 from apex_host.types import BrowserObservation
 
@@ -48,6 +50,8 @@ _BANNER = BannerParser()
 _BROWSER_PARSER = BrowserParser()
 _ACCESS = AccessParser()
 _PRIV_ESC = PrivEscParser()
+_OBJECTIVE = ObjectiveParser()
+_CAPABILITY = CapabilityParser()
 
 
 def _port_from_nc_args(args: list[str]) -> str:
@@ -108,15 +112,31 @@ def parse_single_result(
             default_protocol = "ssh" if tool_name == "ssh_access" else "ftp"
             protocol = str(tool_result.get("protocol", default_protocol)) or default_protocol
             operation = str(tool_result.get("operation", ""))
+            success = bool(tool_result.get("success", False))
             parsed = _ACCESS.parse_structured(
                 protocol=protocol, target=target, username=username,
-                success=bool(tool_result.get("success", False)),
+                success=success,
                 authenticated=bool(tool_result.get("authenticated", False)),
                 port=str(tool_result.get("port", "")),
                 proto=str(tool_result.get("proto", "tcp")),
                 evidence_text=str(tool_result.get("response_summary", "")),
                 proof_type=f"{protocol}_{operation}".strip("_") if operation else protocol,
             )
+            if tool_name == "ssh_access" and success:
+                # Access-capability refactor: a validated SSH login also
+                # produces a generic, transport-tagged access_capability
+                # record — the ONE thing ObjectivePlanner (and any future
+                # capability-consuming planner) ever looks for. Merged into
+                # the same ParsedObservation so both land in one
+                # apply_deltas batch.
+                cap_obs = _CAPABILITY.derive_ssh_capability(
+                    target=target, username=username, source_task_id=str(tool_result.get("task_id", "")),
+                )
+                parsed = ParsedObservation(
+                    node_deltas=[*parsed.node_deltas, *cap_obs.node_deltas],
+                    edge_deltas=[*parsed.edge_deltas, *cap_obs.edge_deltas],
+                    proposed_knowledge=[*parsed.proposed_knowledge, *cap_obs.proposed_knowledge],
+                )
             return parsed, tool_name
         parsed = _ACCESS.parse_text(
             stdout, target=target, username=username,
@@ -170,6 +190,37 @@ def parse_single_result(
             command_key=str(tool_result.get("command_key", "")),
             source_command=str(tool_result.get("source_command", "")),
             port=str(tool_result.get("port", "")),
+        )
+        return parsed, tool_name
+    if parser_name == "objective" and tool_name == "user_flag_verify":
+        # Phase 18 — bounded user-flag verification (made capability-
+        # generic in the access-capability refactor). Unlike most other
+        # tool_result branches, this is NEVER gated on
+        # tool_result.get("error") alone: a connection-level failure
+        # (nothing learned about this candidate) and a read-level failure
+        # (a real, informative negative — "no such file") must be told
+        # apart, which only ObjectiveParser.parse_user_flag_result's own
+        # "connected" gate can do (see that method's docstring).
+        #
+        # Verification itself already happened inside UserFlagExecutor
+        # (the one authoritative verify_user_flag() call site) — this
+        # parser only ever receives its already-computed, secret-free
+        # result fields (verified/value_digest/redacted_value), never the
+        # raw candidate stdout.
+        parsed = _OBJECTIVE.parse_user_flag_result(
+            target=target,
+            objective_type=str(tool_result.get("objective_type", "user_flag")),
+            candidate_path=str(tool_result.get("candidate_path", "")),
+            connected=bool(tool_result.get("connected", False)),
+            verified=bool(tool_result.get("verified", False)),
+            value_digest=str(tool_result.get("value_digest", "")),
+            redacted_value=str(tool_result.get("redacted_value", "")),
+            verification_method=str(tool_result.get("verification_method", "")),
+            capability_id=str(tool_result.get("capability_id", "")),
+            capability_type=str(tool_result.get("capability_type", "")),
+            principal=str(tool_result.get("principal", "")),
+            attempted_paths=list(tool_result.get("attempted_paths", [])),
+            is_last_candidate=bool(tool_result.get("is_last_candidate", False)),
         )
         return parsed, tool_name
     raw = RawObservation(raw=stdout, metadata={"source": tool_name, "target": target})

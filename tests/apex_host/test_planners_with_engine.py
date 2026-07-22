@@ -575,13 +575,15 @@ class TestGlobalPlannerPhaseSelection:
         )
         assert phase == ApexPhase.credential
 
-    def test_host_service_endpoint_access_state_returns_priv_esc(self) -> None:
-        """access_state (a validated login) does advance past credential."""
+    def test_host_service_endpoint_access_state_returns_objective(self) -> None:
+        """access_state (a validated login) does advance past credential —
+        Phase 18: toward the unresolved objective phase, not directly to
+        priv_esc, and never terminal on its own."""
         gp = GlobalPlanner(max_turns=20)
         phase = gp.decide_phase(
             node_types_seen={"host", "service", "endpoint", "access_state"}, turn_count=0
         )
-        assert phase == ApexPhase.priv_esc
+        assert phase == ApexPhase.objective
 
     def test_max_turns_returns_done(self) -> None:
         gp = GlobalPlanner(max_turns=5)

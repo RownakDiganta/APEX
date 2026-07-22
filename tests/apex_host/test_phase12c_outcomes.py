@@ -48,6 +48,7 @@ from apex_host.orchestration.terminal_episode import (
     terminal_state_fields,
     write_terminal_episode,
 )
+from apex_host.runtime_registry import CapabilityRuntimeRegistry
 from apex_host.tools.registry import ToolRegistry
 from apex_host.types import ApexPhase
 
@@ -131,12 +132,15 @@ def _make_initial_state(
 # ---------------------------------------------------------------------------
 
 class TestEngagementOutcomeModel:
-    def test_exactly_15_outcomes_defined(self) -> None:
-        assert len(_ALL_OUTCOMES) == 15
+    def test_exactly_16_outcomes_defined(self) -> None:
+        # Phase 18 added EngagementOutcome.user_flag_verified.
+        assert len(_ALL_OUTCOMES) == 16
 
     @pytest.mark.parametrize("outcome", _ALL_OUTCOMES)
-    def test_is_success_outcome_true_only_for_validated_access(self, outcome: EngagementOutcome) -> None:
-        expected = outcome is EngagementOutcome.validated_access
+    def test_is_success_outcome_true_only_for_user_flag_verified(self, outcome: EngagementOutcome) -> None:
+        # Phase 18: validated_access (an intermediate milestone) is no
+        # longer success on its own — only user_flag_verified is.
+        expected = outcome is EngagementOutcome.user_flag_verified
         assert is_success_outcome(outcome) is expected
 
     @pytest.mark.parametrize("outcome", _ALL_OUTCOMES)
@@ -154,7 +158,9 @@ class TestEngagementOutcomeModel:
 
     def test_exit_code_table_matches_spec(self) -> None:
         expected = {
-            EngagementOutcome.validated_access: 0,
+            EngagementOutcome.user_flag_verified: 0,
+            # Phase 18: access alone is access-only exhaustion, not success.
+            EngagementOutcome.validated_access: 1,
             EngagementOutcome.goal_completed: 0,
             EngagementOutcome.max_turns_exhausted: 1,
             EngagementOutcome.phase_budget_exhausted: 1,
@@ -173,10 +179,10 @@ class TestEngagementOutcomeModel:
         for outcome, code in expected.items():
             assert exit_code_for(outcome) == code, outcome
 
-    def test_only_validated_access_maps_to_legacy_success(self) -> None:
+    def test_only_user_flag_verified_maps_to_legacy_success(self) -> None:
         for outcome in _ALL_OUTCOMES:
             status = legacy_status_for(outcome)
-            if outcome is EngagementOutcome.validated_access:
+            if outcome is EngagementOutcome.user_flag_verified:
                 assert status == "success"
             else:
                 assert status != "success"
@@ -188,6 +194,7 @@ class TestEngagementOutcomeModel:
         # EngagementOutcome(str, Enum) — .value round-trips through JSON.
         assert EngagementOutcome("validated_access") is EngagementOutcome.validated_access
         assert EngagementOutcome.validated_access.value == "validated_access"
+        assert EngagementOutcome("user_flag_verified") is EngagementOutcome.user_flag_verified
 
 
 # ---------------------------------------------------------------------------
@@ -195,36 +202,52 @@ class TestEngagementOutcomeModel:
 # ---------------------------------------------------------------------------
 
 class TestEvaluateTerminationPrecedence:
-    def test_validated_access_wins_unconditionally(self) -> None:
+    def test_objective_verified_wins_unconditionally(self) -> None:
         decision = evaluate_termination(
-            max_turns=5, turn_count=1, has_access_state=True,
+            max_turns=5, turn_count=1, objective_verified=True,
             next_phase="recon", current_phase="recon", stall=_no_stall(),
         )
         assert decision.terminate is True
-        assert decision.outcome is EngagementOutcome.validated_access
+        assert decision.outcome is EngagementOutcome.user_flag_verified
         assert decision.success is True
 
-    def test_validated_access_wins_even_on_last_allowed_turn(self) -> None:
-        # A credential validated on the very last allowed turn is still
+    def test_objective_verified_wins_even_on_last_allowed_turn(self) -> None:
+        # An objective verified on the very last allowed turn is still
         # success, never max_turns_exhausted.
         decision = evaluate_termination(
-            max_turns=3, turn_count=3, has_access_state=True,
-            next_phase="done", current_phase="priv_esc", stall=_no_stall(),
+            max_turns=3, turn_count=3, objective_verified=True,
+            next_phase="done", current_phase="objective", stall=_no_stall(),
         )
-        assert decision.outcome is EngagementOutcome.validated_access
+        assert decision.outcome is EngagementOutcome.user_flag_verified
         assert decision.success is True
 
-    def test_validated_access_wins_even_when_stalled(self) -> None:
+    def test_objective_verified_wins_even_when_stalled(self) -> None:
         stall = StallDecision(True, EngagementOutcome.duplicate_task_stall, "stalled")
         decision = evaluate_termination(
-            max_turns=20, turn_count=5, has_access_state=True,
+            max_turns=20, turn_count=5, objective_verified=True,
             next_phase="recon", current_phase="recon", stall=stall,
         )
-        assert decision.outcome is EngagementOutcome.validated_access
+        assert decision.outcome is EngagementOutcome.user_flag_verified
+
+    def test_validated_access_alone_is_not_success(self) -> None:
+        """Phase 18 — evaluate_termination() has no `has_access_state`
+        parameter at all anymore: a validated access_state must never be
+        passed as `objective_verified`. This test proves that a caller
+        supplying objective_verified=False (correct — access alone is not
+        the objective) never produces a success outcome, even when other
+        inputs superficially resemble the old "credential just validated"
+        scenario."""
+        decision = evaluate_termination(
+            max_turns=20, turn_count=1, objective_verified=False,
+            next_phase="objective", current_phase="credential", stall=_no_stall(),
+        )
+        assert decision.success is False
+        assert decision.outcome is not EngagementOutcome.user_flag_verified
+        assert decision.terminate is False  # "objective" is not "done" and no stall fired
 
     def test_done_at_max_turns_is_max_turns_exhausted(self) -> None:
         decision = evaluate_termination(
-            max_turns=5, turn_count=5, has_access_state=False,
+            max_turns=5, turn_count=5, objective_verified=False,
             next_phase="done", current_phase="web", stall=_no_stall(),
         )
         assert decision.outcome is EngagementOutcome.max_turns_exhausted
@@ -232,7 +255,7 @@ class TestEvaluateTerminationPrecedence:
 
     def test_done_from_priv_esc_before_max_turns_is_phase_budget_exhausted(self) -> None:
         decision = evaluate_termination(
-            max_turns=20, turn_count=8, has_access_state=False,
+            max_turns=20, turn_count=8, objective_verified=False,
             next_phase="done", current_phase="priv_esc", stall=_no_stall(),
         )
         assert decision.outcome is EngagementOutcome.phase_budget_exhausted
@@ -240,7 +263,7 @@ class TestEvaluateTerminationPrecedence:
 
     def test_done_from_non_priv_esc_before_max_turns_is_goal_completed(self) -> None:
         decision = evaluate_termination(
-            max_turns=20, turn_count=8, has_access_state=False,
+            max_turns=20, turn_count=8, objective_verified=False,
             next_phase="done", current_phase="web", stall=_no_stall(),
         )
         assert decision.outcome is EngagementOutcome.goal_completed
@@ -249,7 +272,7 @@ class TestEvaluateTerminationPrecedence:
     def test_stall_decision_propagates_when_not_done(self) -> None:
         stall = StallDecision(True, EngagementOutcome.no_actionable_task, "3 no-op turns")
         decision = evaluate_termination(
-            max_turns=20, turn_count=4, has_access_state=False,
+            max_turns=20, turn_count=4, objective_verified=False,
             next_phase="credential", current_phase="credential", stall=stall,
         )
         assert decision.outcome is EngagementOutcome.no_actionable_task
@@ -258,14 +281,14 @@ class TestEvaluateTerminationPrecedence:
 
     def test_max_turns_fallback_when_not_done_and_not_stalled(self) -> None:
         decision = evaluate_termination(
-            max_turns=3, turn_count=3, has_access_state=False,
+            max_turns=3, turn_count=3, objective_verified=False,
             next_phase="recon", current_phase="recon", stall=_no_stall(),
         )
         assert decision.outcome is EngagementOutcome.max_turns_exhausted
 
     def test_no_termination_when_nothing_applies(self) -> None:
         decision = evaluate_termination(
-            max_turns=20, turn_count=2, has_access_state=False,
+            max_turns=20, turn_count=2, objective_verified=False,
             next_phase="web", current_phase="recon", stall=_no_stall(),
         )
         assert decision.terminate is False
@@ -278,14 +301,14 @@ class TestEvaluateTerminationPrecedence:
         # when done fires — done is checked before stall in the evaluator).
         stall = StallDecision(True, EngagementOutcome.policy_blocked, "policy stall")
         decision = evaluate_termination(
-            max_turns=20, turn_count=5, has_access_state=False,
+            max_turns=20, turn_count=5, objective_verified=False,
             next_phase="done", current_phase="web", stall=stall,
         )
         assert decision.outcome is EngagementOutcome.goal_completed
 
     def test_reason_and_phase_and_turn_populated(self) -> None:
         decision = evaluate_termination(
-            max_turns=5, turn_count=5, has_access_state=False,
+            max_turns=5, turn_count=5, objective_verified=False,
             next_phase="recon", current_phase="recon", stall=_no_stall(),
         )
         assert decision.reason
@@ -509,18 +532,18 @@ class TestStallTracker:
 class TestTerminalEpisode:
     def test_build_terminal_episode_shape_success(self) -> None:
         decision = TerminationDecision(
-            terminate=True, outcome=EngagementOutcome.validated_access,
-            success=True, reason="access_state present", phase="priv_esc", turn=4,
+            terminate=True, outcome=EngagementOutcome.user_flag_verified,
+            success=True, reason="objective verified", phase="objective", turn=4,
         )
         episode = build_terminal_episode(decision, run_id="run-x")
         assert episode.agent == "apex.orchestration"
         assert episode.action == "engagement_terminated"
         assert episode.outcome is Outcome.success
-        assert episode.data["outcome"] == "validated_access"
+        assert episode.data["outcome"] == "user_flag_verified"
         assert episode.data["success"] is True
         assert episode.data["run_id"] == "run-x"
         assert episode.task_id is None
-        assert episode.phase == "priv_esc"
+        assert episode.phase == "objective"
 
     def test_build_terminal_episode_shape_failure(self) -> None:
         decision = TerminationDecision(
@@ -632,6 +655,7 @@ def _build_deps(
         api=api, dispatcher=dispatcher, global_planner=GlobalPlanner(max_turns=config.max_turns),
         phase_planners=planners, repair_engine=RepairEngine(model_router=None, allowed_tools=config.allowed_tools, dry_run=True),
         config=config, anchor_id=f"host:{config.target}", stall_tracker=StallTracker(),
+        capability_registry=CapabilityRuntimeRegistry(),
     )
 
 
@@ -873,7 +897,15 @@ class TestContinuationNodeIntegration:
         terminal_entries = [e for e in all_episodes if e.action == "engagement_terminated"]
         assert len(terminal_entries) == 1
 
-    async def test_validated_access_full_graph(self) -> None:
+    async def test_access_state_alone_does_not_terminate_as_success(self) -> None:
+        """Phase 18 — a validated access_state (seeded directly, matching
+        what the credential phase's own parser produces) is an important
+        intermediate milestone but must never, by itself, terminate the
+        engagement as success. With no ssh-protocol access_state and no
+        credentials configured, ObjectivePlanner can never emit a task, so
+        the engagement eventually stalls (no_actionable_task) rather than
+        looping forever or fabricating success — proving the mandate
+        end-to-end through the real compiled graph."""
         from apex_host.graph import build_apex_graph
 
         api = _make_api()
@@ -890,9 +922,13 @@ class TestContinuationNodeIntegration:
         graph = build_apex_graph(api, registry, config)
         final_state = await graph.ainvoke(_make_initial_state(target=target))
 
-        assert final_state["outcome"] == EngagementOutcome.validated_access.value
-        assert final_state["turn_count"] == 1
+        assert final_state["outcome"] != EngagementOutcome.user_flag_verified.value
+        assert final_state["outcome"] != EngagementOutcome.validated_access.value
         assert final_state["completed"] is True
+        # Must NOT terminate on the very first turn the way pre-Phase-18
+        # code did — the engagement genuinely continues toward the
+        # objective phase before eventually stalling.
+        assert final_state["turn_count"] > 1
 
     async def test_planner_failure_full_graph_via_monkeypatched_planner(self) -> None:
         from apex_host.orchestration import builder as builder_mod
@@ -953,16 +989,29 @@ class TestReportOutcomeIntegration:
         assert report.status == "stopped_max_turns"
         assert report.completed_successfully is False
 
-    def test_report_success_only_when_validated_access(self) -> None:
+    def test_report_success_only_when_user_flag_verified(self) -> None:
         state = _make_initial_state()
         state["completed"] = True
-        state["outcome"] = EngagementOutcome.validated_access.value
-        state["termination_phase"] = "priv_esc"
+        state["outcome"] = EngagementOutcome.user_flag_verified.value
+        state["termination_phase"] = "objective"
         config = _make_config()
         report = build_report(state, _empty_subgraph(), config)
         assert report.success is True
         assert report.completed_successfully is True
         assert report.status == "success"
+
+    def test_report_validated_access_alone_is_not_success(self) -> None:
+        # Phase 18 — a validated access_state is an intermediate milestone,
+        # never independently success.
+        state = _make_initial_state()
+        state["completed"] = True
+        state["outcome"] = EngagementOutcome.validated_access.value
+        state["termination_phase"] = "objective"
+        config = _make_config()
+        report = build_report(state, _empty_subgraph(), config)
+        assert report.success is False
+        assert report.completed_successfully is False
+        assert report.status != "success"
 
     def test_stall_reason_populated_only_for_stall_outcomes(self) -> None:
         state = _make_initial_state()
@@ -992,12 +1041,21 @@ class TestReportOutcomeIntegration:
     def test_outcome_headline_success(self) -> None:
         state = _make_initial_state()
         state["completed"] = True
-        state["outcome"] = EngagementOutcome.validated_access.value
+        state["outcome"] = EngagementOutcome.user_flag_verified.value
         config = _make_config()
         report = build_report(state, _empty_subgraph(), config)
         headline = outcome_headline(report)
         assert headline.startswith("SUCCESS")
-        assert "access" in headline
+        assert "flag" in headline
+
+    def test_outcome_headline_validated_access_is_not_success(self) -> None:
+        state = _make_initial_state()
+        state["completed"] = True
+        state["outcome"] = EngagementOutcome.validated_access.value
+        config = _make_config()
+        report = build_report(state, _empty_subgraph(), config)
+        headline = outcome_headline(report)
+        assert not headline.startswith("SUCCESS")
 
     def test_outcome_headline_stopped_max_turns(self) -> None:
         state = _make_initial_state()
@@ -1071,24 +1129,25 @@ class TestReportOutcomeIntegration:
 
 
 # ---------------------------------------------------------------------------
-# 11. No success without access_state — cross-cutting invariant
+# 11. No success without a verified objective — cross-cutting invariant
+#     (Phase 18 — a validated access_state alone is never sufficient)
 # ---------------------------------------------------------------------------
 
 class TestNoSuccessWithoutAccessState:
-    def test_evaluate_termination_success_requires_has_access_state_true(self) -> None:
-        for has_access in (True, False):
+    def test_evaluate_termination_success_requires_objective_verified_true(self) -> None:
+        for verified in (True, False):
             decision = evaluate_termination(
-                max_turns=20, turn_count=5, has_access_state=has_access,
+                max_turns=20, turn_count=5, objective_verified=verified,
                 next_phase="done", current_phase="web", stall=_no_stall(),
             )
-            if has_access:
+            if verified:
                 assert decision.success is True
-                assert decision.outcome is EngagementOutcome.validated_access
+                assert decision.outcome is EngagementOutcome.user_flag_verified
             else:
                 assert decision.success is False
-                assert decision.outcome is not EngagementOutcome.validated_access
+                assert decision.outcome is not EngagementOutcome.user_flag_verified
 
-    @pytest.mark.parametrize("outcome", [o for o in _ALL_OUTCOMES if o is not EngagementOutcome.validated_access])
+    @pytest.mark.parametrize("outcome", [o for o in _ALL_OUTCOMES if o is not EngagementOutcome.user_flag_verified])
     def test_no_other_outcome_is_ever_success(self, outcome: EngagementOutcome) -> None:
         assert is_success_outcome(outcome) is False
 
@@ -1136,7 +1195,8 @@ class TestRunHtbLocalExitCodes:
     @pytest.mark.parametrize(
         "outcome,expected_code",
         [
-            (EngagementOutcome.validated_access, 0),
+            (EngagementOutcome.user_flag_verified, 0),
+            (EngagementOutcome.validated_access, 1),
             (EngagementOutcome.max_turns_exhausted, 1),
             (EngagementOutcome.no_actionable_task, 1),
             (EngagementOutcome.policy_blocked, 3),
@@ -1219,7 +1279,7 @@ class TestMainExitCodes:
 
         state = _make_initial_state()
         state["completed"] = True
-        state["outcome"] = EngagementOutcome.validated_access.value
+        state["outcome"] = EngagementOutcome.user_flag_verified.value
 
         class _FakeRuntime:
             async def seed_all(self) -> dict[str, Any]:

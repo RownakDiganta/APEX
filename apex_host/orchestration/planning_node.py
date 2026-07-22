@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from apex_host.graph_state import ApexGraphState
 from apex_host.planners.capabilities import capabilities_from_subgraph
+from apex_host.planners.objective import objective_status_from_subgraph
 from apex_host.types import ApexPhase
 
 if TYPE_CHECKING:
@@ -30,12 +31,16 @@ def make_global_plan_node(
         node_types_seen = {n.type for n in subgraph.nodes}
         caps = capabilities_from_subgraph(subgraph)
         has_web = any(c.name == "web_probe" for c in caps)
+        objective_status = objective_status_from_subgraph(
+            subgraph, deps.config.target, deps.config.objective_type
+        )
 
         phase = deps.global_planner.decide_phase(
             node_types_seen=node_types_seen,
             turn_count=state["turn_count"],
             current_phase=state.get("phase"),
             has_web_capability=has_web,
+            objective_status=objective_status,
         )
         if phase != ApexPhase.done:
             deps.global_planner.record_turn(phase)

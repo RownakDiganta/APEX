@@ -36,6 +36,7 @@ from apex_host.knowledge.seed_loader import (
     seed_compiled_knowledge_full,
     seed_payload_repo,
 )
+from apex_host.orchestration.capability_seed import seed_direct_file_read_capability
 from apex_host.planning.budget import LLMBudgetTracker
 from apex_host.tools.backend import select_runtime_backend
 from apex_host.tools.registry import ToolRegistry
@@ -176,6 +177,19 @@ class ApexRuntime:
         # through ApexRuntime.
         tool_backend = select_runtime_backend(self.config)
 
+        # Phase 20 — one-time, startup-only, zero-network derivation of an
+        # operator-attested direct-file-read access_capability (see
+        # apex_host/orchestration/capability_seed.py's module docstring for
+        # why this must happen BEFORE the graph runs: a DFR-only engagement,
+        # with no SSH access ever attempted, must still be able to reach the
+        # objective phase). A failure here is logged and never blocks the
+        # engagement — the run proceeds exactly as it would have if no
+        # direct-file-read primitive were configured at all.
+        try:
+            await seed_direct_file_read_capability(self.api, self.config)
+        except Exception as exc:
+            logger.warning("seed_direct_file_read_capability failed (non-fatal): %s", exc)
+
         graph = build_apex_graph(
             self.api, self.registry, self.config,
             model_router=model_router,
@@ -218,6 +232,9 @@ class ApexRuntime:
             "workflow_summary": {},
             "learning_summary": {},
             "task_latency_log": [],
+            "objective_status": "",
+            "objective_summary": {},
+            "direct_file_read_log": [],
         }
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": run_id},

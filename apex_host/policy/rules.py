@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 
 from apex_host.planners.priv_esc_opportunities import ENUM_COMMANDS as _ENUM_COMMANDS
 from apex_host.policy.models import PolicyDecision, PolicyStatus
+from apex_host.verification.user_flag import is_bounded_candidate_path
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -118,6 +119,11 @@ _PRIV_ESC_PLANNING_TOOLS: frozenset[str] = frozenset({
 # PrivEscEnumExecutor's own identical allowlist (both are sourced from the
 # same table in apex_host/planners/priv_esc_opportunities.py::ENUM_COMMANDS).
 _PRIV_ESC_ENUM_COMMAND_KEYS: frozenset[str] = frozenset(_ENUM_COMMANDS)
+
+# Phase 18 — bounded user-flag-objective verification tasks. Routed by
+# TaskDispatcher to UserFlagExecutor exactly like the other specialised
+# executors above — never through the generic run_command_fn path.
+_USER_FLAG_VERIFICATION_TOOLS: frozenset[str] = frozenset({"user_flag_verify"})
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +443,75 @@ def check_bounded_priv_esc_enumeration(
     )
 
 
+def check_bounded_user_flag_verification(
+    task: "TaskSpec",
+    policy: "ScopePolicy",
+    config: "ApexConfig",
+) -> PolicyDecision | None:
+    """Explicit approval (or a defense-in-depth block) for bounded
+    user-flag-objective verification tasks (Phase 18: ``user_flag_verify``).
+
+    Mirrors ``check_bounded_priv_esc_enumeration`` exactly: this rule adds
+    one verification-specific check on top of every already-applicable
+    blocking rule above (scope, attacking-infrastructure, password-list,
+    sensitive-data all already apply unmodified, since these tasks carry
+    the same ``target``/``args`` params any other task does). The requested
+    ``candidate_path`` must pass
+    ``apex_host.verification.user_flag.is_bounded_candidate_path`` — the
+    SAME function ``UserFlagExecutor`` itself checks before ever opening a
+    connection (defense in depth, not a replacement for that check). This
+    rule cannot make an unsafe planner safe: it only classifies tasks
+    ``ObjectivePlanner`` already produced under its own one-bounded-
+    candidate-per-turn invariant (see
+    ``apex_host/planners/objective_planner.py``).
+
+    Phase 20 — no changes were needed to support the direct-file-read
+    capability. This rule was already fully transport-independent: it
+    inspects only ``task.params["target"]``/``["candidate_path"]``, both of
+    which are present in a ``user_flag_verify`` task regardless of whether
+    ``ObjectivePlanner`` selected an SSH or a direct-file-read capability
+    (neither ``capability_id``/``capability_type``/``principal`` nor any
+    HTTP-specific field ever needs to reach this rule — the request SHAPE
+    itself, unlike the candidate path, is never task-controlled at all; see
+    ``apex_host/runtime_registry.py::DirectFileReadPrimitive``). A blocked
+    task never reaches ``UserFlagExecutor``, and therefore never reaches the
+    adapter, regardless of which transport it would have used.
+    """
+    tool = str(task.params.get("tool", "")).strip().lower()
+    if tool not in _USER_FLAG_VERIFICATION_TOOLS:
+        return None
+
+    raw_target = str(task.params.get("target", "")).strip()
+    if raw_target not in policy.allowed_targets:
+        return None  # fall through; check_target_in_scope already blocked this
+
+    candidate_path = str(task.params.get("candidate_path", "")).strip()
+    allowed_filenames = frozenset(getattr(config, "user_flag_candidate_filenames", None) or [])
+
+    if not is_bounded_candidate_path(candidate_path, allowed_filenames=allowed_filenames):
+        return PolicyDecision(
+            status=PolicyStatus.blocked,
+            rule_name="bounded_user_flag_verification",
+            reason=(
+                f"user_flag_verify requested candidate_path {candidate_path!r} "
+                "which fails bounded-path validation"
+            ),
+            task_tool=tool,
+            task_target=raw_target,
+        )
+
+    return PolicyDecision(
+        status=PolicyStatus.approved,
+        rule_name="bounded_user_flag_verification",
+        reason=(
+            f"tool {tool!r} is a bounded, read-only user-flag verification task "
+            f"against assigned target {raw_target!r}"
+        ),
+        task_tool=tool,
+        task_target=raw_target,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Ordered rule registry used by PolicyAdvisor
 # ---------------------------------------------------------------------------
@@ -453,4 +528,5 @@ ALL_RULES: tuple[_RuleFn, ...] = (
     check_safe_recon_allowed,
     check_bounded_credential_validation,
     check_bounded_priv_esc_enumeration,
+    check_bounded_user_flag_verification,
 )

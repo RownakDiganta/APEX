@@ -77,6 +77,11 @@ _EVIDENCE_NODE_TYPES: frozenset[str] = frozenset({
     "web_opportunity",
     "workflow_recommendation",
     "experience", "experience_recommendation",
+    # Phase 18 — objective_evidence is a concrete, human-actionable
+    # observation (the digest/redacted-form proof an objective was
+    # verified); the coordination-only `objective` node itself is
+    # deliberately excluded, mirroring `workflow`/`session`'s exclusion.
+    "objective_evidence",
 })
 
 
