@@ -492,3 +492,95 @@ def experience_recommendation_id(experience_node_id: str) -> str:
     'experience_recommendation:experience:10.10.10.14:successful_workflow:credential_to_privesc'
     """
     return f"experience_recommendation:{experience_node_id}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 18 — user-flag objective and verification node/edge IDs
+#
+# One new edge type is genuinely new here: `enables` (access_state ->
+# objective) and `satisfied_by` (objective -> objective_evidence), matching
+# the generic `access_state --enables--> objective --satisfied_by-->
+# objective_evidence` shape in docs/user-flag-objective.md. The
+# host-reachability edge reuses `indicates_edge_id` (host -> objective) —
+# the same "don't fragment the graph" discipline Phase 14/15/16 already
+# established for their own `*_opportunity`/`workflow`/`experience` nodes.
+# ---------------------------------------------------------------------------
+
+def objective_id(target: str, objective_type: str) -> str:
+    """Canonical ID for an objective node (Phase 18).
+
+    Content-addressed on ``target``+``objective_type`` only (never on
+    status/attempted_paths) — re-deriving the same objective across turns
+    always upserts the same node, exactly one per target+objective_type.
+
+    >>> objective_id("10.10.10.14", "user_flag")
+    'objective:10.10.10.14:user_flag'
+    """
+    return f"objective:{target}:{objective_type}"
+
+
+def objective_evidence_id(target: str, objective_type: str, discriminator: str) -> str:
+    """Canonical ID for an objective_evidence node (Phase 18).
+
+    ``discriminator`` is the candidate source path that produced the
+    verified evidence (slugged, never the flag value itself) — so a
+    different successful path would produce a distinct node, while
+    re-verifying the SAME path always upserts the same node.
+
+    >>> objective_evidence_id("10.10.10.14", "user_flag", "/home/user/user.txt")
+    'objective_evidence:10.10.10.14:user_flag:home-user-user-txt'
+    """
+    return f"objective_evidence:{target}:{objective_type}:{_slug(discriminator)}"
+
+
+def enables_edge_id(from_node_id: str, to_node_id: str) -> str:
+    """Canonical ID for an 'enables' edge (access_state -> objective, Phase 18).
+
+    >>> enables_edge_id("access_state:10.0.0.1:root:ssh", "objective:10.0.0.1:user_flag")
+    'enables:access_state:10.0.0.1:root:ssh:objective:10.0.0.1:user_flag'
+    """
+    return f"enables:{from_node_id}:{to_node_id}"
+
+
+def satisfied_by_edge_id(from_node_id: str, to_node_id: str) -> str:
+    """Canonical ID for a 'satisfied_by' edge (objective -> objective_evidence, Phase 18).
+
+    >>> satisfied_by_edge_id("objective:10.0.0.1:user_flag", "objective_evidence:10.0.0.1:user_flag:x")
+    'satisfied_by:objective:10.0.0.1:user_flag:objective_evidence:10.0.0.1:user_flag:x'
+    """
+    return f"satisfied_by:{from_node_id}:{to_node_id}"
+
+
+# ---------------------------------------------------------------------------
+# Access-capability abstraction node/edge IDs (capability refactor)
+#
+# Reuses `enables_edge_id` (already generic) for access_state -> access_capability
+# AND for access_capability -> objective — "enables" now describes the whole
+# chain (access_state enables the capability; the capability enables the
+# objective), consistent with the "don't fragment the graph" discipline this
+# project already applies to every other edge type. `has_capability` is the
+# one genuinely new edge type: host -> access_capability, for the same
+# host-reachability reason `indicates` exists for host -> objective/opportunity/
+# workflow/experience nodes elsewhere in this codebase.
+# ---------------------------------------------------------------------------
+
+def access_capability_id(target: str, capability_type: str, principal: str) -> str:
+    """Canonical ID for an access_capability node.
+
+    Content-addressed on ``target``+``capability_type``+``principal`` —
+    re-deriving the same proven capability always upserts the same node,
+    never a duplicate.
+
+    >>> access_capability_id("10.10.10.14", "ssh_command", "root")
+    'access_capability:10.10.10.14:ssh_command:root'
+    """
+    return f"access_capability:{target}:{capability_type}:{_slug(principal)}"
+
+
+def has_capability_edge_id(from_node_id: str, to_node_id: str) -> str:
+    """Canonical ID for a 'has_capability' edge (host -> access_capability).
+
+    >>> has_capability_edge_id("host:10.0.0.1", "access_capability:10.0.0.1:ssh_command:root")
+    'has_capability:host:10.0.0.1:access_capability:10.0.0.1:ssh_command:root'
+    """
+    return f"has_capability:{from_node_id}:{to_node_id}"

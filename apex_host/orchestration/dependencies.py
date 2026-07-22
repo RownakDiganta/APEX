@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from apex_host.planning.repair import RepairEngine
     from apex_host.planners.global_planner import GlobalPlanner
     from apex_host.policy.llm_guard import LLMPolicyGuard
+    from apex_host.runtime_registry import CapabilityRuntimeRegistry
     from apex_host.tools.registry import ToolRegistry
     from memfabric.api import MemoryAPI
     from memfabric.coordination.protocols import Planner
@@ -48,6 +49,14 @@ class OrchestrationDeps:
     # ApexGraphState (mirrors GlobalPlanner's own _spent budget counters —
     # see apex_host/orchestration/stall.py's module docstring).
     stall_tracker: "StallTracker"
+    # Access-capability refactor — runtime-only (never EKG-persisted) map
+    # of capability_id -> adapter, one instance per engagement. Populated
+    # by make_objective_node immediately before each objective turn from
+    # whatever validated AccessCapability records the live EKG currently
+    # has (see apex_host/runtime_registry.py's module docstring). Never a
+    # planner concern (memfabric Invariant 7 — planners stay pure over
+    # subgraph/evidence data only).
+    capability_registry: "CapabilityRuntimeRegistry"
 
 
 def build_planners(
@@ -69,6 +78,7 @@ def build_planners(
     """
     from apex_host.planners.browser_planner import BrowserPlanner
     from apex_host.planners.credential_planner import CredentialPlanner
+    from apex_host.planners.objective_planner import ObjectivePlanner
     from apex_host.planners.priv_esc_planner import PrivEscPlanner
     from apex_host.planners.recon_planner import ReconPlanner
     from apex_host.planners.web_planner import WebPlanner
@@ -114,5 +124,10 @@ def build_planners(
             password_candidates=config.password_candidates,
             **_kwargs(),
         ),
+        # Phase 18 — no LLM seam by design (see ObjectivePlanner's own
+        # docstring); config is passed directly rather than through
+        # _kwargs() since this planner's constructor shape intentionally
+        # differs from the LLM-capable planners above.
+        ApexPhase.objective.value: ObjectivePlanner(config.target, registry, config=config),
         "browser": BrowserPlanner(config.target, registry, **_kwargs()),
     }

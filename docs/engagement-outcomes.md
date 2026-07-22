@@ -4,6 +4,33 @@
 termination evaluator, bounded stall detection, the exactly-one
 terminal-episode guarantee, `RunReport` fields, and CLI exit codes.
 
+> **Phase 18 update (user-flag objective and verification):** the success
+> definition documented in this file has been redefined. Before Phase 18,
+> `EngagementOutcome.validated_access` (a validated `access_state` node in
+> the EKG) was the sole success outcome. As of Phase 18,
+> `EngagementOutcome.user_flag_verified` is the sole success outcome —
+> `validated_access` is now classified as an intermediate-milestone,
+> non-success outcome (exit code changed from `0` to `1`; legacy status
+> changed from `"success"` to `"abandoned"`). This file has been updated in
+> place to describe the current, correct behavior rather than kept as a
+> stale historical record, since it is a living design document (unlike
+> CLAUDE.md's append-only correction convention for certain sections). Full
+> design: [`docs/user-flag-objective.md`](user-flag-objective.md).
+
+> **Phase 20 update (direct file read capability):** `GlobalPlanner`'s
+> credential-phase gate previously required a validated `access_state`
+> node before the engagement could ever reach the `objective` phase. It
+> now also accepts a validated `access_capability` node (§3's
+> `objective_verified`/success-outcome model itself is unchanged — this is
+> purely a *reachability* fix, not a new success condition): a
+> direct-file-read engagement, where no credential-based login is ever
+> attempted, can now reach the objective phase and terminate as
+> `user_flag_verified` exactly like an SSH-based engagement can.
+> `EngagementOutcome.user_flag_verified` remains the ONLY success outcome
+> and the only exit-code-0 outcome; `validated_access` remains an
+> intermediate milestone regardless of which access mechanism produced it.
+> Full design: [`docs/user-flag-objective.md`](user-flag-objective.md) §17.
+
 ## 1. Why this exists
 
 Before Phase 12C, an APEX engagement could stop for many different reasons —
@@ -26,29 +53,35 @@ never computed independently.
 ## 2. The outcome model
 
 `EngagementOutcome` (`apex_host/orchestration/outcome.py`) is a `str, Enum`
-— fifteen members, split into four families:
+— sixteen members (Phase 18 added `user_flag_verified`), split into five
+families:
 
 | Family | Members |
 |---|---|
-| Success | `validated_access` |
+| Success | `user_flag_verified` |
+| Intermediate milestone (never success) | `validated_access` |
 | Organic / resource exhaustion | `goal_completed`, `max_turns_exhausted`, `phase_budget_exhausted` |
 | Stall-detector | `no_actionable_task`, `duplicate_task_stall`, `policy_blocked` |
 | Hard failure | `planner_failure`, `parser_failure`, `tool_failure`, `memory_failure`, `unknown_phase` |
 | Outside-the-graph | `cancelled`, `configuration_failure`, `internal_error` |
 
-### Success definition (non-negotiable)
+### Success definition (non-negotiable) — redefined by Phase 18
 
 ```python
 def is_success_outcome(outcome: EngagementOutcome) -> bool:
-    return outcome is EngagementOutcome.validated_access
+    return outcome is EngagementOutcome.user_flag_verified
 ```
 
-Exactly one outcome ever means success. `goal_completed` — an organic,
-non-error completion of the phase ladder without a validated credential — is
-explicitly **not** success. This is the same invariant the pre-Phase-12C
-code already enforced ("success must continue to mean a validated
-`access_state` node exists in the EKG"); Phase 12C only gives it one
-authoritative implementation instead of several ad-hoc checks.
+Exactly one outcome ever means success: `EngagementOutcome.user_flag_verified`
+(the configured engagement objective — default `"user_flag"` — has been
+retrieved and cryptographically confirmed by the one authoritative verifier,
+`apex_host.verification.user_flag.verify_user_flag()`). Neither
+`goal_completed` (an organic, non-error completion of the phase ladder) nor
+`validated_access` (a validated `access_state` node — an important
+intermediate milestone) is ever success on its own. See
+[`docs/user-flag-objective.md`](user-flag-objective.md) for the full design
+of the objective model, EKG representation, and verification mechanism this
+depends on.
 
 ## 3. Termination evaluator (`evaluate_termination`)
 
@@ -61,10 +94,15 @@ termination reason is decided.
 
 ### Precedence (highest first)
 
-1. **`validated_access`** — an `access_state` node exists in the live EKG.
-   Checked first, unconditionally, so a credential validated on the very
-   last allowed turn is still reported as success, never as an exhaustion
-   outcome.
+1. **`user_flag_verified`** (Phase 18) — the configured objective's
+   `objective` EKG node has `status == "verified"` (see
+   `apex_host.planners.objective.objective_status_from_subgraph`). Checked
+   first, unconditionally, so an objective verified on the very last
+   allowed turn is still reported as success, never as an exhaustion
+   outcome. A validated `access_state` alone never satisfies this
+   condition — `evaluate_termination()`'s parameter for this check is
+   `objective_verified: bool`, not `has_access_state: bool` (renamed by
+   Phase 18; see `docs/user-flag-objective.md` §9).
 2. **An upstream node already produced a definitive terminal outcome this
    turn** — `dispatch_node.py`, `parsing_node.py`, or `memory_node.py`
    caught an exception and set `state["outcome"]` to `planner_failure`,
@@ -272,25 +310,26 @@ classifies identically.
 ```
 ════════════════════════════════════════════════════════════
  APEX HTB Engagement Report
- Target : 10.10.10.14   Mode : dry-run
+ Target : 10.10.10.14   Mode : live
  Status : SUCCESS   Successful : Yes
- Outcome: SUCCESS — validated ssh access
+ Outcome: SUCCESS — user flag verified
  Turns  : 4   Final phase : done   Completed : Yes
 ════════════════════════════════════════════════════════════
 
 Engagement Outcome
-  Outcome           : validated_access
-  Termination phase : priv_esc
+  Outcome           : user_flag_verified
+  Termination phase : objective
   Termination turn  : 4
-  Reason            : access_state present in the EKG — credential validated
+  Reason            : configured objective verified — evidence recorded in the EKG
   Access validated  : protocol=ssh username=root
 ```
 
-Representative headlines (`outcome_headline()`):
+Representative headlines (`outcome_headline()`) — updated by Phase 18:
 
 | Outcome | Headline |
 |---|---|
-| `validated_access` | `SUCCESS — validated {protocol} access` |
+| `user_flag_verified` | `SUCCESS — user flag verified` |
+| `validated_access` | `PARTIAL — validated {protocol} access — objective not verified` |
 | `max_turns_exhausted` | `STOPPED — maximum turns exhausted` |
 | `no_actionable_task` | `STOPPED — no actionable task remained` |
 | `phase_budget_exhausted` | `STOPPED — phase budget exhausted` |
@@ -312,11 +351,11 @@ Representative headlines (`outcome_headline()`):
 ```json
 {
   "engagement_outcome": {
-    "outcome": "validated_access",
+    "outcome": "user_flag_verified",
     "success": true,
-    "headline": "SUCCESS — validated ssh access",
-    "termination_reason": "access_state present in the EKG — credential validated",
-    "termination_phase": "priv_esc",
+    "headline": "SUCCESS — user flag verified",
+    "termination_reason": "configured objective verified — evidence recorded in the EKG",
+    "termination_phase": "objective",
     "termination_turn": 4,
     "stall_reason": "",
     "no_action_count": 1,
@@ -332,8 +371,8 @@ deterministic process exit code derived from `exit_code_for()`:
 
 | Code | Meaning | Outcomes |
 |---|---|---|
-| `0` | Success | `validated_access`, `goal_completed` |
-| `1` | Exhausted / stalled | `max_turns_exhausted`, `phase_budget_exhausted`, `no_actionable_task`, `duplicate_task_stall` |
+| `0` | Success | `user_flag_verified`, `goal_completed` |
+| `1` | Exhausted / stalled / access-only | `validated_access` (Phase 18 — access alone, objective never verified), `max_turns_exhausted`, `phase_budget_exhausted`, `no_actionable_task`, `duplicate_task_stall` |
 | `2` | Configuration error | `configuration_failure` |
 | `3` | Policy blocked | `policy_blocked` |
 | `4` | Operational failure | `planner_failure`, `parser_failure`, `tool_failure`, `memory_failure`, `unknown_phase`, `internal_error` |
@@ -342,9 +381,10 @@ deterministic process exit code derived from `exit_code_for()`:
 Examples:
 
 ```bash
-$ python -m apex_host.eval.run_htb_local --target 10.10.10.14 --dry-run
+$ python -m apex_host.eval.run_htb_local --target 10.10.10.14 --dry-run \
+    --username root --password ''
 ...
- Outcome: SUCCESS — validated ssh access
+ Outcome: SUCCESS — user flag verified
 $ echo $?
 0
 
@@ -354,6 +394,13 @@ $ python -m apex_host.eval.run_htb_local --target 10.10.10.14 --dry-run --max-tu
 $ echo $?
 1
 ```
+
+**Phase 18 note:** a real dry-run engagement can never actually reach the
+`user_flag_verified` outcome — the first example above is illustrative of
+the exit-code contract, not a literal transcript; see
+[`docs/user-flag-objective.md`](user-flag-objective.md) §10 for what
+dry-run engagements can and cannot report, and §6 for the live (or
+test-fake-backed) path that can.
 
 `--preflight` remains a distinct utility mode (not an engagement outcome)
 and keeps its own plain `0`/`1` exit codes (all tools found / tools

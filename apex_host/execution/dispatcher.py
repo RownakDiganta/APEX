@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from apex_host.agents.priv_esc_enum_executor import PrivEscEnumExecutor
     from apex_host.agents.ssh_executor import SSHExecutor
     from apex_host.agents.telnet_executor import TelnetExecutor
+    from apex_host.agents.user_flag_executor import UserFlagExecutor
     from apex_host.config import ApexConfig
     from apex_host.policy import PolicyAdvisor
     from apex_host.types import ToolCommand, ToolResult
@@ -97,6 +98,13 @@ def _make_blocked_result(
         "error": error_msg if policy_blocked or conflict_blocked else None,
         "phase": phase,
     }
+    # Phase 20 — carried through, harmless/empty for non-user_flag_verify
+    # tools, so a blocked direct-file-read attempt can still be attributed
+    # to its capability_type in write_memory's metrics (see
+    # apex_host/orchestration/memory_node.py).
+    if tool == "user_flag_verify":
+        d["capability_id"] = str(task.params.get("capability_id", ""))
+        d["capability_type"] = str(task.params.get("capability_type", ""))
     if policy_blocked:
         d["policy_blocked"] = True
         d["policy_rule"] = policy_rule
@@ -185,6 +193,7 @@ class TaskDispatcher:
         ftp_executor: "FTPExecutor | None" = None,
         priv_esc_analysis_executor: "PrivEscAnalysisExecutor | None" = None,
         priv_esc_enum_executor: "PrivEscEnumExecutor | None" = None,
+        user_flag_executor: "UserFlagExecutor | None" = None,
     ) -> None:
         self._advisor = advisor
         self._registry = task_registry
@@ -196,6 +205,7 @@ class TaskDispatcher:
         self._ftp_executor = ftp_executor
         self._priv_esc_analysis_executor = priv_esc_analysis_executor
         self._priv_esc_enum_executor = priv_esc_enum_executor
+        self._user_flag_executor = user_flag_executor
 
     async def dispatch(
         self,
@@ -385,6 +395,8 @@ class TaskDispatcher:
                 tr_dict, disposition = await self._run_priv_esc_analysis(task, context, args, target, parser, phase)
             elif tool == "priv_esc_enum":
                 tr_dict, disposition = await self._run_priv_esc_enum(task, context, args, target, parser, phase)
+            elif tool == "user_flag_verify":
+                tr_dict, disposition = await self._run_user_flag_verify(task, context, args, target, parser, phase)
             else:
                 tr_dict, disposition = await self._run_command(task, context, args, target, parser, phase)
         except asyncio.CancelledError:
@@ -692,6 +704,77 @@ class TaskDispatcher:
             # Phase 17: real, measured wall-clock enumeration-command time
             # (set by PrivEscEnumExecutor — see apex_host/eval/benchmark.py).
             "duration_seconds": float(ep_data.get("duration_seconds", 0.0) or 0.0),
+        }
+        disposition = (
+            ExecutionDisposition.EXECUTED_SUCCESS if success
+            else ExecutionDisposition.EXECUTED_FAILURE
+        )
+        return tr, disposition
+
+    async def _run_user_flag_verify(
+        self,
+        task: TaskSpec,
+        context: ExecutionContext,
+        args: list[str],
+        target: str,
+        parser: str,
+        phase: str,
+    ) -> tuple[dict[str, Any], ExecutionDisposition]:
+        """Run a user_flag_verify task via UserFlagExecutor (Phase 18; made
+        capability-generic in the access-capability refactor).
+
+        A bounded, read-only candidate-path read against whichever
+        ``AccessCapability`` ``ObjectivePlanner`` selected — see
+        ``apex_host/agents/user_flag_executor.py``. Never includes a
+        password or the raw candidate value anywhere in the returned dict:
+        verification now happens inside the executor itself, so this
+        dict only ever carries the verifier's already-computed,
+        secret-free result fields (``verified``/``value_digest``/
+        ``redacted_value``).
+        """
+        if self._user_flag_executor is None:
+            tr: dict[str, Any] = {
+                "task_id": task.id, "tool": "user_flag_verify", "args": args,
+                "target": target, "parser": parser, "stdout": "",
+                "stderr": "", "returncode": 1, "dry_run": context.dry_run,
+                "error": "user-flag executor not configured", "phase": phase,
+            }
+            return tr, ExecutionDisposition.TOOL_UNAVAILABLE
+
+        result = await self._user_flag_executor.run(task, context.evidence)
+        ep_data = result.episode.data
+        success = bool(ep_data.get("success", False))
+        tr = {
+            "task_id": task.id, "tool": "user_flag_verify", "args": args,
+            "target": target, "parser": parser,
+            # Never the raw candidate value — only the verifier's
+            # secret-free fields (see method docstring).
+            "stdout": "", "stderr": "",
+            "returncode": 0 if success else 1,
+            "dry_run": bool(ep_data.get("dry_run", False)),
+            "error": ep_data.get("error"), "phase": phase,
+            "connected": bool(ep_data.get("connected", False)),
+            "candidate_path": str(ep_data.get("candidate_path", "")),
+            "objective_type": str(task.params.get("objective_type", "user_flag")),
+            "capability_id": str(ep_data.get("capability_id", "")),
+            "capability_type": str(ep_data.get("capability_type", "")),
+            "principal": str(ep_data.get("principal", "")),
+            "verified": bool(ep_data.get("verified", False)),
+            "value_digest": str(ep_data.get("value_digest", "")),
+            "redacted_value": str(ep_data.get("redacted_value", "")),
+            "verification_method": str(ep_data.get("verification_method", "")),
+            "attempted_paths": list(task.params.get("attempted_paths", [])),
+            "attempted_capability_paths": list(task.params.get("attempted_capability_paths", [])),
+            "is_last_candidate": bool(task.params.get("is_last_candidate", False)),
+            # Phase 17: real, measured wall-clock read time.
+            "duration_seconds": float(ep_data.get("duration_seconds", 0.0) or 0.0),
+            # Phase 20 — transport-neutral BoundedReadResult metadata (never
+            # the raw candidate output). "" / None when no real read was
+            # attempted (bounded-path rejection, dry-run, missing adapter).
+            "status_code": ep_data.get("status_code"),
+            "bytes_received": int(ep_data.get("bytes_received", 0) or 0),
+            "truncated": bool(ep_data.get("truncated", False)),
+            "read_method": str(ep_data.get("read_method", "")),
         }
         disposition = (
             ExecutionDisposition.EXECUTED_SUCCESS if success

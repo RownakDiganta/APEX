@@ -107,11 +107,22 @@ def _exposes_edge(host_id: str, svc_id: str) -> Edge:
 # ---------------------------------------------------------------------------
 
 class TestEarlyStop:
-    """reflect_or_continue sets completed=True when access_state is in EKG."""
+    """reflect_or_continue's termination behavior around a validated access_state.
+
+    Phase 18: a validated access_state alone no longer stops the engagement
+    early as "success" — it routes toward the unresolved objective phase
+    instead. These tests were originally written against the pre-Phase-18
+    behavior (access_state -> immediate validated_access success) and have
+    been updated to assert the new, correct behavior: access is real
+    progress, but the objective (not access alone) governs termination."""
 
     @pytest.mark.asyncio
-    async def test_early_stop_when_access_state_present(self) -> None:
-        """Engagement stops early after access_state node is written to EKG."""
+    async def test_access_state_alone_does_not_fabricate_success(self) -> None:
+        """A validated access_state (telnet protocol, no ssh) with no
+        credentials configured cannot satisfy ObjectivePlanner (it only
+        acts on ssh-protocol access), so the engagement eventually stalls
+        (no_actionable_task) rather than looping forever or reporting
+        success from access alone."""
         target = "10.10.10.99"
         config = _make_apex_config(target=target, max_turns=20)
         api = _make_memfabric_api()
@@ -180,9 +191,9 @@ class TestEarlyStop:
         final_state = await graph.ainvoke(initial_state)
 
         assert final_state["completed"] is True
-        assert final_state["turn_count"] <= 5, (
-            f"Should have stopped early, but ran {final_state['turn_count']} turns"
-        )
+        # Never fabricates success from access_state alone.
+        assert final_state["outcome"] != "user_flag_verified"
+        assert final_state["outcome"] != "validated_access"
 
     @pytest.mark.asyncio
     async def test_no_early_stop_without_access_state(self) -> None:

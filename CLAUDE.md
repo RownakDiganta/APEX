@@ -984,6 +984,9 @@ it becomes a staged `KnowledgeEntry` at confidence 0.25–0.3.
 | `workflow_recommendation` (Phase 15) | Advisory text for a human operator summarizing one workflow's state — never a command APEX itself would run | `text`, `category`, `priority`, `workflow_id` |
 | `experience` (Phase 16) | A structured, non-executable record of what happened in a past (or repeatedly within the current) engagement — content-addressed on target+category+discriminator so replay is an upsert, never a duplicate | `category`, `target`, `discriminator`, `context`, `evidence_excerpt`, `outcome`, `recommendation`, `confidence`, `occurrence_count` |
 | `experience_recommendation` (Phase 16) | Advisory text for a human operator derived from one experience — never a command APEX itself would run and never an automatic planner override | `text`, `category`, `priority`, `experience_id` |
+| `objective` (Phase 18) | One engagement objective (default `user_flag`) — content-addressed on target+objective_type so it is exactly one node per target+type, never duplicated | `objective_type`, `status` (`pending`\|`in_progress`\|`verified`\|`failed`), `target`, `attempted_paths`, `attempt_count`. **Never a raw flag value.** |
+| `objective_evidence` (Phase 18) | Proof one objective was satisfied — created ONLY on a verified result, never for a failed attempt | `evidence_type`, `verified`, `value_digest` (SHA-256), `redacted_value`, `source_tool`, `source_path`, `access_identity`, `verification_method`, `confidence`, `capability_type`, `capability_id` (Phase 18B). **No plaintext field of any kind.** |
+| `access_capability` (Phase 18B) | A structured, non-executable record of a proven access mechanism (never an exploit type) — content-addressed on target+capability_type+principal | `capability_type` (`ssh_command`\|`telnet_command`\|`web_command`\|`local_shell`\|`arbitrary_file_read`\|`api_file_read`), `host_id`, `validated`, `principal`, `confidence`, `source_task_id`, `metadata`. **Never a password/cookie/token/session/socket.** |
 
 | Edge type | Meaning |
 |---|---|
@@ -991,10 +994,13 @@ it becomes a staged `KnowledgeEntry` at confidence 0.25–0.3.
 | `runs` | service → tech, endpoint → tech |
 | `requires` | endpoint → auth_flow |
 | `contains` | endpoint → form, endpoint → token, endpoint → endpoint (Phase 14: discovered-but-unvisited link); (Phase 15) workflow → workflow_step |
-| `indicates` (Phase 13) | host/access_state → priv_esc_opportunity (evidence that produced the opportunity); (Phase 14) endpoint → web_opportunity; (Phase 15) host → workflow, host → session, workflow_step → session; (Phase 16) host → experience, experience → workflow (only when the workflow node is confirmed present in the same batch's known_node_ids) |
+| `indicates` (Phase 13) | host/access_state → priv_esc_opportunity (evidence that produced the opportunity); (Phase 14) endpoint → web_opportunity; (Phase 15) host → workflow, host → session, workflow_step → session; (Phase 16) host → experience, experience → workflow (only when the workflow node is confirmed present in the same batch's known_node_ids); (Phase 18) host → objective (reachability) |
 | `collects` (Phase 13B) | host → priv_esc_evidence |
 | `produces` (Phase 13B) | priv_esc_evidence → priv_esc_opportunity |
 | `recommends` (Phase 13B) | priv_esc_opportunity → priv_esc_recommendation; (Phase 15) workflow → workflow_recommendation; (Phase 16) experience → experience_recommendation |
+| `enables` (Phase 18; source changed in Phase 18B) | access_capability → objective — a validated, transport-independent access capability enables pursuing the objective (was `access_state → objective` before Phase 18B's access-capability refactor); (Phase 18B) access_state → access_capability — validated access produced this capability |
+| `satisfied_by` (Phase 18) | objective → objective_evidence — the objective's proof |
+| `has_capability` (Phase 18B) | host → access_capability — reachability |
 
 #### Parser routing (in `apex_host/graph.py` `parse_observation`)
 
@@ -7278,3 +7284,674 @@ them. No CSV export (JSON only, per this phase's own scope). No new
 exploitation, privilege escalation, persistence, or shell-access
 capability was added or performed — `access_state` remains the
 engagement's only success signal.
+
+> **Correction (Phase 18, 2026-07-22):** the statement above ("`access_state`
+> remains the engagement's only success signal") was true when Phase 17
+> completed and is left in place per this file's append-only correction
+> convention (see e.g. §18 R12-style corrections above), not rewritten. It
+> is no longer accurate: Phase 18 redefines benchmark success to require a
+> *verified user flag* — a validated `access_state` is now an intermediate
+> milestone only, never independently success. See the Phase 18 record
+> immediately below.
+
+### Phase 18 — User Flag Objective and Verification ✓ COMPLETE
+
+**Full design document:** [`docs/user-flag-objective.md`](docs/user-flag-objective.md)
+(15 sections). This entry is a summary and progress record; that document
+is authoritative.
+
+**Scope:** Ali's confirmed benchmark success definition, in neutral
+project language: for the selected HTB benchmark, success means verified
+retrieval of the user flag. Before this phase,
+`EngagementOutcome.validated_access` (a validated `access_state` node) was
+the sole success outcome — the moment credential validation succeeded
+(Phase 12B), the engagement terminated as success. This overstated what
+had actually been achieved. Phase 18 makes `validated access != benchmark
+success` and `verified user flag == benchmark success` a hard, tested
+invariant threaded through the outcome model, the phase ladder, the EKG,
+reporting, and CLI exit codes.
+
+**Objective model (`apex_host/types.py`):** `ObjectiveStatus` (`pending` —
+implicit, never persisted — `in_progress`, `verified`, `failed`),
+`Objective` and `ObjectiveEvidenceRecord` dataclasses (the in-planner/
+report view reconstructed from EKG node props, never a second independent
+store — memfabric Invariant 1). `ObjectiveEvidenceRecord` deliberately has
+NO plaintext-value field of any kind.
+
+**EKG representation:** two new node types (`objective`,
+`objective_evidence` — see §12.8 table above), two new edge types
+(`enables`: access_state → objective; `satisfied_by`: objective →
+objective_evidence), reusing `indicates` for host → objective
+reachability (the same "don't fragment the graph" discipline Phase
+14/15/16 established). `objective` is content-addressed on
+target+objective_type (exactly one per engagement, upserted, never
+duplicated). At most one `objective_evidence` node ever exists per
+engagement — only a VERIFIED result creates one; a failed attempt only
+updates the `objective` node's `attempted_paths`/`status`, and a
+connection-level failure (nothing learned about that specific candidate)
+produces no node update at all.
+
+**The one authoritative verifier (`apex_host/verification/user_flag.py`):**
+`verify_user_flag()` and `is_bounded_candidate_path()` are the SOLE place
+flag-verification and bounded-path-validation logic lives — the policy
+rule, the executor, and the parser all call into this module rather than
+re-implementing any part of it (mirrors `apex_host.security.redaction`'s
+"one authoritative module" convention). Conservative by construction:
+rejects empty/multiline/oversized/malformed output and command-error
+markers before ever checking format; the format check itself is a generic,
+bounded-token regex (`DEFAULT_FLAG_FORMAT_REGEX`), never a specific known
+flag value. On success, returns only a SHA-256 digest and a short
+redacted display — the raw candidate value exists only as a local
+variable inside this function and is discarded immediately; the result
+dataclass has no field that could carry it further.
+
+**Bounded verification mechanism:** a dedicated structured operation,
+`user_flag_verify`, routed through the existing dispatcher/policy/
+tool-execution architecture — mirrors the Phase 13B `priv_esc_enum`
+precedent exactly (same SSH-session reuse rationale: `ToolBackend` has no
+concept of "read a file inside an already-authenticated session").
+`ObjectivePlanner` (`apex_host/planners/objective_planner.py`, no LLM
+seam — bounded credential-bearing verification tasks are too sensitive to
+route through an LLM-backed planner) only ever emits a task once a
+validated SSH `access_state` already exists AND the same operator-supplied
+credentials already used in the credential phase are configured, one
+bounded candidate at a time (from `ApexConfig.user_flag_candidate_roots` x
+`user_flag_candidate_filenames`, capped by `max_user_flag_attempts`),
+never repeating an already-attempted candidate, stopping the moment the
+objective is verified. `UserFlagExecutor`
+(`apex_host/agents/user_flag_executor.py`) performs raw I/O only — one
+`cat -- <validated-path>` read per call, byte-capped, dry-run returns a
+deliberately unremarkable synthetic result — and never interprets content
+as a flag itself; that is exclusively `ObjectiveParser`'s job via the
+verifier.
+
+**GlobalPlanner phase ladder (`apex_host/planners/global_planner.py`):** a
+new `ApexPhase.objective` member is inserted between `credential` and
+`priv_esc`: `recon → web → credential → objective → priv_esc → done`.
+Access alone now routes to `objective`, never to `done` — the literal fix
+for "route toward the unresolved user_flag objective instead of marking
+the engagement done." Once `objective_status == "verified"` the ladder
+goes straight to `done`, NEVER through `priv_esc` afterward (no further
+exploitation/privilege-escalation work is dispatched once the objective is
+verified — enforced by branch ordering, not a runtime flag). A `"failed"`
+objective or an exhausted objective-phase budget falls through to the
+pre-existing `priv_esc` intermediate-milestone phase, completely
+unchanged. `objective_status` is computed once per turn via
+`apex_host.planners.objective.objective_status_from_subgraph()` and passed
+as a plain string, matching the existing `has_web_capability` parameter
+convention — `decide_phase()` remains pure.
+
+**Engagement outcome integration
+(`apex_host/orchestration/outcome.py`):** `EngagementOutcome` gained
+`user_flag_verified` — the ONLY value `is_success_outcome()` returns
+`True` for. `validated_access` remains a real enum member (used for
+`access_summary` reporting and the pre-Phase-12C legacy-state fallback in
+`apex_host.eval.report._derive_outcome_from_state`) but its exit code
+changed from `0` to `1` and its legacy status from `"success"` to
+`"abandoned"`. `evaluate_termination()`'s `has_access_state: bool`
+parameter was renamed to `objective_verified: bool`.
+`apex_host/orchestration/continuation_node.py`'s `reflect_or_continue`
+computes objective status from the same subgraph snapshot already fetched
+for the stall/replan peek (no extra read).
+
+**Redaction — a real leak found and fixed:** while building this phase's
+own test suite, the raw candidate stdout was found flowing from
+`UserFlagExecutor` through `TaskDispatcher._run_user_flag_verify`'s `tr`
+dict into the persisted episodic log verbatim (the same `tr` dict serves
+both `parse_observation`, which legitimately needs the raw value to
+verify it, and `write_memory`, which must never persist it). Fixed by
+redacting specifically inside `write_memory` (`apex_host/orchestration
+/memory_node.py`) — after parsing has already happened, immediately before
+the episode is built — using a new
+`apex_host.security.redaction.redact_user_flag_output()` blanket-
+replacement helper (a candidate read is the *unknown* value under
+investigation, so unlike a known password it cannot be selectively
+substring-redacted the way `redact_session_text()` works).
+
+**Reporting (`apex_host/eval/report.py`):** nine new `RunReport` fields,
+all derived directly from the final subgraph via
+`apex_host.planners.objective.objective_report_fields()`. An always-shown
+"Objective Summary" text section and `"objective"` JSON block give the
+required four-way breakdown: `Access obtained` / `Flag attempted` / `Flag
+verified` / `Benchmark success`. `apex_host/eval/benchmark.py`'s
+`_EVIDENCE_NODE_TYPES` gained `"objective_evidence"`.
+`apex_host/eval/evaluation.py::HTBEvaluation.success` needed no code
+change — it already derives from `report.success`, so the benchmark
+"solved machines" headline metric picked up the stricter definition
+automatically.
+
+**Configuration/CLI:** `ApexConfig.objective_type` (default `"user_flag"`
+— the default for the whole config, not just the HTB runner),
+`user_flag_candidate_filenames`, `user_flag_candidate_roots`,
+`max_user_flag_attempts`, `user_flag_max_output_bytes`,
+`user_flag_verification_regex`, each with a CLI flag on both
+`apex_host.main` and `apex_host.eval.run_htb_local`. No CLI flag,
+environment variable, or config field accepts an expected plaintext flag
+value anywhere.
+
+**New files:** `apex_host/verification/__init__.py`,
+`apex_host/verification/user_flag.py`,
+`apex_host/agents/user_flag_executor.py`,
+`apex_host/parsers/objective_parser.py`,
+`apex_host/planners/objective.py`,
+`apex_host/planners/objective_planner.py`,
+`docs/user-flag-objective.md`,
+`tests/apex_host/test_phase18_user_flag_objective.py` (57 tests).
+
+**Modified files:** `apex_host/types.py` (`ApexPhase.objective`,
+`ObjectiveStatus`, `Objective`, `ObjectiveEvidenceRecord`),
+`apex_host/graph_ids.py` (`objective_id`, `objective_evidence_id`,
+`enables_edge_id`, `satisfied_by_edge_id`), `apex_host/config.py` (six new
+fields + CLI wiring), `apex_host/security/redaction.py`
+(`redact_user_flag_output`), `apex_host/planners/global_planner.py`
+(phase ladder + budget), `apex_host/orchestration/outcome.py`
+(`user_flag_verified`, renamed parameter, updated tables),
+`apex_host/orchestration/continuation_node.py` (objective-verification
+check replaces access_state check), `apex_host/orchestration/routing.py`
+(`PHASE_NODE["objective"]`), `apex_host/orchestration/dispatch_node.py`
+(`make_objective_node`), `apex_host/orchestration/parsing_node.py`
+(`user_flag_verify` routing), `apex_host/orchestration/memory_node.py`
+(redaction fix), `apex_host/orchestration/planning_node.py`
+(`objective_status` computation), `apex_host/orchestration/dependencies.py`
+(`ObjectivePlanner` registration), `apex_host/orchestration/builder.py`
+(`objective_agent` node/edges, `UserFlagExecutor` wiring),
+`apex_host/execution/dispatcher.py` (`_run_user_flag_verify`),
+`apex_host/policy/rules.py` (`check_bounded_user_flag_verification`),
+`apex_host/graph_state.py` (`objective_status`/`objective_summary`
+fields), `apex_host/runtime.py` + `apex_host/eval/run_synthetic_machine.py`
+(new state-field initialization), `apex_host/eval/report.py` (nine new
+fields, text/JSON sections, headline table update),
+`apex_host/eval/benchmark.py` (`_EVIDENCE_NODE_TYPES`), `apex_host/main.py`
++ `apex_host/eval/run_htb_local.py` (six new CLI flags each),
+`docs/engagement-outcomes.md`, `README.md`,
+`APEX-Nexus-Unified-Architecture-Detailed.md`. **43 pre-existing tests
+across 9 files updated** (never weakened — each now asserts the new,
+correct behavior): `test_credential_phase_fix.py`,
+`test_credential_planner_multiprotocol.py`, `test_graph.py`,
+`test_live_run_fixes.py`, `test_phase10_orchestration.py`,
+`test_phase12a_state_machine.py`, `test_phase12c_outcomes.py`,
+`test_phase13_priv_esc_planning.py`, `test_phase17_benchmarking.py`,
+`test_planners_with_engine.py`, `test_report.py`.
+
+**Explicitly not changed:** no arbitrary autonomous exploitation, payload
+upload, reverse shell, persistence, root-flag capture, or root privilege
+escalation was added anywhere in this phase. `memfabric/` was not touched
+(verified by static scan — no cybersecurity/Phase-18 terminology anywhere
+in it). No machine-specific filenames, target names, or expected flag
+values were added anywhere (verified by static scan). Docker, Compose,
+VPN, and GitHub Actions were not touched. No branch was created; no commit
+or push was made as part of this phase's work.
+
+**Validation (clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest tests/apex_host/test_phase18_user_flag_objective.py -q` | 57 passed |
+| `uv run pytest tests/ -q` (full) | 4394 passed — no regressions |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy` | Success |
+| `python -m apex_host.main --help` | exit 0 |
+| `python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Remaining known limitations (documented, not defects — see
+`docs/user-flag-objective.md` §15 for the full list):** `ObjectivePlanner`
+only acts on a validated SSH `access_state` (Telnet/FTP access remains
+real, reported progress but does not currently lead to objective
+verification). With the default config there is exactly one candidate
+path (`/home/<user>/user.txt`) even though `max_user_flag_attempts`
+defaults to 3 — the cap only matters once an operator configures
+additional roots/filenames. A `"failed"` objective never re-opens within
+the same engagement even if priv_esc later discovers a different user's
+home directory. Only `objective_type="user_flag"` is implemented — no
+`root_flag` objective exists, and CLAUDE.md's existing "no root privilege
+escalation" constraint is unaffected. `objective_status`/`objective_summary`
+live-state fields are one-turn stale (mirrors `privilege_summary`/
+`web_session_state`'s established pattern); the final report always
+re-derives from the complete final EKG. This phase alone does not make
+APEX capable of solving arbitrary HTB machines — it makes user-flag
+verification the authoritative benchmark completion condition and
+provides the safe, generic mechanism to detect that condition once access
+has already been achieved by earlier phases.
+
+> **Correction/superseded note (Phase 18B, below):** several claims in
+> this Phase 18 record are now stale — `ObjectivePlanner` no longer acts on
+> `access_state` directly, `TaskSpec.params` no longer carries `username`/
+> `port`/`password`, and `verify_user_flag()` is now called from
+> `UserFlagExecutor` rather than `ObjectiveParser`. Left in place per this
+> file's append-only correction convention (§21 R12) — it accurately
+> describes the system as it existed at the end of Phase 18, before the
+> access-capability refactor. Phase 18B below is authoritative for the
+> current design.
+
+### Phase 18B — Access Capability Abstraction (refactor of Phase 18) ✓ COMPLETE
+
+**Full design document:** [`docs/user-flag-objective.md`](docs/user-flag-objective.md)
+§16 (16 sections total after this addition). This entry is a summary and
+progress record; that document is authoritative.
+
+**Scope:** Phase 18 hardcoded the User Flag Objective to SSH end-to-end —
+`ObjectivePlanner` searched for an `access_state` node with
+`service == "ssh"`, put a raw `username`/`password`/`port` into the
+`TaskSpec`, and `UserFlagExecutor` spoke Paramiko directly. This refactor
+makes the *access mechanism* fully transport-independent while leaving the
+*objective* (still exactly one: `user_flag`) and the one authoritative
+verifier (`apex_host/verification/user_flag.py`, unchanged) exactly as
+Phase 18 designed them. `memfabric/` was not touched — all work is inside
+`apex_host`.
+
+**New data model (`apex_host/types.py`):** `AccessCapabilityType` (six
+members — `ssh_command`, `telnet_command`, `web_command`, `local_shell`,
+`arbitrary_file_read`, `api_file_read` — capability TYPES, never exploit
+types, never themselves executable actions; only `ssh_command` has a real
+adapter) and `AccessCapability` (`capability_id`, `host_id`,
+`capability_type`, `validated`, `principal`, `confidence`,
+`source_task_id`, `metadata`). The dataclass structurally cannot hold a
+password/cookie/bearer-token/SSH-session/shell-object/socket — there is no
+such field, enforced by a static test. Stored in the EKG as an
+`access_capability` node (`apex_host/graph_ids.py::access_capability_id`,
+content-addressed) with two new edges: `host --has_capability-->
+access_capability` and `access_state --enables--> access_capability`.
+
+**Runtime-only capability registry (`apex_host/runtime_registry.py`,
+new):** `FlagReadCapability` — a `Protocol` exposing exactly ONE operation,
+`async read_bounded_file(path) -> tuple[bool, str, str | None]` — so the
+objective layer can never request arbitrary command execution.
+`CapabilityRuntimeRegistry` is a plain in-process `dict[capability_id,
+FlagReadCapability]`, never written through `MemoryAPI`, never in
+`ApexGraphState` — live sessions/credentials must never be stored inside
+`MemoryAPI` (a new, additive invariant for this refactor, consistent with
+Invariant 1). One instance lives in `OrchestrationDeps.capability_registry`
+(new frozen-dataclass field), constructed fresh per engagement exactly
+like `StallTracker`. `SSHCapabilityAdapter` is the one concrete adapter —
+byte-for-byte the pre-refactor executor's own Paramiko behavior (fresh
+`SSHClient()` per call, closed in `finally`, `allow_agent=False`,
+`look_for_keys=False`, no SFTP, no port forwarding), just relocated.
+**Telnet/web-shell support was explicitly NOT implemented this phase** —
+only the abstraction and the one SSH adapter.
+
+**Who populates the registry:** neither the planner (must stay pure over
+subgraph/evidence, memfabric Invariant 7) nor the executor (only ever
+looks up an already-registered adapter). `apex_host/orchestration
+/dispatch_node.py::make_objective_node` does it, once per objective turn,
+immediately before dispatch — reading every validated `AccessCapability`
+from a fresh subgraph fetch and calling `capability_registry.ensure_ssh()`
+for each whose principal matches `config.username_candidates[0]`. This is
+the ONE place live connection parameters (e.g. a password) are ever paired
+with a `capability_id`.
+
+**`CapabilityParser` (`apex_host/parsers/capability_parser.py`, new):**
+`derive_ssh_capability(target, username, source_task_id)` — the sole place
+a validated SSH login becomes a generic `access_capability` EKG record.
+Called from `apex_host/orchestration/parsing_node.py` immediately after
+`AccessParser.parse_structured()` succeeds for `tool == "ssh_access"`,
+merged into the same `ParsedObservation` (one `apply_deltas` batch).
+
+**`apex_host/planners/access_capabilities.py` (new):** pure, no-IO
+helpers — `access_capabilities_from_subgraph()`, `rank_capabilities()`
+(validated first, then confidence descending, then `capability_id`
+ascending — never random/insertion-order-dependent),
+`best_capability_for_objective()` (accepts `exclude_capability_ids` so a
+capability with nothing left to try can be skipped in favor of a second
+validated one), and `capability_type_label()` (feeds the report's
+"Capability used" line — see below).
+
+**`ObjectivePlanner` refactored:** no longer searches for SSH access
+specifically; calls `best_capability_for_objective()` and ranks/selects
+generically. Emitted `TaskSpec.params` now carries `capability_id`,
+`capability_type`, `principal`, `candidate_path` — **never `username`,
+`port`, or `password`** (eliminating that class of leak at the source
+rather than needing a defensive mask). No longer requires operator
+credentials to be configured at plan time — a validated `AccessCapability`
+node is already structural proof credentials worked; provisioning the
+runtime adapter is now the orchestration layer's job (see above).
+
+**`UserFlagExecutor` refactored:** resolves `capability_id` to an adapter
+via the registry, calls `adapter.read_bounded_file(path)`, and is now the
+ONE call site for `verify_user_flag()` (moved here from `ObjectiveParser`
+— closes the raw-flag-leak class of bug at its root, since the raw
+candidate value now never leaves this executor's stack frame). Never
+branches on `capability_type` anywhere in its control flow (verified by
+static scan) — it genuinely does not know whether it is talking to SSH,
+Telnet, or anything else.
+
+**`ObjectiveParser` refactored:** no longer calls `verify_user_flag()` —
+takes the executor's already-computed `verified`/`value_digest`/
+`redacted_value`/`verification_method` plus `capability_id`/
+`capability_type`/`principal` directly. The semantic edge changed from
+`access_state --enables--> objective` to
+`access_capability --enables--> objective`. `objective_evidence` nodes
+gained `capability_type`/`capability_id` props.
+
+**Reporting:** `RunReport` gained `objective_evidence_capability_type`.
+The text report gained a `Capability used    : SSH Command` line (verified-
+only) and `to_json_dict()` gained `capability_type`/`capability_label`
+keys — rendered via `capability_type_label()`, **deliberately never a
+"Transport: SSH" framing**, so a future capability type needs zero report
+rendering changes, only one new `CAPABILITY_TYPE_LABELS` entry.
+
+**Policy:** no new rule needed — `check_bounded_user_flag_verification()`
+already operated only on `target`/`candidate_path`, both unchanged in the
+new params shape.
+
+**Configuration:** one new field, `ApexConfig.user_flag_read_timeout_seconds`
+(default `35.0`) — `UserFlagExecutor`'s own outer defensive timeout
+ceiling around `adapter.read_bounded_file()`, independent of whatever
+timeouts the resolved adapter applies internally. New CLI flag
+`--user-flag-read-timeout` on both `apex_host.main` and
+`apex_host.eval.run_htb_local`.
+
+**Extension rule (binding for future capability types):** adding a new
+transport (Telnet, arbitrary file read, an API file-read, a web shell)
+requires ONLY: (1) a new adapter class in `runtime_registry.py`, (2) a new
+`derive_*_capability()` method on `CapabilityParser` + one new routing
+branch in `parsing_node.py`, (3) a new registration branch in
+`dispatch_node.py::_register_capability_adapter()`, (4) a new
+`CAPABILITY_TYPE_LABELS` entry. It must NEVER require touching
+`ObjectivePlanner`, `UserFlagExecutor`, `ObjectiveParser`, the report
+generator, or the policy rule — enforced going forward by the static scans
+in `TestObjectiveTransportIndependence`
+(`tests/apex_host/test_access_capability_refactor.py`).
+
+**New files:** `apex_host/runtime_registry.py`,
+`apex_host/parsers/capability_parser.py`,
+`apex_host/planners/access_capabilities.py`,
+`tests/apex_host/test_access_capability_refactor.py` (53 tests).
+
+**Modified files:** `apex_host/types.py` (`AccessCapabilityType`,
+`AccessCapability`, `ObjectiveEvidenceRecord.capability_type`/
+`.capability_id`), `apex_host/graph_ids.py` (`access_capability_id`,
+`has_capability_edge_id`), `apex_host/agents/user_flag_executor.py`
+(full rewrite — registry lookup + the one `verify_user_flag()` call site),
+`apex_host/parsers/objective_parser.py` (new signature, capability-sourced
+`enables` edge), `apex_host/planners/objective_planner.py` (capability
+selection/ranking, no more SSH-specific search or credential params),
+`apex_host/planners/objective.py` (`objective_evidence_capability_type`
+report field), `apex_host/orchestration/dependencies.py`
+(`OrchestrationDeps.capability_registry`), `apex_host/orchestration
+/builder.py` (constructs the registry, wires it into `UserFlagExecutor`),
+`apex_host/orchestration/dispatch_node.py`
+(`_register_capability_adapter`, `_ssh_port_for_capability`, pre-dispatch
+registration in `make_objective_node`), `apex_host/orchestration
+/parsing_node.py` (`CapabilityParser` routing after `ssh_access` success;
+new `objective` branch param shape), `apex_host/execution/dispatcher.py`
+(`_run_user_flag_verify` tr dict reshaped — no raw stdout/username/port),
+`apex_host/config.py` (`user_flag_read_timeout_seconds` + CLI wiring),
+`apex_host/main.py` + `apex_host/eval/run_htb_local.py`
+(`--user-flag-read-timeout`), `apex_host/eval/report.py` (`Capability
+used` line, `capability_type`/`capability_label` JSON fields),
+`docs/user-flag-objective.md` (§16 + updates to §6/§7/§11/§12/§14/§15),
+`README.md`, `APEX-Nexus-Unified-Architecture-Detailed.md`. Six
+pre-existing test files needed fixes purely from the `OrchestrationDeps`
+new-required-field/routing-change ripple — never weakened, only updated to
+match the new behavior: `tests/apex_host/test_phase10_orchestration.py`,
+`tests/apex_host/test_phase12a_state_machine.py`,
+`tests/apex_host/test_phase12c_outcomes.py`,
+`tests/apex_host/test_phase13b_priv_esc_enumeration.py` (one test pre-dated
+Phase 18's own objective-phase routing change and needed a `"failed"`
+objective seed to keep reaching `priv_esc_agent` directly — a Phase 18 gap
+this session closed, not a Phase 18B regression),
+`tests/apex_host/test_phase18_user_flag_objective.py` (extensively
+updated in place — capability seeding helper, new task-param assertions,
+`ObjectivePlanner` test rewrites, `enables`-edge-source assertion fix; 58
+tests after the refactor, up from 57).
+
+**Explicitly not changed:** no Telnet/web-shell/local-shell/API-file-read
+adapter was implemented — only the abstraction and the SSH adapter, per
+this phase's own explicit scope boundary. No exploitation, payload,
+persistence, or root-flag capability was added. `memfabric/` was not
+touched. Docker, Compose, VPN, and GitHub Actions were not touched. No
+branch was created; no commit or push was made as part of this phase's
+work.
+
+**Validation (clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest tests/apex_host/test_access_capability_refactor.py -q` | 53 passed |
+| `uv run pytest tests/apex_host/test_phase18_user_flag_objective.py -q` | 58 passed |
+| `uv run pytest tests/ -q` (full) | 4451 passed — no regressions |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy` | Success |
+| `python -m apex_host.main --help` | exit 0 |
+| `python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Remaining known limitations (documented, not defects — see
+`docs/user-flag-objective.md` §16.12 for the full list):** SSH remains the
+only concrete adapter, though the abstraction above it is fully generic.
+The credential-matching rule in `_register_capability_adapter()` assumes
+exactly one configured credential pair (mirrors `CredentialPlanner`'s own
+established invariant) — no rotation through multiple pairs.
+`objective_evidence` nodes written before this refactor have
+`capability_type`/`capability_id` default to `""` (backward compatible).
+
+### Phase 20 — Direct File Read Capability (second `FlagReadCapability` adapter) ✓ COMPLETE
+
+**Full design document:** [`docs/user-flag-objective.md`](docs/user-flag-objective.md)
+§17 (18 sections total after this addition). This entry is a summary and
+progress record; that document is authoritative.
+
+**Scope:** Phase 18B's §16.11 explicitly predicted this: a second
+`FlagReadCapability` adapter added using only its four documented
+extension points, with **no change** to `ObjectivePlanner`,
+`UserFlagExecutor`, `ObjectiveParser`, the report generator, or
+`check_bounded_user_flag_verification`. This phase adds a generic, bounded,
+policy-gated **direct-file-read** capability — covering primitives such as
+an arbitrary file read, a local file inclusion, a path-traversal read, an
+authenticated file-download endpoint, an internal application endpoint
+returning bounded file contents, or an XSS-assisted workflow that resolves
+to a bounded file read — so the User Flag Objective can be satisfied
+**without SSH**. **This phase does not implement a specific exploit or
+solve a named HTB machine** — it provides generic plumbing that consumes
+an operator's own already-confirmed request shape, exactly like
+`--username`/`--password` already does for credentials. `memfabric/` was
+not touched — all work is inside `apex_host`.
+
+**Capability types reused, not invented:** `AccessCapabilityType.arbitrary_file_read`/
+`.api_file_read` already existed (added speculatively in Phase 18B, ahead
+of a real adapter). Both now share ONE adapter class
+(`DirectFileReadCapabilityAdapter`) — no `alert_xss`/`lfi_exploit`/
+machine-named capability type was added anywhere. The capability describes
+what APEX can do, never how the primitive was discovered.
+
+**`BoundedReadResult` (`apex_host/runtime_registry.py`, new dataclass):**
+`FlagReadCapability.read_bounded_file()`'s return type changed from a bare
+3-tuple to a shared dataclass (`connected`, `output`, `error`,
+`status_code`, `return_code`, `bytes_received`, `truncated`, `method`).
+`SSHCapabilityAdapter` now wraps its own internal tuple into this same
+shape at its one return point — the reason `UserFlagExecutor` never needs
+to know which adapter produced a result.
+
+**`DirectFileReadPrimitive` + `DirectFileReadCapabilityAdapter`
+(`apex_host/runtime_registry.py`, new):** a fixed, pre-validated request
+shape (`target_origin`, `endpoint_template` containing `{path}`, `method`
+restricted to GET/POST, `headers`, `timeout_seconds`, `max_response_bytes`,
+`allow_redirects`, `max_redirect_hops`, `allowed_filenames`) constructed
+and validated (`ValueError` on any malformed shape) once, at registration
+time — never at request time, never task-controlled.
+`read_bounded_file(path)` is the adapter's ONLY public method (no generic
+"fetch this URL"/"make this request" method exists — statically enforced).
+Before any network I/O: validates the path via the SAME
+`is_bounded_candidate_path()` §18/Phase-18 already uses everywhere;
+URL-encodes and substitutes the path into the fixed template; verifies the
+result is still same-origin. Redirects are **disabled by default**
+(`allow_redirects=False`); when explicitly enabled, every hop is validated
+against the exact authorized origin (scheme/host/port must all match, no
+userinfo) and capped at a small `max_redirect_hops` (default 1). The
+response body is read via `httpx.AsyncClient(follow_redirects=False)` +
+manual `aiter_bytes()` streaming, stopping the moment `max_response_bytes`
+would be exceeded — bounding both the byte cap and decompression-bomb
+risk. **Oversized responses are rejected outright** (`output=""` + an
+explicit error), never partially accepted with a truncated prefix — a real
+defect (an early version passed through the truncated prefix, which could
+in principle coincidentally resemble a well-formed flag) found and fixed
+during this phase's own test-writing, before it ever shipped. Error strings
+are fixed/generic — never `str(exc)`, never the full request URL with its
+query string — so a configured header value (e.g. a session cookie) can
+never leak through an error message.
+
+**Capability derivation (`CapabilityParser.derive_direct_file_read_capability`,
+new method):** requires a `validation_method` from an explicit accepted
+set (`operator_attestation`, `canary_file_match`, `path_dependent_content`,
+`structural_signature_match`) and `confidence >= 0.6` — an HTTP 200 alone,
+an LLM's own claim, or "the endpoint looks interesting" is never
+sufficient; such calls return an empty `ParsedObservation`. Sanitized
+metadata only (`validation_method`, `requires_auth`, `max_response_bytes`,
+`request_shape_id`) — never a cookie/token/header/raw body/raw flag value.
+
+**Operator-attested seeding (`apex_host/orchestration/capability_seed.py`,
+new file):** `seed_direct_file_read_capability()` mirrors
+`--username`/`--password`'s trust model — the operator has already
+confirmed a fixed request shape works, and supplies that confirmation via
+nine new `ApexConfig` fields (`direct_file_read_operator_attested`,
+`_capability_type`, `_origin`, `_endpoint_template`, `_method`, `_headers`,
+`_principal`, `_max_response_bytes`, `_timeout_seconds`,
+`_allow_redirects`, `_confidence`), called once at engagement startup,
+performing **no live network operation** — only fixed EKG deltas from
+already-known configuration, after validating the origin's hostname
+matches `config.target`. Idempotent.
+
+**`runtime_available` distinction (new `AccessCapability` field, default
+`True` for backward compatibility):** both `derive_ssh_capability` and
+`derive_direct_file_read_capability` now start a freshly-derived capability
+at `runtime_available=False` — no adapter exists yet at derivation time.
+`dispatch_node.py::make_objective_node` writes the real registration
+outcome back onto the EKG node, but only when it changes, and at a fixed
+confidence of `0.5` — deliberately **below** `MemoryAPI`'s
+`conflict_confidence_floor` (0.8 default), since `runtime_available` is a
+re-derived runtime status flag, not an epistemic claim; writing it at the
+capability's own (often high) derivation confidence produced a real,
+observed spurious epistemic `Conflict` on every `False → True` transition
+(found and fixed this phase). A capability whose metadata exists but has
+no registered adapter is now visibly distinct from an executable one, and
+`ObjectivePlanner` never selects it for execution.
+
+**Attempt tracking became pair-scoped (`(capability_id, candidate_path)`),
+not flat-path-scoped:** a failed SSH attempt on a path no longer
+permanently blocks retrying that same path through a different, later-
+available capability. `objective.attempted_capability_paths` stores
+`[capability_id, candidate_path]` pairs; the objective's status only
+becomes `"failed"` once EVERY validated+available capability's EVERY
+candidate is exhausted (true global exhaustion, computed fresh each turn)
+— not merely because the one capability the planner picked this turn ran
+out. This is the "substantial" retry-scoping correction the task's own
+instructions anticipated, and is covered by a dedicated test proving a
+failed-SSH → available-DFR retry on the identical path succeeds.
+
+**`GlobalPlanner` phase-ladder fix (`apex_host/planners/global_planner.py`):**
+the credential-phase gate previously required an `access_state` node before
+the objective phase was reachable — a DFR-only engagement (no SSH ever
+attempted) could never progress. The gate now also accepts an
+`access_capability` node: `if "access_state" not in node_types_seen and
+"access_capability" not in node_types_seen: return ApexPhase.credential`.
+
+**`ObjectivePlanner`/`UserFlagExecutor`/`ObjectiveParser`/
+`check_bounded_user_flag_verification`: unchanged**, exactly as Phase
+18B's extension contract promised — proven, not merely claimed, by
+architecture-scan tests that grep each module's source for
+transport-specific branching, capability-type vocabulary, and
+request-shape vocabulary (headers/cookie/origin/endpoint_template),
+confirming none of it leaked into any of these four components.
+
+**Reporting:** `capability_type_label("arbitrary_file_read")` renamed from
+`"Arbitrary File Read"` to `"Direct File Read"` (matching this phase's own
+required report wording; verified nothing else depended on the old
+string). A new "Direct File Read Summary" report section (shown only when
+at least one direct-file-read capability exists) adds seven `RunReport`
+fields (`direct_file_read_capabilities_derived`, `_adapters_registered`,
+`_attempts`, `_blocked_attempts`, `_verified_count`, `_rejected_oversized`,
+`_rejected_cross_origin`), all derived from a new
+`ApexGraphState.direct_file_read_log` accumulator (mirrors
+`credential_validation_log`'s established pattern) populated by
+`write_memory` for `user_flag_verify` results against a direct-file-read
+capability only.
+
+**Explicitly not changed:** no generic HTTP/SSRF executor was introduced —
+`read_bounded_file(path)` remains the adapter's only method, taking only
+the bounded candidate path; every other request-shape field is fixed
+configuration, never task-controlled. No exploitation, payload,
+persistence, or root-flag capability was added. `memfabric/` was not
+touched (verified by an architecture-scan test grepping the entire
+`memfabric/` tree for direct-file-read-specific terminology). No
+machine-specific code, expected file path, or hardcoded flag value was
+added anywhere (verified by static scans). Docker, Compose, VPN, and
+GitHub Actions were not touched. No branch was created; no commit or push
+was made as part of this phase's work.
+
+**New files:** `apex_host/orchestration/capability_seed.py`,
+`tests/apex_host/test_phase20_direct_file_read_capability.py` (105 tests
+across the 14 required categories: capability model, capability
+derivation, runtime registry, adapter behavior, origin/redirect security,
+candidate-path security, `UserFlagExecutor` independence, verifier
+integration, policy, planner, EKG/persistence, full graph — positive
+(synthetic verified success via direct file read, no SSH anywhere),
+negative full graph, architecture scans).
+
+**Modified files:** `apex_host/runtime_registry.py` (`BoundedReadResult`,
+`DirectFileReadPrimitive`, `DirectFileReadCapabilityAdapter`,
+`ensure_direct_file_read`), `apex_host/types.py`
+(`AccessCapability.runtime_available`), `apex_host/parsers/capability_parser.py`
+(`derive_direct_file_read_capability`, `derive_ssh_capability` now starts
+`runtime_available=False`), `apex_host/planners/access_capabilities.py`
+(label rename, `_DIRECTNESS_RANK`, `runtime_available` filtering),
+`apex_host/planners/objective.py` (`objective_attempted_capability_pairs`),
+`apex_host/planners/objective_planner.py` (pair-scoped exhaustion,
+`_is_globally_exhausted`), `apex_host/parsers/objective_parser.py`
+(`attempted_capability_paths` persistence), `apex_host/execution/dispatcher.py`
+(direct-file-read metrics fields in the `user_flag_verify` result dict),
+`apex_host/config.py` (eleven new `direct_file_read_*` fields + CLI
+wiring + `to_safe_dict()` header redaction), `apex_host/runtime.py`
+(startup capability seeding call + `direct_file_read_log` init),
+`apex_host/eval/run_synthetic_machine.py` (same state-field init),
+`apex_host/graph_state.py` (`direct_file_read_log` field),
+`apex_host/orchestration/memory_node.py` (log accumulation),
+`apex_host/planners/global_planner.py` (phase-gate fix),
+`apex_host/orchestration/dispatch_node.py`
+(`_register_direct_file_read_adapter`, `runtime_available` writeback at
+confidence 0.5), `apex_host/eval/report.py` (seven new fields, text/JSON
+sections), `apex_host/main.py` + `apex_host/eval/run_htb_local.py` (nine
+new CLI flags each), `apex_host/policy/rules.py` (documentation-only —
+confirmed no functional change needed), `docs/user-flag-objective.md`
+(new §17), `README.md`. Two pre-existing test files updated in place
+(behavior legitimately changed, not weakened):
+`tests/apex_host/test_access_capability_refactor.py` (tuple → dataclass
+attribute access, new field in the capability field-spec assertion),
+`tests/apex_host/test_phase18_user_flag_objective.py` (`_seed_validated_ssh_access`
+now marks the capability `runtime_available` — simulating the
+orchestration registration step for tests that construct
+`_ObjectiveDeterministic` directly; one exhaustion test updated to seed
+the new pair-scoped `attempted_capability_paths` field, with an inline
+comment documenting why).
+
+**Validation (clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest tests/apex_host/test_phase20_direct_file_read_capability.py -q` | 105 passed |
+| `uv run pytest tests/apex_host/test_phase18_user_flag_objective.py tests/apex_host/test_access_capability_refactor.py -q` | 216 passed |
+| `uv run pytest tests/ -q` (full) | 4558 passed — no regressions |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy` | Success — 171 source files |
+| `python -m apex_host.main --help` | exit 0 |
+| `python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Remaining known limitations (documented, not defects — see
+`docs/user-flag-objective.md` §17.18 for the full list):** only one
+operator-attested direct-file-read primitive can be configured per
+engagement (not a list). No live web-exploitation validation step
+*discovers* a direct-file-read primitive automatically — the operator must
+supply the confirmed request shape via configuration; building autonomous
+discovery was explicitly out of this phase's scope. `max_redirect_hops`
+defaults to 1 once redirects are enabled. Verified user flag remains the
+only benchmark-success condition (`EngagementOutcome.user_flag_verified`,
+exit code 0); a validated `access_state`/`access_capability` alone remains
+an intermediate milestone, never independently success — this phase adds a
+second way to reach the same objective, not a second success condition.

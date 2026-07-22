@@ -4,16 +4,17 @@
 
 ``make_continuation_node`` returns the ``reflect_or_continue`` async
 LangGraph node — the single place every graph-internal termination reason
-is decided (Phase 12C). After each turn it:
+is decided (Phase 12C; success redefined in Phase 18). After each turn it:
 
 1. Peeks at the live EKG (bounded, best-effort — a failed peek degrades
    gracefully rather than crashing the turn).
 2. Applies the outcome precedence documented in
-   ``apex_host.orchestration.outcome`` (module docstring): validated_access
-   first, unconditionally; then any upstream-preset outcome
-   (``state["outcome"]`` already set by ``dispatch_node``/``parsing_node``/
-   ``memory_node`` this turn); then stall detection; then phase-budget/
-   max-turns exhaustion.
+   ``apex_host.orchestration.outcome`` (module docstring): the configured
+   objective being verified first, unconditionally (Phase 18 — NOT a bare
+   ``access_state``, which is an intermediate milestone only); then any
+   upstream-preset outcome (``state["outcome"]`` already set by
+   ``dispatch_node``/``parsing_node``/``memory_node`` this turn); then
+   stall detection; then phase-budget/max-turns exhaustion.
 3. On termination, writes the single canonical terminal ``Episode``
    (``apex_host.orchestration.terminal_episode``) and threads
    ``outcome``/``termination_reason``/``termination_phase``/``stall_reason``
@@ -34,6 +35,7 @@ from apex_host.orchestration.outcome import (
 )
 from apex_host.orchestration.terminal_episode import terminal_state_fields, write_terminal_episode
 from apex_host.planners.capabilities import capabilities_from_subgraph
+from apex_host.planners.objective import objective_status_from_subgraph
 from apex_host.planners.workflow_orchestration import (
     build_workflow_graph_deltas,
     derive_sessions_from_subgraph,
@@ -98,13 +100,22 @@ def make_continuation_node(deps: "OrchestrationDeps") -> Any:
             except Exception as exc:
                 logger.debug("reflect_or_continue: workflow sync failed: %s", exc)
 
-        has_access_state = "access_state" in node_types_seen
+        # Phase 18: a validated access_state is an intermediate milestone
+        # only — success requires the configured objective (default
+        # "user_flag") to be VERIFIED. See apex_host.orchestration.outcome
+        # module docstring "Success invariant".
+        objective_status = "pending"
+        if subgraph is not None:
+            objective_status = objective_status_from_subgraph(
+                subgraph, state["target"], deps.config.objective_type
+            )
+        objective_verified = objective_status == "verified"
 
-        # --- Outcome precedence level 1: validated_access always wins. ---
-        if has_access_state:
+        # --- Outcome precedence level 1: objective verification always wins. ---
+        if objective_verified:
             decision = TerminationDecision(
-                terminate=True, outcome=EngagementOutcome.validated_access, success=True,
-                reason="access_state present in the EKG — credential validated",
+                terminate=True, outcome=EngagementOutcome.user_flag_verified, success=True,
+                reason="configured objective verified — evidence recorded in the EKG",
                 phase=current_phase, turn=turn_count,
             )
         else:
@@ -136,6 +147,7 @@ def make_continuation_node(deps: "OrchestrationDeps") -> Any:
                             turn_count=turn_count,
                             has_web_capability=has_web_peek,
                             current_phase=state.get("phase"),
+                            objective_status=objective_status,
                         )
                         next_phase_value = next_phase.value
                     except Exception as exc:
@@ -153,7 +165,7 @@ def make_continuation_node(deps: "OrchestrationDeps") -> Any:
 
                 decision = evaluate_termination(
                     max_turns=deps.config.max_turns, turn_count=turn_count,
-                    has_access_state=False, next_phase=next_phase_value,
+                    objective_verified=False, next_phase=next_phase_value,
                     current_phase=current_phase, stall=stall,
                 )
                 if not decision.terminate:

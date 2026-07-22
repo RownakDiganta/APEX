@@ -23,6 +23,8 @@ PHASE_NODE: dict[str, str] = {
     ApexPhase.recon.value: "recon_agent",
     ApexPhase.web.value: "web_agent",
     ApexPhase.credential.value: "execute_agent",
+    # Phase 18 — pursues the configured engagement objective.
+    ApexPhase.objective.value: "objective_agent",
     ApexPhase.priv_esc.value: "priv_esc_agent",
 }
 

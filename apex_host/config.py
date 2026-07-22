@@ -252,6 +252,104 @@ class ApexConfig:
     # No CLI flag (mirrors tool_service_token's own "env-var only for a
     # sensitive path" precedent, though this is not itself a secret).
     htb_ovpn_path: str | None = None
+    # ---------------------------------------------------------------------------
+    # Phase 18 — user-flag objective and bounded verification
+    # (apex_host/verification/user_flag.py; apex_host/agents/user_flag_executor.py;
+    #  docs/user-flag-objective.md)
+    # ---------------------------------------------------------------------------
+    # objective_type selects the engagement's benchmark success condition.
+    # "user_flag" is the only implemented objective and is the default for
+    # BOTH the general library/runtime and the HTB benchmark runner — Ali's
+    # confirmed benchmark success definition ("success means verified
+    # retrieval of the user flag") applies by default, not only when an
+    # operator opts in. A validated access_state node is never independently
+    # treated as success; see apex_host/orchestration/outcome.py.
+    objective_type: str = "user_flag"
+    # Small, documented, overrideable list of generic HTB user-flag filename
+    # candidates. Never a machine-specific value (CLAUDE.md §13.8/§13.9).
+    user_flag_candidate_filenames: list[str] = field(default_factory=lambda: ["user.txt"])
+    # Bounded candidate root templates. "{username}" is substituted with the
+    # already-authenticated SSH username (validated against a conservative
+    # POSIX-username charset before substitution — see
+    # apex_host/planners/objective_planner.py); a root containing
+    # "{username}" is skipped defensively if the username fails that check.
+    user_flag_candidate_roots: list[str] = field(default_factory=lambda: ["/home/{username}"])
+    # Hard cap on distinct candidate paths attempted per engagement — bounds
+    # the discovery surface; never an unrestricted recursive filesystem search.
+    max_user_flag_attempts: int = 3
+    # Per-read output cap in bytes — the verifier also independently rejects
+    # oversized/multiline/malformed content regardless of this cap.
+    user_flag_max_output_bytes: int = 4096
+    # Optional override for the verifier's expected flag-format regex. None
+    # (the default) uses apex_host.verification.user_flag.DEFAULT_FLAG_FORMAT_REGEX
+    # — a generic, conservative bounded-token pattern, never a specific
+    # machine's known flag value (CLAUDE.md §13.8/§13.9 — no exact expected
+    # flag value may ever appear in source or configuration).
+    user_flag_verification_regex: str | None = None
+    # Access-capability refactor — outer defensive timeout ceiling for one
+    # UserFlagExecutor.run() call, independent of whatever transport-
+    # specific timeouts the resolved capability adapter applies internally
+    # (e.g. SSHCapabilityAdapter's own ssh_connect_timeout_seconds /
+    # ssh_auth_timeout_seconds / ssh_command_timeout_seconds). Belt-and-
+    # suspenders only — never the primary bound.
+    user_flag_read_timeout_seconds: float = 35.0
+
+    # ---------------------------------------------------------------------------
+    # Phase 20 — direct file-read access capability
+    # (apex_host/runtime_registry.py::DirectFileReadCapabilityAdapter;
+    #  apex_host/parsers/capability_parser.py::derive_direct_file_read_capability;
+    #  docs/user-flag-objective.md §17)
+    # ---------------------------------------------------------------------------
+    # Every field below describes a FULLY FIXED, operator-supplied HTTP
+    # request shape for a pre-validated file-read primitive (an arbitrary
+    # file read, an LFI, a path-traversal primitive, an authenticated
+    # file-download endpoint, ...) — mirrors --username/--password's own
+    # trust boundary exactly: the operator asserts, out of band, that this
+    # exact request shape already works; APEX never discovers, probes for,
+    # or autonomously exploits it. NONE of these fields are ever
+    # LLM-controlled, planner-controlled, or task-controlled — only the ONE
+    # bounded candidate path substituted per read varies.
+    #
+    # `direct_file_read_operator_attested` is the explicit opt-in gate: with
+    # the default `False`, none of the fields below have any effect — no
+    # `access_capability` node is ever derived from them. This mirrors
+    # `policy_enabled`'s own "safe unless explicitly configured" precedent.
+    direct_file_read_operator_attested: bool = False
+    # "arbitrary_file_read" or "api_file_read" — behaviorally identical at
+    # runtime (same adapter), differing only in this metadata classification
+    # of the underlying primitive (see AccessCapabilityType).
+    direct_file_read_capability_type: str = "arbitrary_file_read"
+    # scheme://host[:port] ONLY — no path, no query, no userinfo. Every
+    # request (and every followed redirect) must resolve to exactly this
+    # origin or it is rejected — see DirectFileReadCapabilityAdapter.
+    direct_file_read_origin: str | None = None
+    # A path+query template containing exactly one "{path}" placeholder,
+    # e.g. "/download.php?file={path}" or "/files/{path}".
+    direct_file_read_endpoint_template: str | None = None
+    # "GET" or "POST" only — validated at adapter construction time.
+    direct_file_read_method: str = "GET"
+    # Fixed, operator-supplied headers (e.g. a pre-obtained session cookie
+    # or bearer token VALUE) — runtime-only; never written to the EKG,
+    # never included in any report, episode, or log line.
+    direct_file_read_headers: dict[str, str] = field(default_factory=dict)
+    # A label identifying who/what this capability is attributed to (e.g.
+    # an application username, or a fixed operator-chosen tag like
+    # "application" when no specific principal applies). Required —
+    # mirrors derive_ssh_capability's own "no username, no node" guard.
+    direct_file_read_principal: str = ""
+    # Bounded response-size cap in bytes — enforced independently by the
+    # adapter itself (never trusts the verifier's own cap alone).
+    direct_file_read_max_response_bytes: int = 4096
+    direct_file_read_timeout_seconds: float = 15.0
+    # Default False — "be extremely conservative with redirects." When
+    # True, at most one same-origin redirect is followed (see
+    # DirectFileReadPrimitive.max_redirect_hops).
+    direct_file_read_allow_redirects: bool = False
+    # Confidence recorded on the derived access_capability node. Fixed and
+    # conservative — never a specific known-flag value, never inferred from
+    # the target or EKG content (CLAUDE.md §13.8/§13.9).
+    direct_file_read_confidence: float = 0.7
+
     # Configuration schema version — increment when the config format changes in a
     # backward-incompatible way (new required fields, renamed fields, type changes).
     # Exposed via to_safe_dict() so consumers can detect incompatible changes.
@@ -274,6 +372,10 @@ class ApexConfig:
         not itself a credential, so the filename alone is shown rather than
         a full "[redacted]" — this lets an operator confirm *which* profile
         is configured without exposing the full host path.
+        ``direct_file_read_headers`` (Phase 20) values are replaced with
+        ``"[redacted]"`` — a fixed header may carry a session cookie or
+        bearer token value; header NAMES are kept (so an operator can
+        confirm which headers are configured) but never the values.
         All other fields are returned verbatim — no other field stores a plaintext secret.
         """
         d: dict[str, object] = {f.name: getattr(self, f.name) for f in _dc_fields(self)}
@@ -283,6 +385,8 @@ class ApexConfig:
             d["tool_service_token"] = _REDACTED
         if self.htb_ovpn_path:
             d["htb_ovpn_path"] = _basename(self.htb_ovpn_path)
+        if self.direct_file_read_headers:
+            d["direct_file_read_headers"] = {k: _REDACTED for k in self.direct_file_read_headers}
         return d
 
     @classmethod
@@ -336,7 +440,40 @@ class ApexConfig:
             "vpn_service_url": _g("vpn_service_url", None),
             "htb_route_cidr": _g("htb_route_cidr", "10.129.0.0/16"),
             "htb_ovpn_path": _g("htb_ovpn_path", None),
+            # Phase 18 — user-flag objective configuration. Never a CLI
+            # option accepts an expected plaintext flag value.
+            "objective_type": _g("objective_type", "user_flag"),
+            "max_user_flag_attempts": _g("max_user_flag_attempts", 3),
+            "user_flag_max_output_bytes": _g("user_flag_max_output_bytes", 4096),
+            "user_flag_verification_regex": _g("user_flag_verification_regex", None),
+            "user_flag_read_timeout_seconds": _g("user_flag_read_timeout_seconds", 35.0),
+            # Phase 20 — direct file-read access capability. Never enabled
+            # unless the operator explicitly passes --direct-file-read-attested.
+            "direct_file_read_operator_attested": bool(_g("direct_file_read_operator_attested", False)),
+            "direct_file_read_capability_type": _g("direct_file_read_capability_type", "arbitrary_file_read"),
+            "direct_file_read_origin": _g("direct_file_read_origin", None),
+            "direct_file_read_endpoint_template": _g("direct_file_read_endpoint_template", None),
+            "direct_file_read_method": _g("direct_file_read_method", "GET"),
+            "direct_file_read_principal": _g("direct_file_read_principal", ""),
+            "direct_file_read_max_response_bytes": _g("direct_file_read_max_response_bytes", 4096),
+            "direct_file_read_timeout_seconds": _g("direct_file_read_timeout_seconds", 15.0),
+            "direct_file_read_allow_redirects": bool(_g("direct_file_read_allow_redirects", False)),
+            "direct_file_read_confidence": _g("direct_file_read_confidence", 0.7),
         }
+        user_flag_filenames = getattr(args, "user_flag_candidate_filenames", None)
+        if user_flag_filenames:
+            kwargs["user_flag_candidate_filenames"] = list(user_flag_filenames)
+        user_flag_roots = getattr(args, "user_flag_candidate_roots", None)
+        if user_flag_roots:
+            kwargs["user_flag_candidate_roots"] = list(user_flag_roots)
+        direct_file_read_headers = getattr(args, "direct_file_read_header", None)
+        if direct_file_read_headers:
+            headers: dict[str, str] = {}
+            for entry in direct_file_read_headers:
+                name, sep, value = str(entry).partition(":")
+                if sep:
+                    headers[name.strip()] = value.strip()
+            kwargs["direct_file_read_headers"] = headers
         if getattr(args, "vpn_health_timeout", None) is not None:
             kwargs["vpn_health_timeout_seconds"] = float(getattr(args, "vpn_health_timeout"))
         if getattr(args, "max_llm_calls", None) is not None:

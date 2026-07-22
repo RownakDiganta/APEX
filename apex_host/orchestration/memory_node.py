@@ -25,11 +25,20 @@ from memfabric.types import Episode, Outcome
 from apex_host.graph_state import ApexGraphState
 from apex_host.orchestration.completion import outcome_for
 from apex_host.orchestration.outcome import EngagementOutcome
+from apex_host.security.redaction import redact_user_flag_output
+from apex_host.types import AccessCapabilityType
 
 if TYPE_CHECKING:
     from apex_host.orchestration.dependencies import OrchestrationDeps
 
 logger = logging.getLogger(__name__)
+
+#: Phase 20 — the two capability_type values that count toward the
+#: direct-file-read metrics/audit log below (behaviorally identical at
+#: runtime, distinct only in operator-facing classification).
+_DIRECT_FILE_READ_TYPES: frozenset[str] = frozenset({
+    AccessCapabilityType.arbitrary_file_read.value, AccessCapabilityType.api_file_read.value,
+})
 
 
 def make_memory_node(deps: "OrchestrationDeps") -> Any:
@@ -48,6 +57,7 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
         backend_entries: list[dict[str, Any]] = []
         credential_entries: list[dict[str, Any]] = []
         latency_entries: list[dict[str, Any]] = []
+        direct_file_read_entries: list[dict[str, Any]] = []
         for tr in results_to_write:
             # F13: skipped-duplicate tasks never executed — skip episode creation.
             if tr.get("skipped_duplicate"):
@@ -59,6 +69,17 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
             else:
                 o = outcome_for(int(tr.get("returncode", 0) or 0), tr.get("error"))
 
+            # Phase 18: a user_flag_verify tool_result's "stdout" carries the
+            # raw candidate read — the value under investigation, not yet
+            # known to be secret-free. It must never reach the persisted
+            # episodic log verbatim (it already served its only legitimate
+            # purpose — verification — in parse_observation, which ran
+            # before this node). Every other field (candidate_path,
+            # username, error, etc.) is left intact for audit purposes.
+            episode_data = tr
+            if tr.get("tool") == "user_flag_verify":
+                episode_data = {**tr, "stdout": redact_user_flag_output(str(tr.get("stdout", "")))}
+
             episode = Episode(
                 agent=f"apex.{state['phase']}",
                 action=(
@@ -66,7 +87,7 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
                     f"{tr.get('target', tr.get('url', ''))}"
                 ).strip(),
                 outcome=o,
-                data=tr,
+                data=episode_data,
                 task_id=tr.get("task_id"),
                 phase=state["phase"],
             )
@@ -87,6 +108,8 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
                     failure_result["credential_validation_log"] = credential_entries
                 if latency_entries:
                     failure_result["task_latency_log"] = latency_entries
+                if direct_file_read_entries:
+                    failure_result["direct_file_read_log"] = direct_file_read_entries
                 return failure_result
 
             if o != Outcome.success:
@@ -153,6 +176,29 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
                     "phase": state["phase"],
                 })
 
+            # Phase 20: direct-file-read attempt audit log — never the raw
+            # candidate output (tr never carries it in the first place; see
+            # UserFlagExecutor's own "why verification now happens here").
+            # Only user_flag_verify results whose capability_type is a
+            # direct-file-read type are recorded here; SSH-backed
+            # user_flag_verify attempts are already covered by the report's
+            # existing objective_* fields.
+            capability_type = str(tr.get("capability_type", ""))
+            if tool_name == "user_flag_verify" and capability_type in _DIRECT_FILE_READ_TYPES:
+                direct_file_read_entries.append({
+                    "capability_id": str(tr.get("capability_id", "")),
+                    "capability_type": capability_type,
+                    "candidate_path": str(tr.get("candidate_path", "")),
+                    "blocked": bool(tr.get("policy_blocked", False)),
+                    "connected": bool(tr.get("connected", False)),
+                    "verified": bool(tr.get("verified", False)),
+                    "status_code": tr.get("status_code"),
+                    "bytes_received": int(tr.get("bytes_received", 0) or 0),
+                    "truncated": bool(tr.get("truncated", False)),
+                    "error": tr.get("error"),
+                    "phase": state["phase"],
+                })
+
         result: dict[str, Any] = {}
         if error_entries:
             result["error_episodes"] = error_entries
@@ -162,6 +208,8 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
             result["credential_validation_log"] = credential_entries
         if latency_entries:
             result["task_latency_log"] = latency_entries
+        if direct_file_read_entries:
+            result["direct_file_read_log"] = direct_file_read_entries
         return result
 
     return write_memory

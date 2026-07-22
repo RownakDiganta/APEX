@@ -36,12 +36,13 @@ from memfabric.types import Edge, Node
 
 from apex_host.config import ApexConfig
 from apex_host.graph import build_apex_graph
+from apex_host.graph_ids import access_capability_id
 from apex_host.graph_state import ApexGraphState
 from apex_host.orchestration.diagnostics_node import make_unknown_phase_node
 from apex_host.orchestration.routing import UNKNOWN_PHASE_NODE, route_after_global_plan
 from apex_host.planners.global_planner import GlobalPlanner
 from apex_host.tools.registry import ToolRegistry
-from apex_host.types import ApexPhase
+from apex_host.types import AccessCapabilityType, ApexPhase
 
 _TARGET = "10.10.10.99"
 _ANCHOR = f"host:{_TARGET}"
@@ -129,17 +130,24 @@ class TestBugACredentialBudgetExhaustion:
 
         assert gp.budget_remaining(ApexPhase.credential) == 0
 
+        # Phase 18: forcing past credential routes to the unresolved
+        # objective phase first — not directly to priv_esc.
         phase = gp.decide_phase(
             node_types_seen=node_types_seen, turn_count=2, current_phase="credential"
         )
-        assert phase == ApexPhase.priv_esc
+        assert phase == ApexPhase.objective
 
     def test_no_oscillation_across_repeated_peek_and_global_plan_calls(self) -> None:
         """Regression for Bug A: simulate several more turns exactly the way
         production code calls decide_phase — reflect_or_continue's peek
         (current_phase=<this turn's phase>) followed by the next turn's
         global_plan call (current_phase=<peek's own return value>). Before
-        the fix, the second call in each pair reverted to credential."""
+        the fix, the second call in each pair reverted to credential.
+
+        Phase 18: the steady state once credential's budget is exhausted
+        (and no real access_state exists) is now `objective`, not
+        `priv_esc` — the fix under test (no oscillation back to
+        `credential`) is unaffected by which forward phase is reached."""
         gp = GlobalPlanner(max_turns=100, phase_budgets={"credential": 2})
         node_types_seen = {"host", "service", "endpoint"}
         gp.record_turn(ApexPhase.credential)
@@ -152,62 +160,82 @@ class TestBugACredentialBudgetExhaustion:
                 node_types_seen=node_types_seen, turn_count=turn,
                 current_phase=current_phase_value,
             )
-            assert peeked == ApexPhase.priv_esc, (
-                f"turn {turn}: peek reverted to {peeked!r} instead of staying priv_esc"
+            assert peeked == ApexPhase.objective, (
+                f"turn {turn}: peek reverted to {peeked!r} instead of staying objective"
             )
             dispatched = gp.decide_phase(
                 node_types_seen=node_types_seen, turn_count=turn,
                 current_phase=peeked.value,
             )
-            assert dispatched == ApexPhase.priv_esc, (
+            assert dispatched == ApexPhase.objective, (
                 f"turn {turn}: global_plan call oscillated back to {dispatched!r} "
-                "instead of dispatching priv_esc (Bug A regression)"
+                "instead of dispatching objective (Bug A regression)"
             )
+            assert dispatched != ApexPhase.credential
             current_phase_value = dispatched.value
 
     async def test_full_graph_priv_esc_agent_actually_dispatched(self) -> None:
-        """End-to-end proof that priv_esc_agent is genuinely invoked (not
-        just that decide_phase returns priv_esc in isolation): run the
-        compiled graph with credential's budget pre-exhausted and assert a
-        priv_esc-phase planner decision was recorded."""
+        """End-to-end proof that priv_esc_agent is genuinely invoked once
+        the objective phase itself concludes without success (Phase 18):
+        seed a REAL ssh access_state plus operator credentials so
+        ObjectivePlanner actually dispatches a bounded verification task
+        (never an AbandonSignal) — in dry-run mode that attempt always
+        fails to verify, and with only one default candidate path
+        (max_user_flag_attempts default x one filename) that single
+        failure immediately marks the objective 'failed', letting the very
+        next turn fall through to priv_esc."""
         api = make_api()
         await _seed_node(api, _ANCHOR, "host", {"ip": _TARGET})
         await _seed_node(
-            api, f"service:{_TARGET}:80/tcp", "service",
-            {"port": "80", "proto": "tcp", "service": "http", "state": "open"},
+            api, f"service:{_TARGET}:22/tcp", "service",
+            {"port": "22", "proto": "tcp", "service": "ssh", "state": "open"},
         )
         await _seed_node(
-            api, f"endpoint:{_TARGET}:seed", "endpoint", {"url": f"http://{_TARGET}/"}
+            api, f"access_state:{_TARGET}:testuser:ssh", "access_state",
+            {"level": "user", "username": "testuser", "target": _TARGET, "service": "ssh"},
         )
-        for to_id in (f"service:{_TARGET}:80/tcp", f"endpoint:{_TARGET}:seed"):
+        # Access-capability refactor: ObjectivePlanner now selects among
+        # validated AccessCapability nodes rather than access_state nodes
+        # directly (see apex_host/planners/access_capabilities.py) — a
+        # capability node is normally produced by CapabilityParser once a
+        # real ssh_access task succeeds through the dispatcher; this test
+        # seeds the equivalent EKG state directly.
+        cap_id = access_capability_id(_TARGET, AccessCapabilityType.ssh_command.value, "testuser")
+        await _seed_node(
+            api, cap_id, "access_capability",
+            {
+                "capability_type": AccessCapabilityType.ssh_command.value,
+                "host_id": _ANCHOR, "validated": True, "principal": "testuser",
+                "confidence": 0.85, "source_task_id": "", "metadata": {},
+            },
+        )
+        for to_id in (
+            f"service:{_TARGET}:22/tcp", f"access_state:{_TARGET}:testuser:ssh", cap_id,
+        ):
             await _seed_edge(api, _ANCHOR, to_id)
 
-        config = ApexConfig(target=_TARGET, dry_run=True, max_turns=6)
+        config = ApexConfig(
+            target=_TARGET, dry_run=True, max_turns=6,
+            username_candidates=["testuser"], password_candidates=["testpass"],
+        )
         registry = ToolRegistry.from_config(config)
+        graph = build_apex_graph(api, registry, config)
+        final_state = await graph.ainvoke(make_initial_state(_TARGET))
 
-        # Force credential's budget to exhaust immediately (1 turn allowed)
-        # so it is exhausted well before max_turns, matching the diagnostic
-        # report's real-world scenario (no telnet, no auth_flow — credential
-        # can never resolve organically). GlobalPlanner is constructed
-        # inside build_apex_graph from this module-level default table.
-        from apex_host.planners import global_planner as gp_mod
-
-        original_defaults = dict(gp_mod._DEFAULT_PHASE_BUDGETS)
-        gp_mod._DEFAULT_PHASE_BUDGETS[ApexPhase.credential.value] = 1
-        try:
-            graph = build_apex_graph(api, registry, config)
-            final_state = await graph.ainvoke(make_initial_state(_TARGET))
-        finally:
-            gp_mod._DEFAULT_PHASE_BUDGETS.clear()
-            gp_mod._DEFAULT_PHASE_BUDGETS.update(original_defaults)
-
-        phases_dispatched = {
+        phases_dispatched = [
             d.get("phase") for d in final_state["planner_decisions"] if d.get("phase")
-        }
+        ]
+        assert ApexPhase.objective.value in phases_dispatched, (
+            f"objective_agent was never dispatched; phases seen: {phases_dispatched}"
+        )
         assert ApexPhase.priv_esc.value in phases_dispatched, (
-            f"priv_esc_agent was never dispatched; phases seen: {phases_dispatched}"
+            f"priv_esc_agent was never dispatched after the objective failed; "
+            f"phases seen: {phases_dispatched}"
         )
         assert final_state["completed"] is True
+        # Never fabricates success from access alone or from an
+        # unverified objective attempt.
+        assert final_state["outcome"] != "user_flag_verified"
 
 
 # ---------------------------------------------------------------------------
@@ -272,15 +300,23 @@ class TestBugBAuthFlowIsNotAccessState:
 
 
 class TestAccessStateAdvancesPastCredential:
-    def test_decide_phase_advances_to_priv_esc(self) -> None:
+    def test_decide_phase_advances_to_objective(self) -> None:
+        # Phase 18: access_state routes to the objective phase, never
+        # straight to priv_esc, and access alone is never terminal.
         gp = GlobalPlanner(max_turns=20)
         phase = gp.decide_phase(
             node_types_seen={"host", "service", "endpoint", "access_state"},
             turn_count=0,
         )
-        assert phase == ApexPhase.priv_esc
+        assert phase == ApexPhase.objective
 
-    async def test_full_graph_dispatches_priv_esc_agent(self) -> None:
+    async def test_full_graph_dispatches_objective_agent_not_priv_esc(self) -> None:
+        """With access_state already present but NOT ssh-protocol and no
+        credentials configured, the compiled graph routes to objective_agent
+        (not priv_esc_agent), ObjectivePlanner abandons (no ssh access it
+        can act on), and — critically — the engagement does NOT terminate
+        as success merely because access_state exists (Phase 18's core
+        mandate)."""
         api = make_api()
         await _seed_node(api, _ANCHOR, "host", {"ip": _TARGET})
         await _seed_node(
@@ -302,11 +338,15 @@ class TestAccessStateAdvancesPastCredential:
 
         # Phase 12C: `phase` always becomes "done" once terminated;
         # `termination_phase` records the phase actually dispatched
-        # (priv_esc, since access_state was already present when
-        # global_plan ran this turn) and `outcome` is validated_access.
+        # (objective, since access_state was already present when
+        # global_plan ran this turn). Phase 18: access alone never
+        # produces a success outcome — with max_turns=1 the engagement
+        # simply exhausts its turn budget.
         assert final_state["phase"] == "done"
-        assert final_state["termination_phase"] == "priv_esc"
-        assert final_state["outcome"] == "validated_access"
+        assert final_state["termination_phase"] == "objective"
+        assert final_state["outcome"] == "max_turns_exhausted"
+        assert final_state["outcome"] != "user_flag_verified"
+        assert final_state["outcome"] != "validated_access"
         assert final_state["completed"] is True
 
 
@@ -345,6 +385,7 @@ class TestBugEUnknownPhaseHandling:
         from apex_host.orchestration.dependencies import OrchestrationDeps
         from apex_host.orchestration.stall import StallTracker
         from apex_host.policy import PolicyAdvisor, load_policy
+        from apex_host.runtime_registry import CapabilityRuntimeRegistry
 
         api = make_api()
         config = ApexConfig(target=_TARGET, dry_run=True, max_turns=5)
@@ -358,6 +399,7 @@ class TestBugEUnknownPhaseHandling:
             global_planner=GlobalPlanner(max_turns=config.max_turns),
             phase_planners={}, repair_engine=None,  # type: ignore[arg-type]
             config=config, anchor_id=_ANCHOR, stall_tracker=StallTracker(),
+            capability_registry=CapabilityRuntimeRegistry(),
         )
         node = make_unknown_phase_node(deps)
 
@@ -399,6 +441,7 @@ class TestBugEUnknownPhaseHandling:
             turn_count: int,
             current_phase: str | None = None,
             has_web_capability: bool = True,
+            objective_status: str = "pending",
         ) -> ApexPhase:
             return ApexPhase.exploit
 
@@ -429,13 +472,18 @@ class TestBugEUnknownPhaseHandling:
 
 
 class TestFullRegressionCredentialToPrivEscToCompletion:
-    async def test_synthetic_engagement_completes_without_oscillation(self) -> None:
+    async def test_synthetic_engagement_stalls_cleanly_without_oscillation_or_fabricated_success(
+        self,
+    ) -> None:
         """End-to-end synthetic engagement: seed an EKG that already has
         host+service+endpoint (web phase satisfied) with credential's
-        budget exhausted immediately. Run several turns and prove the
-        engagement (a) actually reaches priv_esc, (b) completes within the
-        turn budget rather than spinning until max_turns doing nothing, and
-        (c) never re-dispatches execute_agent after priv_esc is reached."""
+        budget exhausted immediately, and NO real access ever available
+        (no credentials configured, no ssh access_state). Phase 18: the
+        engagement routes credential -> objective (never straight to
+        priv_esc), ObjectivePlanner can never act without real ssh access,
+        and the stall detector — strictly more responsive than either
+        phase's own turn budget — cleanly stops the engagement rather than
+        oscillating or fabricating success from access alone."""
         from apex_host.planners import global_planner as gp_mod
 
         api = make_api()
@@ -465,38 +513,29 @@ class TestFullRegressionCredentialToPrivEscToCompletion:
         phase_sequence = [
             d.get("phase") for d in final_state["planner_decisions"] if d.get("phase")
         ]
-        assert ApexPhase.priv_esc.value in phase_sequence, (
-            f"priv_esc never dispatched; sequence was {phase_sequence}"
+        # Phase 18: objective (not priv_esc) is reached immediately after
+        # credential's one-turn budget — no oscillation back to credential,
+        # and never a bare-fabricated priv_esc dispatch with nothing to do.
+        assert ApexPhase.objective.value in phase_sequence, (
+            f"objective never dispatched; sequence was {phase_sequence}"
         )
-        # No oscillation: priv_esc is reached immediately after credential's
-        # one-turn budget (index 1 of 2 dispatched phases: credential, then
-        # priv_esc) — before the fix this never happened at all, the
-        # sequence bounced credential/(nothing) until max_turns.
-        first_priv_esc = phase_sequence.index(ApexPhase.priv_esc.value)
-        assert first_priv_esc == 1, (
-            f"priv_esc should be reached on the second dispatched turn "
+        first_objective = phase_sequence.index(ApexPhase.objective.value)
+        assert first_objective == 1, (
+            f"objective should be reached on the second dispatched turn "
             f"(right after credential's 1-turn budget); sequence was {phase_sequence}"
         )
-        # And once reached, credential must never be dispatched again.
-        assert ApexPhase.credential.value not in phase_sequence[first_priv_esc + 1:], (
-            f"credential re-dispatched after priv_esc — oscillation regression: {phase_sequence}"
+        assert ApexPhase.credential.value not in phase_sequence[first_objective + 1:], (
+            f"credential re-dispatched after objective — oscillation regression: {phase_sequence}"
         )
-        assert all(p == ApexPhase.priv_esc.value for p in phase_sequence[first_priv_esc:]), (
-            f"expected only priv_esc dispatches after it is first reached: {phase_sequence}"
-        )
-        # Phase 12C fix: PrivEscPlanner has no organic exit condition of its
-        # own, and priv_esc's own turn budget (default 4) would eventually
-        # bound it via phase_budget_exhausted — but the stall detector
-        # (also Phase 12C) is strictly more responsive here: credential's
-        # AbandonSignal (turn 1) and priv_esc's AbandonSignal (turns 2-3,
-        # no searchsploit configured) are three *consecutive* no-action
-        # turns regardless of which phase they nominally belong to, so
-        # no_actionable_task fires at turn 3 — well before either
-        # priv_esc's own budget or the global max_turns=8 ceiling would
-        # have. Either mechanism alone would have prevented the old
-        # infinite oscillation; this proves the faster one wins.
+        # Stall detector (Phase 12C) is strictly more responsive than either
+        # phase's own turn budget here: credential's AbandonSignal (turn 1)
+        # and objective's AbandonSignal (turns 2-3, no real ssh access ever
+        # available) are three *consecutive* no-action turns, so
+        # no_actionable_task fires at turn 3 — well before priv_esc is ever
+        # reached, and well before the global max_turns=8 ceiling.
         assert final_state["turn_count"] == 3
         assert final_state["turn_count"] < config.max_turns
         assert final_state["completed"] is True
         assert final_state["outcome"] == "no_actionable_task"
+        assert final_state["outcome"] != "user_flag_verified"
         assert final_state["stall_reason"]

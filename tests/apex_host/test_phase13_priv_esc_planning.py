@@ -964,7 +964,14 @@ def _make_initial_state(target: str, run_id: str = "run-p13", phase: str = "priv
 
 class TestFullGraphIntegration:
     async def test_searchsploit_and_analytical_opportunities_persisted(self) -> None:
+        """Phase 18: reaching priv_esc now requires the objective phase to
+        have already concluded (verified or failed) — pre-seed an
+        ``objective`` node with status="failed" so this test can exercise
+        PrivEscPlanner's own opportunity-detection logic directly, without
+        needing a full multi-turn objective-phase detour (which is a
+        separate feature, covered by its own tests)."""
         from apex_host.graph import build_apex_graph
+        from apex_host.graph_ids import objective_id
 
         api = _make_api()
         ts = now()
@@ -985,6 +992,13 @@ class TestFullGraphIntegration:
             confidence=0.85, source="ssh", first_seen=ts, last_seen=ts,
         ))
         await api.upsert_edge(Edge(id="e2", from_id=h_id, to_id=access_id, type="exposes", props={}, confidence=0.9, source="t", first_seen=ts, last_seen=ts))
+        obj_id = objective_id(_TARGET, "user_flag")
+        await api.upsert_node(Node(
+            id=obj_id, type="objective",
+            props={"objective_type": "user_flag", "status": "failed", "target": _TARGET, "attempted_paths": []},
+            confidence=0.5, source="t", first_seen=ts, last_seen=ts,
+        ))
+        await api.upsert_edge(Edge(id="e3", from_id=h_id, to_id=obj_id, type="indicates", props={}, confidence=0.5, source="t", first_seen=ts, last_seen=ts))
 
         config = ApexConfig(target=_TARGET, dry_run=True, max_turns=2, allowed_tools=["nmap", "curl", "nc", "searchsploit"])
         registry = ToolRegistry.from_config(config)

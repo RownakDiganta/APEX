@@ -365,20 +365,60 @@ class TestGlobalPlannerAccessStateTrigger:
     def _gp(self) -> GlobalPlanner:
         return GlobalPlanner(max_turns=20)
 
-    def test_access_state_advances_to_priv_esc(self) -> None:
-        """access_state in EKG triggers priv_esc advancement (successful login)."""
+    def test_access_state_advances_to_objective_not_priv_esc(self) -> None:
+        """Phase 18: access_state in EKG advances toward the unresolved
+        objective (default user_flag) — NOT directly to priv_esc, and never
+        marks the engagement done. Only once the objective is verified or
+        its own budget is exhausted does the ladder fall through to
+        priv_esc (see test_objective_verified_advances_to_done and
+        test_objective_budget_exhausted_falls_through_to_priv_esc below)."""
         phase = self._gp().decide_phase(
             node_types_seen={"host", "service", "access_state"},
             turn_count=0,
             has_web_capability=False,
         )
-        assert phase == ApexPhase.priv_esc
+        assert phase == ApexPhase.objective
 
-    def test_access_state_with_endpoint_advances_to_priv_esc(self) -> None:
-        """access_state + endpoint → priv_esc (not stuck in credential)."""
+    def test_access_state_with_endpoint_advances_to_objective(self) -> None:
+        """access_state + endpoint → objective (not stuck in credential)."""
         phase = self._gp().decide_phase(
             node_types_seen={"host", "service", "endpoint", "access_state"},
             turn_count=0,
+        )
+        assert phase == ApexPhase.objective
+
+    def test_objective_verified_advances_to_done(self) -> None:
+        """Once the objective is verified, the engagement is terminal —
+        it never routes through priv_esc afterward."""
+        phase = self._gp().decide_phase(
+            node_types_seen={"host", "service", "access_state"},
+            turn_count=0,
+            has_web_capability=False,
+            objective_status="verified",
+        )
+        assert phase == ApexPhase.done
+
+    def test_objective_failed_falls_through_to_priv_esc(self) -> None:
+        """Once the objective is explicitly failed (all bounded candidates
+        exhausted without success), the ladder falls through to the
+        pre-existing priv_esc intermediate-milestone phase, exactly as it
+        did before Phase 18."""
+        phase = self._gp().decide_phase(
+            node_types_seen={"host", "service", "access_state"},
+            turn_count=0,
+            has_web_capability=False,
+            objective_status="failed",
+        )
+        assert phase == ApexPhase.priv_esc
+
+    def test_objective_budget_exhausted_falls_through_to_priv_esc(self) -> None:
+        gp = GlobalPlanner(max_turns=20, phase_budgets={"objective": 1})
+        gp.record_turn(ApexPhase.objective)
+        phase = gp.decide_phase(
+            node_types_seen={"host", "service", "access_state"},
+            turn_count=1,
+            has_web_capability=False,
+            objective_status="in_progress",
         )
         assert phase == ApexPhase.priv_esc
 
@@ -402,13 +442,14 @@ class TestGlobalPlannerAccessStateTrigger:
         assert phase == ApexPhase.credential
 
     def test_access_state_with_no_endpoint_still_advances(self) -> None:
-        """access_state alone (telnet-only, no web endpoint) → priv_esc."""
+        """access_state alone (telnet-only, no web endpoint) → objective
+        (Phase 18 — no longer directly to priv_esc)."""
         phase = self._gp().decide_phase(
             node_types_seen={"host", "service", "access_state"},
             turn_count=0,
             has_web_capability=False,
         )
-        assert phase == ApexPhase.priv_esc
+        assert phase == ApexPhase.objective
 
 
 # ---------------------------------------------------------------------------

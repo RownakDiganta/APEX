@@ -233,8 +233,10 @@ class TestGlobalPlannerGateWithMultiProtocolCapabilities:
         )
         assert phase == ApexPhase.credential
 
-    def test_access_state_from_ssh_advances_to_priv_esc(self) -> None:
+    def test_access_state_from_ssh_advances_to_objective(self) -> None:
+        # Phase 18: access_state routes toward the unresolved objective
+        # first — not directly to priv_esc.
         phase = self._gp().decide_phase(
             node_types_seen={"host", "service", "access_state"}, turn_count=0, has_web_capability=False,
         )
-        assert phase == ApexPhase.priv_esc
+        assert phase == ApexPhase.objective

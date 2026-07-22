@@ -35,6 +35,14 @@ from typing import Any
 
 REDACTED_PLACEHOLDER: str = "[redacted]"
 SESSION_REDACTED_PLACEHOLDER: str = "[session_redacted]"
+#: Phase 18 — replaces the raw candidate output of a user_flag_verify
+#: read (apex_host/agents/user_flag_executor.py) before it is persisted to
+#: the episodic store. Unlike redact_session_text's substring replacement
+#: (which needs to already know the secret value to redact it), a
+#: candidate flag read is the UNKNOWN value under investigation — it
+#: cannot be selectively redacted, only blanket-replaced. See
+#: apex_host.orchestration.memory_node.write_memory, the sole call site.
+USER_FLAG_OUTPUT_REDACTED_PLACEHOLDER: str = "[user_flag_output_redacted]"
 
 
 def redact_session_text(text: str, *, passwords: list[str]) -> str:
@@ -81,3 +89,19 @@ def redact_dict(d: dict[str, Any], *, passwords: list[str]) -> dict[str, Any]:
     Returns a **new** dict; *d* is not mutated.
     """
     return {k: redact_value(v, passwords=passwords) for k, v in d.items()}
+
+
+def redact_user_flag_output(text: str) -> str:
+    """Blanket-replace a candidate user-flag read's raw output.
+
+    Unlike ``redact_session_text``/``redact_value`` (which substitute an
+    already-known secret value out of surrounding text), the output of a
+    user-flag candidate read IS the unknown value under investigation —
+    there is nothing to selectively redact, only the whole value to
+    replace. Returns ``USER_FLAG_OUTPUT_REDACTED_PLACEHOLDER`` unchanged
+    when *text* is empty (nothing to redact, and the placeholder itself is
+    already non-sensitive either way).
+    """
+    if not text:
+        return text
+    return USER_FLAG_OUTPUT_REDACTED_PLACEHOLDER

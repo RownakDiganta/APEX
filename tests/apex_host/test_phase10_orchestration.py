@@ -740,10 +740,11 @@ class TestDependencies:
         assert "dispatcher" in names
         assert "repair_engine" in names
 
-    def test_deps03_build_planners_returns_four_phases(self) -> None:
-        """DEPS-03: build_planners returns a dict with all four ApexPhase keys,
-        plus the Phase 14 "browser" entry (a distinct graph node from
-        web_agent, but not itself an ApexPhase — see
+    def test_deps03_build_planners_returns_five_phases(self) -> None:
+        """DEPS-03: build_planners returns a dict with all five ApexPhase
+        keys (recon/web/credential/objective/priv_esc — Phase 18 added
+        "objective"), plus the Phase 14 "browser" entry (a distinct graph
+        node from web_agent, but not itself an ApexPhase — see
         apex_host.orchestration.dependencies.build_planners docstring)."""
         from apex_host.orchestration.dependencies import build_planners
         config = _make_config()
@@ -751,7 +752,8 @@ class TestDependencies:
         planners = build_planners(config, registry)
         expected = {
             ApexPhase.recon.value, ApexPhase.web.value,
-            ApexPhase.credential.value, ApexPhase.priv_esc.value,
+            ApexPhase.credential.value, ApexPhase.objective.value,
+            ApexPhase.priv_esc.value,
             "browser",
         }
         assert set(planners.keys()) == expected
@@ -809,6 +811,7 @@ class TestDependencies:
             model_router=None, allowed_tools=config.allowed_tools, dry_run=True
         )
         from apex_host.orchestration.stall import StallTracker
+        from apex_host.runtime_registry import CapabilityRuntimeRegistry
 
         deps = OrchestrationDeps(
             api=api, dispatcher=dispatcher,
@@ -816,6 +819,7 @@ class TestDependencies:
             phase_planners=phase_planners,
             repair_engine=engine, config=config,
             anchor_id="host:10.10.10.1", stall_tracker=StallTracker(),
+            capability_registry=CapabilityRuntimeRegistry(),
         )
         assert "10.10.10.1" in deps.anchor_id
 

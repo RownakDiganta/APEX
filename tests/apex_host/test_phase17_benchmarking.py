@@ -544,7 +544,10 @@ class TestHTBEvaluation:
         assert evaluation.success is False
         assert evaluation.privilege_opportunities == 1  # findings exist but success is still False
 
-    def test_success_true_only_on_validated_access(self) -> None:
+    def test_success_true_only_on_user_flag_verified(self) -> None:
+        # Phase 18: benchmark success requires the objective (default
+        # user_flag) to be verified — a validated access_state alone
+        # (outcome="validated_access") is never sufficient.
         access_node = Node(
             id=f"access_state:{_TARGET}:root:ssh", type="access_state",
             props={"username": "root", "target": _TARGET, "service": "ssh"},
@@ -556,8 +559,15 @@ class TestHTBEvaluation:
             subgraph=subgraph,
         )
         evaluation = build_htb_evaluation(report, machine_name="Cap", difficulty="Easy")
-        assert evaluation.success is True
+        assert evaluation.success is False
         assert evaluation.credentials_validated == 1
+
+        report_success = build_report(
+            config=_base_config(), final_state=_report_final_state(outcome="user_flag_verified"),
+            subgraph=subgraph,
+        )
+        evaluation_success = build_htb_evaluation(report_success, machine_name="Cap", difficulty="Easy")
+        assert evaluation_success.success is True
 
     def test_services_discovered_from_node_counts(self) -> None:
         subgraph = _subgraph(_host_node(), _service_node(port="22"), _service_node(port="80"))

@@ -72,6 +72,8 @@ from apex_host.planners.experience_replay import (
     experiences_from_subgraph,
     rank_experiences,
 )
+from apex_host.planners.access_capabilities import capability_type_label
+from apex_host.planners.objective import objective_report_fields
 from apex_host.eval.benchmark import compute_benchmark, benchmark_to_json_dict, format_benchmark_text
 from apex_host.eval.evaluation import build_htb_evaluation, evaluation_to_json_dict, format_evaluation_text
 
@@ -81,6 +83,12 @@ if TYPE_CHECKING:
     from apex_host.graph_state import ApexGraphState
 
 _SEP = "═" * 60
+
+#: Phase 20 — the two capability_type values counted toward the Direct
+#: File Read summary below (mirrors apex_host.orchestration.memory_node's
+#: identical constant — kept separate to avoid a report -> orchestration
+#: import for a two-string set).
+_DIRECT_FILE_READ_CAPABILITY_TYPES = frozenset({"arbitrary_file_read", "api_file_read"})
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +190,50 @@ class RunReport:
     # "username": str|None} — never a password. Empty username/protocol
     # when validated is False.
     access_summary: dict[str, Any] = field(default_factory=dict)
+
+    # Phase 18 — user-flag objective summary. Always derived directly from
+    # the FINAL subgraph's `objective`/`objective_evidence` nodes (see
+    # apex_host.planners.objective.objective_report_fields) — never a
+    # second, independent classification of "did we succeed." A validated
+    # access_state (see access_summary above) is an important intermediate
+    # milestone but is NEVER, by itself, benchmark success — only
+    # `objective_verified` (equivalently `success` above, since
+    # `EngagementOutcome.user_flag_verified` is the sole success outcome)
+    # means the objective was actually retrieved and confirmed. The raw
+    # flag value itself is never present anywhere on this dataclass —
+    # `objective_evidence_digest`/`objective_evidence_redacted` are the
+    # only representations, per docs/user-flag-objective.md.
+    objective_type: str = ""
+    objective_status: str = ""
+    objective_verified: bool = False
+    objective_attempts: int = 0
+    objective_evidence_digest: str = ""
+    objective_evidence_redacted: str = ""
+    objective_evidence_source_path: str = ""
+    objective_evidence_access_identity: str = ""
+    objective_verification_timestamp: str = ""
+    # Access-capability refactor — which AccessCapability transport type
+    # produced the verified evidence (e.g. "ssh_command"). Deliberately a
+    # capability-type label, never a "Transport: SSH" framing — a future
+    # adapter (Telnet, arbitrary file read, ...) needs no change here or in
+    # any rendering logic below, only a new entry in
+    # apex_host.planners.access_capabilities.CAPABILITY_TYPE_LABELS.
+    objective_evidence_capability_type: str = ""
+
+    # Phase 20 — direct-file-read capability summary. Capability/adapter
+    # counts are derived directly from the final subgraph's
+    # access_capability nodes (never a second, independent store); attempt/
+    # blocked/verified/rejection counts come from the accumulated
+    # state["direct_file_read_log"] (mirrors credential_validation_log's
+    # own convention — the EKG has no node-level representation of a
+    # *blocked* or *rejected* attempt). Never the raw candidate output.
+    direct_file_read_capabilities_derived: int = 0
+    direct_file_read_adapters_registered: int = 0
+    direct_file_read_attempts: int = 0
+    direct_file_read_blocked_attempts: int = 0
+    direct_file_read_verified_count: int = 0
+    direct_file_read_rejected_oversized: int = 0
+    direct_file_read_rejected_cross_origin: int = 0
 
     # Phase 13 — privilege-escalation planning summary, derived from
     # final_state["privilege_summary"]/["privilege_state"]/["enumeration_complete"]
@@ -535,6 +587,40 @@ def build_report(
     termination_phase = str(final_state.get("termination_phase") or "")
     stall_reason = str(final_state.get("stall_reason") or "")
 
+    # Phase 18: user-flag objective summary, derived directly from the
+    # final subgraph (never the possibly-one-turn-stale
+    # final_state["objective_summary"] snapshot) — mirrors every other
+    # Phase 13-17 report section's convention.
+    objective_fields = objective_report_fields(subgraph, config.target, config.objective_type)
+
+    # Phase 20: direct-file-read capability summary. Capability
+    # derivation/registration counts come directly from the final subgraph
+    # (never the state snapshot); attempt/blocked/verified/rejection counts
+    # come from state["direct_file_read_log"] (an accumulated audit log —
+    # mirrors credential_validation_log's own convention, since the EKG has
+    # no representation of a *blocked* or *rejected* attempt beyond the
+    # objective node's own attempted_capability_paths list).
+    raw_dfr_log = list(final_state.get("direct_file_read_log") or [])
+    direct_file_read_capabilities_derived = sum(
+        1 for n in subgraph.nodes
+        if n.type == "access_capability" and str(n.props.get("capability_type", "")) in _DIRECT_FILE_READ_CAPABILITY_TYPES
+    )
+    direct_file_read_adapters_registered = sum(
+        1 for n in subgraph.nodes
+        if n.type == "access_capability"
+        and str(n.props.get("capability_type", "")) in _DIRECT_FILE_READ_CAPABILITY_TYPES
+        and bool(n.props.get("runtime_available", False))
+    )
+    direct_file_read_blocked_attempts = sum(1 for e in raw_dfr_log if e.get("blocked"))
+    direct_file_read_attempts = sum(1 for e in raw_dfr_log if not e.get("blocked"))
+    direct_file_read_verified_count = sum(1 for e in raw_dfr_log if e.get("verified"))
+    direct_file_read_rejected_oversized = sum(1 for e in raw_dfr_log if e.get("truncated"))
+    direct_file_read_rejected_cross_origin = sum(
+        1 for e in raw_dfr_log
+        if "outside the authorized origin" in str(e.get("error") or "")
+        or "redirects are disabled" in str(e.get("error") or "")
+    )
+
     # Phase 13: privilege-escalation planning summary. Derived directly from
     # the FINAL subgraph's priv_esc_opportunity nodes (not from
     # final_state["privilege_summary"]) so the report is always complete and
@@ -708,6 +794,23 @@ def build_report(
         stall_reason=stall_reason,
         no_action_count=no_action_count,
         access_summary=access_summary,
+        objective_type=str(objective_fields["objective_type"]),
+        objective_status=str(objective_fields["objective_status"]),
+        objective_verified=bool(objective_fields["objective_verified"]),
+        objective_attempts=int(objective_fields["objective_attempts"]),
+        objective_evidence_digest=str(objective_fields["objective_evidence_digest"]),
+        objective_evidence_redacted=str(objective_fields["objective_evidence_redacted"]),
+        objective_evidence_source_path=str(objective_fields["objective_evidence_source_path"]),
+        objective_evidence_access_identity=str(objective_fields["objective_evidence_access_identity"]),
+        objective_verification_timestamp=str(objective_fields["objective_verification_timestamp"]),
+        objective_evidence_capability_type=str(objective_fields.get("objective_evidence_capability_type", "")),
+        direct_file_read_capabilities_derived=direct_file_read_capabilities_derived,
+        direct_file_read_adapters_registered=direct_file_read_adapters_registered,
+        direct_file_read_attempts=direct_file_read_attempts,
+        direct_file_read_blocked_attempts=direct_file_read_blocked_attempts,
+        direct_file_read_verified_count=direct_file_read_verified_count,
+        direct_file_read_rejected_oversized=direct_file_read_rejected_oversized,
+        direct_file_read_rejected_cross_origin=direct_file_read_rejected_cross_origin,
         privilege_state=privilege_state,
         privilege_opportunity_count=privilege_opportunity_count,
         privilege_categories=privilege_categories,
@@ -772,7 +875,9 @@ def _samples_from_summary(final_state: "ApexGraphState") -> list[str]:
 # turns exhausted" / "BLOCKED — policy prevented further progress" /
 # "FAILED — parser error" / "CANCELLED — user interrupted run".
 _OUTCOME_HEADLINE: dict[EngagementOutcome, tuple[str, str]] = {
-    EngagementOutcome.validated_access: ("SUCCESS", "validated {protocol} access"),
+    EngagementOutcome.user_flag_verified: ("SUCCESS", "user flag verified"),
+    # Phase 18: an intermediate milestone only — never benchmark success.
+    EngagementOutcome.validated_access: ("PARTIAL", "validated {protocol} access — objective not verified"),
     EngagementOutcome.goal_completed: ("STOPPED", "engagement reached its organic completion state"),
     EngagementOutcome.max_turns_exhausted: ("STOPPED", "maximum turns exhausted"),
     EngagementOutcome.phase_budget_exhausted: ("STOPPED", "phase budget exhausted"),
@@ -841,6 +946,48 @@ def format_text(report: RunReport) -> str:
         )
     if report.no_action_count:
         lines.append(f"  No-action turns   : {report.no_action_count}")
+
+    # Objective Summary (Phase 18 — the authoritative benchmark-success
+    # breakdown: access alone is never enough. Always shown, since
+    # objective_type defaults to "user_flag" for every engagement — mirrors
+    # the always-shown "Policy Gate" section's convention).
+    lines.append("\nObjective Summary")
+    lines.append(f"  Objective type     : {report.objective_type or 'n/a'}")
+    lines.append(f"  Status             : {report.objective_status or 'pending'}")
+    lines.append(f"  Attempts           : {report.objective_attempts}")
+    lines.append(f"  Access obtained    : {'Yes' if report.access_summary.get('validated') else 'No'}")
+    lines.append(f"  Flag attempted     : {'Yes' if report.objective_attempts else 'No'}")
+    lines.append(f"  Flag verified      : {'Yes' if report.objective_verified else 'No'}")
+    lines.append(f"  Benchmark success  : {'Yes' if report.success else 'No'}")
+    if report.objective_verified:
+        lines.append(f"  Verified at        : {report.objective_verification_timestamp or 'n/a'}")
+        lines.append(f"  Evidence digest    : {report.objective_evidence_digest or 'n/a'}")
+        lines.append(f"  Evidence (redacted): {report.objective_evidence_redacted or 'n/a'}")
+        lines.append(f"  Source path        : {report.objective_evidence_source_path or 'n/a'}")
+        lines.append(f"  Access identity    : {report.objective_evidence_access_identity or 'n/a'}")
+        # Access-capability refactor: a capability-type LABEL only (e.g.
+        # "SSH Command") — deliberately never framed as "Transport: SSH",
+        # so a future capability type (Telnet, arbitrary file read, ...)
+        # needs no change to this rendering logic, only a new entry in
+        # apex_host.planners.access_capabilities.CAPABILITY_TYPE_LABELS.
+        if report.objective_evidence_capability_type:
+            lines.append(
+                f"  Capability used    : {capability_type_label(report.objective_evidence_capability_type)}"
+            )
+
+    # Direct File Read Summary (Phase 20 — shown only when at least one
+    # direct-file-read capability was ever derived; a target with none
+    # configured shows nothing here). Never a raw URL, header, cookie, or
+    # candidate output — bounded, sanitized metrics only.
+    if report.direct_file_read_capabilities_derived:
+        lines.append("\nDirect File Read Summary")
+        lines.append(f"  Capabilities derived : {report.direct_file_read_capabilities_derived}")
+        lines.append(f"  Adapters registered  : {report.direct_file_read_adapters_registered}")
+        lines.append(f"  Bounded attempts     : {report.direct_file_read_attempts}")
+        lines.append(f"  Blocked attempts     : {report.direct_file_read_blocked_attempts}")
+        lines.append(f"  Verified reads       : {report.direct_file_read_verified_count}")
+        lines.append(f"  Rejected (oversized) : {report.direct_file_read_rejected_oversized}")
+        lines.append(f"  Rejected (cross-origin redirect): {report.direct_file_read_rejected_cross_origin}")
 
     # Privilege Escalation Summary (Phase 13 — shown only when the priv_esc
     # phase produced any state at all; a target never reaching that phase
@@ -1213,6 +1360,34 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
             "stall_reason": report.stall_reason,
             "no_action_count": report.no_action_count,
             "access_summary": report.access_summary,
+        },
+        "objective": {
+            "objective_type": report.objective_type,
+            "status": report.objective_status,
+            "verified": report.objective_verified,
+            "attempts": report.objective_attempts,
+            "access_obtained": bool(report.access_summary.get("validated")),
+            "attempted": bool(report.objective_attempts),
+            "benchmark_success": report.success,
+            "verification_timestamp": report.objective_verification_timestamp,
+            "evidence_digest": report.objective_evidence_digest,
+            "evidence_redacted": report.objective_evidence_redacted,
+            "evidence_source_path": report.objective_evidence_source_path,
+            "evidence_access_identity": report.objective_evidence_access_identity,
+            "capability_type": report.objective_evidence_capability_type,
+            "capability_label": (
+                capability_type_label(report.objective_evidence_capability_type)
+                if report.objective_evidence_capability_type else ""
+            ),
+        },
+        "direct_file_read": {
+            "capabilities_derived": report.direct_file_read_capabilities_derived,
+            "adapters_registered": report.direct_file_read_adapters_registered,
+            "attempts": report.direct_file_read_attempts,
+            "blocked_attempts": report.direct_file_read_blocked_attempts,
+            "verified_count": report.direct_file_read_verified_count,
+            "rejected_oversized": report.direct_file_read_rejected_oversized,
+            "rejected_cross_origin": report.direct_file_read_rejected_cross_origin,
         },
         "privilege_escalation": {
             "state": report.privilege_state,
