@@ -36,7 +36,10 @@ from apex_host.knowledge.seed_loader import (
     seed_compiled_knowledge_full,
     seed_payload_repo,
 )
-from apex_host.orchestration.capability_seed import seed_direct_file_read_capability
+from apex_host.orchestration.capability_seed import (
+    seed_bounded_command_capability,
+    seed_direct_file_read_capability,
+)
 from apex_host.planning.budget import LLMBudgetTracker
 from apex_host.tools.backend import select_runtime_backend
 from apex_host.tools.registry import ToolRegistry
@@ -190,6 +193,13 @@ class ApexRuntime:
         except Exception as exc:
             logger.warning("seed_direct_file_read_capability failed (non-fatal): %s", exc)
 
+        # Phase 21 — same startup-only, zero-execution seeding pattern for
+        # an operator-attested bounded command-execution capability.
+        try:
+            await seed_bounded_command_capability(self.api, self.config)
+        except Exception as exc:
+            logger.warning("seed_bounded_command_capability failed (non-fatal): %s", exc)
+
         graph = build_apex_graph(
             self.api, self.registry, self.config,
             model_router=model_router,
@@ -235,6 +245,7 @@ class ApexRuntime:
             "objective_status": "",
             "objective_summary": {},
             "direct_file_read_log": [],
+            "bounded_command_log": [],
         }
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": run_id},

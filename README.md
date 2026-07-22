@@ -710,6 +710,26 @@ report generator needed **zero changes** — proof that Phase 18B's
 extension contract holds. Full design:
 [`docs/user-flag-objective.md`](docs/user-flag-objective.md) §17.
 
+**Bounded command-execution capability (Phase 21):** a third
+`FlagReadCapability` adapter, `BoundedCommandCapabilityAdapter`, lets the
+User Flag Objective be satisfied through a generic, bounded, policy-gated
+command-execution primitive (`local_shell`, `remote_command`, or the
+already-existing `web_command` type) instead of SSH or a direct file read.
+It exposes no generic `execute()`/`run_shell()` method — its only method,
+`read_bounded_file(path)`, delegates to an injected, narrow
+`BoundedCommandReadStrategy` that internally issues one fixed,
+non-configurable command (`cat -- <path>`) through
+`apex_host.tools.backend.ToolBackend` — the same already-safety-gated,
+dry-run-aware execution seam every other command in this codebase uses, so
+no new subprocess call site was introduced. No CLI flag anywhere accepts a
+command string, shell syntax, or payload — only structured configuration
+(`--bounded-command-attested`, `--bounded-command-capability-type`,
+`--bounded-command-principal`, ...) binds an already-safe runtime
+strategy. `ObjectivePlanner`, `UserFlagExecutor`, `ObjectiveParser`, and the
+report generator again needed **zero changes** — the abstraction's
+extension contract now holds for a third, structurally different adapter.
+Full design: [`docs/user-flag-objective.md`](docs/user-flag-objective.md) §18.
+
 **Safety**: `ApexConfig.dry_run` defaults to `True`. Every command execution
 path goes through `apex_host/tools/runner.py`, which checks
 `apex_host/tools/safety.py` first (allowlist + unconditional destructive-

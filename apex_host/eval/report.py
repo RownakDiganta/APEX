@@ -90,6 +90,11 @@ _SEP = "═" * 60
 #: import for a two-string set).
 _DIRECT_FILE_READ_CAPABILITY_TYPES = frozenset({"arbitrary_file_read", "api_file_read"})
 
+#: Phase 21 — the three capability_type values counted toward the Bounded
+#: Command summary below (mirrors apex_host.orchestration.memory_node's
+#: _COMMAND_CAPABILITY_TYPES — kept separate for the same reason as above).
+_COMMAND_CAPABILITY_TYPES = frozenset({"local_shell", "remote_command", "web_command"})
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -234,6 +239,23 @@ class RunReport:
     direct_file_read_verified_count: int = 0
     direct_file_read_rejected_oversized: int = 0
     direct_file_read_rejected_cross_origin: int = 0
+
+    # Phase 21 — bounded command-execution capability summary. Same
+    # derivation convention as the Direct File Read summary above:
+    # capability/adapter counts from the final subgraph's access_capability
+    # nodes; attempt/blocked/verified/timeout/oversized counts from the
+    # accumulated state["bounded_command_log"].
+    # unavailable_strategies = capabilities_derived - adapters_registered
+    # (bounded at >= 0) — capabilities whose metadata exists but which
+    # never got a runtime adapter registered.
+    bounded_command_capabilities_derived: int = 0
+    bounded_command_adapters_registered: int = 0
+    bounded_command_unavailable_strategies: int = 0
+    bounded_command_attempts: int = 0
+    bounded_command_blocked_attempts: int = 0
+    bounded_command_timeouts: int = 0
+    bounded_command_oversized: int = 0
+    bounded_command_verified_count: int = 0
 
     # Phase 13 — privilege-escalation planning summary, derived from
     # final_state["privilege_summary"]/["privilege_state"]/["enumeration_complete"]
@@ -621,6 +643,30 @@ def build_report(
         or "redirects are disabled" in str(e.get("error") or "")
     )
 
+    # Phase 21: bounded command-execution capability summary — same
+    # derivation convention as the direct-file-read summary above.
+    raw_cmd_log = list(final_state.get("bounded_command_log") or [])
+    bounded_command_capabilities_derived = sum(
+        1 for n in subgraph.nodes
+        if n.type == "access_capability" and str(n.props.get("capability_type", "")) in _COMMAND_CAPABILITY_TYPES
+    )
+    bounded_command_adapters_registered = sum(
+        1 for n in subgraph.nodes
+        if n.type == "access_capability"
+        and str(n.props.get("capability_type", "")) in _COMMAND_CAPABILITY_TYPES
+        and bool(n.props.get("runtime_available", False))
+    )
+    bounded_command_unavailable_strategies = max(
+        0, bounded_command_capabilities_derived - bounded_command_adapters_registered
+    )
+    bounded_command_blocked_attempts = sum(1 for e in raw_cmd_log if e.get("blocked"))
+    bounded_command_attempts = sum(1 for e in raw_cmd_log if not e.get("blocked"))
+    bounded_command_verified_count = sum(1 for e in raw_cmd_log if e.get("verified"))
+    bounded_command_oversized = sum(1 for e in raw_cmd_log if e.get("truncated"))
+    bounded_command_timeouts = sum(
+        1 for e in raw_cmd_log if "timeout" in str(e.get("error") or "").lower()
+    )
+
     # Phase 13: privilege-escalation planning summary. Derived directly from
     # the FINAL subgraph's priv_esc_opportunity nodes (not from
     # final_state["privilege_summary"]) so the report is always complete and
@@ -811,6 +857,14 @@ def build_report(
         direct_file_read_verified_count=direct_file_read_verified_count,
         direct_file_read_rejected_oversized=direct_file_read_rejected_oversized,
         direct_file_read_rejected_cross_origin=direct_file_read_rejected_cross_origin,
+        bounded_command_capabilities_derived=bounded_command_capabilities_derived,
+        bounded_command_adapters_registered=bounded_command_adapters_registered,
+        bounded_command_unavailable_strategies=bounded_command_unavailable_strategies,
+        bounded_command_attempts=bounded_command_attempts,
+        bounded_command_blocked_attempts=bounded_command_blocked_attempts,
+        bounded_command_timeouts=bounded_command_timeouts,
+        bounded_command_oversized=bounded_command_oversized,
+        bounded_command_verified_count=bounded_command_verified_count,
         privilege_state=privilege_state,
         privilege_opportunity_count=privilege_opportunity_count,
         privilege_categories=privilege_categories,
@@ -988,6 +1042,21 @@ def format_text(report: RunReport) -> str:
         lines.append(f"  Verified reads       : {report.direct_file_read_verified_count}")
         lines.append(f"  Rejected (oversized) : {report.direct_file_read_rejected_oversized}")
         lines.append(f"  Rejected (cross-origin redirect): {report.direct_file_read_rejected_cross_origin}")
+
+    # Bounded Command Summary (Phase 21 — shown only when at least one
+    # bounded command-execution capability was ever derived). Never a raw
+    # command string, session handle, or candidate output — bounded,
+    # sanitized metrics only.
+    if report.bounded_command_capabilities_derived:
+        lines.append("\nBounded Command Summary")
+        lines.append(f"  Capabilities derived : {report.bounded_command_capabilities_derived}")
+        lines.append(f"  Adapters registered  : {report.bounded_command_adapters_registered}")
+        lines.append(f"  Strategies unavailable: {report.bounded_command_unavailable_strategies}")
+        lines.append(f"  Bounded attempts     : {report.bounded_command_attempts}")
+        lines.append(f"  Blocked attempts     : {report.bounded_command_blocked_attempts}")
+        lines.append(f"  Timeouts             : {report.bounded_command_timeouts}")
+        lines.append(f"  Oversized outputs    : {report.bounded_command_oversized}")
+        lines.append(f"  Verified reads       : {report.bounded_command_verified_count}")
 
     # Privilege Escalation Summary (Phase 13 — shown only when the priv_esc
     # phase produced any state at all; a target never reaching that phase
@@ -1388,6 +1457,16 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
             "verified_count": report.direct_file_read_verified_count,
             "rejected_oversized": report.direct_file_read_rejected_oversized,
             "rejected_cross_origin": report.direct_file_read_rejected_cross_origin,
+        },
+        "bounded_command": {
+            "capabilities_derived": report.bounded_command_capabilities_derived,
+            "adapters_registered": report.bounded_command_adapters_registered,
+            "unavailable_strategies": report.bounded_command_unavailable_strategies,
+            "attempts": report.bounded_command_attempts,
+            "blocked_attempts": report.bounded_command_blocked_attempts,
+            "timeouts": report.bounded_command_timeouts,
+            "oversized": report.bounded_command_oversized,
+            "verified_count": report.bounded_command_verified_count,
         },
         "privilege_escalation": {
             "state": report.privilege_state,

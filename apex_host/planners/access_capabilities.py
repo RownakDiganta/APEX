@@ -36,27 +36,35 @@ if TYPE_CHECKING:
 #: report.py's rendering logic. Note: "Direct File Read" is the shared
 #: display label the report deliberately uses for BOTH arbitrary_file_read
 #: and api_file_read specific labels below — see `capability_type_label`.
+#: "Local Command" (Phase 21) is a deliberate rename of the enum member's
+#: own name (`local_shell`) to the more capability-oriented, human-facing
+#: label the report should show — the SAME rename pattern already applied
+#: to `arbitrary_file_read` -> "Direct File Read" in Phase 20.
 CAPABILITY_TYPE_LABELS: dict[str, str] = {
     AccessCapabilityType.ssh_command.value: "SSH Command",
     AccessCapabilityType.telnet_command.value: "Telnet Command",
     AccessCapabilityType.web_command.value: "Web Command",
-    AccessCapabilityType.local_shell.value: "Local Shell",
+    AccessCapabilityType.local_shell.value: "Local Command",
     AccessCapabilityType.arbitrary_file_read.value: "Direct File Read",
     AccessCapabilityType.api_file_read.value: "API File Read",
+    AccessCapabilityType.remote_command.value: "Remote Command",
 }
 
-#: Directness tie-break table (Phase 20) — used ONLY to break ties between
-#: capabilities of otherwise-equal validated/available/confidence standing,
-#: never to override confidence itself. Lower rank sorts first. Roughly:
-#: a direct, bounded file read is the most surgical/least-invasive access
-#: mechanism; a local shell/SSH command is a step more general; a remote
-#: interactive protocol is the least direct. An unrecognised or future
-#: capability type sorts last (forward-compatible, never crashes).
+#: Directness tie-break table (Phase 20; extended Phase 21) — used ONLY to
+#: break ties between capabilities of otherwise-equal
+#: validated/available/confidence standing, never to override confidence
+#: itself. Lower rank sorts first. Roughly: a direct, bounded file read is
+#: the most surgical/least-invasive access mechanism; a local/SSH/generic
+#: remote command channel is a step more general; a protocol mediated
+#: through telnet or a fixed web request shape is the least direct. An
+#: unrecognised or future capability type sorts last (forward-compatible,
+#: never crashes).
 _DIRECTNESS_RANK: dict[str, int] = {
     AccessCapabilityType.arbitrary_file_read.value: 0,
     AccessCapabilityType.api_file_read.value: 0,
     AccessCapabilityType.local_shell.value: 1,
     AccessCapabilityType.ssh_command.value: 1,
+    AccessCapabilityType.remote_command.value: 1,
     AccessCapabilityType.telnet_command.value: 2,
     AccessCapabilityType.web_command.value: 2,
 }

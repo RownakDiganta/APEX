@@ -1,6 +1,7 @@
 # capability_seed.py
-# One-time, startup-only derivation of an operator-attested direct-file-read AccessCapability from ApexConfig — never a live network operation.
-"""Startup-only direct-file-read capability seeding (Phase 20).
+# One-time, startup-only derivation of an operator-attested direct-file-read or bounded-command AccessCapability from ApexConfig — never a live network operation or command execution.
+"""Startup-only direct-file-read capability seeding (Phase 20; extended in
+Phase 21 with bounded command-execution capability seeding).
 
 Mirrors ``--username``/``--password``'s own trust boundary: the operator
 has ALREADY manually confirmed (through authorized testing — an arbitrary
@@ -54,12 +55,27 @@ logger = logging.getLogger(__name__)
 
 
 async def seed_direct_file_read_capability(api: "MemoryAPI", config: "ApexConfig") -> bool:
-    """Derive an operator-attested direct-file-read ``access_capability``
-    node from *config*, if fully configured and not already present.
+    """Derive an operator-attested direct-file-read (or ``web_command``,
+    Phase 21 — see below) ``access_capability`` node from *config*, if
+    fully configured and not already present.
 
     Returns ``True`` when a capability was newly derived this call,
     ``False`` otherwise (not configured, already present, or the origin
     failed the authorized-target check).
+
+    Phase 21 — ``config.direct_file_read_capability_type`` may also be
+    ``"web_command"``: the underlying fixed HTTP request shape is
+    identical to a direct-file-read primitive (and is registered by the
+    SAME ``_register_direct_file_read_adapter`` at runtime — see
+    ``apex_host/orchestration/dispatch_node.py``), but ``web_command``
+    represents "a command executes and its response happens to contain the
+    read output," a different evidentiary claim than "this endpoint serves
+    a file directly." Its derivation is therefore routed to
+    ``CapabilityParser.derive_command_capability`` (command-evidence
+    vocabulary) rather than ``derive_direct_file_read_capability``
+    (file-read-evidence vocabulary), while still validating and reusing the
+    exact same ``direct_file_read_origin``/``endpoint_template``/etc.
+    configuration.
     """
     if not config.direct_file_read_operator_attested:
         return False
@@ -106,17 +122,29 @@ async def seed_direct_file_read_capability(api: "MemoryAPI", config: "ApexConfig
             source="capability_seed", first_seen=timestamp, last_seen=timestamp,
         ))
 
-    parsed = CapabilityParser().derive_direct_file_read_capability(
-        target=target,
-        capability_type=capability_type,
-        principal=config.direct_file_read_principal,
-        source_task_id="",
-        validation_method="operator_attestation",
-        confidence=config.direct_file_read_confidence,
-        requires_auth=bool(config.direct_file_read_headers),
-        max_response_bytes=config.direct_file_read_max_response_bytes,
-        request_shape_id=cap_id,
-    )
+    if capability_type is AccessCapabilityType.web_command:
+        parsed = CapabilityParser().derive_command_capability(
+            target=target,
+            capability_type=capability_type,
+            principal=config.direct_file_read_principal,
+            source_task_id="",
+            validation_method="operator_attestation",
+            confidence=config.direct_file_read_confidence,
+            max_output_bytes=config.direct_file_read_max_response_bytes,
+            strategy_id=cap_id,
+        )
+    else:
+        parsed = CapabilityParser().derive_direct_file_read_capability(
+            target=target,
+            capability_type=capability_type,
+            principal=config.direct_file_read_principal,
+            source_task_id="",
+            validation_method="operator_attestation",
+            confidence=config.direct_file_read_confidence,
+            requires_auth=bool(config.direct_file_read_headers),
+            max_response_bytes=config.direct_file_read_max_response_bytes,
+            request_shape_id=cap_id,
+        )
     if not parsed.node_deltas:
         logger.warning("seed_direct_file_read_capability: derivation rejected the supplied evidence")
         return False
@@ -125,6 +153,84 @@ async def seed_direct_file_read_capability(api: "MemoryAPI", config: "ApexConfig
     logger.info(
         "seed_direct_file_read_capability: derived %s capability_id=%s principal=%s",
         capability_type.value, cap_id, config.direct_file_read_principal,
+    )
+    return True
+
+
+async def seed_bounded_command_capability(api: "MemoryAPI", config: "ApexConfig") -> bool:
+    """Derive an operator-attested ``local_shell``/``remote_command``
+    ``access_capability`` node from *config*, if fully configured and not
+    already present (Phase 21).
+
+    Mirrors ``seed_direct_file_read_capability`` exactly in shape and
+    safety properties: performs NO live command execution — it only
+    constructs and applies a fixed set of EKG deltas from already-known,
+    already-supplied configuration. The ONE real command execution in the
+    entire bounded-command flow is the bounded, policy-gated
+    ``user_flag_verify`` task itself, dispatched later through the normal
+    ``TaskDispatcher.dispatch()`` pipeline. Idempotent (content-addressed
+    capability ID).
+
+    Returns ``True`` when a capability was newly derived this call,
+    ``False`` otherwise (not configured, already present, or an
+    unrecognised capability type).
+    """
+    if not config.bounded_command_operator_attested:
+        return False
+    if not config.bounded_command_principal:
+        logger.debug("seed_bounded_command_capability: no bounded_command_principal configured; skipping")
+        return False
+
+    try:
+        capability_type = AccessCapabilityType(config.bounded_command_capability_type)
+    except ValueError:
+        logger.warning(
+            "seed_bounded_command_capability: unrecognised capability_type %r; skipping",
+            config.bounded_command_capability_type,
+        )
+        return False
+    if capability_type not in (AccessCapabilityType.local_shell, AccessCapabilityType.remote_command):
+        logger.warning(
+            "seed_bounded_command_capability: capability_type %r is not local_shell/"
+            "remote_command (use direct_file_read_capability_type='web_command' instead); skipping",
+            config.bounded_command_capability_type,
+        )
+        return False
+
+    target = config.target
+    cap_id = access_capability_id(target, capability_type.value, config.bounded_command_principal)
+    h_id = host_id(target)
+
+    existing_subgraph = await api.get_subgraph(h_id, depth=1)
+    if any(n.id == cap_id for n in existing_subgraph.nodes):
+        logger.debug("seed_bounded_command_capability: capability %s already present; skipping", cap_id)
+        return False
+
+    if not any(n.id == h_id for n in existing_subgraph.nodes):
+        timestamp = now()
+        await api.upsert_node(Node(
+            id=h_id, type="host", props={"ip": target}, confidence=0.5,
+            source="capability_seed", first_seen=timestamp, last_seen=timestamp,
+        ))
+
+    parsed = CapabilityParser().derive_command_capability(
+        target=target,
+        capability_type=capability_type,
+        principal=config.bounded_command_principal,
+        source_task_id="",
+        validation_method="operator_attestation",
+        confidence=config.bounded_command_confidence,
+        max_output_bytes=config.bounded_command_max_output_bytes,
+        strategy_id=cap_id,
+    )
+    if not parsed.node_deltas:
+        logger.warning("seed_bounded_command_capability: derivation rejected the supplied evidence")
+        return False
+
+    await api.apply_deltas(nodes=parsed.node_deltas, edges=parsed.edge_deltas)
+    logger.info(
+        "seed_bounded_command_capability: derived %s capability_id=%s principal=%s",
+        capability_type.value, cap_id, config.bounded_command_principal,
     )
     return True
 

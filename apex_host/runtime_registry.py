@@ -1,7 +1,8 @@
 # runtime_registry.py
 # Runtime-only (never persisted to MemoryAPI/EKG) registry mapping capability_id to a bounded-read adapter, plus the SSH and direct-file-read adapter implementations.
 """Runtime-only capability registry and adapters (capability refactor;
-extended in Phase 20 with a generic direct-file-read adapter).
+extended in Phase 20 with a generic direct-file-read adapter; extended in
+Phase 21 with a generic bounded command-execution adapter).
 
 This module is the ONE place a live/reusable access mechanism (an SSH
 connection's parameters, a pre-validated HTTP file-read request shape, a
@@ -56,6 +57,7 @@ from apex_host.verification.user_flag import is_bounded_candidate_path
 
 if TYPE_CHECKING:
     from apex_host.config import ApexConfig
+    from apex_host.tools.backend import ToolBackend
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +211,25 @@ class CapabilityRuntimeRegistry:
         if existing is not None:
             return existing
         adapter: FlagReadCapability = DirectFileReadCapabilityAdapter(primitive)
+        self._adapters[capability_id] = adapter
+        return adapter
+
+    def ensure_bounded_command(
+        self, capability_id: str, *, primitive: "BoundedCommandReadPrimitive",
+    ) -> FlagReadCapability:
+        """Idempotently register (and return) a
+        ``BoundedCommandCapabilityAdapter`` for *capability_id* (Phase 21),
+        built from an already-constructed ``BoundedCommandReadPrimitive``.
+
+        Mirrors ``ensure_ssh``/``ensure_direct_file_read``'s idempotency
+        exactly. Constructing the adapter performs no execution — the
+        underlying strategy is only ever invoked from
+        ``read_bounded_file()``, once per verification attempt.
+        """
+        existing = self._adapters.get(capability_id)
+        if existing is not None:
+            return existing
+        adapter: FlagReadCapability = BoundedCommandCapabilityAdapter(primitive)
         self._adapters[capability_id] = adapter
         return adapter
 
@@ -591,3 +612,218 @@ async def _read_bounded_body(response: "object", max_bytes: int) -> tuple[str, b
             break
     raw = b"".join(chunks)[: max_bytes + 1]
     return raw.decode("utf-8", errors="replace"), truncated
+
+
+# ---------------------------------------------------------------------------
+# Bounded command-execution adapter (Phase 21).
+#
+# Unlike DirectFileReadCapabilityAdapter (a fixed HTTP request shape),
+# BoundedCommandCapabilityAdapter delegates the actual "how do I read a
+# file" mechanism to an injected, narrow BoundedCommandReadStrategy — this
+# lets a single adapter class service `local_shell` and `remote_command`
+# capabilities alike (they differ only in which strategy/backend was
+# constructed for them, never in the adapter's own logic). The strategy
+# Protocol exposes exactly one operation, read_file(path, ...) — never a
+# generic execute()/run_shell()/exec() — so no arbitrary command string can
+# ever cross from the objective layer into a real execution context.
+#
+# CLAUDE.md §13.6 ("No raw child-process spawning outside
+# apex_host/tools/runner.py") is honored by construction: the one
+# reference strategy shipped here, ToolBackendCommandReadStrategy, never
+# launches a process itself — it delegates to an injected
+# `apex_host.tools.backend.ToolBackend` (the SAME already-safety-gated,
+# already-dry-run-aware execution seam every other command in this
+# codebase goes through), issuing a single FIXED argv command
+# (`cat -- <path>`) — never a shell string, never operator- or
+# LLM-controlled beyond the one bounded candidate path.
+# ---------------------------------------------------------------------------
+
+
+class BoundedCommandReadStrategy(Protocol):
+    """The ONLY operation a command-execution runtime strategy may expose
+    to ``BoundedCommandCapabilityAdapter``.
+
+    Deliberately narrower than ``FlagReadCapability`` is wide: there is no
+    ``execute()``/``run_shell()``/``send_command()`` here, and there never
+    may be one. A strategy implementation may internally hold a reference
+    to a much broader execution backend (a ``ToolBackend``, an existing
+    authenticated web/remote session, ...), but it must expose only this
+    one bounded, path-scoped method to the capability layer — the broader
+    backend object itself is never stored in ``BoundedCommandReadPrimitive``
+    or returned from any method here.
+    """
+
+    async def read_file(
+        self, path: str, *, timeout_seconds: float, max_output_bytes: int,
+    ) -> BoundedReadResult:
+        """Attempt one bounded, read-only command execution against *path*.
+
+        *path* is the only variable input — the concrete command shape
+        (executable, fixed flags, working directory, environment) is
+        entirely the strategy implementation's own fixed configuration,
+        never supplied by the caller."""
+        ...
+
+
+@dataclass(slots=True)
+class BoundedCommandReadPrimitive:
+    """A fixed, pre-validated command-read strategy binding for one
+    ``access_capability`` (Phase 21) — the command-execution analogue of
+    ``DirectFileReadPrimitive``.
+
+    ``strategy`` is a runtime-only object (never JSON-serializable, never
+    persisted to the EKG or any checkpoint) — it is constructed fresh, per
+    engagement, by the orchestration layer
+    (``apex_host.orchestration.dispatch_node._register_bounded_command_adapter``)
+    and held only inside this primitive, which itself lives only inside the
+    in-process ``CapabilityRuntimeRegistry``.
+
+    Immutable after construction (``__post_init__`` validates and never
+    mutates); the only per-call variable is the candidate path passed to
+    ``BoundedCommandCapabilityAdapter.read_bounded_file()``.
+    """
+
+    capability_id: str
+    strategy: BoundedCommandReadStrategy
+    allowed_filenames: frozenset[str] = field(default_factory=frozenset)
+    timeout_seconds: float = 15.0
+    max_output_bytes: int = 4096
+
+    def __post_init__(self) -> None:
+        if self.timeout_seconds <= 0:
+            raise ValueError("BoundedCommandReadPrimitive.timeout_seconds must be positive")
+        if self.max_output_bytes <= 0:
+            raise ValueError("BoundedCommandReadPrimitive.max_output_bytes must be positive")
+
+
+class BoundedCommandCapabilityAdapter:
+    """``FlagReadCapability`` adapter backed by a narrow, injected
+    ``BoundedCommandReadStrategy`` (Phase 21).
+
+    Its only objective-facing public method is ``read_bounded_file(path)``
+    — there is no second method, and it never exposes the underlying
+    strategy or any broader execution backend to a caller. On every call:
+
+    1. Re-validates *path* via ``is_bounded_candidate_path()`` — defense in
+       depth on top of whatever validation the caller (``UserFlagExecutor``,
+       the policy layer) already performed; the adapter never trusts a
+       caller to have already validated.
+    2. Invokes ``self._primitive.strategy.read_file(path, ...)`` under an
+       outer ``asyncio.wait_for`` timeout (belt-and-suspenders on top of
+       whatever internal timeout the strategy itself applies).
+    3. Re-enforces the maximum output size on the strategy's own returned output —
+       an oversized result is rejected outright (``output=""``, a bounded
+       ``truncated=True`` result), mirroring
+       ``DirectFileReadCapabilityAdapter``'s identical "never partially
+       accept a truncated prefix" invariant, never partially accepted.
+    4. Never logs, returns, or persists the raw output beyond the
+       ``BoundedReadResult`` handed back to ``UserFlagExecutor`` — same
+       lifecycle as every other adapter in this module.
+
+    Exceptions raised by the strategy (a safety-gate ``ValueError``, a
+    backend-unavailable error, ...) are caught and mapped to a bounded,
+    sanitized error category — the adapter never raises.
+    """
+
+    def __init__(self, primitive: BoundedCommandReadPrimitive) -> None:
+        self._primitive = primitive
+
+    async def read_bounded_file(self, path: str) -> BoundedReadResult:
+        if not is_bounded_candidate_path(path, allowed_filenames=self._primitive.allowed_filenames):
+            return BoundedReadResult(
+                connected=False, output="", error="candidate path failed bounded-path validation",
+            )
+
+        try:
+            result = await asyncio.wait_for(
+                self._primitive.strategy.read_file(
+                    path,
+                    timeout_seconds=self._primitive.timeout_seconds,
+                    max_output_bytes=self._primitive.max_output_bytes,
+                ),
+                timeout=self._primitive.timeout_seconds + 5.0,
+            )
+        except asyncio.TimeoutError:
+            return BoundedReadResult(connected=False, output="", error="timeout: bounded command read timed out")
+        except ValueError as exc:
+            # The one exception type command-execution safety gates (e.g.
+            # apex_host.tools.safety.check_command) are expected to raise —
+            # never let it propagate past this boundary.
+            return BoundedReadResult(
+                connected=False, output="",
+                error=f"execution_context_unavailable: {type(exc).__name__}",
+            )
+        except Exception as exc:  # noqa: BLE001 - adapters never raise past this boundary
+            logger.debug("bounded command strategy raised %s", type(exc).__name__)
+            return BoundedReadResult(
+                connected=False, output="",
+                error=f"execution_context_unavailable: {type(exc).__name__}",
+            )
+
+        if len(result.output.encode("utf-8", errors="replace")) > self._primitive.max_output_bytes:
+            return BoundedReadResult(
+                connected=result.connected, output="",
+                error="oversized_output: response exceeds the maximum bounded size",
+                return_code=result.return_code, truncated=True, method=result.method,
+            )
+        return result
+
+
+class ToolBackendCommandReadStrategy:
+    """The one concrete, real ``BoundedCommandReadStrategy`` reference
+    implementation (Phase 21) — wraps an existing, already-safety-gated
+    ``apex_host.tools.backend.ToolBackend`` (local or remote) rather than
+    launching a child process directly, so this file never becomes a
+    second command-execution entry point (CLAUDE.md §13.6).
+
+    Issues exactly one fixed, non-configurable command per call:
+    ``cat -- <path>`` as an argv list (``["--", path]``) — never a shell
+    string, never any operator/LLM-controlled flag. ``cat`` must be present
+    in ``ApexConfig.allowed_tools`` (an optional tool, not enabled by
+    default — see ``apex_host/tools/registry.py``) or the underlying
+    ``ToolBackend`` rejects it via ``apex_host.tools.safety.check_command``
+    and this strategy maps that rejection to
+    ``execution_context_unavailable`` rather than letting the exception
+    escape uncaught.
+
+    Dry-run is honored transitively and redundantly: ``UserFlagExecutor``
+    already short-circuits before ever resolving an adapter when
+    ``config.dry_run`` is True, and separately, whichever ``ToolBackend``
+    the caller injected here (via ``apex_host.tools.backend
+    .select_runtime_backend(config)``) is *itself* guaranteed to be a
+    ``DryRunToolBackend`` whenever ``config.dry_run`` is True — so even a
+    hypothetical future caller that bypassed the executor's own dry-run
+    gate could not reach a real command execution through this strategy.
+    """
+
+    _FIXED_TOOL: str = "cat"
+
+    def __init__(self, *, backend: "ToolBackend") -> None:
+        self._backend = backend
+
+    async def read_file(
+        self, path: str, *, timeout_seconds: float, max_output_bytes: int,
+    ) -> BoundedReadResult:
+        result = await self._backend.execute(self._FIXED_TOOL, ["--", path], timeout_seconds=timeout_seconds)
+        success = result.returncode == 0 and not result.timed_out
+        output = result.stdout if success else ""
+        error: str | None = None
+        if result.timed_out:
+            error = "timeout: bounded command read timed out"
+        elif not success:
+            # cat's own stderr for a missing/unreadable file (e.g. "No such
+            # file or directory", "Permission denied") is not sensitive —
+            # it never contains anything beyond the fixed error phrase and
+            # the already-known candidate path — and is exactly the kind
+            # of content verify_user_flag()'s own error-marker check
+            # already knows how to reject. Bounded defensively regardless.
+            error = (result.error or result.stderr or "non-zero exit")[:200]
+        return BoundedReadResult(
+            connected=not result.timed_out,
+            output=output,
+            error=error,
+            return_code=result.returncode,
+            bytes_received=len(output.encode("utf-8", errors="replace")),
+            truncated=False,
+            method=f"cmd_{result.backend or 'local'}",
+        )

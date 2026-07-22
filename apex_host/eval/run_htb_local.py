@@ -407,8 +407,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--direct-file-read-capability-type", dest="direct_file_read_capability_type",
-        default=None, metavar="TYPE", choices=["arbitrary_file_read", "api_file_read"],
-        help="Capability classification: 'arbitrary_file_read' or 'api_file_read' (default: arbitrary_file_read).",
+        default=None, metavar="TYPE",
+        choices=["arbitrary_file_read", "api_file_read", "web_command"],
+        help=(
+            "Capability classification: 'arbitrary_file_read', 'api_file_read', "
+            "or 'web_command' (Phase 21 — same fixed request shape, but records "
+            "that the endpoint executes a command rather than serving a file "
+            "directly) (default: arbitrary_file_read)."
+        ),
     )
     parser.add_argument(
         "--direct-file-read-origin", dest="direct_file_read_origin",
@@ -449,6 +455,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--direct-file-read-allow-redirects", dest="direct_file_read_allow_redirects",
         action="store_true", default=None,
         help="Follow at most one same-origin redirect (default: disabled — be extremely conservative with redirects).",
+    )
+    parser.add_argument(
+        "--bounded-command-attested", dest="bounded_command_operator_attested",
+        action="store_true", default=None,
+        help=(
+            "Enable the bounded command-execution access capability (Phase 21). "
+            "Asserts an already-established, operator-confirmed command-execution "
+            "context (a local shell/session, or a non-web remote session) works. "
+            "No flag anywhere accepts a command string, shell syntax, or payload — "
+            "the one fixed command ever run is 'cat -- <candidate_path>'."
+        ),
+    )
+    parser.add_argument(
+        "--bounded-command-capability-type", dest="bounded_command_capability_type",
+        default=None, metavar="TYPE", choices=["local_shell", "remote_command"],
+        help=(
+            "Capability classification: 'local_shell' or 'remote_command' "
+            "(default: local_shell). 'web_command' is configured through "
+            "--direct-file-read-* instead."
+        ),
+    )
+    parser.add_argument(
+        "--bounded-command-principal", dest="bounded_command_principal",
+        default=None, metavar="LABEL",
+        help="Identity label this capability is attributed to.",
+    )
+    parser.add_argument(
+        "--bounded-command-timeout", dest="bounded_command_timeout_seconds",
+        type=float, default=None, metavar="SECONDS",
+        help="Bounded command-read timeout in seconds (default: 15.0).",
+    )
+    parser.add_argument(
+        "--bounded-command-max-bytes", dest="bounded_command_max_output_bytes",
+        type=int, default=None, metavar="N",
+        help="Maximum bounded command output size in bytes (default: 4096).",
     )
     return parser.parse_args(argv)
 

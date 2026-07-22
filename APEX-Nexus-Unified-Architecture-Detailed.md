@@ -412,6 +412,24 @@ being a single‑purpose Error‑Path feature and becomes a system‑wide proper
 > `ObjectiveParser`, and the report generator required zero changes to
 > support the new adapter, confirming the abstraction's own design promise.
 > See `docs/user-flag-objective.md` §17 for the full design.
+>
+> **Bounded command-execution capability note (added post-Phase-21 —
+> `CLAUDE.md` §23 "Phase 21"):** a third capability adapter,
+> `BoundedCommandCapabilityAdapter`, lets the objective be satisfied
+> through a generic, bounded, policy-gated command-execution primitive (an
+> authenticated web command endpoint, a validated command-injection
+> primitive, an established web-shell-like channel, a validated local
+> shell/session handle, a validated remote command channel, or an existing
+> authorized execution backend) instead of SSH or a direct file read. It
+> exposes no generic `execute()`/`run_shell()` method to the objective
+> layer — its only method takes a bounded candidate path and delegates to
+> an injected, narrow runtime strategy that internally issues one fixed,
+> non-configurable command (`cat -- <path>`) through the same
+> already-safety-gated tool-execution seam every other command in this
+> codebase uses. `ObjectivePlanner`, `UserFlagExecutor`, `ObjectiveParser`,
+> and the report generator again required zero changes — the abstraction's
+> design promise now holds for a third, structurally different adapter.
+> See `docs/user-flag-objective.md` §18 for the full design.
 
 - **Same benchmark as the paper:** the 42 HTB machines; headline metric is the
   71.4% (30/42) success rate — under this implementation, "success" per

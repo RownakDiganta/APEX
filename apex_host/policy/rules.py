@@ -125,6 +125,15 @@ _PRIV_ESC_ENUM_COMMAND_KEYS: frozenset[str] = frozenset(_ENUM_COMMANDS)
 # executors above — never through the generic run_command_fn path.
 _USER_FLAG_VERIFICATION_TOOLS: frozenset[str] = frozenset({"user_flag_verify"})
 
+# Phase 21 — defense-in-depth: task.params keys that would indicate
+# arbitrary command/shell/environment/executable control if ever present.
+# ObjectivePlanner never emits any of these (see _build_task) — this check
+# exists to BLOCK such a task should a future bug ever add one, not because
+# the current planner can produce one.
+_FORBIDDEN_COMMAND_PARAM_KEYS: frozenset[str] = frozenset({
+    "command", "shell_command", "exec", "payload", "env", "cwd", "executable", "args",
+})
+
 
 # ---------------------------------------------------------------------------
 # Public rule functions
@@ -476,6 +485,22 @@ def check_bounded_user_flag_verification(
     ``apex_host/runtime_registry.py::DirectFileReadPrimitive``). A blocked
     task never reaches ``UserFlagExecutor``, and therefore never reaches the
     adapter, regardless of which transport it would have used.
+
+    Phase 21 — likewise no functional change was needed for the bounded
+    command-execution capability: ``ObjectivePlanner`` never emits a
+    ``command``/``shell_command``/``exec``/``payload``/``env``/``cwd``/
+    ``executable``/``args`` field in a ``user_flag_verify`` task's params
+    regardless of which capability type it selected (see
+    ``apex_host/planners/objective_planner.py::_build_task`` — the params
+    shape is identical across every capability type). This rule now also
+    defensively rejects a task whose params contain any of those keys
+    (``_FORBIDDEN_COMMAND_PARAM_KEYS`` below) — belt-and-suspenders against
+    a future planner bug ever adding one, not a response to anything the
+    current planner can produce. The fixed command shape
+    (``cat -- <candidate_path>``) and the fixed strategy binding
+    (``ApexConfig.bounded_command_*``) are never task-controlled at all —
+    exactly mirroring the direct-file-read request shape's own
+    never-task-controlled guarantee.
     """
     tool = str(task.params.get("tool", "")).strip().lower()
     if tool not in _USER_FLAG_VERIFICATION_TOOLS:
@@ -484,6 +509,20 @@ def check_bounded_user_flag_verification(
     raw_target = str(task.params.get("target", "")).strip()
     if raw_target not in policy.allowed_targets:
         return None  # fall through; check_target_in_scope already blocked this
+
+    forbidden_keys_present = _FORBIDDEN_COMMAND_PARAM_KEYS.intersection(task.params.keys())
+    if forbidden_keys_present:
+        return PolicyDecision(
+            status=PolicyStatus.blocked,
+            rule_name="bounded_user_flag_verification",
+            reason=(
+                f"user_flag_verify task params contain disallowed field(s) "
+                f"{sorted(forbidden_keys_present)!r} — arbitrary command/shell/"
+                "environment/executable control is never permitted"
+            ),
+            task_tool=tool,
+            task_target=raw_target,
+        )
 
     candidate_path = str(task.params.get("candidate_path", "")).strip()
     allowed_filenames = frozenset(getattr(config, "user_flag_candidate_filenames", None) or [])

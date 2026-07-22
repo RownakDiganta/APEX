@@ -315,9 +315,14 @@ class ApexConfig:
     # `access_capability` node is ever derived from them. This mirrors
     # `policy_enabled`'s own "safe unless explicitly configured" precedent.
     direct_file_read_operator_attested: bool = False
-    # "arbitrary_file_read" or "api_file_read" — behaviorally identical at
-    # runtime (same adapter), differing only in this metadata classification
-    # of the underlying primitive (see AccessCapabilityType).
+    # "arbitrary_file_read", "api_file_read", or "web_command" (Phase 21) —
+    # all three are behaviorally identical at runtime (same adapter),
+    # differing only in this metadata classification of the underlying
+    # primitive (see AccessCapabilityType). "web_command" additionally
+    # routes derivation through CapabilityParser.derive_command_capability
+    # (command-evidence vocabulary) instead of
+    # derive_direct_file_read_capability (file-read-evidence vocabulary) —
+    # see apex_host/orchestration/capability_seed.py.
     direct_file_read_capability_type: str = "arbitrary_file_read"
     # scheme://host[:port] ONLY — no path, no query, no userinfo. Every
     # request (and every followed redirect) must resolve to exactly this
@@ -349,6 +354,45 @@ class ApexConfig:
     # conservative — never a specific known-flag value, never inferred from
     # the target or EKG content (CLAUDE.md §13.8/§13.9).
     direct_file_read_confidence: float = 0.7
+
+    # ---------------------------------------------------------------------------
+    # Phase 21 — bounded command-execution access capability
+    # (apex_host/runtime_registry.py::BoundedCommandCapabilityAdapter;
+    #  apex_host/parsers/capability_parser.py::derive_command_capability;
+    #  docs/user-flag-objective.md §18)
+    # ---------------------------------------------------------------------------
+    # Mirrors --username/--password's and direct_file_read_*'s own trust
+    # boundary exactly: the operator asserts, out of band, that a specific,
+    # already-established command-execution context (a local shell/session,
+    # a non-web remote session, ...) already works; APEX never discovers,
+    # probes for, or autonomously establishes it. Deliberately NOT a
+    # `--command`/`--exec`/`--shell-command`/`--payload` style field — there
+    # is no field anywhere in this config that accepts a command string,
+    # shell syntax, or payload. The one fixed, non-configurable command this
+    # capability ever runs is `cat -- <candidate_path>` via an argv list,
+    # issued through the SAME already-safety-gated
+    # `apex_host.tools.backend.ToolBackend` seam every other command in this
+    # codebase uses (see `apex_host/runtime_registry.py
+    # ::ToolBackendCommandReadStrategy`).
+    #
+    # `bounded_command_operator_attested` is the explicit opt-in gate: with
+    # the default `False`, none of the fields below have any effect.
+    bounded_command_operator_attested: bool = False
+    # "local_shell" or "remote_command" only. "web_command" is configured
+    # through the direct_file_read_* fields above instead (it shares
+    # DirectFileReadCapabilityAdapter — see
+    # apex_host/orchestration/dispatch_node.py::_register_capability_adapter).
+    bounded_command_capability_type: str = "local_shell"
+    # A label identifying who/what this capability is attributed to —
+    # required, mirrors direct_file_read_principal's own guard.
+    bounded_command_principal: str = ""
+    # Confidence recorded on the derived access_capability node. Fixed and
+    # conservative — never inferred from the target or EKG content.
+    bounded_command_confidence: float = 0.7
+    bounded_command_timeout_seconds: float = 15.0
+    # Bounded output-size cap in bytes — enforced independently by the
+    # adapter itself (never trusts the verifier's own cap alone).
+    bounded_command_max_output_bytes: int = 4096
 
     # Configuration schema version — increment when the config format changes in a
     # backward-incompatible way (new required fields, renamed fields, type changes).
@@ -459,6 +503,16 @@ class ApexConfig:
             "direct_file_read_timeout_seconds": _g("direct_file_read_timeout_seconds", 15.0),
             "direct_file_read_allow_redirects": bool(_g("direct_file_read_allow_redirects", False)),
             "direct_file_read_confidence": _g("direct_file_read_confidence", 0.7),
+            # Phase 21 — bounded command-execution access capability. Never
+            # enabled unless the operator explicitly passes
+            # --bounded-command-attested. No flag anywhere accepts a
+            # command string, shell syntax, or payload.
+            "bounded_command_operator_attested": bool(_g("bounded_command_operator_attested", False)),
+            "bounded_command_capability_type": _g("bounded_command_capability_type", "local_shell"),
+            "bounded_command_principal": _g("bounded_command_principal", ""),
+            "bounded_command_confidence": _g("bounded_command_confidence", 0.7),
+            "bounded_command_timeout_seconds": _g("bounded_command_timeout_seconds", 15.0),
+            "bounded_command_max_output_bytes": _g("bounded_command_max_output_bytes", 4096),
         }
         user_flag_filenames = getattr(args, "user_flag_candidate_filenames", None)
         if user_flag_filenames:

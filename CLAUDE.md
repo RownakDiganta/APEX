@@ -7955,3 +7955,199 @@ only benchmark-success condition (`EngagementOutcome.user_flag_verified`,
 exit code 0); a validated `access_state`/`access_capability` alone remains
 an intermediate milestone, never independently success — this phase adds a
 second way to reach the same objective, not a second success condition.
+
+### Phase 21 — Generic Bounded Command-Execution Capability (third `FlagReadCapability` adapter) ✓ COMPLETE
+
+**Full design document:** [`docs/user-flag-objective.md`](docs/user-flag-objective.md)
+§18. This entry is a summary and progress record; that document is
+authoritative.
+
+**Scope:** §17.17's extension contract predicted this too: a further
+`FlagReadCapability` adapter added using only its four documented
+extension points, with **no change** to `ObjectivePlanner`,
+`UserFlagExecutor`, `ObjectiveParser`, the report generator, or (beyond one
+defensive hardening) `check_bounded_user_flag_verification`. This phase
+adds a generic, bounded, policy-gated **command-execution** capability —
+covering primitives such as an authenticated web command endpoint, a
+validated command-injection primitive, an established web-shell-like
+channel, a validated local shell/session handle, a validated remote
+command channel, or an existing authorized execution backend that can run
+one narrow read action — so the User Flag Objective can be satisfied
+without SSH or a direct file read. **This phase does not implement
+vulnerability discovery, payload generation, reverse-shell creation,
+persistence, privilege escalation, or arbitrary interactive shells.**
+`memfabric/` was not touched — all work is inside `apex_host`.
+
+**Capability types — mostly reused, one genuine addition:**
+`AccessCapabilityType.web_command` (already existed since Phase 18B) is
+reused with NO new adapter — it shares `DirectFileReadCapabilityAdapter`
+and `ApexConfig.direct_file_read_*` configuration exactly as
+`arbitrary_file_read`/`api_file_read` do (the mechanism, a fixed HTTP
+request shape, is identical; only the capability_type label and its
+derivation evidence differ). `AccessCapabilityType.local_shell` (also
+pre-existing) is reused, relabeled `"Local Command"` in reports (the same
+rename pattern Phase 20 established for `arbitrary_file_read` → "Direct
+File Read"). `AccessCapabilityType.remote_command` is a genuinely new 7th
+enum member — no existing type represented "an already-established,
+non-web, non-SSH remote session." `local_shell` and `remote_command` share
+ONE new adapter class, `BoundedCommandCapabilityAdapter`.
+
+**The narrow strategy protocol — how arbitrary command execution was
+prevented:** `BoundedCommandReadStrategy` (a new `Protocol` in
+`apex_host/runtime_registry.py`) exposes exactly one method,
+`read_file(path, *, timeout_seconds, max_output_bytes) -> BoundedReadResult`
+— no `execute()`/`run_shell()`/`send_command()`/`exec()` anywhere,
+statically enforced. `BoundedCommandCapabilityAdapter.read_bounded_file(path)`
+is the ONLY method the objective layer, the LLM, or task metadata can ever
+reach; the objective controls exactly one `capability_id` and one approved
+candidate path, never a command name, shell operator, pipe, redirect,
+environment variable, working directory, interpreter, executable path, or
+any argument beyond the path value. `BoundedCommandReadPrimitive` (the
+command-execution analogue of `DirectFileReadPrimitive`) binds a
+`capability_id` to a fixed `strategy` object plus
+`allowed_filenames`/`timeout_seconds`/`max_output_bytes`, validated at
+construction (`__post_init__` rejects non-positive timeout/byte values)
+and never mutated afterward.
+
+**`ToolBackendCommandReadStrategy`** — the one concrete reference
+implementation — wraps an existing, already-safety-gated
+`apex_host.tools.backend.ToolBackend` (the SAME seam Infra Phase 2/4
+already built) rather than spawning a subprocess directly, so this phase
+introduces **no new subprocess call site** (CLAUDE.md §13.6 honored by
+construction). It issues exactly one fixed, non-configurable command per
+call: `cat -- <path>` as an argv list, never a shell string. `"cat"` is a
+new, optional entry in `apex_host/tools/registry.py::_KNOWN_TOOLS` (not in
+the default `allowed_tools` — mirrors `ffuf`/`gobuster`'s existing
+optional-tool precedent) and is still independently checked against the
+allowlist and destructive-command blocklist by
+`apex_host.tools.safety.check_command` on every call. Dry-run is honored
+twice, independently: `UserFlagExecutor`'s own existing short-circuit, plus
+`apex_host.tools.backend.select_runtime_backend`'s own binding invariant
+that guarantees a `DryRunToolBackend` whenever `config.dry_run=True`.
+
+**Capability derivation (`CapabilityParser.derive_command_capability`, new
+method):** requires a validation-method vocabulary distinct from Direct
+File Read's own (`operator_attestation`, `canary_output_match`,
+`nonce_bound_execution`, `deterministic_benign_command`,
+`backend_confirmed_session`) and `confidence >= 0.6` — an HTTP 200 alone,
+an LLM's claim of successful command injection, output merely containing
+a common OS word, a shell-like error, discovered credentials, or
+application administrator access are all explicitly rejected. Sanitized
+metadata: `{validation_method, max_output_bytes, strategy_id, read_only:
+True}` — never a command string, shell payload, session token, or raw
+canary/flag value.
+
+**Runtime registry:** `CapabilityRuntimeRegistry.ensure_bounded_command(...)`
+mirrors `ensure_ssh`/`ensure_direct_file_read`'s idempotency exactly.
+`apex_host/orchestration/dispatch_node.py::_register_capability_adapter`
+gained one more routing branch dispatching `local_shell`/`remote_command`
+to a new `_register_bounded_command_adapter`, and extended the existing
+`web_command` case into the same branch that already handles
+`arbitrary_file_read`/`api_file_read`.
+
+**Operator-attested seeding:** `apex_host/orchestration/capability_seed.py
+::seed_bounded_command_capability` mirrors `seed_direct_file_read_capability`
+exactly — six new `ApexConfig` fields
+(`bounded_command_operator_attested`, `_capability_type`, `_principal`,
+`_confidence`, `_timeout_seconds`, `_max_output_bytes`), called once at
+startup, **no live command execution**. Deliberately **no**
+`--command`/`--exec`/`--shell-command`/`--payload` CLI flag exists
+anywhere. `web_command` is seeded through the existing
+`seed_direct_file_read_capability` (extended to route its derivation call
+to `derive_command_capability` instead of
+`derive_direct_file_read_capability` when `capability_type ==
+web_command`, while still reusing the identical `direct_file_read_*`
+configuration).
+
+**Attempt tracking:** no new work needed — pair-scoped `(capability_id,
+candidate_path)` tracking (Phase 20) already generalizes to any number of
+capability types; a failed SSH/DFR attempt never blocks a retry through a
+bounded-command capability on the same path, and vice versa.
+
+**Policy:** `check_bounded_user_flag_verification()` needed no functional
+change — it already inspected only `target`/`candidate_path`. One
+defensive hardening was added to the SAME rule:
+`_FORBIDDEN_COMMAND_PARAM_KEYS` (`command`, `shell_command`, `exec`,
+`payload`, `env`, `cwd`, `executable`, `args`) — a task whose params
+contain any of those keys is blocked outright. Belt-and-suspenders against
+a future planner bug, not a response to anything the current planner can
+produce; proven by a dispatcher-level test that such a task never reaches
+the executor.
+
+**Reporting:** `capability_type_label("local_shell")` renamed
+`"Local Shell"` → `"Local Command"`; `"remote_command"` added as
+`"Remote Command"`. A new "Bounded Command Summary" report section (shown
+only when at least one command-capability node exists) adds eight
+`RunReport` fields (`bounded_command_capabilities_derived`,
+`_adapters_registered`, `_unavailable_strategies`, `_attempts`,
+`_blocked_attempts`, `_timeouts`, `_oversized`, `_verified_count`), derived
+from the final subgraph plus a new `ApexGraphState.bounded_command_log`
+accumulator (mirrors `direct_file_read_log`'s convention; disjoint
+capability-type sets mean no double-counting).
+
+**New files:** none — all work extends existing Phase 18B/20 files.
+`tests/apex_host/test_phase21_bounded_command_capability.py` (119 tests
+across the 15 required categories: capability types, bounded command
+primitive, path security, no-shell-construction, capability derivation,
+runtime registry, `UserFlagExecutor` independence, verifier integration,
+planner, policy, persistence/redaction, full graph — positive (synthetic
+verified success via `local_shell`, no SSH or direct-file-read anywhere),
+negative full graph, dry-run graph, architecture scans).
+
+**Modified files:** `apex_host/runtime_registry.py`
+(`BoundedCommandReadStrategy`, `BoundedCommandReadPrimitive`,
+`BoundedCommandCapabilityAdapter`, `ToolBackendCommandReadStrategy`,
+`ensure_bounded_command`), `apex_host/types.py`
+(`AccessCapabilityType.remote_command`, updated docstring),
+`apex_host/parsers/capability_parser.py` (`derive_command_capability`),
+`apex_host/planners/access_capabilities.py` (label rename, new label,
+`remote_command` directness rank), `apex_host/orchestration/dispatch_node.py`
+(`_register_bounded_command_adapter`, extended `web_command` routing),
+`apex_host/policy/rules.py` (`_FORBIDDEN_COMMAND_PARAM_KEYS` check),
+`apex_host/config.py` (six new `bounded_command_*` fields + CLI wiring +
+extended `direct_file_read_capability_type` choices), `apex_host/orchestration
+/capability_seed.py` (`seed_bounded_command_capability`, extended
+`seed_direct_file_read_capability` for `web_command`), `apex_host/runtime.py`
+(startup capability seeding call + `bounded_command_log` init),
+`apex_host/eval/run_synthetic_machine.py` (same state-field init),
+`apex_host/graph_state.py` (`bounded_command_log` field),
+`apex_host/orchestration/memory_node.py` (log accumulation),
+`apex_host/eval/report.py` (eight new fields, text/JSON sections),
+`apex_host/main.py` + `apex_host/eval/run_htb_local.py` (five new CLI
+flags each + extended `--direct-file-read-capability-type` choices),
+`docs/user-flag-objective.md` (new §18), `docs/engagement-outcomes.md`,
+`APEX-Nexus-Unified-Architecture-Detailed.md`, `README.md`. Two
+pre-existing test files updated in place (behavior legitimately changed,
+not weakened): `tests/apex_host/test_access_capability_refactor.py`
+(`test_all_six_capability_types_exist` → `test_all_seven_capability_types_exist`,
+now asserting the new `remote_command` member exists).
+
+**Validation (clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest tests/apex_host/test_phase21_bounded_command_capability.py -q` | 119 passed |
+| `uv run pytest tests/ -q` (full) | 4677 passed — no regressions |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy` | Success — 171 source files |
+| `python -m apex_host.main --help` | exit 0 |
+| `python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Remaining known limitations (documented, not defects — see
+`docs/user-flag-objective.md` §18.13 for the full list):** `remote_command`'s
+real-world backend (a Kali tool-service container) requires `"cat"` to be
+independently allowlisted in `apex_tool_service/allowlist.py` — out of
+this phase's scope; until then, `remote_command` registration only
+succeeds against a `ToolBackend` that already accepts `"cat"`. Only one
+operator-attested bounded-command primitive can be configured per
+engagement. No live web-exploitation or session-discovery step discovers
+a command-execution primitive automatically — the operator must supply
+the confirmed strategy binding via configuration. Verified user flag
+remains the only benchmark-success condition
+(`EngagementOutcome.user_flag_verified`, exit code 0); command execution
+alone, and access alone, are never independently success — this phase
+adds a third way to reach the same objective, not a new success
+condition.
