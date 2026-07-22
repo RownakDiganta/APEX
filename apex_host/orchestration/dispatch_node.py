@@ -31,23 +31,21 @@ from typing import TYPE_CHECKING, Any
 from memfabric.ids import now
 from memfabric.types import AbandonSignal, Goal, Node, TaskSpec
 
+from apex_host.capabilities.runtime_resolution import register_capability_adapter
 from apex_host.execution.context import ExecutionContext
 from apex_host.execution.dispositions import ExecutionDisposition
 from apex_host.graph_state import ApexGraphState
 from apex_host.orchestration.models import task_info
 from apex_host.orchestration.outcome import EngagementOutcome
 from apex_host.planners.access_capabilities import access_capabilities_from_subgraph
-from apex_host.planners.capabilities import capabilities_from_subgraph
 from apex_host.planners.objective import objective_state_fields
 from apex_host.planners.priv_esc_opportunities import privilege_state_fields
 from apex_host.planners.web_opportunities import web_session_state_fields
-from apex_host.types import AccessCapabilityType, ApexPhase
+from apex_host.types import ApexPhase
 
 if TYPE_CHECKING:
     from apex_host.orchestration.dependencies import OrchestrationDeps
-    from apex_host.types import AccessCapability
     from memfabric.coordination.protocols import Planner
-    from memfabric.types import SubgraphView
 
 logger = logging.getLogger(__name__)
 
@@ -238,161 +236,6 @@ def make_priv_esc_node(deps: "OrchestrationDeps") -> Any:
     return priv_esc_agent
 
 
-def _ssh_port_for_capability(subgraph: "SubgraphView") -> str:
-    """Lowest-port ``access_validate_ssh`` capability's port, or the SSH
-    default. Mirrors the pre-refactor ``objective_planner._ssh_port``
-    helper — relocated here since resolving a runtime connection detail
-    for a capability adapter is an orchestration-layer concern, never a
-    planner concern (memfabric Invariant 7)."""
-    caps = [c for c in capabilities_from_subgraph(subgraph) if c.name == "access_validate_ssh"]
-    if not caps:
-        return "22"
-    return sorted(caps, key=lambda c: int(c.port) if c.port.isdigit() else 22)[0].port or "22"
-
-
-def _register_capability_adapter(
-    deps: "OrchestrationDeps", subgraph: "SubgraphView", target: str, cap: "AccessCapability"
-) -> bool:
-    """Register a runtime adapter for one validated ``AccessCapability`` so
-    ``UserFlagExecutor`` can resolve ``capability_id -> adapter`` this turn.
-    Returns ``True`` iff an adapter was successfully constructed and
-    registered — the caller uses this to keep the EKG node's
-    ``runtime_available`` prop accurate (see ``make_objective_node``).
-
-    Orchestration-layer-only concern: planners stay pure over subgraph/
-    evidence data (memfabric Invariant 7); executors only ever *look up* an
-    already-registered adapter (see ``apex_host/runtime_registry.py``).
-    SSH, direct-file-read (``arbitrary_file_read``/``api_file_read``), and
-    bounded command execution (``local_shell``/``remote_command``/
-    ``web_command``, Phase 21) have real adapters — an unrecognised
-    ``capability_type`` is silently skipped (forward-compatible: a future
-    capability type simply has no adapter registered, and stays
-    ``runtime_available=False``, until its own registration branch is added
-    here). ``web_command`` deliberately shares
-    ``_register_direct_file_read_adapter`` (and therefore
-    ``ApexConfig.direct_file_read_*`` configuration) with
-    ``arbitrary_file_read``/``api_file_read`` — the underlying mechanism (a
-    fixed HTTP request shape) is identical; only the capability_type label
-    differs, recording whether the operator classifies the primitive as
-    "serves a file directly" or "executes a command whose response happens
-    to contain the read output."
-    """
-    if cap.capability_type is AccessCapabilityType.ssh_command:
-        return _register_ssh_adapter(deps, subgraph, target, cap)
-    if cap.capability_type in (
-        AccessCapabilityType.arbitrary_file_read,
-        AccessCapabilityType.api_file_read,
-        AccessCapabilityType.web_command,
-    ):
-        return _register_direct_file_read_adapter(deps, target, cap)
-    if cap.capability_type in (AccessCapabilityType.local_shell, AccessCapabilityType.remote_command):
-        return _register_bounded_command_adapter(deps, target, cap)
-    return False
-
-
-def _register_ssh_adapter(
-    deps: "OrchestrationDeps", subgraph: "SubgraphView", target: str, cap: "AccessCapability"
-) -> bool:
-    usernames = list(getattr(deps.config, "username_candidates", None) or [])
-    passwords = list(getattr(deps.config, "password_candidates", None) or [])
-    # Mirrors CredentialPlanner's own one-credential-pair-per-engagement
-    # invariant: only the first configured pair is ever validated, so only
-    # a capability whose principal matches it can be provisioned here.
-    if not usernames or not passwords or cap.principal != usernames[0]:
-        return False
-    deps.capability_registry.ensure_ssh(
-        cap.capability_id,
-        target=target,
-        port=_ssh_port_for_capability(subgraph),
-        username=cap.principal,
-        password=passwords[0],
-        config=deps.config,
-    )
-    return True
-
-
-def _register_direct_file_read_adapter(
-    deps: "OrchestrationDeps", target: str, cap: "AccessCapability"
-) -> bool:
-    """Construct (from operator-supplied ``ApexConfig`` fields only — never
-    from the capability node's own EKG metadata, which carries no secret)
-    and register a ``DirectFileReadCapabilityAdapter``. Performs NO network
-    I/O — constructing the adapter/primitive is always safe.
-
-    Mirrors ``_register_ssh_adapter``'s principal-matching discipline: only
-    a capability whose principal matches the operator's configured
-    ``direct_file_read_principal`` can be provisioned here.
-    """
-    from apex_host.runtime_registry import DirectFileReadPrimitive
-
-    config = deps.config
-    if not config.direct_file_read_origin or not config.direct_file_read_endpoint_template:
-        return False
-    if cap.principal != config.direct_file_read_principal:
-        return False
-    allowed_filenames = frozenset(getattr(config, "user_flag_candidate_filenames", None) or [])
-    try:
-        primitive = DirectFileReadPrimitive(
-            capability_id=cap.capability_id,
-            target_origin=config.direct_file_read_origin,
-            endpoint_template=config.direct_file_read_endpoint_template,
-            method=config.direct_file_read_method,
-            headers=dict(config.direct_file_read_headers),
-            timeout_seconds=config.direct_file_read_timeout_seconds,
-            max_response_bytes=config.direct_file_read_max_response_bytes,
-            allow_redirects=config.direct_file_read_allow_redirects,
-            allowed_filenames=allowed_filenames,
-        )
-    except ValueError as exc:
-        logger.warning("direct-file-read primitive construction rejected: %s", exc)
-        return False
-    deps.capability_registry.ensure_direct_file_read(cap.capability_id, primitive=primitive)
-    return True
-
-
-def _register_bounded_command_adapter(
-    deps: "OrchestrationDeps", target: str, cap: "AccessCapability"
-) -> bool:
-    """Construct and register a ``BoundedCommandCapabilityAdapter`` for a
-    validated ``local_shell``/``remote_command`` capability (Phase 21).
-
-    Mirrors ``_register_direct_file_read_adapter``'s principal-matching
-    discipline: only a capability whose principal matches the operator's
-    configured ``bounded_command_principal`` can be provisioned here. The
-    one reference strategy (``ToolBackendCommandReadStrategy``) is
-    constructed from ``apex_host.tools.backend.select_runtime_backend`` —
-    the SAME centralized, dry-run-aware backend selector every other
-    command-execution path in this codebase uses — so this registration
-    step performs no execution itself (constructing a ``ToolBackend`` and a
-    strategy wrapper is always safe) and inherits the same dry-run
-    guarantee as every other tool invocation.
-    """
-    from apex_host.runtime_registry import BoundedCommandReadPrimitive, ToolBackendCommandReadStrategy
-    from apex_host.tools.backend import select_runtime_backend
-
-    config = deps.config
-    if not config.bounded_command_operator_attested:
-        return False
-    if cap.principal != config.bounded_command_principal:
-        return False
-    allowed_filenames = frozenset(getattr(config, "user_flag_candidate_filenames", None) or [])
-    try:
-        backend = select_runtime_backend(config)
-        strategy = ToolBackendCommandReadStrategy(backend=backend, target=target)
-        primitive = BoundedCommandReadPrimitive(
-            capability_id=cap.capability_id,
-            strategy=strategy,
-            allowed_filenames=allowed_filenames,
-            timeout_seconds=config.bounded_command_timeout_seconds,
-            max_output_bytes=config.bounded_command_max_output_bytes,
-        )
-    except ValueError as exc:
-        logger.warning("bounded-command primitive construction rejected: %s", exc)
-        return False
-    deps.capability_registry.ensure_bounded_command(cap.capability_id, primitive=primitive)
-    return True
-
-
 def make_objective_node(deps: "OrchestrationDeps") -> Any:
     """Return the ``objective_agent`` node bound to the objective planner.
 
@@ -430,7 +273,10 @@ def make_objective_node(deps: "OrchestrationDeps") -> Any:
             for cap in access_capabilities_from_subgraph(pre_subgraph):
                 if not cap.validated or deps.capability_registry.has(cap.capability_id):
                     continue
-                registered = _register_capability_adapter(deps, pre_subgraph, state["target"], cap)
+                registered = register_capability_adapter(
+                    config=deps.config, capability_registry=deps.capability_registry,
+                    subgraph=pre_subgraph, target=state["target"], cap=cap,
+                )
                 if registered != cap.runtime_available:
                     timestamp = now()
                     await deps.api.upsert_node(Node(

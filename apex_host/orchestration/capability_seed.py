@@ -1,7 +1,10 @@
 # capability_seed.py
 # One-time, startup-only derivation of an operator-attested direct-file-read or bounded-command AccessCapability from ApexConfig — never a live network operation or command execution.
 """Startup-only direct-file-read capability seeding (Phase 20; extended in
-Phase 21 with bounded command-execution capability seeding).
+Phase 21 with bounded command-execution capability seeding; Phase 23:
+routed through the same ``CapabilityDiscoveryEngine`` every automatically
+-derived capability now goes through, rather than calling
+``CapabilityParser`` directly).
 
 Mirrors ``--username``/``--password``'s own trust boundary: the operator
 has ALREADY manually confirmed (through authorized testing — an arbitrary
@@ -21,9 +24,13 @@ to reach the ``objective`` phase — see ``apex_host/planners/global_planner
 .py``'s updated ``_select_phase`` gate).
 
 This function performs **NO live network operation of any kind** — it only
-constructs and applies a fixed set of EKG deltas from already-known,
-already-supplied configuration. The ONE real network operation in the
-entire direct-file-read flow is the bounded, policy-gated
+constructs a ``CapabilityEvidence(evidence_type=OPERATOR_ATTESTED, ...)``
+object and runs it through ``run_capability_discovery()``, which itself
+performs no network I/O either (materialization is a graph write via
+``CapabilityParser``; runtime registration merely constructs Python
+objects from config — see ``apex_host.capabilities.discovery``/
+``apex_host.capabilities.runtime_resolution``). The ONE real network
+operation in the entire direct-file-read flow is the bounded, policy-gated
 ``user_flag_verify`` task itself, dispatched later through the normal
 ``TaskDispatcher.dispatch()`` pipeline exactly like every other live
 operation in this codebase.
@@ -32,6 +39,19 @@ Idempotent: a second call (e.g. a future checkpoint-resume path) is a
 no-op once the capability node already exists for this target/type/
 principal (content-addressed ID — see ``apex_host/graph_ids.py
 ::access_capability_id``).
+
+Two independent capability-creation paths temporarily existed side by
+side after the access-capability refactor introduced this seeding module
+(Phase 20/21) and before Phase 23 unified them: seeding called
+``CapabilityParser.derive_*`` directly, while a validated SSH login (in
+``apex_host.orchestration.parsing_node``) already went through a similar
+direct-call pattern. Phase 23 collapses BOTH onto the single
+``CapabilityEvidence -> CapabilityDiscoveryEngine -> CapabilityParser``
+pipeline — this module no longer imports ``CapabilityParser`` at all.
+``tests/apex_host/test_phase23_capability_discovery.py`` proves the
+resulting EKG node metadata is identical (modulo the new, additive
+``evidence_provenance``/``runtime_generation`` bookkeeping keys) to what
+the pre-Phase-23 direct-call path produced.
 """
 from __future__ import annotations
 
@@ -39,11 +59,13 @@ import logging
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
-from memfabric.ids import now
+from memfabric.ids import new_id, now
 from memfabric.types import Node
 
+from apex_host.capabilities.discovery import CapabilityDiscoveryContext, run_capability_discovery
+from apex_host.capabilities.evidence import CapabilityEvidence, CapabilityEvidenceType
 from apex_host.graph_ids import access_capability_id, host_id
-from apex_host.parsers.capability_parser import CapabilityParser
+from apex_host.runtime_registry import CapabilityRuntimeRegistry
 from apex_host.types import AccessCapabilityType
 
 if TYPE_CHECKING:
@@ -123,33 +145,40 @@ async def seed_direct_file_read_capability(api: "MemoryAPI", config: "ApexConfig
         ))
 
     if capability_type is AccessCapabilityType.web_command:
-        parsed = CapabilityParser().derive_command_capability(
-            target=target,
-            capability_type=capability_type,
-            principal=config.direct_file_read_principal,
-            source_task_id="",
-            validation_method="operator_attestation",
-            confidence=config.direct_file_read_confidence,
-            max_output_bytes=config.direct_file_read_max_response_bytes,
-            strategy_id=cap_id,
-        )
+        sanitized_attributes = {
+            "max_output_bytes": config.direct_file_read_max_response_bytes,
+            "strategy_id": cap_id,
+        }
     else:
-        parsed = CapabilityParser().derive_direct_file_read_capability(
-            target=target,
-            capability_type=capability_type,
-            principal=config.direct_file_read_principal,
-            source_task_id="",
-            validation_method="operator_attestation",
-            confidence=config.direct_file_read_confidence,
-            requires_auth=bool(config.direct_file_read_headers),
-            max_response_bytes=config.direct_file_read_max_response_bytes,
-            request_shape_id=cap_id,
-        )
-    if not parsed.node_deltas:
+        sanitized_attributes = {
+            "requires_auth": bool(config.direct_file_read_headers),
+            "max_response_bytes": config.direct_file_read_max_response_bytes,
+            "request_shape_id": cap_id,
+        }
+    evidence = CapabilityEvidence(
+        evidence_id=new_id(),
+        evidence_type=CapabilityEvidenceType.OPERATOR_ATTESTED,
+        capability_family=capability_type,
+        target_host_id=h_id,
+        source_task_id="",
+        principal=config.direct_file_read_principal,
+        validation_method="operator_attestation",
+        confidence=config.direct_file_read_confidence,
+        timestamp=now(),
+        sanitized_attributes=sanitized_attributes,
+    )
+    discovery_result = await run_capability_discovery(
+        [evidence],
+        context=CapabilityDiscoveryContext(
+            api=api, config=config, capability_registry=CapabilityRuntimeRegistry(),
+            subgraph=existing_subgraph, target=target, now_iso=now(),
+            attempt_runtime_registration=False,
+        ),
+    )
+    if discovery_result.capabilities_derived < 1:
         logger.warning("seed_direct_file_read_capability: derivation rejected the supplied evidence")
         return False
 
-    await api.apply_deltas(nodes=parsed.node_deltas, edges=parsed.edge_deltas)
     logger.info(
         "seed_direct_file_read_capability: derived %s capability_id=%s principal=%s",
         capability_type.value, cap_id, config.direct_file_read_principal,
@@ -213,21 +242,33 @@ async def seed_bounded_command_capability(api: "MemoryAPI", config: "ApexConfig"
             source="capability_seed", first_seen=timestamp, last_seen=timestamp,
         ))
 
-    parsed = CapabilityParser().derive_command_capability(
-        target=target,
-        capability_type=capability_type,
-        principal=config.bounded_command_principal,
+    evidence = CapabilityEvidence(
+        evidence_id=new_id(),
+        evidence_type=CapabilityEvidenceType.OPERATOR_ATTESTED,
+        capability_family=capability_type,
+        target_host_id=h_id,
         source_task_id="",
+        principal=config.bounded_command_principal,
         validation_method="operator_attestation",
         confidence=config.bounded_command_confidence,
-        max_output_bytes=config.bounded_command_max_output_bytes,
-        strategy_id=cap_id,
+        timestamp=now(),
+        sanitized_attributes={
+            "max_output_bytes": config.bounded_command_max_output_bytes,
+            "strategy_id": cap_id,
+        },
     )
-    if not parsed.node_deltas:
+    discovery_result = await run_capability_discovery(
+        [evidence],
+        context=CapabilityDiscoveryContext(
+            api=api, config=config, capability_registry=CapabilityRuntimeRegistry(),
+            subgraph=existing_subgraph, target=target, now_iso=now(),
+            attempt_runtime_registration=False,
+        ),
+    )
+    if discovery_result.capabilities_derived < 1:
         logger.warning("seed_bounded_command_capability: derivation rejected the supplied evidence")
         return False
 
-    await api.apply_deltas(nodes=parsed.node_deltas, edges=parsed.edge_deltas)
     logger.info(
         "seed_bounded_command_capability: derived %s capability_id=%s principal=%s",
         capability_type.value, cap_id, config.bounded_command_principal,

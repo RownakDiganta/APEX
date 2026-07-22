@@ -752,6 +752,30 @@ Full design: [`docs/user-flag-objective.md`](docs/user-flag-objective.md)
 §19, [`docs/kali-tool-service.md`](docs/kali-tool-service.md) §19,
 [`docs/remote-tool-backend.md`](docs/remote-tool-backend.md) §9.
 
+**Structured automatic capability derivation (Phase 23):** a deterministic
+capability-evidence discovery pipeline (`apex_host/capabilities/`) — not
+autonomous vulnerability discovery — that lets a validated execution
+result automatically produce an `AccessCapability` instead of requiring
+the operator to manually seed every one. A validated execution result
+becomes structured `CapabilityEvidence`, evaluated by one pure,
+deterministic `CapabilityProvider` per family (SSH, direct-file-read,
+local/remote command, web-command), and materialized through the SAME
+`CapabilityParser` every prior capability path already used — providers
+never write `MemoryAPI`, never mutate the runtime registry, never touch a
+network/tool/LLM (enforced by a static architecture scan). Confidence
+merges monotonically (`max(existing, incoming)`) across repeated evidence,
+achieved by detecting and auto-resolving memfabric's own epistemic
+`Conflict` via its documented default policy rather than bypassing it. A
+new `objective_reopening_eligible()` check lets a newly-derived, runtime-
+active capability reopen a previously exhausted or failed User Flag
+Objective — generically, with no transport-specific logic, and never
+retrying an already-failed `(capability_id, candidate_path)` pair. Operator
+seeding (`capability_seed.py`) now routes through this same pipeline
+rather than writing capability metadata directly. `ObjectivePlanner`,
+`UserFlagExecutor`, `ObjectiveParser`, and `verify_user_flag()` needed
+**zero changes**. Full design:
+[`docs/user-flag-objective.md`](docs/user-flag-objective.md) §20.
+
 **Safety**: `ApexConfig.dry_run` defaults to `True`. Every command execution
 path goes through `apex_host/tools/runner.py`, which checks
 `apex_host/tools/safety.py` first (allowlist + unconditional destructive-

@@ -37,6 +37,8 @@ report generator.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from memfabric.ids import now
 from memfabric.types import Edge, Node, ParsedObservation
 
@@ -156,6 +158,7 @@ class CapabilityParser:
 
     def derive_ssh_capability(
         self, *, target: str, username: str, source_task_id: str,
+        confidence: float = _SSH_CAPABILITY_CONFIDENCE, metadata: dict[str, Any] | None = None,
     ) -> ParsedObservation:
         """Build the ``access_capability`` node + edges for a validated SSH
         login (mirrors ``AccessParser.parse_structured``'s own "only on
@@ -171,6 +174,15 @@ class CapabilityParser:
         orchestration layer (``apex_host.orchestration.dispatch_node
         ._register_capability_adapter``) flips it to ``True`` once it
         successfully constructs and registers a real adapter for it.
+
+        ``confidence``/``metadata`` (Phase 23) default to the original fixed
+        values so every pre-existing call site (a single live-login
+        derivation, always at ``_SSH_CAPABILITY_CONFIDENCE``) is unaffected.
+        ``apex_host.capabilities.discovery`` passes its own monotonically-
+        merged confidence and provenance-bearing metadata explicitly — the
+        SAME parameter shape ``derive_direct_file_read_capability``/
+        ``derive_command_capability`` already accept, so all three
+        derivation methods now support confidence merging identically.
         """
         if not username:
             return ParsedObservation()
@@ -186,12 +198,12 @@ class CapabilityParser:
                 "host_id": h_id,
                 "validated": True,
                 "principal": username,
-                "confidence": _SSH_CAPABILITY_CONFIDENCE,
+                "confidence": confidence,
                 "source_task_id": source_task_id,
-                "metadata": {},
+                "metadata": dict(metadata or {}),
                 "runtime_available": False,
             },
-            confidence=_SSH_CAPABILITY_CONFIDENCE,
+            confidence=confidence,
             source="capability_parser",
             first_seen=timestamp,
             last_seen=timestamp,
@@ -202,13 +214,13 @@ class CapabilityParser:
             Edge(
                 id=has_capability_edge_id(h_id, cap_id),
                 from_id=h_id, to_id=cap_id, type="has_capability", props={},
-                confidence=_SSH_CAPABILITY_CONFIDENCE, source="capability_parser",
+                confidence=confidence, source="capability_parser",
                 first_seen=timestamp, last_seen=timestamp,
             ),
             Edge(
                 id=enables_edge_id(acc_id, cap_id),
                 from_id=acc_id, to_id=cap_id, type="enables", props={},
-                confidence=_SSH_CAPABILITY_CONFIDENCE, source="capability_parser",
+                confidence=confidence, source="capability_parser",
                 first_seen=timestamp, last_seen=timestamp,
             ),
         ]

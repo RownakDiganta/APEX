@@ -688,7 +688,7 @@ class TestRuntimeRegistry:
     async def test_missing_runtime_strategy_leaves_capability_unavailable(self) -> None:
         """A validated capability with NO operator-supplied bounded-command
         configuration must not be considered executable."""
-        from apex_host.orchestration.dispatch_node import _register_capability_adapter
+        from apex_host.capabilities.runtime_resolution import register_capability_adapter
 
         api = _make_api()
         cap_id = await _seed_validated_command_capability(api, _TARGET, runtime_available=False)
@@ -697,8 +697,9 @@ class TestRuntimeRegistry:
 
         config = ApexConfig(target=_TARGET, dry_run=True)  # bounded_command_operator_attested defaults False
         registry = CapabilityRuntimeRegistry()
-        deps = _fake_deps(api, config, registry)
-        registered = _register_capability_adapter(deps, subgraph, _TARGET, capability)
+        registered = register_capability_adapter(
+            config=config, capability_registry=registry, subgraph=subgraph, target=_TARGET, cap=capability,
+        )
         assert registered is False
         assert registry.has(cap_id) is False
 
@@ -723,20 +724,6 @@ class TestRuntimeRegistry:
         registry = CapabilityRuntimeRegistry()
         cap_id = access_capability_id(_TARGET, "local_shell", "application")
         assert registry.has(cap_id) is False  # EKG may say True, registry says otherwise until registered
-
-
-def _fake_deps(api: MemoryAPI, config: ApexConfig, registry: CapabilityRuntimeRegistry) -> Any:
-    """Minimal stand-in exposing only the attributes
-    ``_register_capability_adapter`` reads — mirrors
-    ``test_phase20_direct_file_read_capability.py``'s identical helper."""
-    class _Deps:
-        pass
-
-    d = _Deps()
-    d.api = api  # type: ignore[attr-defined]
-    d.config = config  # type: ignore[attr-defined]
-    d.capability_registry = registry  # type: ignore[attr-defined]
-    return d
 
 
 # ---------------------------------------------------------------------------

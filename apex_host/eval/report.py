@@ -257,6 +257,23 @@ class RunReport:
     bounded_command_oversized: int = 0
     bounded_command_verified_count: int = 0
 
+    # Phase 23 — deterministic capability-discovery summary. Aggregated
+    # from accumulated state["capability_discovery_log"] (one
+    # CapabilityDiscoveryResult.to_dict() per turn that emitted at least
+    # one CapabilityEvidence — see apex_host.capabilities.discovery and
+    # apex_host.orchestration.parsing_node). Capability-derivation itself
+    # is never a benchmark success condition — verified user flag remains
+    # the only exit-code-0 outcome regardless of these counts.
+    capability_discovery_evidence_evaluated: int = 0
+    capability_discovery_evidence_accepted: int = 0
+    capability_discovery_evidence_rejected: int = 0
+    capability_discovery_duplicate_evidence: int = 0
+    capability_discovery_capabilities_derived: int = 0
+    capability_discovery_capabilities_updated: int = 0
+    capability_discovery_adapters_registered: int = 0
+    capability_discovery_validated_but_unavailable: int = 0
+    capability_discovery_provider_failures: int = 0
+
     # Phase 13 — privilege-escalation planning summary, derived from
     # final_state["privilege_summary"]/["privilege_state"]/["enumeration_complete"]
     # (populated by apex_host.orchestration.dispatch_node.make_priv_esc_node
@@ -667,6 +684,31 @@ def build_report(
         1 for e in raw_cmd_log if "timeout" in str(e.get("error") or "").lower()
     )
 
+    # Phase 23: deterministic capability-discovery summary — a plain sum
+    # across every turn's accumulated CapabilityDiscoveryResult.to_dict()
+    # entry (each entry is already a per-turn total, not a per-evidence-item
+    # record, so summing across turns is the correct aggregation).
+    raw_discovery_log = list(final_state.get("capability_discovery_log") or [])
+    capability_discovery_evidence_evaluated = sum(int(e.get("evidence_evaluated", 0)) for e in raw_discovery_log)
+    capability_discovery_evidence_accepted = sum(int(e.get("evidence_accepted", 0)) for e in raw_discovery_log)
+    capability_discovery_evidence_rejected = sum(int(e.get("evidence_rejected", 0)) for e in raw_discovery_log)
+    capability_discovery_duplicate_evidence = sum(int(e.get("duplicate_evidence", 0)) for e in raw_discovery_log)
+    capability_discovery_capabilities_derived = sum(
+        int(e.get("capabilities_derived", 0)) for e in raw_discovery_log
+    )
+    capability_discovery_capabilities_updated = sum(
+        int(e.get("capabilities_updated", 0)) for e in raw_discovery_log
+    )
+    capability_discovery_adapters_registered = sum(
+        int(e.get("runtime_adapters_registered", 0)) for e in raw_discovery_log
+    )
+    capability_discovery_validated_but_unavailable = sum(
+        int(e.get("validated_but_unavailable", 0)) for e in raw_discovery_log
+    )
+    capability_discovery_provider_failures = sum(
+        int(e.get("provider_failures", 0)) for e in raw_discovery_log
+    )
+
     # Phase 13: privilege-escalation planning summary. Derived directly from
     # the FINAL subgraph's priv_esc_opportunity nodes (not from
     # final_state["privilege_summary"]) so the report is always complete and
@@ -865,6 +907,15 @@ def build_report(
         bounded_command_timeouts=bounded_command_timeouts,
         bounded_command_oversized=bounded_command_oversized,
         bounded_command_verified_count=bounded_command_verified_count,
+        capability_discovery_evidence_evaluated=capability_discovery_evidence_evaluated,
+        capability_discovery_evidence_accepted=capability_discovery_evidence_accepted,
+        capability_discovery_evidence_rejected=capability_discovery_evidence_rejected,
+        capability_discovery_duplicate_evidence=capability_discovery_duplicate_evidence,
+        capability_discovery_capabilities_derived=capability_discovery_capabilities_derived,
+        capability_discovery_capabilities_updated=capability_discovery_capabilities_updated,
+        capability_discovery_adapters_registered=capability_discovery_adapters_registered,
+        capability_discovery_validated_but_unavailable=capability_discovery_validated_but_unavailable,
+        capability_discovery_provider_failures=capability_discovery_provider_failures,
         privilege_state=privilege_state,
         privilege_opportunity_count=privilege_opportunity_count,
         privilege_categories=privilege_categories,
@@ -1057,6 +1108,25 @@ def format_text(report: RunReport) -> str:
         lines.append(f"  Timeouts             : {report.bounded_command_timeouts}")
         lines.append(f"  Oversized outputs    : {report.bounded_command_oversized}")
         lines.append(f"  Verified reads       : {report.bounded_command_verified_count}")
+
+    # Capability Discovery Summary (Phase 23 — shown only when at least one
+    # piece of CapabilityEvidence was ever evaluated this engagement, which
+    # covers both automatically-derived and operator-attested capabilities
+    # since Phase 23 routes both through the same discovery pipeline).
+    # Capability derivation is never itself a benchmark-success signal —
+    # this section is purely informational.
+    if report.capability_discovery_evidence_evaluated:
+        lines.append("\nCapability Discovery Summary")
+        lines.append(f"  Evidence evaluated   : {report.capability_discovery_evidence_evaluated}")
+        lines.append(f"  Evidence accepted    : {report.capability_discovery_evidence_accepted}")
+        lines.append(f"  Evidence rejected    : {report.capability_discovery_evidence_rejected}")
+        lines.append(f"  Duplicate evidence   : {report.capability_discovery_duplicate_evidence}")
+        lines.append(f"  Capabilities derived : {report.capability_discovery_capabilities_derived}")
+        lines.append(f"  Capabilities updated : {report.capability_discovery_capabilities_updated}")
+        lines.append(f"  Adapters registered  : {report.capability_discovery_adapters_registered}")
+        lines.append(f"  Validated but unavailable: {report.capability_discovery_validated_but_unavailable}")
+        if report.capability_discovery_provider_failures:
+            lines.append(f"  Provider failures    : {report.capability_discovery_provider_failures}")
 
     # Privilege Escalation Summary (Phase 13 — shown only when the priv_esc
     # phase produced any state at all; a target never reaching that phase
@@ -1467,6 +1537,17 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
             "timeouts": report.bounded_command_timeouts,
             "oversized": report.bounded_command_oversized,
             "verified_count": report.bounded_command_verified_count,
+        },
+        "capability_discovery": {
+            "evidence_evaluated": report.capability_discovery_evidence_evaluated,
+            "evidence_accepted": report.capability_discovery_evidence_accepted,
+            "evidence_rejected": report.capability_discovery_evidence_rejected,
+            "duplicate_evidence": report.capability_discovery_duplicate_evidence,
+            "capabilities_derived": report.capability_discovery_capabilities_derived,
+            "capabilities_updated": report.capability_discovery_capabilities_updated,
+            "adapters_registered": report.capability_discovery_adapters_registered,
+            "validated_but_unavailable": report.capability_discovery_validated_but_unavailable,
+            "provider_failures": report.capability_discovery_provider_failures,
         },
         "privilege_escalation": {
             "state": report.privilege_state,

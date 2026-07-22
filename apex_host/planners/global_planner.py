@@ -149,6 +149,7 @@ class GlobalPlanner:
         current_phase: str | None = None,
         has_web_capability: bool = True,
         objective_status: str = "pending",
+        objective_reopened: bool = False,
     ) -> ApexPhase:
         """Return the phase the engagement should run in this turn.
 
@@ -196,6 +197,18 @@ class GlobalPlanner:
             updated to compute it (never crashes; simply routes to the
             objective phase once access exists, exactly as if no attempt
             had been made yet).
+        objective_reopened:
+            Phase 23 — ``True`` when
+            ``apex_host.planners.objective.objective_reopening_eligible``
+            found a validated, runtime-active capability the objective has
+            never had a chance to try, even though the objective's own
+            organic condition (below) would otherwise skip it (a "failed"
+            status, or an exhausted objective-phase turn budget). Overrides
+            BOTH of those skip conditions — never overrides
+            ``objective_status == "verified"`` (checked first, always
+            terminal). Defaults ``False`` for callers that have not been
+            updated to compute it — identical behavior to before this
+            parameter existed.
         """
         if turn_count >= self._max_turns:
             return ApexPhase.done
@@ -216,6 +229,7 @@ class GlobalPlanner:
             has_web_capability=has_web_capability,
             objective_status=objective_status,
             objective_budget_exhausted=objective_budget_exhausted,
+            objective_reopened=objective_reopened,
         )
         if selected is ApexPhase.priv_esc and self.budget_remaining(ApexPhase.priv_esc.value) == 0:
             return ApexPhase.done
@@ -228,6 +242,7 @@ class GlobalPlanner:
         has_web_capability: bool = True,
         objective_status: str = "pending",
         objective_budget_exhausted: bool = False,
+        objective_reopened: bool = False,
     ) -> ApexPhase:
         """EKG-driven phase selection.
 
@@ -270,7 +285,15 @@ class GlobalPlanner:
           phase's budget ran out without success): fall through to the
           pre-existing ``priv_esc`` intermediate-milestone phase exactly as
           before this phase existed, preserving the rest of the phase
-          ladder unchanged.
+          ladder unchanged — UNLESS ``objective_reopened`` is ``True``
+          (Phase 23): a validated, runtime-active capability the objective
+          has never had a chance to try was automatically derived (e.g.
+          from a live SSH login discovered during priv_esc/web
+          enumeration, after the objective phase itself had already been
+          exhausted) — see
+          ``apex_host.planners.objective.objective_reopening_eligible``.
+          In that case the objective phase runs again despite the
+          otherwise-terminal condition.
         """
         if "host" not in node_types_seen:
             return ApexPhase.recon
@@ -282,7 +305,7 @@ class GlobalPlanner:
             return ApexPhase.credential
         if objective_status == "verified":
             return ApexPhase.done
-        if objective_status != "failed" and not objective_budget_exhausted:
+        if objective_reopened or (objective_status != "failed" and not objective_budget_exhausted):
             return ApexPhase.objective
         if "service" in node_types_seen:
             return ApexPhase.priv_esc

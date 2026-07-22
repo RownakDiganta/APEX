@@ -426,7 +426,7 @@ class TestRuntimeRegistry:
         """A validated capability with NO operator-supplied primitive
         configuration must not be considered executable — registration
         fails gracefully, runtime_available stays False."""
-        from apex_host.orchestration.dispatch_node import _register_capability_adapter
+        from apex_host.capabilities.runtime_resolution import register_capability_adapter
 
         api = _make_api()
         cap_id = await _seed_validated_dfr_capability(api, _TARGET, runtime_available=False)
@@ -435,26 +435,11 @@ class TestRuntimeRegistry:
 
         config = ApexConfig(target=_TARGET, dry_run=True)  # no direct_file_read_* fields set
         registry = CapabilityRuntimeRegistry()
-        deps = _fake_deps(api, config, registry)
-        registered = _register_capability_adapter(deps, subgraph, _TARGET, capability)
+        registered = register_capability_adapter(
+            config=config, capability_registry=registry, subgraph=subgraph, target=_TARGET, cap=capability,
+        )
         assert registered is False
         assert registry.has(cap_id) is False
-
-
-def _fake_deps(api: MemoryAPI, config: ApexConfig, registry: CapabilityRuntimeRegistry) -> Any:
-    """Minimal stand-in exposing only the attributes
-    ``_register_capability_adapter`` reads (``api``/``config``/
-    ``capability_registry``) — avoids constructing a full
-    ``OrchestrationDeps`` (which needs a dispatcher/planners/etc. this test
-    never uses)."""
-    class _Deps:
-        pass
-
-    d = _Deps()
-    d.api = api  # type: ignore[attr-defined]
-    d.config = config  # type: ignore[attr-defined]
-    d.capability_registry = registry  # type: ignore[attr-defined]
-    return d
 
 
 # ---------------------------------------------------------------------------

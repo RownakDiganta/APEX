@@ -20,12 +20,14 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from memfabric.ids import new_id, now
 from memfabric.types import ParsedObservation, RawObservation
 
+from apex_host.capabilities.discovery import CapabilityDiscoveryContext, run_capability_discovery
+from apex_host.capabilities.evidence import CapabilityEvidence, CapabilityEvidenceType
 from apex_host.parsers.access_parser import AccessParser
 from apex_host.parsers.banner_parser import BannerParser
 from apex_host.parsers.browser_parser import BrowserParser
-from apex_host.parsers.capability_parser import CapabilityParser
 from apex_host.parsers.command_parser import CommandParser
 from apex_host.parsers.ffuf_parser import FfufParser
 from apex_host.parsers.gobuster_parser import GobusterParser
@@ -34,7 +36,7 @@ from apex_host.orchestration.outcome import EngagementOutcome
 from apex_host.parsers.nmap_parser import NmapParser
 from apex_host.parsers.objective_parser import ObjectiveParser
 from apex_host.parsers.priv_esc_parser import PrivEscParser
-from apex_host.types import BrowserObservation
+from apex_host.types import AccessCapabilityType, BrowserObservation
 
 if TYPE_CHECKING:
     from apex_host.orchestration.dependencies import OrchestrationDeps
@@ -51,7 +53,15 @@ _BROWSER_PARSER = BrowserParser()
 _ACCESS = AccessParser()
 _PRIV_ESC = PrivEscParser()
 _OBJECTIVE = ObjectiveParser()
-_CAPABILITY = CapabilityParser()
+
+#: Minimum confidence assigned to automatically-emitted SSH capability
+#: evidence — mirrors ``CapabilityParser``'s own pre-existing
+#: ``_SSH_CAPABILITY_CONFIDENCE`` constant (0.85), duplicated here as a
+#: plain float (not imported) since it is evidence-emission bookkeeping,
+#: not derivation-acceptance logic — the acceptance threshold itself
+#: still lives solely in ``apex_host.parsers.capability_parser``, imported
+#: by ``apex_host.capabilities.providers``.
+_SSH_EVIDENCE_CONFIDENCE = 0.85
 
 
 def _port_from_nc_args(args: list[str]) -> str:
@@ -122,21 +132,14 @@ def parse_single_result(
                 evidence_text=str(tool_result.get("response_summary", "")),
                 proof_type=f"{protocol}_{operation}".strip("_") if operation else protocol,
             )
-            if tool_name == "ssh_access" and success:
-                # Access-capability refactor: a validated SSH login also
-                # produces a generic, transport-tagged access_capability
-                # record — the ONE thing ObjectivePlanner (and any future
-                # capability-consuming planner) ever looks for. Merged into
-                # the same ParsedObservation so both land in one
-                # apply_deltas batch.
-                cap_obs = _CAPABILITY.derive_ssh_capability(
-                    target=target, username=username, source_task_id=str(tool_result.get("task_id", "")),
-                )
-                parsed = ParsedObservation(
-                    node_deltas=[*parsed.node_deltas, *cap_obs.node_deltas],
-                    edge_deltas=[*parsed.edge_deltas, *cap_obs.edge_deltas],
-                    proposed_knowledge=[*parsed.proposed_knowledge, *cap_obs.proposed_knowledge],
-                )
+            # Phase 23: a validated SSH login no longer derives its
+            # access_capability record directly here — it emits structured
+            # CapabilityEvidence instead, evaluated by the same
+            # CapabilityDiscoveryEngine every automatically- and
+            # operator-seeded capability now goes through (see
+            # apex_host.capabilities and this module's
+            # ssh_capability_evidence_for_result). Discovery runs once per
+            # turn, after this per-result loop, in parse_observation below.
             return parsed, tool_name
         parsed = _ACCESS.parse_text(
             stdout, target=target, username=username,
@@ -227,6 +230,53 @@ def parse_single_result(
     return _COMMAND.parse(raw), tool_name
 
 
+def ssh_capability_evidence_for_result(
+    tool_result: dict[str, Any], *, target: str,
+) -> CapabilityEvidence | None:
+    """Build ``SSH_AUTHENTICATED_COMMAND`` evidence from one successful
+    ``ssh_access`` tool_result, or ``None`` when the result does not
+    qualify (Phase 23).
+
+    This is the ONE place a real, live executor result is turned into
+    automatic capability evidence in this codebase today — every other
+    supported family (direct-file-read, local_shell, remote_command,
+    web_command) currently has no organic, live-executor-produced
+    evidence source of its own (each still requires a fixed
+    operator-supplied request/strategy shape before any read can ever be
+    attempted at all — see ``apex_host/orchestration/capability_seed.py``,
+    now itself routed through the same discovery pipeline via
+    ``OPERATOR_ATTESTED`` evidence). Adding a genuinely new live evidence
+    source for one of those families later requires only a new function
+    like this one plus a call site here — never touching
+    ``apex_host.capabilities.providers``/``discovery``.
+
+    Rejects (returns ``None``): a non-``ssh_access`` tool, a failed login,
+    a missing username, or (implicitly, via
+    :func:`apex_host.capabilities.evidence.validate_evidence` downstream)
+    a dry-run result — ``TaskDispatcher`` never marks a dry-run credential
+    result ``success=True`` in the first place, but the evidence's own
+    ``is_dry_run`` field is still populated defensively from the
+    tool_result's own ``dry_run`` flag.
+    """
+    if tool_result.get("tool") != "ssh_access" or not tool_result.get("success"):
+        return None
+    username = str(tool_result.get("username", ""))
+    if not username:
+        return None
+    return CapabilityEvidence(
+        evidence_id=new_id(),
+        evidence_type=CapabilityEvidenceType.SSH_AUTHENTICATED_COMMAND,
+        capability_family=AccessCapabilityType.ssh_command,
+        target_host_id=f"host:{target}",
+        source_task_id=str(tool_result.get("task_id", "")),
+        principal=username,
+        validation_method="deterministic_benign_command",
+        confidence=_SSH_EVIDENCE_CONFIDENCE,
+        timestamp=now(),
+        is_dry_run=bool(tool_result.get("dry_run", False)),
+    )
+
+
 def findings_from_parsed(
     parsed: ParsedObservation, *, phase: str, source: str, timestamp: str
 ) -> list[dict[str, Any]]:
@@ -254,7 +304,11 @@ def make_parsing_node(deps: "OrchestrationDeps") -> Any:
             return {}
 
         all_findings: list[dict[str, Any]] = []
+        pending_evidence: list[CapabilityEvidence] = []
         for tool_result in results_to_parse:
+            evidence = ssh_capability_evidence_for_result(tool_result, target=deps.config.target)
+            if evidence is not None:
+                pending_evidence.append(evidence)
             try:
                 parsed, source = parse_single_result(tool_result, state)
             except Exception as exc:
@@ -290,6 +344,35 @@ def make_parsing_node(deps: "OrchestrationDeps") -> Any:
                     source=source, timestamp=tool_result.get("timestamp", ""),
                 )
             )
-        return {"findings": all_findings}
+
+        result: dict[str, Any] = {"findings": all_findings}
+        # Phase 23: capability discovery runs once per turn, after every
+        # tool_result in this turn has been parsed and its own deltas
+        # applied — "after structured parsing/validation and before the
+        # next global planning decision" (the next global_plan node runs
+        # at the start of the FOLLOWING turn). A discovery failure
+        # degrades gracefully: it never turns into a parser_failure/
+        # memory_failure outcome, since capability derivation is an
+        # enhancement on top of an already-successful parse, not a
+        # requirement for turn correctness.
+        if pending_evidence and getattr(deps.config, "capability_discovery_enabled", True):
+            try:
+                subgraph = await deps.api.get_subgraph(deps.anchor_id, depth=2)
+                discovery_result = await run_capability_discovery(
+                    pending_evidence,
+                    context=CapabilityDiscoveryContext(
+                        api=deps.api, config=deps.config, capability_registry=deps.capability_registry,
+                        subgraph=subgraph, target=deps.config.target,
+                        now_iso=now(),
+                        evidence_ttl_seconds=getattr(deps.config, "capability_evidence_ttl_seconds", 0.0),
+                        max_evidence_per_cycle=getattr(
+                            deps.config, "capability_discovery_max_evidence_per_cycle", 50,
+                        ),
+                    ),
+                )
+                result["capability_discovery_log"] = [discovery_result.to_dict()]
+            except Exception as exc:
+                logger.warning("capability discovery failed in phase %s: %s", state["phase"], exc)
+        return result
 
     return parse_observation

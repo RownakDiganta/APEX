@@ -8353,3 +8353,197 @@ Command/file-read capability access alone remains non-success — verified
 user flag remains the only exit-code-0 outcome; this phase completes a
 runtime path for an existing capability, it does not add a new success
 condition.
+
+### Phase 23 — Structured Automatic Capability Derivation ✓ COMPLETE
+
+**Full design document:** [`docs/user-flag-objective.md`](docs/user-flag-objective.md)
+§20. This entry is a summary and progress record; that document is
+authoritative.
+
+**Scope:** a **deterministic capability-evidence discovery pipeline, not
+autonomous vulnerability discovery.** Before this phase, only SSH gained
+an automatic, parser-driven `AccessCapability` (derived inline in
+`parsing_node.py` immediately after a real validated login);
+direct-file-read/`local_shell`/`remote_command`/`web_command` capabilities
+existed ONLY through operator-attested startup seeding
+(`capability_seed.py` calling `CapabilityParser.derive_*` directly). This
+phase closes that architectural gap generically: a validated execution
+result already proves a capability exists; a new package,
+`apex_host/capabilities/`, converts that proof into structured
+`CapabilityEvidence`, evaluates it through one pure, deterministic
+provider per family, and materializes accepted decisions through the SAME
+`CapabilityParser` (§ access-capability refactor) every prior capability
+path already used — never a second, competing writer.
+
+**Pipeline:** `Executor/parser result -> CapabilityEvidence ->
+CapabilityDiscoveryEngine.discover() -> validate_evidence() (central,
+family-agnostic gate) -> CapabilityProvider.evaluate() (pure, one per
+family) -> CapabilityDerivationDecision -> CapabilityParser.derive_*()
+(sole metadata writer) -> MemoryAPI.apply_deltas() (the only graph write
+in this package) -> runtime_resolution.register_capability_adapter() ->
+CapabilityRuntimeRegistry adapter (when resolvable) -> ObjectivePlanner`
+(unchanged — still just reads `AccessCapability` records).
+
+**Insertion point:** `apex_host/orchestration/parsing_node.py`'s existing
+`parse_observation` node, once per turn, after that turn's normal
+per-tool_result parse+`apply_deltas` loop — no new LangGraph node was
+added. SSH evidence emission
+(`ssh_capability_evidence_for_result()`) replaced the old inline
+`derive_ssh_capability()` call at that same site.
+
+**Evidence model:** `CapabilityEvidence` (immutable,
+`apex_host/capabilities/evidence.py`) — never carries a password, private
+key, bearer token, cookie, raw output, or raw flag value;
+`validate_evidence()` scans `sanitized_attributes`' KEYS (never values)
+against a forbidden set before any provider sees it. Six evidence types
+(`SSH_AUTHENTICATED_COMMAND`, `DIRECT_FILE_READ_VALIDATED`,
+`LOCAL_COMMAND_VALIDATED`, `REMOTE_COMMAND_VALIDATED`,
+`WEB_COMMAND_VALIDATED`, `RUNTIME_SESSION_CONFIRMED` reserved,
+`OPERATOR_ATTESTED`) — none named after a vulnerability or machine.
+
+**Central validation rejects:** missing target, evidence-type/family
+mismatch, confidence below 0.6, an unaccepted validation method (`http_200`,
+`llm_claim`, `credentials_found`, `admin_access`, `payload_attempted`,
+`banner_only`, `port_open` — an HTTP 200 or an LLM claim is never
+sufficient), a smuggled secret/output/flag `sanitized_attributes` key,
+dry-run evidence (unconditionally), a malformed `runtime_generation`, and
+(opt-in TTL) stale evidence.
+
+**Five providers** (`apex_host/capabilities/providers.py`), each pure and
+reusing `CapabilityParser`'s own pre-existing acceptance
+thresholds/vocabularies (never duplicated): `SSHCapabilityProvider`,
+`DirectFileReadCapabilityProvider`, `LocalCommandCapabilityProvider`,
+`RemoteCommandCapabilityProvider`, `WebCommandCapabilityProvider` (the
+last honestly reports `runtime_unavailable` rather than faking runtime
+activation, since no current mechanism supplies it an HTTP request shape
+automatically). Providers never write `MemoryAPI`, never mutate
+`CapabilityRuntimeRegistry`, never touch a network/tool/LLM — enforced by
+a static architecture-scan test.
+
+**Identity/dedup/confidence merge:** identity unchanged from the
+access-capability refactor (content-addressed, never secret-derived).
+Duplicate `evidence_id` replay → `duplicate` status, confidence unchanged.
+New evidence for an existing identity → `updated`, confidence merged via
+`max(existing, incoming)`. **A real substrate interaction found and
+resolved during this phase:** a bare re-upsert with a different
+confidence/metadata value for an already-high-confidence field
+legitimately raises an open memfabric `Conflict` (epistemic-conflict
+invariant) rather than silently applying — the discovery engine now
+detects and immediately auto-resolves any such conflict via `MemoryAPI
+.auto_resolve_conflict()` (the substrate's own documented "higher
+confidence wins" policy), achieving the intended monotonic-merge result
+through the correct mechanism rather than a second, bypassing
+implementation.
+
+**Runtime resolution relocated, not duplicated:**
+`apex_host/orchestration/dispatch_node.py`'s former private
+`_register_ssh_adapter`/`_register_direct_file_read_adapter`/
+`_register_bounded_command_adapter` functions moved verbatim to
+`apex_host/capabilities/runtime_resolution.py` (public
+`register_capability_adapter()`); `dispatch_node.py`'s pre-existing
+per-turn `make_objective_node` registration loop and the new discovery
+engine now call the SAME implementation.
+
+**Capability lifecycle** (`apex_host/capabilities/lifecycle.py`) — a
+pure, derived view (`candidate`/`active`/`unavailable` reachable;
+`validated`/`expired`/`revoked`/`superseded` reserved for forward
+compatibility, matching this codebase's own established convention).
+
+**Objective reopening** (the "reopening the objective" gap):
+`apex_host.planners.objective.objective_reopening_eligible()` (pure, no
+transport-specific logic) returns `True` whenever the objective isn't
+verified and a validated+runtime-available capability's ID has never
+appeared in `attempted_capability_paths`. `GlobalPlanner.decide_phase()`
+gained an `objective_reopened: bool = False` parameter that overrides the
+`"failed"`-status skip and the exhausted-budget skip (never the
+`"verified"` terminal check) — wired into both `planning_node.py` (the
+real per-turn decision) and `continuation_node.py` (the peek). Old failed
+`(capability_id, candidate_path)` pairs are never deleted; only a
+genuinely new capability ID can trigger reopening.
+
+**Operator seed migration:** `capability_seed.py`'s two `seed_*`
+functions now construct `OPERATOR_ATTESTED` evidence and call
+`run_capability_discovery()` instead of calling `CapabilityParser
+.derive_*` directly — routed through the SAME pipeline as every
+automatically-derived capability. Seeding runs before the engagement
+graph starts (no real `CapabilityRuntimeRegistry` exists yet), so it uses
+a new `CapabilityDiscoveryContext.attempt_runtime_registration=False`
+opt-out to avoid writing a misleading `runtime_available=True` against a
+throwaway registry — the pre-existing per-turn registration loop performs
+the real registration on the first objective turn regardless, unchanged
+from before this phase. Pre-existing Phase 20/21 tests (unmodified) prove
+the resulting EKG metadata is unchanged.
+
+**Files created:** `apex_host/capabilities/__init__.py`, `evidence.py`,
+`decisions.py`, `providers.py`, `discovery.py`, `runtime_resolution.py`,
+`lifecycle.py`; `tests/apex_host/test_phase23_capability_discovery.py`
+(179 tests).
+
+**Files modified:** `apex_host/orchestration/dispatch_node.py` (imports
+relocated registration functions, removed the old private duplicates),
+`apex_host/orchestration/parsing_node.py` (SSH evidence emission + per-turn
+discovery call, replacing the old inline `derive_ssh_capability` call),
+`apex_host/orchestration/capability_seed.py` (routed through the discovery
+pipeline), `apex_host/planners/objective.py`
+(`objective_reopening_eligible`), `apex_host/planners/global_planner.py`
+(`objective_reopened` parameter), `apex_host/orchestration/planning_node.py`
++ `continuation_node.py` (compute + pass `objective_reopened`),
+`apex_host/parsers/capability_parser.py` (`derive_ssh_capability` gained
+optional `confidence`/`metadata` parameters, mirroring the other two
+`derive_*` methods, so the monotonic confidence merge actually reaches
+storage), `apex_host/config.py` (three new fields:
+`capability_discovery_enabled`, `capability_evidence_ttl_seconds`,
+`capability_discovery_max_evidence_per_cycle`), `apex_host/graph_state.py`
+(`capability_discovery_log` field), `apex_host/runtime.py` +
+`apex_host/eval/run_synthetic_machine.py` (new state-field initialization),
+`apex_host/eval/report.py` (nine new `RunReport` fields, "Capability
+Discovery Summary" text section, `"capability_discovery"` JSON block),
+`tests/apex_host/test_phase20_direct_file_read_capability.py` +
+`test_phase21_bounded_command_capability.py` (two call sites updated to
+import `register_capability_adapter` from its new
+`apex_host.capabilities.runtime_resolution` location with its new
+keyword-argument signature — the relocation, not a behavior change),
+`tests/apex_host/test_phase12a_state_machine.py` (one stale
+`GlobalPlanner.decide_phase` monkeypatch stub gained the new
+`objective_reopened` parameter), `docs/user-flag-objective.md` (new §20),
+`README.md`.
+
+**Explicitly not changed:** no exploitation, vulnerability discovery,
+payload generation, reverse-shell creation, or persistence was added
+anywhere in this phase. `ObjectivePlanner`, `UserFlagExecutor`,
+`ObjectiveParser`, and `verify_user_flag()` remain fully unchanged and
+transport-independent — no branching on capability type anywhere in
+them, statically verified. `memfabric/` was not touched. No branch was
+created; no commit or push was made as part of this phase's work.
+
+**Validation (clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest tests/apex_host/test_phase23_capability_discovery.py -q` | 179 passed |
+| `uv run pytest tests/ -q` (full) | **4982 passed** — no regressions |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy` | Success — 139 source files |
+| `python -m apex_host.main --help` | exit 0 |
+| `python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Remaining known limitations (documented, not defects — see
+`docs/user-flag-objective.md` §20.19 for the full list):** only SSH gains
+a genuinely new, organic, live-executor-produced evidence source in this
+phase — the other four families still require an operator-supplied
+request/strategy shape before a runtime adapter can ever activate; this
+phase unifies HOW all five are derived, it does not add autonomous
+discovery of a new primitive for those four. `WebCommandCapabilityProvider`
+never reaches `active` lifecycle state from automatic evidence alone
+(always honestly reports `runtime_unavailable`). `runtime_generation`/
+`runtime_reference_id` are validated fields with no current concrete
+resolver consuming them (reserved for a future executor-held-session
+design). Conflict auto-resolution always applies the substrate's one
+fixed default policy — no per-capability override. `repair_node.py`'s own
+separate `parse_single_result()` call site does not emit capability
+evidence (a narrow, documented edge case). Command/access capability
+alone remains non-success — verified user flag remains the only
+exit-code-0 outcome; `memfabric/` remains unchanged.
