@@ -491,3 +491,15 @@ wrong, but the run is over."
 > `StallTracker`'s own stagnant-fingerprint detection is unaffected — a
 > reopened objective phase that is genuinely making progress (a new
 > capability, a new candidate path) does not look stagnant to it.
+
+> **Note (Phase 24):** Phase 24 (see `docs/user-flag-objective.md` §21)
+> gives `runtime_available` a real invalidation path — a capability whose
+> underlying session/adapter is torn down (e.g. a connection-level
+> failure, or process shutdown) is unregistered and its
+> `runtime_available` flag flips back to `False`, exactly like any other
+> per-turn write-back. `objective_reopening_eligible()`'s existing
+> `runtime_available` check (unchanged) now behaves more precisely as a
+> result: a capability that WAS active and got invalidated correctly stops
+> counting toward reopening eligibility until it (or a different
+> capability) is re-registered. No change to `GlobalPlanner.decide_phase()`,
+> `EngagementOutcome`, or the outcome precedence order.

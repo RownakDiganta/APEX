@@ -2490,20 +2490,284 @@ behavior change).
   from automatically-produced evidence alone (always `runtime_unavailable`
   without an operator-configured request shape) — honestly reported, never
   faked.
-- `runtime_generation`/`runtime_reference_id` are accepted, validated
+- ~~`runtime_generation`/`runtime_reference_id` are accepted, validated
   fields with no current concrete resolver consuming them — reserved for
-  a future executor-held-session resolver design.
+  a future executor-held-session resolver design.~~ **Superseded by
+  Phase 24 (§21):** a real `RuntimeReferenceStore`/`RuntimeReferenceResolver`
+  now mints, resolves, and invalidates these — see §21.
 - Conflict auto-resolution always applies the substrate's DEFAULT policy
   (higher confidence wins, tie → higher logical_version) — there is no
   per-capability override; a genuine three-way disagreement between
   operator attestation and two different live evidence sources still
   resolves deterministically via that one fixed policy, never a bespoke
   per-family rule.
-- `repair_node.py`'s own, separate `parse_single_result()` call site (for
+- ~~`repair_node.py`'s own, separate `parse_single_result()` call site (for
   a repaired task's single result) does not emit capability evidence —
   only the main per-turn `parse_observation` loop does. A capability
   derived from a REPAIRED SSH task is not automatically captured; this is
-  a narrow, documented edge case, not the common path.
+  a narrow, documented edge case, not the common path.~~ **Fixed in Phase 24
+  (§21):** both node factories now share `parse_result_and_collect_evidence`/
+  `run_pending_capability_discovery`, so a repaired `ssh_access` success
+  emits capability evidence identically to a normally-dispatched one.
+- No new exploitation, privilege escalation, persistence, or shell-access
+  capability was added or performed anywhere in this phase. Command
+  execution alone, and access alone, remain non-success — verified user
+  flag remains the only exit-code-0 outcome. `memfabric/` was not
+  modified.
+
+## 21. Runtime Reference Resolution (Phase 24)
+
+**Status:** implemented. Phase 23 (§20) scaffolded
+`CapabilityEvidence.runtime_reference_id`/`runtime_generation` and
+`CapabilityDerivationDecision.runtime_reference_id` but nothing ever
+minted or resolved a real value — every emitter left them at their
+defaults. This phase makes the concept real: a `RuntimeReferenceStore`
+mints opaque, non-secret handles bound to a target/capability_type/
+generation, a `RuntimeReferenceResolver` validates and resolves them back
+to a live adapter, `CapabilityRuntimeRegistry` gained safe-replacement
+semantics (`replace()`/`unregister()`/`generation_for()`), and the two
+Phase 23 known-limitations struck through above are both closed.
+
+### 21.1 Why this is a runtime-only layer, not a new persisted concept
+
+`RuntimeReference` objects live only in `apex_host/capabilities/
+runtime_references.py`'s `RuntimeReferenceStore`, one instance per
+engagement, constructed alongside `CapabilityRuntimeRegistry` in
+`apex_host.orchestration.builder.build_apex_graph` — never written
+through `MemoryAPI`, never a field on `ApexGraphState`, never touched by
+the LangGraph checkpointer. This is deliberate, not an oversight: a
+runtime reference exists to let the objective layer resolve "does a live
+adapter still back this capability_id, and is it the SAME construction of
+runtime material as before" — a question whose only correct answer source
+is the live, in-process registry. Persisting a `RuntimeReference` would
+create exactly the failure mode this phase is designed to prevent: a
+resolver trusting stale, disk-durable metadata about a session that no
+longer exists.
+
+Capability-node IDENTITY itself (`access_capability_id(target,
+capability_type, principal)`, §16) never changes across generations —
+this phase does not introduce versioned capability nodes. "Which
+construction of the runtime material this is" lives entirely in the
+runtime-reference/registry-generation concept, layered transparently on
+top of the unchanged, content-addressed capability identity scheme.
+
+### 21.2 `RuntimeReference` / `RuntimeReferenceStore` / `RuntimeReferenceResolver`
+
+`RuntimeReference` (`@dataclass(frozen=True, slots=True)`): `reference_id`
+(opaque, `secrets.token_urlsafe(32)` — explicitly NOT a Python `id()`
+value, NOT derived from any secret), `capability_id`, `target`,
+`capability_type`, `generation`, `authorization_scope_id`, `created_at`,
+`expires_at`, `revoked`, `revocation_reason`. `to_dict()`/`__repr__()`
+both expose only an 8-character digest of `reference_id`, never the full
+value.
+
+`RuntimeReferenceStore` — `mint()` (creates a reference, automatically
+revoking any prior live reference for the same `capability_id` —
+`revocation_reason="superseded_by_new_generation"`), `get()`,
+`current_reference_for(capability_id)`, `invalidate()` (explicit),
+`invalidate_for_capability()`, `invalidate_for_target()` (authorization/
+target-change trigger), `invalidate_all()` (process-shutdown trigger,
+wired from `ApexRuntime.aclose()` — see §21.5).
+
+`RuntimeReferenceResolver.resolve(reference_id, *, target, capability_type,
+now_iso="", expected_generation=None)` — validates, in order: existence
+→ revocation → expiry → target match → capability-type match →
+generation match (only when `expected_generation` is supplied) → registry
+lookup by `capability_id`. **Never falls back to a "global" adapter for a
+mismatched target** — a `target_mismatch` is always a hard rejection.
+**Never reconstructs an adapter from the reference's own fields** — the
+adapter always comes from a live `CapabilityRuntimeRegistry.get()` call at
+the very end of `resolve()`, so even a reference minted before the
+adapter was (re-)registered resolves correctly once it is.
+
+### 21.3 The 13 sanitized error/revocation reasons (`RuntimeReferenceError`)
+
+One bounded, `str`-valued enum serves double duty: (1) `resolve()`'s
+return-code vocabulary, and (2) the `revocation_reason` a store-level
+invalidation call records. `not_found`, `revoked`, `expired`,
+`target_mismatch`, `type_mismatch`, `generation_mismatch`,
+`scope_mismatch` (reserved — no current multi-scope deployment), `adapter_
+unavailable` (reserved — no registry entry violates `FlagReadCapability`
+today), `capability_unregistered`, `backend_disconnected`, `authorization_
+revoked`, `session_invalid`, `internal_error` (reserved defensive
+catch-all). Never derived from raw adapter/exception content.
+
+### 21.4 Meaningful `runtime_generation`
+
+`CapabilityRuntimeRegistry` gained a per-capability generation counter.
+`generation_for(capability_id)` returns 0 (never registered), 1 (first
+registration), or prior+1. Three safe-replacement primitives:
+
+- `replace(capability_id, adapter)` — unconditional install, always bumps
+  the generation ("newer replaces").
+- `unregister(capability_id)` — removes the adapter but **preserves** the
+  generation counter ("revoke unregisters" — a subsequent re-registration
+  is still a NEW generation, never silently renumbered back to 1).
+- `register()`/`ensure_ssh()`/`ensure_direct_file_read()`/
+  `ensure_bounded_command()` — all route through the same "is this the
+  first-ever registration?" check, keyed off whether a generation was
+  *ever* recorded (`self._generations`), not current adapter presence —
+  this is what makes a re-registration after `unregister()` correctly bump
+  rather than reset.
+
+`generation` only increments on a REAL replacement — never on replay of
+identical evidence, never on an idempotent `ensure_*` call that returns an
+existing adapter unchanged, and never on checkpoint replay (there is no
+checkpoint for this data — see §21.6).
+
+### 21.5 Invalidation triggers
+
+| Trigger | Mechanism |
+|---|---|
+| Process shutdown | `ApexRuntime.aclose()` calls `self._runtime_reference_store.invalidate_all(reason="shutdown")`. `ApexRuntime` now constructs `CapabilityRuntimeRegistry`/`RuntimeReferenceStore` explicitly (mirroring how it already constructs and closes `tool_backend`) and passes them into `build_apex_graph(capability_registry=..., runtime_reference_store=...)` — both new, optional kwargs; `None` (every pre-Phase-24 caller) preserves exact prior behavior. |
+| Explicit revocation | `RuntimeReferenceStore.invalidate(reference_id)` / `invalidate_for_capability(capability_id)`. |
+| Authorization/target change | `RuntimeReferenceStore.invalidate_for_target(target)` — a tested, available method; no synthetic call site was added inside `ApexRuntime` since `config.target` never changes mid-engagement in this codebase's current architecture. |
+| Backend-disconnected / session-invalid read | `apex_host.orchestration.dispatch_node._invalidate_on_connection_failure`: a `user_flag_verify` tool_result with `connected=False` (a connection/auth/backend-level failure, distinct from "file not found," which is `connected=True` — see `BoundedReadResult.connected`'s own docstring) triggers `capability_registry.unregister(capability_id)` + `runtime_reference_store.invalidate_for_capability(..., reason="session_invalid")`, so the NEXT objective turn's registration loop registers fresh instead of silently reusing a dead adapter forever (the pre-Phase-24 `ensure_*` methods were otherwise idempotent-forever). |
+| Natural expiry | `mint(..., ttl_seconds=...)`; `ApexConfig.capability_runtime_reference_ttl_seconds` (default `0.0` — no expiry) threads through both registration call sites. |
+| Generation supersession | Automatic inside `mint()` — see §21.2. |
+
+`apex_host.orchestration.dispatch_node.make_objective_node`'s per-turn
+registration loop now also calls a new `_ensure_runtime_reference` helper
+after every successful registration (both the "not yet registered" and
+the "already registered, just needs a fresh-generation reference" paths),
+and `apex_host.capabilities.discovery.CapabilityDiscoveryEngine` mirrors
+the identical logic via a new, optional `CapabilityDiscoveryContext
+.runtime_reference_store` field (`None` — the default — preserves exact
+pre-Phase-24 behavior for every existing caller/test).
+
+### 21.6 Persistence and replay guarantee
+
+Neither `RuntimeReference`/`RuntimeReferenceStore`/`RuntimeReferenceResolver`
+nor `CapabilityRuntimeRegistry` ever appear in `ApexGraphState` or any
+LangGraph checkpoint payload (a static architecture-scan test proves this
+via `typing.get_type_hints(ApexGraphState)`). A resumed/replayed engagement
+always starts with an EMPTY store and registry — every previously-"active"
+capability's EKG node may still say `runtime_available=True` from before
+the restart (that is stale metadata, not live state) until the
+orchestration layer re-registers it fresh on the next objective turn. A
+`reference_id` minted by one `RuntimeReferenceStore` instance is
+meaningless to a different instance (including one built after a process
+restart) — proven directly by a test that mints in one store and attempts
+to resolve against a resolver backed by a second, empty store.
+
+### 21.7 Typed organic evidence emission (`apex_host/capabilities/emission.py`)
+
+Every evidence-emission function takes a **typed dataclass result**, never
+a generic dict. `evidence_from_ssh_validation(result: CredentialValidationResult,
+...)` is the one function with a real, live producer today —
+`apex_host.orchestration.parsing_node.ssh_capability_evidence_for_result`
+(the pre-existing dict-based tr-dict wrapper) now constructs a
+`CredentialValidationResult` from the tr-dict's known fields and delegates
+to it, so the acceptance logic lives in exactly one typed place.
+
+The other four families (`DirectFileReadValidationResult`,
+`LocalCommandValidationResult`, `RemoteCommandValidationResult`,
+`WebCommandValidationResult`, each with a matching `evidence_from_*`
+function) have **no live validating executor anywhere in this codebase**
+— confirmed by re-reading `apex_host/execution/dispatcher.py` in full
+during this phase's own architecture assessment: DFR/local-command/
+remote-command/web-command capabilities are activated exclusively through
+operator attestation (`apex_host/orchestration/capability_seed.py`) today.
+Per this phase's own explicit scope boundary, only the minimal typed
+result model and emission seam were added for those four — building live
+discovery for them was out of scope. `web_command` in particular is
+documented, not merely deferred: its runtime adapter requires an
+operator-fixed HTTP request shape that no executor in this codebase
+derives autonomously (`WebCommandCapabilityProvider` already explained
+this before this phase; nothing changed it).
+
+### 21.8 Shared result-processing helper (closes the repair-node gap)
+
+`apex_host/orchestration/parsing_node.py` now exposes two functions
+factored out of `parse_observation`'s per-result loop:
+`parse_result_and_collect_evidence(tool_result, state, *, target)` (parse
++ collect evidence; kept separate from the `MemoryAPI` write so a parser
+failure and a memory-write failure can still be told apart, exactly as
+before — `parser_failure` vs. `memory_failure`) and
+`apply_parsed_observation(deps, parsed)` (the write). A third function,
+`run_pending_capability_discovery(deps, pending_evidence)`, wraps the
+"run discovery once, build the `capability_discovery_log` state update,
+degrade gracefully on failure" logic both node factories need.
+`apex_host/orchestration/repair_node.py`'s `repair_agent` now calls all
+three instead of a direct, evidence-blind `parse_single_result()` +
+`apply_deltas()` — a repaired `ssh_access` success now emits capability
+evidence identically to a normally-dispatched one.
+
+### 21.9 Configuration
+
+| Field | Default | Purpose |
+|---|---|---|
+| `capability_runtime_reference_ttl_seconds` | `0.0` | 0 disables reference expiry entirely (still invalidated by generation supersession, explicit revocation, target change, connection-failure, or shutdown). No CLI flag — set via `ApexConfig(...)` construction or `ApexConfig.from_cli_args()`'s generic `_g()` fallback, mirroring `capability_evidence_ttl_seconds`'s own precedent (§20.16). |
+
+### 21.10 Dry-run guarantee
+
+`config.dry_run=True` guarantees **no `RuntimeReference` object of any
+kind is ever created** — checked independently in both minting call sites
+(`dispatch_node._ensure_runtime_reference` and
+`CapabilityDiscoveryEngine._ensure_runtime_reference`), each returning
+before calling `store.mint()` when `config.dry_run` is `True`. Verified by
+a full dry-run engagement run through the real compiled graph asserting
+the store's internal reference map is empty afterward, regardless of how
+many capabilities were derived/registered during the run (adapter
+registration itself is unaffected by dry-run — only the runtime-reference
+bookkeeping layer is gated).
+
+### 21.11 Objective-reopening interaction
+
+`apex_host.planners.objective.objective_reopening_eligible` (§20.11)
+already reasoned at the capability level (`validated and runtime_available
+and never-attempted capability_id`) — this phase adds tests proving the
+FULL transition it was designed for: a capability that was
+`runtime_available=True`, gets invalidated (its EKG node's
+`runtime_available` flips back to `False` by the same per-turn write-back
+`make_objective_node` already performed before this phase), is correctly
+NOT eligible for reopening while unavailable, and a *different*,
+newly-available capability_id (e.g. a fallback transport) correctly IS
+eligible even though the objective's own `status` still reads `"failed"`
+from the exhausted first capability.
+
+### 21.12 Tests
+
+`tests/apex_host/test_phase24_runtime_reference_activation.py` (144
+tests) covers: the `RuntimeReference` model, the 13-member error
+vocabulary, `RuntimeReferenceStore` (mint/lookup/all four invalidation
+methods/supersession), `RuntimeReferenceResolver` (success path + every
+individual mismatch/failure reason + never-falls-back-to-global +
+never-reconstructs-from-fields-alone), `CapabilityRuntimeRegistry` safe-
+replacement semantics, typed SSH emission, the four typed stub emitters,
+the dict-wrapper/typed-emitter parity, the shared result-processing
+helper (both in isolation and via a real `repair_node` integration test),
+`dispatch_node`'s minting/invalidation wiring, `discovery.py`'s optional
+store wiring, `builder.py`/`OrchestrationDeps` wiring, `ApexRuntime.aclose()`
+invalidation, objective-reopening runtime-activation transitions,
+persistence/replay architecture scans, dry-run guarantees, configuration,
+and a full synthetic end-to-end generation lifecycle (register → mint →
+resolve → connection failure → invalidate → re-register → new generation
+→ resolve again). No test performs a real network operation or requires
+Docker/VPN/a real HTB machine.
+
+### 21.13 Known limitations (Phase 24)
+
+- `invalidate_for_target()` (the authorization/target-change trigger) is a
+  real, tested store method but has no synthetic call site inside
+  `ApexRuntime` — `config.target` is fixed for the lifetime of one
+  engagement in this codebase's current architecture, so there is no
+  natural "target changed mid-run" event to wire it to yet.
+- `scope_mismatch`/`adapter_unavailable`/`internal_error` in
+  `RuntimeReferenceError` are reserved, documented-but-not-reachable
+  members (mirrors this codebase's own established convention, e.g.
+  `CapabilityDerivationStatus.superseded`/`revoked`) — no current code path
+  produces a multi-authorization-scope deployment, a registry entry that
+  fails the `FlagReadCapability` check, or an internal resolver error.
+  `expected_generation` is an opt-in resolver parameter; no current caller
+  supplies it (the objective/discovery registration loops always resolve
+  by capability_id through the registry directly, never by reference_id —
+  the reference is bookkeeping for audit/generation-tracking, not yet a
+  required hop in the live read path).
+- DFR/local-command/remote-command/web-command still have no live
+  validating executor — only typed stub result models and emission seams
+  were added (§21.7), per this phase's own explicit scope boundary. No
+  live discovery mechanism was fabricated for them.
 - No new exploitation, privilege escalation, persistence, or shell-access
   capability was added or performed anywhere in this phase. Command
   execution alone, and access alone, remain non-success — verified user

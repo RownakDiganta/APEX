@@ -170,15 +170,106 @@ class CapabilityRuntimeRegistry:
 
     def __init__(self) -> None:
         self._adapters: dict[str, FlagReadCapability] = {}
+        #: Phase 24 — monotonic per-capability generation counter. Starts
+        #: at 0 (unregistered); becomes 1 on first registration; bumps by
+        #: exactly 1 on every subsequent ``replace()`` call. Never bumped
+        #: by an idempotent ``ensure_*``/``register()`` call that leaves an
+        #: existing adapter in place unchanged — see
+        #: ``apex_host.capabilities.runtime_references`` module docstring
+        #: "runtime_generation semantics".
+        self._generations: dict[str, int] = {}
 
     def register(self, capability_id: str, adapter: FlagReadCapability) -> None:
+        """Unconditional set. First call for a given ``capability_id``
+        establishes generation 1; a second call (including one AFTER an
+        intervening ``unregister()``) is treated as an explicit replace
+        (bumps generation) — unlike ``ensure_*``, which is idempotent and
+        never overwrites. Prefer ``ensure_*``/``replace()`` in new code;
+        this method is kept for the pre-Phase-24 call shape.
+
+        "Is this the first-ever registration?" is determined by whether a
+        generation was ever recorded (``self._generations``), NOT by
+        current ``_adapters`` membership — ``unregister()`` deliberately
+        removes the adapter but preserves the generation counter (see its
+        own docstring), so a re-registration after an unregister must
+        still bump, never reset to 1.
+        """
+        is_new = capability_id not in self._generations
         self._adapters[capability_id] = adapter
+        self._generations[capability_id] = 1 if is_new else self._generations[capability_id] + 1
 
     def get(self, capability_id: str) -> FlagReadCapability | None:
         return self._adapters.get(capability_id)
 
     def has(self, capability_id: str) -> bool:
         return capability_id in self._adapters
+
+    def generation_for(self, capability_id: str) -> int:
+        """The current generation for *capability_id* — 0 when never
+        registered, 1 after the first successful registration, and
+        incremented by exactly 1 on every subsequent ``replace()``."""
+        return self._generations.get(capability_id, 0)
+
+    def replace(self, capability_id: str, adapter: FlagReadCapability) -> int:
+        """Explicitly install *adapter* for *capability_id*, REGARDLESS of
+        whether one already exists — the "newer replaces" half of Phase
+        24's safe-replacement semantics. Unlike ``ensure_*``, this never
+        returns an existing adapter unchanged; it always installs the
+        supplied one and bumps the generation counter. Returns the new
+        generation number (1 for a first-ever registration via this
+        method, otherwise the prior generation + 1).
+
+        Callers that only want "replace if this is genuinely newer" should
+        check ``generation_for(capability_id)`` themselves before calling
+        (the "older rejected" half) — this method itself has no opinion
+        about ordering; it is the unconditional primitive the rest of the
+        safe-replacement policy is built from.
+
+        Like ``register()``, "is this the first-ever registration?" is
+        determined by ``self._generations`` membership, not current
+        ``_adapters`` membership — a ``replace()`` call for a
+        previously-``unregister()``-ed capability still bumps the
+        generation rather than resetting it to 1.
+        """
+        is_new = capability_id not in self._generations
+        self._adapters[capability_id] = adapter
+        new_generation = 1 if is_new else self._generations[capability_id] + 1
+        self._generations[capability_id] = new_generation
+        return new_generation
+
+    def unregister(self, capability_id: str) -> bool:
+        """Remove any adapter registered for *capability_id* — the
+        "revoke unregisters" half of Phase 24's safe-replacement
+        semantics. Idempotent: unregistering an already-absent
+        ``capability_id`` is a harmless no-op returning ``False``.
+
+        Deliberately does NOT reset ``generation_for()`` to 0 — a future
+        re-registration after an unregister is itself a new generation
+        (the underlying runtime material was invalidated and must be
+        treated as genuinely different from before, never silently
+        renumbered back to 1), consistent with "never bumped by replay."
+        """
+        existed = capability_id in self._adapters
+        self._adapters.pop(capability_id, None)
+        return existed
+
+    def _ensure(self, capability_id: str, adapter: FlagReadCapability) -> FlagReadCapability:
+        """Shared idempotent-registration body for every ``ensure_*``
+        method: returns the existing adapter unchanged (never bumping
+        ``generation_for()``) on a repeat call, otherwise installs
+        *adapter* and bumps the generation (Phase 24 — 1 for a genuinely
+        first-ever registration, matching ``register()``'s own semantics;
+        prior_generation + 1 for a re-registration after an intervening
+        ``unregister()``, so a stale connection's replacement is always
+        observably a new generation, never silently renumbered back to 1).
+        """
+        existing = self._adapters.get(capability_id)
+        if existing is not None:
+            return existing
+        is_new = capability_id not in self._generations
+        self._adapters[capability_id] = adapter
+        self._generations[capability_id] = 1 if is_new else self._generations[capability_id] + 1
+        return adapter
 
     def ensure_ssh(
         self,
@@ -201,8 +292,7 @@ class CapabilityRuntimeRegistry:
         adapter: FlagReadCapability = SSHCapabilityAdapter(
             target=target, port=port, username=username, password=password, config=config,
         )
-        self._adapters[capability_id] = adapter
-        return adapter
+        return self._ensure(capability_id, adapter)
 
     def ensure_direct_file_read(
         self, capability_id: str, *, primitive: "DirectFileReadPrimitive",
@@ -220,8 +310,7 @@ class CapabilityRuntimeRegistry:
         if existing is not None:
             return existing
         adapter: FlagReadCapability = DirectFileReadCapabilityAdapter(primitive)
-        self._adapters[capability_id] = adapter
-        return adapter
+        return self._ensure(capability_id, adapter)
 
     def ensure_bounded_command(
         self, capability_id: str, *, primitive: "BoundedCommandReadPrimitive",
@@ -239,8 +328,7 @@ class CapabilityRuntimeRegistry:
         if existing is not None:
             return existing
         adapter: FlagReadCapability = BoundedCommandCapabilityAdapter(primitive)
-        self._adapters[capability_id] = adapter
-        return adapter
+        return self._ensure(capability_id, adapter)
 
 
 # ---------------------------------------------------------------------------

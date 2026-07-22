@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 from memfabric.ids import now
 from memfabric.types import AbandonSignal, Goal, Node, TaskSpec
 
+from apex_host.capabilities.runtime_references import RuntimeReferenceError
 from apex_host.capabilities.runtime_resolution import register_capability_adapter
 from apex_host.execution.context import ExecutionContext
 from apex_host.execution.dispositions import ExecutionDisposition
@@ -236,6 +237,63 @@ def make_priv_esc_node(deps: "OrchestrationDeps") -> Any:
     return priv_esc_agent
 
 
+def _ensure_runtime_reference(deps: "OrchestrationDeps", cap: Any, target: str) -> None:
+    """Mint a fresh :class:`~apex_host.capabilities.runtime_references.RuntimeReference`
+    for *cap* when the registry's current generation for it is not already
+    backed by a live, non-revoked reference (Phase 24).
+
+    Dry-run guarantee: when ``config.dry_run`` is ``True``, this function
+    never calls ``store.mint()`` — no ``RuntimeReference`` object of any
+    kind is ever created in dry-run mode, mirroring
+    ``DryRunToolBackend``'s own unconditional-safety discipline. This is
+    additive bookkeeping only; it never affects whether registration
+    itself succeeded (``register_capability_adapter``'s own return value,
+    written back as ``runtime_available``, is unaffected by whether a
+    reference was minted).
+    """
+    if deps.config.dry_run:
+        return
+    generation = deps.capability_registry.generation_for(cap.capability_id)
+    if generation < 1:
+        return
+    current = deps.runtime_reference_store.current_reference_for(cap.capability_id)
+    if current is not None and not current.revoked and current.generation == generation:
+        return
+    deps.runtime_reference_store.mint(
+        capability_id=cap.capability_id,
+        target=target,
+        capability_type=cap.capability_type,
+        generation=generation,
+        authorization_scope_id=deps.config.target,
+        ttl_seconds=float(getattr(deps.config, "capability_runtime_reference_ttl_seconds", 0.0) or 0.0),
+    )
+
+
+def _invalidate_on_connection_failure(deps: "OrchestrationDeps", tool_result: dict[str, Any] | None) -> None:
+    """Runtime invalidation trigger: a ``user_flag_verify`` result whose
+    ``connected`` field is ``False`` means the underlying access mechanism
+    (an SSH session, a bounded command strategy, ...) failed at the
+    connection/authentication/backend layer — a runtime-context-
+    invalidating failure, distinct from a merely-informative read failure
+    (e.g. "no such file", which still means ``connected=True``; see
+    ``BoundedReadResult.connected``'s own docstring). On this signal, the
+    stale adapter/reference is torn down so the NEXT objective turn's
+    registration loop attempts a fresh registration rather than silently
+    reusing a dead adapter forever (Phase 24 — the ``ensure_*`` methods on
+    ``CapabilityRuntimeRegistry`` are otherwise idempotent-forever)."""
+    if not tool_result or tool_result.get("tool") != "user_flag_verify":
+        return
+    if tool_result.get("connected", True):
+        return
+    capability_id = str(tool_result.get("capability_id") or "")
+    if not capability_id:
+        return
+    deps.capability_registry.unregister(capability_id)
+    deps.runtime_reference_store.invalidate_for_capability(
+        capability_id, reason=RuntimeReferenceError.session_invalid.value,
+    )
+
+
 def make_objective_node(deps: "OrchestrationDeps") -> Any:
     """Return the ``objective_agent`` node bound to the objective planner.
 
@@ -266,17 +324,31 @@ def make_objective_node(deps: "OrchestrationDeps") -> Any:
     graph — see ``AccessCapability.runtime_available``'s docstring. Only
     written when it actually changes, to avoid a needless upsert every
     turn once a capability's availability has stabilised.
+
+    Phase 24: every successful registration also mints (or reuses) a
+    :class:`~apex_host.capabilities.runtime_references.RuntimeReference`
+    tied to the registry's own generation counter for that capability —
+    see ``_ensure_runtime_reference``. After dispatching, a
+    ``user_flag_verify`` result reporting ``connected=False`` (a
+    connection/session-level failure, not a mere "file not found") tears
+    down the stale adapter/reference so the next turn registers fresh —
+    see ``_invalidate_on_connection_failure``.
     """
     async def objective_agent(state: "ApexGraphState") -> dict[str, Any]:
         try:
             pre_subgraph = await deps.api.get_subgraph(deps.anchor_id, depth=2)
             for cap in access_capabilities_from_subgraph(pre_subgraph):
-                if not cap.validated or deps.capability_registry.has(cap.capability_id):
+                if not cap.validated:
+                    continue
+                if deps.capability_registry.has(cap.capability_id):
+                    _ensure_runtime_reference(deps, cap, state["target"])
                     continue
                 registered = register_capability_adapter(
                     config=deps.config, capability_registry=deps.capability_registry,
                     subgraph=pre_subgraph, target=state["target"], cap=cap,
                 )
+                if registered:
+                    _ensure_runtime_reference(deps, cap, state["target"])
                 if registered != cap.runtime_available:
                     timestamp = now()
                     await deps.api.upsert_node(Node(
@@ -301,6 +373,10 @@ def make_objective_node(deps: "OrchestrationDeps") -> Any:
         result = await _dispatch_tasks(
             deps, state, deps.phase_planners[ApexPhase.objective.value], single_task=True
         )
+        try:
+            _invalidate_on_connection_failure(deps, result.get("last_tool_result"))
+        except Exception as exc:
+            logger.debug("objective_agent: runtime invalidation check failed: %s", exc)
         try:
             subgraph = await deps.api.get_subgraph(deps.anchor_id, depth=2)
             result.update(objective_state_fields(subgraph, state["target"], deps.config.objective_type))

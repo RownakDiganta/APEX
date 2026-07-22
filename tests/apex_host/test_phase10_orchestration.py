@@ -811,15 +811,20 @@ class TestDependencies:
             model_router=None, allowed_tools=config.allowed_tools, dry_run=True
         )
         from apex_host.orchestration.stall import StallTracker
+        from apex_host.capabilities.runtime_references import RuntimeReferenceResolver, RuntimeReferenceStore
         from apex_host.runtime_registry import CapabilityRuntimeRegistry
 
+        capability_registry = CapabilityRuntimeRegistry()
+        runtime_reference_store = RuntimeReferenceStore()
         deps = OrchestrationDeps(
             api=api, dispatcher=dispatcher,
             global_planner=GlobalPlanner(max_turns=1),
             phase_planners=phase_planners,
             repair_engine=engine, config=config,
             anchor_id="host:10.10.10.1", stall_tracker=StallTracker(),
-            capability_registry=CapabilityRuntimeRegistry(),
+            capability_registry=capability_registry,
+            runtime_reference_store=runtime_reference_store,
+            runtime_reference_resolver=RuntimeReferenceResolver(runtime_reference_store, capability_registry),
         )
         assert "10.10.10.1" in deps.anchor_id
 

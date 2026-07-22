@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from memfabric.types import SubgraphView
 
     from apex_host.config import ApexConfig
+    from apex_host.capabilities.runtime_references import RuntimeReferenceStore
     from apex_host.runtime_registry import CapabilityRuntimeRegistry
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,16 @@ class CapabilityDiscoveryContext:
     evidence_ttl_seconds: float = 0.0
     max_evidence_per_cycle: int = _DEFAULT_MAX_EVIDENCE_PER_CYCLE
     providers: tuple[CapabilityProvider, ...] = field(default_factory=lambda: DEFAULT_PROVIDERS)
+    #: Phase 24 — optional. When supplied (and ``config.dry_run`` is
+    #: ``False``), a successful runtime registration also mints/reuses a
+    #: ``RuntimeReference`` tied to the registry's own generation counter
+    #: — see ``apex_host.orchestration.dispatch_node._ensure_runtime_reference``,
+    #: whose logic this mirrors for the discovery-engine registration path
+    #: (organic SSH evidence, and operator-attested seeding when the
+    #: seeding caller chooses to enable registration). ``None`` (the
+    #: default) preserves the exact pre-Phase-24 behavior for every
+    #: existing caller/test that does not care about runtime references.
+    runtime_reference_store: "RuntimeReferenceStore | None" = None
     #: When ``False``, materialize accepted decisions (write the
     #: ``access_capability`` node) but skip the runtime-registration
     #: attempt entirely, leaving ``runtime_available=False`` exactly as
@@ -320,6 +331,7 @@ class CapabilityDiscoveryEngine:
 
             if registered:
                 result.adapters_registered += 1
+                self._ensure_runtime_reference(context, cap)
             else:
                 result.runtime_unavailable_count += 1
 
@@ -335,6 +347,31 @@ class CapabilityDiscoveryEngine:
                 logger.debug("runtime_available write-back failed for %s: %s", capability_id, exc)
 
         return result
+
+    def _ensure_runtime_reference(self, context: CapabilityDiscoveryContext, cap: AccessCapability) -> None:
+        """Mirrors ``apex_host.orchestration.dispatch_node
+        ._ensure_runtime_reference`` for this engine's own registration
+        loop (Phase 24). No-op when ``context.runtime_reference_store`` is
+        ``None`` (the default — most existing callers/tests) or when
+        ``context.config.dry_run`` is ``True`` (dry-run guarantee: no
+        ``RuntimeReference`` object of any kind is ever created)."""
+        store = context.runtime_reference_store
+        if store is None or context.config.dry_run:
+            return
+        generation = context.capability_registry.generation_for(cap.capability_id)
+        if generation < 1:
+            return
+        current = store.current_reference_for(cap.capability_id)
+        if current is not None and not current.revoked and current.generation == generation:
+            return
+        store.mint(
+            capability_id=cap.capability_id,
+            target=context.target,
+            capability_type=cap.capability_type,
+            generation=generation,
+            authorization_scope_id=context.config.target,
+            ttl_seconds=float(getattr(context.config, "capability_runtime_reference_ttl_seconds", 0.0) or 0.0),
+        )
 
     async def _ensure_host_node(self, context: CapabilityDiscoveryContext) -> None:
         """Defensively upsert a ``host`` node for *context.target* if the

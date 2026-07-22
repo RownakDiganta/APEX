@@ -20,11 +20,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from memfabric.ids import new_id, now
+from memfabric.ids import now
 from memfabric.types import ParsedObservation, RawObservation
 
 from apex_host.capabilities.discovery import CapabilityDiscoveryContext, run_capability_discovery
-from apex_host.capabilities.evidence import CapabilityEvidence, CapabilityEvidenceType
+from apex_host.capabilities.emission import evidence_from_ssh_validation
+from apex_host.capabilities.evidence import CapabilityEvidence
 from apex_host.parsers.access_parser import AccessParser
 from apex_host.parsers.banner_parser import BannerParser
 from apex_host.parsers.browser_parser import BrowserParser
@@ -36,7 +37,7 @@ from apex_host.orchestration.outcome import EngagementOutcome
 from apex_host.parsers.nmap_parser import NmapParser
 from apex_host.parsers.objective_parser import ObjectiveParser
 from apex_host.parsers.priv_esc_parser import PrivEscParser
-from apex_host.types import AccessCapabilityType, BrowserObservation
+from apex_host.types import BrowserObservation, CredentialValidationResult
 
 if TYPE_CHECKING:
     from apex_host.orchestration.dependencies import OrchestrationDeps
@@ -53,16 +54,6 @@ _BROWSER_PARSER = BrowserParser()
 _ACCESS = AccessParser()
 _PRIV_ESC = PrivEscParser()
 _OBJECTIVE = ObjectiveParser()
-
-#: Minimum confidence assigned to automatically-emitted SSH capability
-#: evidence — mirrors ``CapabilityParser``'s own pre-existing
-#: ``_SSH_CAPABILITY_CONFIDENCE`` constant (0.85), duplicated here as a
-#: plain float (not imported) since it is evidence-emission bookkeeping,
-#: not derivation-acceptance logic — the acceptance threshold itself
-#: still lives solely in ``apex_host.parsers.capability_parser``, imported
-#: by ``apex_host.capabilities.providers``.
-_SSH_EVIDENCE_CONFIDENCE = 0.85
-
 
 def _port_from_nc_args(args: list[str]) -> str:
     """Extract the port number from nc/netcat argv (last non-flag token)."""
@@ -235,7 +226,12 @@ def ssh_capability_evidence_for_result(
 ) -> CapabilityEvidence | None:
     """Build ``SSH_AUTHENTICATED_COMMAND`` evidence from one successful
     ``ssh_access`` tool_result, or ``None`` when the result does not
-    qualify (Phase 23).
+    qualify (Phase 23; reworked in Phase 24 to delegate to the typed
+    :func:`apex_host.capabilities.emission.evidence_from_ssh_validation`
+    rather than constructing ``CapabilityEvidence`` inline — this function
+    is now a thin, dict-to-typed-dataclass adapter over the tr-dict shape
+    ``apex_host.execution.dispatcher._credential_result_to_tr`` produces;
+    all acceptance logic lives in the typed emitter).
 
     This is the ONE place a real, live executor result is turned into
     automatic capability evidence in this codebase today — every other
@@ -244,35 +240,45 @@ def ssh_capability_evidence_for_result(
     evidence source of its own (each still requires a fixed
     operator-supplied request/strategy shape before any read can ever be
     attempted at all — see ``apex_host/orchestration/capability_seed.py``,
-    now itself routed through the same discovery pipeline via
-    ``OPERATOR_ATTESTED`` evidence). Adding a genuinely new live evidence
-    source for one of those families later requires only a new function
-    like this one plus a call site here — never touching
+    routed through the same discovery pipeline via ``OPERATOR_ATTESTED``
+    evidence, and ``apex_host.capabilities.emission``'s four typed-but-
+    unproduced result stubs for those families). Adding a genuinely new
+    live evidence source for one of those families later requires only a
+    real typed result + a call site like this one — never touching
     ``apex_host.capabilities.providers``/``discovery``.
 
     Rejects (returns ``None``): a non-``ssh_access`` tool, a failed login,
-    a missing username, or (implicitly, via
-    :func:`apex_host.capabilities.evidence.validate_evidence` downstream)
-    a dry-run result — ``TaskDispatcher`` never marks a dry-run credential
-    result ``success=True`` in the first place, but the evidence's own
-    ``is_dry_run`` field is still populated defensively from the
-    tool_result's own ``dry_run`` flag.
+    or a missing username. Dry-run results are still passed through to the
+    typed emitter (which populates ``is_dry_run`` on the resulting
+    evidence) so :func:`apex_host.capabilities.evidence.validate_evidence`
+    rejects them centrally downstream — ``TaskDispatcher`` never marks a
+    dry-run credential result ``success=True`` in the first place, but
+    this keeps the rejection path structurally consistent regardless.
     """
     if tool_result.get("tool") != "ssh_access" or not tool_result.get("success"):
         return None
     username = str(tool_result.get("username", ""))
     if not username:
         return None
-    return CapabilityEvidence(
-        evidence_id=new_id(),
-        evidence_type=CapabilityEvidenceType.SSH_AUTHENTICATED_COMMAND,
-        capability_family=AccessCapabilityType.ssh_command,
-        target_host_id=f"host:{target}",
-        source_task_id=str(tool_result.get("task_id", "")),
-        principal=username,
-        validation_method="deterministic_benign_command",
-        confidence=_SSH_EVIDENCE_CONFIDENCE,
-        timestamp=now(),
+    result = CredentialValidationResult(
+        protocol="ssh",
+        target=target,
+        port=str(tool_result.get("port", "")),
+        username=username,
+        success=True,
+        authenticated=bool(tool_result.get("authenticated", True)),
+        operation=str(tool_result.get("operation", "")),
+        response_summary="",
+        error_category=str(tool_result.get("error_category", "")),
+        error_detail="",
+        duration_seconds=float(tool_result.get("duration_seconds", 0.0) or 0.0),
+        timed_out=bool(tool_result.get("timed_out", False)),
+        executor="ssh",
+    )
+    return evidence_from_ssh_validation(
+        result,
+        task_id=str(tool_result.get("task_id", "")),
+        target=target,
         is_dry_run=bool(tool_result.get("dry_run", False)),
     )
 
@@ -291,6 +297,77 @@ def findings_from_parsed(
     ]
 
 
+def parse_result_and_collect_evidence(
+    tool_result: dict[str, Any], state: "ApexGraphState", *, target: str,
+) -> tuple[ParsedObservation, str, CapabilityEvidence | None]:
+    """Parse one ``tool_result`` and collect any capability evidence it
+    produces — the shared per-result parsing step used by both
+    ``parse_observation``'s main loop and ``repair_node.repair_agent``'s
+    single repaired result (Phase 24).
+
+    Before this function existed, ``repair_node.py`` called
+    ``parse_single_result`` directly and never checked for capability
+    evidence at all — a repaired ``ssh_access`` success was structurally
+    invisible to capability discovery even though a normally-dispatched
+    one was not. Extracting this step once and calling it from both node
+    factories closes that gap without duplicating logic.
+
+    Kept deliberately separate from the ``MemoryAPI.apply_deltas`` write
+    (see :func:`apply_parsed_observation`) so callers can distinguish a
+    parser failure from a memory-write failure exactly as
+    ``parse_observation`` already did before this refactor (``parser_failure``
+    vs. ``memory_failure`` — see ``apex_host.orchestration.outcome``).
+    Raises whatever ``parse_single_result`` raises.
+    """
+    evidence = ssh_capability_evidence_for_result(tool_result, target=target)
+    parsed, source = parse_single_result(tool_result, state)
+    return parsed, source, evidence
+
+
+async def apply_parsed_observation(deps: "OrchestrationDeps", parsed: ParsedObservation) -> None:
+    """Write one already-parsed ``ParsedObservation``'s deltas through
+    ``MemoryAPI`` — the shared write step used by both ``parse_observation``
+    and ``repair_node.repair_agent`` (Phase 24). Raises whatever
+    ``MemoryAPI.apply_deltas`` raises."""
+    await deps.api.apply_deltas(
+        nodes=parsed.node_deltas, edges=parsed.edge_deltas, knowledge=parsed.proposed_knowledge,
+    )
+
+
+async def run_pending_capability_discovery(
+    deps: "OrchestrationDeps", pending_evidence: list[CapabilityEvidence],
+) -> dict[str, Any]:
+    """Run capability discovery once over *pending_evidence* and build the
+    ``capability_discovery_log`` state-update dict, or ``{}`` when there is
+    nothing to discover, discovery is disabled
+    (``config.capability_discovery_enabled=False``), or discovery itself
+    fails (a discovery failure degrades gracefully — never turns into a
+    parser_failure/memory_failure outcome, since capability derivation is
+    an enhancement on top of an already-successful parse, not a
+    requirement for turn correctness). Shared by ``parse_observation`` and
+    ``repair_node.repair_agent`` (Phase 24).
+    """
+    if not pending_evidence or not getattr(deps.config, "capability_discovery_enabled", True):
+        return {}
+    try:
+        subgraph = await deps.api.get_subgraph(deps.anchor_id, depth=2)
+        discovery_result = await run_capability_discovery(
+            pending_evidence,
+            context=CapabilityDiscoveryContext(
+                api=deps.api, config=deps.config, capability_registry=deps.capability_registry,
+                subgraph=subgraph, target=deps.config.target,
+                now_iso=now(),
+                evidence_ttl_seconds=getattr(deps.config, "capability_evidence_ttl_seconds", 0.0),
+                max_evidence_per_cycle=getattr(deps.config, "capability_discovery_max_evidence_per_cycle", 50),
+                runtime_reference_store=deps.runtime_reference_store,
+            ),
+        )
+        return {"capability_discovery_log": [discovery_result.to_dict()]}
+    except Exception as exc:
+        logger.warning("capability discovery failed: %s", exc)
+        return {}
+
+
 def make_parsing_node(deps: "OrchestrationDeps") -> Any:
     """Return the ``parse_observation`` async node bound to *deps*."""
 
@@ -306,11 +383,10 @@ def make_parsing_node(deps: "OrchestrationDeps") -> Any:
         all_findings: list[dict[str, Any]] = []
         pending_evidence: list[CapabilityEvidence] = []
         for tool_result in results_to_parse:
-            evidence = ssh_capability_evidence_for_result(tool_result, target=deps.config.target)
-            if evidence is not None:
-                pending_evidence.append(evidence)
             try:
-                parsed, source = parse_single_result(tool_result, state)
+                parsed, source, evidence = parse_result_and_collect_evidence(
+                    tool_result, state, target=deps.config.target,
+                )
             except Exception as exc:
                 logger.error(
                     "parser failed for tool=%r in phase %s: %s",
@@ -324,11 +400,7 @@ def make_parsing_node(deps: "OrchestrationDeps") -> Any:
                 }
 
             try:
-                await deps.api.apply_deltas(
-                    nodes=parsed.node_deltas,
-                    edges=parsed.edge_deltas,
-                    knowledge=parsed.proposed_knowledge,
-                )
+                await apply_parsed_observation(deps, parsed)
             except Exception as exc:
                 logger.error("apply_deltas failed in parse_observation: %s", exc)
                 return {
@@ -337,6 +409,8 @@ def make_parsing_node(deps: "OrchestrationDeps") -> Any:
                     "termination_reason": f"{type(exc).__name__}: {exc}",
                     "termination_phase": state["phase"],
                 }
+            if evidence is not None:
+                pending_evidence.append(evidence)
 
             all_findings.extend(
                 findings_from_parsed(
@@ -350,29 +424,8 @@ def make_parsing_node(deps: "OrchestrationDeps") -> Any:
         # tool_result in this turn has been parsed and its own deltas
         # applied — "after structured parsing/validation and before the
         # next global planning decision" (the next global_plan node runs
-        # at the start of the FOLLOWING turn). A discovery failure
-        # degrades gracefully: it never turns into a parser_failure/
-        # memory_failure outcome, since capability derivation is an
-        # enhancement on top of an already-successful parse, not a
-        # requirement for turn correctness.
-        if pending_evidence and getattr(deps.config, "capability_discovery_enabled", True):
-            try:
-                subgraph = await deps.api.get_subgraph(deps.anchor_id, depth=2)
-                discovery_result = await run_capability_discovery(
-                    pending_evidence,
-                    context=CapabilityDiscoveryContext(
-                        api=deps.api, config=deps.config, capability_registry=deps.capability_registry,
-                        subgraph=subgraph, target=deps.config.target,
-                        now_iso=now(),
-                        evidence_ttl_seconds=getattr(deps.config, "capability_evidence_ttl_seconds", 0.0),
-                        max_evidence_per_cycle=getattr(
-                            deps.config, "capability_discovery_max_evidence_per_cycle", 50,
-                        ),
-                    ),
-                )
-                result["capability_discovery_log"] = [discovery_result.to_dict()]
-            except Exception as exc:
-                logger.warning("capability discovery failed in phase %s: %s", state["phase"], exc)
+        # at the start of the FOLLOWING turn).
+        result.update(await run_pending_capability_discovery(deps, pending_evidence))
         return result
 
     return parse_observation

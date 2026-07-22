@@ -48,6 +48,7 @@ from apex_host.orchestration.terminal_episode import (
     terminal_state_fields,
     write_terminal_episode,
 )
+from apex_host.capabilities.runtime_references import RuntimeReferenceResolver, RuntimeReferenceStore
 from apex_host.runtime_registry import CapabilityRuntimeRegistry
 from apex_host.tools.registry import ToolRegistry
 from apex_host.types import ApexPhase
@@ -651,11 +652,15 @@ def _build_deps(
         browser_executor=BrowserExecutor(config),
     )
     planners = phase_planners if phase_planners is not None else build_planners(config, registry)
+    capability_registry = CapabilityRuntimeRegistry()
+    runtime_reference_store = RuntimeReferenceStore()
     return OrchestrationDeps(
         api=api, dispatcher=dispatcher, global_planner=GlobalPlanner(max_turns=config.max_turns),
         phase_planners=planners, repair_engine=RepairEngine(model_router=None, allowed_tools=config.allowed_tools, dry_run=True),
         config=config, anchor_id=f"host:{config.target}", stall_tracker=StallTracker(),
-        capability_registry=CapabilityRuntimeRegistry(),
+        capability_registry=capability_registry,
+        runtime_reference_store=runtime_reference_store,
+        runtime_reference_resolver=RuntimeReferenceResolver(runtime_reference_store, capability_registry),
     )
 
 

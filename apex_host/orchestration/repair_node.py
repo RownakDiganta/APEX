@@ -27,7 +27,11 @@ from apex_host.execution.context import ExecutionContext
 from apex_host.execution.dispositions import ExecutionDisposition
 from apex_host.graph_state import ApexGraphState
 from apex_host.orchestration.completion import outcome_for
-from apex_host.orchestration.parsing_node import parse_single_result
+from apex_host.orchestration.parsing_node import (
+    apply_parsed_observation,
+    parse_result_and_collect_evidence,
+    run_pending_capability_discovery,
+)
 
 if TYPE_CHECKING:
     from apex_host.orchestration.dependencies import OrchestrationDeps
@@ -96,11 +100,14 @@ def make_repair_node(deps: "OrchestrationDeps") -> Any:
         repaired_tr["repaired"] = True
         r_error = repaired_tr.get("error")
 
-        parsed, _ = parse_single_result(repaired_tr, state)
-        await deps.api.apply_deltas(
-            nodes=parsed.node_deltas, edges=parsed.edge_deltas,
-            knowledge=parsed.proposed_knowledge,
+        # Phase 24: shared with parse_observation's own per-result body
+        # (apex_host.orchestration.parsing_node) so a repaired ssh_access
+        # success emits capability evidence identically to a
+        # normally-dispatched one — see that module's docstring.
+        parsed, _source, capability_evidence = parse_result_and_collect_evidence(
+            repaired_tr, state, target=deps.config.target,
         )
+        await apply_parsed_observation(deps, parsed)
         r_outcome = outcome_for(int(repaired_tr.get("returncode", 0) or 0), r_error)
         repair_episode = Episode(
             agent=f"apex.{state['phase']}.repair",
@@ -110,9 +117,15 @@ def make_repair_node(deps: "OrchestrationDeps") -> Any:
         )
         await deps.api.apply_deltas(episodes=[repair_episode])
 
-        return {
+        result: dict[str, Any] = {
             "repair_count": new_repair_count, "last_tool_result": repaired_tr,
             "last_error": r_error, "policy_decisions": [r_pd] if r_pd else [],
         }
+        result.update(
+            await run_pending_capability_discovery(
+                deps, [capability_evidence] if capability_evidence is not None else [],
+            )
+        )
+        return result
 
     return repair_agent

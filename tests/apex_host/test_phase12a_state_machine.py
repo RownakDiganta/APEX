@@ -385,6 +385,7 @@ class TestBugEUnknownPhaseHandling:
         from apex_host.orchestration.dependencies import OrchestrationDeps
         from apex_host.orchestration.stall import StallTracker
         from apex_host.policy import PolicyAdvisor, load_policy
+        from apex_host.capabilities.runtime_references import RuntimeReferenceResolver, RuntimeReferenceStore
         from apex_host.runtime_registry import CapabilityRuntimeRegistry
 
         api = make_api()
@@ -394,12 +395,16 @@ class TestBugEUnknownPhaseHandling:
             task_registry=TaskRegistry(), config=config,
             run_command_fn=lambda *a, **k: None,  # type: ignore[arg-type]
         )
+        capability_registry = CapabilityRuntimeRegistry()
+        runtime_reference_store = RuntimeReferenceStore()
         deps = OrchestrationDeps(
             api=api, dispatcher=dispatcher,
             global_planner=GlobalPlanner(max_turns=config.max_turns),
             phase_planners={}, repair_engine=None,  # type: ignore[arg-type]
             config=config, anchor_id=_ANCHOR, stall_tracker=StallTracker(),
-            capability_registry=CapabilityRuntimeRegistry(),
+            capability_registry=capability_registry,
+            runtime_reference_store=runtime_reference_store,
+            runtime_reference_resolver=RuntimeReferenceResolver(runtime_reference_store, capability_registry),
         )
         node = make_unknown_phase_node(deps)
 
