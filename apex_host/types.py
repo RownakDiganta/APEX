@@ -865,13 +865,22 @@ class AccessCapabilityType(str, Enum):
     """A capability TYPE — a classification of *how* a bounded read can be
     performed, never an exploit type and never itself an executable action.
 
-    Only ``ssh_command`` has a concrete adapter implementation today (see
-    ``apex_host.runtime_registry.SSHCapabilityAdapter``). The remaining
-    members exist so the taxonomy, ranking, and reporting layers are
-    complete and forward-compatible — adding a real adapter for one of them
-    must require touching only the adapter + capability-derivation layer,
-    never the planner, verifier, parser, or report generator (see
-    docs/user-flag-objective.md "Access capability abstraction").
+    Concrete adapters exist today for ``ssh_command``
+    (``apex_host.runtime_registry.SSHCapabilityAdapter``),
+    ``arbitrary_file_read``/``api_file_read``/``web_command``
+    (``DirectFileReadCapabilityAdapter`` — ``web_command`` shares this exact
+    adapter and its ``ApexConfig.direct_file_read_*`` configuration; the
+    capability_type label is what distinguishes "this is a file-serving
+    endpoint" from "this is a command-execution endpoint whose response
+    happens to contain the read output" — see
+    docs/user-flag-objective.md §18), and ``local_shell``/``remote_command``
+    (``BoundedCommandCapabilityAdapter``, Phase 21 — see
+    docs/user-flag-objective.md §18). ``telnet_command`` remains a
+    forward-compatible taxonomy placeholder with no adapter. Adding a real
+    adapter for any type must require touching only the adapter +
+    capability-derivation layer, never the planner, verifier, parser, or
+    report generator (see docs/user-flag-objective.md "Access capability
+    abstraction").
     """
     ssh_command = "ssh_command"
     telnet_command = "telnet_command"
@@ -879,6 +888,11 @@ class AccessCapabilityType(str, Enum):
     local_shell = "local_shell"
     arbitrary_file_read = "arbitrary_file_read"
     api_file_read = "api_file_read"
+    #: Phase 21 — a generic, non-web, non-SSH remote command-execution
+    #: channel (e.g. an already-established remote session/backend that
+    #: isn't SSH or Telnet specifically). Distinct from ``ssh_command``,
+    #: which already denotes a specific, concrete protocol.
+    remote_command = "remote_command"
 
 
 @dataclass(slots=True)

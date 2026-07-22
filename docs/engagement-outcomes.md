@@ -31,6 +31,18 @@ terminal-episode guarantee, `RunReport` fields, and CLI exit codes.
 > intermediate milestone regardless of which access mechanism produced it.
 > Full design: [`docs/user-flag-objective.md`](user-flag-objective.md) §17.
 
+> **Phase 21 update (bounded command-execution capability):** no change was
+> needed to this file's model at all. `GlobalPlanner`'s phase-ladder gate
+> (checking for `"access_state"` OR `"access_capability"`) was already
+> capability-type-agnostic as of the Phase 20 update above — a
+> `local_shell`/`remote_command`/`web_command` capability reaches the
+> objective phase through the exact same gate a direct-file-read
+> capability does. `EngagementOutcome.user_flag_verified` remains the ONLY
+> success outcome and the only exit-code-0 outcome regardless of which
+> capability family (SSH, direct file read, or bounded command execution)
+> produced the verified evidence. Full design:
+> [`docs/user-flag-objective.md`](user-flag-objective.md) §18.
+
 ## 1. Why this exists
 
 Before Phase 12C, an APEX engagement could stop for many different reasons —

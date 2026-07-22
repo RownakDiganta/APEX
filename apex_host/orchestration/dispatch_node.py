@@ -262,16 +262,31 @@ def _register_capability_adapter(
     Orchestration-layer-only concern: planners stay pure over subgraph/
     evidence data (memfabric Invariant 7); executors only ever *look up* an
     already-registered adapter (see ``apex_host/runtime_registry.py``).
-    SSH and direct-file-read (``arbitrary_file_read``/``api_file_read``)
-    have real adapters this phase — an unrecognised ``capability_type`` is
-    silently skipped (forward-compatible: a future capability type simply
-    has no adapter registered, and stays ``runtime_available=False``, until
-    its own registration branch is added here).
+    SSH, direct-file-read (``arbitrary_file_read``/``api_file_read``), and
+    bounded command execution (``local_shell``/``remote_command``/
+    ``web_command``, Phase 21) have real adapters — an unrecognised
+    ``capability_type`` is silently skipped (forward-compatible: a future
+    capability type simply has no adapter registered, and stays
+    ``runtime_available=False``, until its own registration branch is added
+    here). ``web_command`` deliberately shares
+    ``_register_direct_file_read_adapter`` (and therefore
+    ``ApexConfig.direct_file_read_*`` configuration) with
+    ``arbitrary_file_read``/``api_file_read`` — the underlying mechanism (a
+    fixed HTTP request shape) is identical; only the capability_type label
+    differs, recording whether the operator classifies the primitive as
+    "serves a file directly" or "executes a command whose response happens
+    to contain the read output."
     """
     if cap.capability_type is AccessCapabilityType.ssh_command:
         return _register_ssh_adapter(deps, subgraph, target, cap)
-    if cap.capability_type in (AccessCapabilityType.arbitrary_file_read, AccessCapabilityType.api_file_read):
+    if cap.capability_type in (
+        AccessCapabilityType.arbitrary_file_read,
+        AccessCapabilityType.api_file_read,
+        AccessCapabilityType.web_command,
+    ):
         return _register_direct_file_read_adapter(deps, target, cap)
+    if cap.capability_type in (AccessCapabilityType.local_shell, AccessCapabilityType.remote_command):
+        return _register_bounded_command_adapter(deps, target, cap)
     return False
 
 
@@ -332,6 +347,49 @@ def _register_direct_file_read_adapter(
         logger.warning("direct-file-read primitive construction rejected: %s", exc)
         return False
     deps.capability_registry.ensure_direct_file_read(cap.capability_id, primitive=primitive)
+    return True
+
+
+def _register_bounded_command_adapter(
+    deps: "OrchestrationDeps", target: str, cap: "AccessCapability"
+) -> bool:
+    """Construct and register a ``BoundedCommandCapabilityAdapter`` for a
+    validated ``local_shell``/``remote_command`` capability (Phase 21).
+
+    Mirrors ``_register_direct_file_read_adapter``'s principal-matching
+    discipline: only a capability whose principal matches the operator's
+    configured ``bounded_command_principal`` can be provisioned here. The
+    one reference strategy (``ToolBackendCommandReadStrategy``) is
+    constructed from ``apex_host.tools.backend.select_runtime_backend`` —
+    the SAME centralized, dry-run-aware backend selector every other
+    command-execution path in this codebase uses — so this registration
+    step performs no execution itself (constructing a ``ToolBackend`` and a
+    strategy wrapper is always safe) and inherits the same dry-run
+    guarantee as every other tool invocation.
+    """
+    from apex_host.runtime_registry import BoundedCommandReadPrimitive, ToolBackendCommandReadStrategy
+    from apex_host.tools.backend import select_runtime_backend
+
+    config = deps.config
+    if not config.bounded_command_operator_attested:
+        return False
+    if cap.principal != config.bounded_command_principal:
+        return False
+    allowed_filenames = frozenset(getattr(config, "user_flag_candidate_filenames", None) or [])
+    try:
+        backend = select_runtime_backend(config)
+        strategy = ToolBackendCommandReadStrategy(backend=backend)
+        primitive = BoundedCommandReadPrimitive(
+            capability_id=cap.capability_id,
+            strategy=strategy,
+            allowed_filenames=allowed_filenames,
+            timeout_seconds=config.bounded_command_timeout_seconds,
+            max_output_bytes=config.bounded_command_max_output_bytes,
+        )
+    except ValueError as exc:
+        logger.warning("bounded-command primitive construction rejected: %s", exc)
+        return False
+    deps.capability_registry.ensure_bounded_command(cap.capability_id, primitive=primitive)
     return True
 
 

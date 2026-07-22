@@ -189,11 +189,14 @@ def _install_fake_ssh(
 # ---------------------------------------------------------------------------
 
 class TestCapabilityCreation:
-    def test_all_six_capability_types_exist(self) -> None:
+    def test_all_seven_capability_types_exist(self) -> None:
+        # Phase 21 added `remote_command` — a generic, non-web, non-SSH
+        # remote command-execution channel — as an additive 7th member.
         names = {t.value for t in AccessCapabilityType}
         assert names == {
             "ssh_command", "telnet_command", "web_command",
             "local_shell", "arbitrary_file_read", "api_file_read",
+            "remote_command",
         }
 
     def test_capability_fields_match_spec(self) -> None:

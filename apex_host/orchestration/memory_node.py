@@ -40,6 +40,16 @@ _DIRECT_FILE_READ_TYPES: frozenset[str] = frozenset({
     AccessCapabilityType.arbitrary_file_read.value, AccessCapabilityType.api_file_read.value,
 })
 
+#: Phase 21 — the three capability_type values that count toward the
+#: bounded-command metrics/audit log below. Disjoint from
+#: _DIRECT_FILE_READ_TYPES, so a given user_flag_verify result's
+#: capability_type ever matches at most one of the two frozensets.
+_COMMAND_CAPABILITY_TYPES: frozenset[str] = frozenset({
+    AccessCapabilityType.local_shell.value,
+    AccessCapabilityType.remote_command.value,
+    AccessCapabilityType.web_command.value,
+})
+
 
 def make_memory_node(deps: "OrchestrationDeps") -> Any:
     """Return the ``write_memory`` async node bound to *deps*."""
@@ -58,6 +68,7 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
         credential_entries: list[dict[str, Any]] = []
         latency_entries: list[dict[str, Any]] = []
         direct_file_read_entries: list[dict[str, Any]] = []
+        bounded_command_entries: list[dict[str, Any]] = []
         for tr in results_to_write:
             # F13: skipped-duplicate tasks never executed — skip episode creation.
             if tr.get("skipped_duplicate"):
@@ -110,6 +121,8 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
                     failure_result["task_latency_log"] = latency_entries
                 if direct_file_read_entries:
                     failure_result["direct_file_read_log"] = direct_file_read_entries
+                if bounded_command_entries:
+                    failure_result["bounded_command_log"] = bounded_command_entries
                 return failure_result
 
             if o != Outcome.success:
@@ -199,6 +212,25 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
                     "phase": state["phase"],
                 })
 
+            # Phase 21: bounded command-execution attempt audit log — never
+            # the raw candidate output (tr never carries it). Only
+            # user_flag_verify results whose capability_type is a command
+            # capability type (local_shell / remote_command / web_command)
+            # are recorded here.
+            if tool_name == "user_flag_verify" and capability_type in _COMMAND_CAPABILITY_TYPES:
+                bounded_command_entries.append({
+                    "capability_id": str(tr.get("capability_id", "")),
+                    "capability_type": capability_type,
+                    "candidate_path": str(tr.get("candidate_path", "")),
+                    "blocked": bool(tr.get("policy_blocked", False)),
+                    "connected": bool(tr.get("connected", False)),
+                    "verified": bool(tr.get("verified", False)),
+                    "bytes_received": int(tr.get("bytes_received", 0) or 0),
+                    "truncated": bool(tr.get("truncated", False)),
+                    "error": tr.get("error"),
+                    "phase": state["phase"],
+                })
+
         result: dict[str, Any] = {}
         if error_entries:
             result["error_episodes"] = error_entries
@@ -210,6 +242,8 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
             result["task_latency_log"] = latency_entries
         if direct_file_read_entries:
             result["direct_file_read_log"] = direct_file_read_entries
+        if bounded_command_entries:
+            result["bounded_command_log"] = bounded_command_entries
         return result
 
     return write_memory

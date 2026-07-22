@@ -214,6 +214,16 @@ class ApexGraphState(TypedDict):
     # candidate output. Feeds apex_host/eval/report.py's Direct File Read
     # Summary section — mirrors credential_validation_log's own convention.
     direct_file_read_log: Annotated[list[dict[str, Any]], operator.add]
+    # Phase 21 — bounded command-execution attempt audit log. One entry per
+    # user_flag_verify tool_result whose capability_type is a command
+    # capability type (local_shell / remote_command / web_command),
+    # populated in write_memory (apex_host.orchestration.memory_node).
+    # Fields per entry: {capability_id, capability_type, candidate_path,
+    # connected, verified, return_code, bytes_received, truncated, error,
+    # phase}. Never the raw candidate output. Feeds
+    # apex_host/eval/report.py's Bounded Command Summary section — mirrors
+    # direct_file_read_log's own convention exactly.
+    bounded_command_log: Annotated[list[dict[str, Any]], operator.add]
 
 
 CompiledApexGraph = Any
