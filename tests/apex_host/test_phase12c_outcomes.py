@@ -133,9 +133,10 @@ def _make_initial_state(
 # ---------------------------------------------------------------------------
 
 class TestEngagementOutcomeModel:
-    def test_exactly_16_outcomes_defined(self) -> None:
+    def test_exactly_17_outcomes_defined(self) -> None:
         # Phase 18 added EngagementOutcome.user_flag_verified.
-        assert len(_ALL_OUTCOMES) == 16
+        # Phase 1 (post-live-test debugging) added EngagementOutcome.llm_unavailable.
+        assert len(_ALL_OUTCOMES) == 17
 
     @pytest.mark.parametrize("outcome", _ALL_OUTCOMES)
     def test_is_success_outcome_true_only_for_user_flag_verified(self, outcome: EngagementOutcome) -> None:
@@ -162,7 +163,11 @@ class TestEngagementOutcomeModel:
             EngagementOutcome.user_flag_verified: 0,
             # Phase 18: access alone is access-only exhaustion, not success.
             EngagementOutcome.validated_access: 1,
-            EngagementOutcome.goal_completed: 0,
+            # Phase 25 audit fix: corrected from 0 to 1 — is_success_outcome()
+            # already returned False for goal_completed; its exit code must
+            # be consistent (see apex_host/orchestration/outcome.py's own
+            # comment on this entry).
+            EngagementOutcome.goal_completed: 1,
             EngagementOutcome.max_turns_exhausted: 1,
             EngagementOutcome.phase_budget_exhausted: 1,
             EngagementOutcome.no_actionable_task: 1,

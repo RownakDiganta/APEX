@@ -92,6 +92,7 @@ def build_planners(
     from apex_host.planners.objective_planner import ObjectivePlanner
     from apex_host.planners.priv_esc_planner import PrivEscPlanner
     from apex_host.planners.recon_planner import ReconPlanner
+    from apex_host.tools.backend import backend_supports_raw_sockets
     from apex_host.planners.web_planner import WebPlanner
 
     _ct = getattr(config, "planning_confidence_threshold", 0.4)
@@ -112,7 +113,12 @@ def build_planners(
         )
 
     return {
-        ApexPhase.recon.value: ReconPlanner(config.target, registry, **_kwargs()),
+        ApexPhase.recon.value: ReconPlanner(
+            config.target,
+            registry,
+            raw_socket_capable=backend_supports_raw_sockets(config),
+            **_kwargs(),
+        ),
         ApexPhase.web.value: WebPlanner(
             config.target,
             registry,

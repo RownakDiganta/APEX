@@ -107,6 +107,22 @@ class ApexConfig:
     max_llm_calls_per_phase: int = 2
     llm_request_timeout_seconds: float = 60.0
     llm_stop_on_repeated_plan: bool = True
+    # Phase 1 (post-live-test debugging) — explicit, configurable live-run
+    # policy for COMPLETE provider failure. Defaults to False so existing
+    # behavior (always fall back to deterministic planning, silently, on
+    # any LLM issue) is completely unchanged unless an operator opts in.
+    # When True AND use_llm is True: once a CONFIRMED PERMANENT provider
+    # misconfiguration is observed (missing key, invalid model,
+    # authentication failure, unsupported endpoint, malformed response —
+    # apex_host.llm.errors.PERMANENT_LLM_ERROR_CATEGORIES), the engagement
+    # terminates immediately with EngagementOutcome.llm_unavailable rather
+    # than silently completing the rest of the run in deterministic
+    # fallback mode while still claiming to be "LLM-guided". Transient
+    # failures (timeout, rate limit, network error) never trigger this —
+    # only a confirmed, non-retriable configuration problem does. Has no
+    # effect when use_llm=False or llm_provider="fake" (no real provider
+    # is ever contacted in either case, so no provider failure can occur).
+    llm_required: bool = False
     # Knowledge promotion strategy — controls how many Reflector passes are
     # run after the compiled knowledge corpus is staged at startup.
     #
@@ -219,6 +235,21 @@ class ApexConfig:
     # tool_service_timeout_seconds: overall request timeout budget for
     # RemoteToolBackend. CLI: --tool-service-timeout.
     tool_service_timeout_seconds: float = 120.0
+    # tool_backend_raw_socket_capable: explicit override for
+    # apex_host.tools.backend.backend_supports_raw_sockets() — the
+    # capability seam ReconPlanner consults to decide whether nmap may use
+    # a raw-socket scan mode (plain "-sV", implicitly SYN-scan) or must be
+    # restricted to TCP-connect mode ("-sT"). None (the default) means
+    # "derive automatically from tool_backend": tool_backend="remote"
+    # (the Kali tool-service container, documented to run as a non-root
+    # user with zero added Linux capabilities — docs/kali-container.md
+    # §5/§14) derives to False; every other backend derives to True,
+    # preserving the pre-existing scan behavior for "local"/"dry-run".
+    # Set explicitly only when a specific deployment's real privilege
+    # differs from that default assumption (e.g. a remote backend granted
+    # NET_RAW, or a sandboxed local backend that is not root). CLI:
+    # --tool-backend-raw-socket-capable / --no-tool-backend-raw-socket-capable.
+    tool_backend_raw_socket_capable: bool | None = None
     # ---------------------------------------------------------------------------
     # Infra Phase 10 — HTB VPN readiness configuration
     # (docs/htb-vpn-container.md; docker/vpn/; apex_host/eval/preflight.py)
@@ -502,6 +533,7 @@ class ApexConfig:
             "knowledge_root": _g("knowledge_root", None),
             "policy_file": _g("policy_file", None),
             "llm_stop_on_repeated_plan": bool(_g("llm_stop_on_repeated_plan", True)),
+            "llm_required": bool(_g("llm_required", False)),
             # Infra Phase 4 — tool-execution backend selection. Note there is
             # deliberately NO --tool-service-token CLI flag: the bearer token
             # is read from the APEX_TOOL_SERVICE_TOKEN environment variable
@@ -512,6 +544,9 @@ class ApexConfig:
             # (`ps`) while environment variables set via `export` are not.
             "tool_backend": _g("tool_backend", "local"),
             "tool_service_url": _g("tool_service_url", None),
+            # None (unset) means "derive automatically from tool_backend" —
+            # see apex_host.tools.backend.backend_supports_raw_sockets().
+            "tool_backend_raw_socket_capable": _g("tool_backend_raw_socket_capable", None),
             # Infra Phase 10 — HTB VPN readiness configuration. All three
             # are None/safe-default unless a caller (container_entrypoint.py
             # for the first two; config_env.py's env merge for all three)

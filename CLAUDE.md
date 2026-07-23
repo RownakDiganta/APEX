@@ -8737,3 +8737,151 @@ typed stub result models and emission seams were added, per this phase's
 own explicit scope boundary. Command/access capability alone remains
 non-success — verified user flag remains the only exit-code-0 outcome;
 `memfabric/` remains unchanged.
+
+### Phase 25 — Final Architecture Integration, Live-Readiness Validation, and Release Hardening ✓ COMPLETE
+
+**Full design document:** [`docs/phase25-release-readiness.md`](docs/phase25-release-readiness.md),
+[`docs/first-live-test-runbook.md`](docs/first-live-test-runbook.md). This
+entry is a summary and progress record; those documents are authoritative.
+**This phase completes the current Phase 1–25 architecture roadmap.**
+
+**Scope:** integrate, validate, and harden the existing Phase 1–24
+architecture for controlled, authorized live testing — not a new
+architecture layer. A full read of `apex_host/eval/preflight.py`,
+`apex_host/container_entrypoint.py`, `apex_host/eval/run_htb_local.py`,
+`apex_host/eval/check_config.py`, and `apex_host/orchestration/outcome.py`
+found six concrete, demonstrated gaps (not hypothetical ones) — see
+`docs/phase25-release-readiness.md` §1 for the full list. The most
+significant: **`apex_host.eval.run_htb_local` — the primary, documented
+host-side entrypoint — had NO live-run safety interlock at all** (Docker's
+`container_entrypoint.py` had one; the everyday host CLI did not).
+
+**New module `apex_host/eval/live_interlock.py`:** the ONE centralized
+live-run safety interlock, now shared by both `container_entrypoint.py`
+and `run_htb_local.py`. `evaluate_live_interlock()` requires five
+independent confirmations (`dry_run_disabled`, `live_confirmed` —
+`--confirm-live`, CLI-only, never an env var — `target_supplied`,
+`target_in_scope` — via `PolicyAdvisor`'s existing scope, never a second
+scope concept — `preflight_passed`), fails fast (skips the expensive,
+network-touching preflight) the moment any cheap confirmation already
+fails, and never itself contacts the engagement target.
+
+**`run_htb_local.py` gained `--preflight-only` and `--confirm-live`,**
+plus a real runtime-cleanup fix: the post-engagement report-building
+section is now wrapped in `try/finally: await runtime.aclose()` — Phase
+24's shutdown-invalidation logic was built but never actually reachable
+from this entrypoint. Both new flags default to safe values and are read
+via `getattr(args, ..., False)` so pre-existing tests that construct a
+bare `argparse.Namespace` (without these new attributes) continue to pass
+unchanged. `container_entrypoint.py`'s own `_handle_run` was refactored to
+call the same `evaluate_live_interlock()` instead of its prior ad-hoc
+confirmation+preflight sequence.
+
+**Real audit fix found and corrected:**
+`EngagementOutcome.goal_completed` mapped to exit code `0` despite
+`is_success_outcome(goal_completed)` already correctly returning `False`
+— a leftover from Phase 12C's original success definition, never updated
+when Phase 18 redefined success to `user_flag_verified` only
+(`validated_access`'s exit code WAS updated at the time; this sibling
+entry was missed). `goal_completed` is currently unreachable through
+`GlobalPlanner` (reserved for forward compatibility), so this had no
+live-run impact, but it directly violated Phase 25's own explicit
+invariant "no outcome other than `user_flag_verified` maps to exit code
+0." Corrected to `1`; the one pre-existing test that encoded the old
+value (`test_phase12c_outcomes.py::test_exit_code_table_matches_spec`)
+was corrected alongside it, with an inline comment explaining why.
+
+**`RunReport.report_schema_version`** (new field, default `"1"`) — surfaced
+in both `format_text()` (report header) and `to_json_dict()` (first key).
+
+**New module `apex_host/eval/release_gate.py`** — the synthetic release-gate
+suite (`uv run python -m apex_host.eval.release_gate`), twelve deterministic
+scenarios (SSH/DFR/remote-bounded-command success, no-capability failure,
+candidate-not-verified failure, runtime-reference expiry, authorization
+revoked, policy denial, dry-run, repair-path capability activation,
+duplicate evidence, restart/replay). Every scenario builds an in-memory
+`MemoryAPI` and drives the REAL production classes directly
+(`CapabilityEvidence` → `run_capability_discovery` → `CapabilityParser` →
+`CapabilityRuntimeRegistry` → `RuntimeReferenceStore`/`RuntimeReferenceResolver`
+→ `UserFlagExecutor` → `verify_user_flag` → `ObjectiveParser`); the one
+deliberate synthetic substitution is the lowest-level transport, replaced
+with an in-memory `_FakeFlagReadCapability` (the exact pluggable seam
+`apex_host/runtime_registry.py` already documents for "a future adapter").
+This is a **test-suite result, not an engagement-success signal** — its
+exit code answers "does the architecture behave correctly?", never "was a
+real target compromised?". A real bug was found and fixed while building
+scenario 5 (`candidate_not_verified`): `ObjectiveParser.parse_user_flag_result`
+builds an `enables` edge FROM the capability_id regardless of verification
+outcome, requiring a real engagement's already-persisted capability node
+— the scenario fixture needed to seed one (not a production bug, a test-
+fixture gap).
+
+**Two naming/preflight-duplication points documented, not merged:**
+`apex_host.tools.preflight.check_local_tools` (§12.7, local allowed-tool
+binary check) and `apex_host.eval.preflight` (Infra Phase 9, environment/
+policy/service readiness) are genuinely different checks that happen to
+share the word "preflight" — merging them risked breaking the documented
+`--preflight` CLI flag's existing meaning, so the richer check is reached
+via the new, distinctly-named `--preflight-only` flag instead.
+
+**Files changed (new):** `apex_host/eval/live_interlock.py`,
+`apex_host/eval/release_gate.py`, `docs/phase25-release-readiness.md`,
+`docs/first-live-test-runbook.md`,
+`tests/apex_host/test_phase25_final_integration.py` (134 tests).
+
+**Files changed (modified):** `apex_host/eval/run_htb_local.py`
+(`--preflight-only`/`--confirm-live` flags, live-interlock gate,
+`runtime.aclose()` cleanup fix), `apex_host/container_entrypoint.py`
+(`_handle_run` refactored onto the shared interlock), `apex_host/eval/report.py`
+(`report_schema_version` field, header line, JSON key),
+`apex_host/orchestration/outcome.py` (`goal_completed` exit-code fix),
+`docs/engagement-outcomes.md` (exit-code table fix + Phase 25 correction
+note), `tests/apex_host/test_phase12c_outcomes.py` (one corrected exit-code
+expectation), `tests/apex_host/test_phase9_config.py` (added
+`release_gate.py` to the approved-`ApexConfig`-construction-sites
+allowlist, matching `run_synthetic_machine.py`'s existing precedent),
+`README.md`.
+
+**Explicitly not changed:** no vulnerability-discovery mechanism, exploit
+generation, arbitrary command execution, or generic HTTP/shell executor
+was added anywhere in this phase. `ObjectivePlanner`, `UserFlagExecutor`,
+`ObjectiveParser`, and `verify_user_flag()` remain fully unchanged and
+transport-independent. `memfabric/` was not touched — verified by static
+scan (zero `apex_host` imports found anywhere under `memfabric/`). No
+machine-specific production logic was added. No branch was created; no
+commit or push was made as part of this phase's work.
+
+**Validation (clean-rebuilt `.venv`, Python 3.11.14):**
+
+| Check | Result |
+|---|---|
+| `uv lock --check` | Pass |
+| `uv sync --all-groups` | Pass |
+| `uv run pytest tests/apex_host/test_phase25_final_integration.py -q` | 134 passed |
+| `uv run python -m apex_host.eval.release_gate` | 12/12 scenarios PASSED, exit 0 |
+| `uv run pytest tests/ -q` (full) | **5264 passed** — no regressions |
+| `uv run ruff check .` | All checks passed |
+| `uv run mypy` | Success — 182 source files |
+| `python -m apex_host.main --help` | exit 0 |
+| `python -m apex_host.eval.run_htb_local --help` | exit 0 |
+| `python -m apex_host.eval.release_gate --help` | exit 0 |
+| `git diff --check` | exit 0 |
+
+**Capability support matrix, known limitations, unsupported vulnerability
+classes, troubleshooting, and the full first-live-test runbook** are
+documented in `docs/phase25-release-readiness.md` §10–§17 and
+`docs/first-live-test-runbook.md` — not duplicated here.
+
+**Live-testing readiness statement:** Phase 25 completes the current
+architecture roadmap. APEX is ready for controlled, authorized live
+testing of the access paths it actually supports (SSH credential
+validation, direct file read, bounded local/remote command reads — all
+gated by the live-run safety interlock and policy scope). It is **a
+generic, capability-driven user-flag retrieval and verification framework
+for supported, already-obtained access paths** — it is **not** a
+universal vulnerability-discovery and exploitation system, and it cannot
+be assumed to solve an arbitrary HTB Easy/Medium machine.
+`user_flag_verified` remains the only benchmark-success outcome. Access
+alone is not success. Command execution alone is not success. Raw flags
+are never persisted. Secrets are never logged. `dry_run` remains enabled
+by default. `memfabric/` remains unchanged.

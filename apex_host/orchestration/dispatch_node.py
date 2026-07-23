@@ -36,6 +36,7 @@ from apex_host.capabilities.runtime_resolution import register_capability_adapte
 from apex_host.execution.context import ExecutionContext
 from apex_host.execution.dispositions import ExecutionDisposition
 from apex_host.graph_state import ApexGraphState
+from apex_host.llm.errors import PERMANENT_LLM_ERROR_CATEGORIES
 from apex_host.orchestration.models import task_info
 from apex_host.orchestration.outcome import EngagementOutcome
 from apex_host.planners.access_capabilities import access_capabilities_from_subgraph
@@ -49,6 +50,13 @@ if TYPE_CHECKING:
     from memfabric.coordination.protocols import Planner
 
 logger = logging.getLogger(__name__)
+
+# Plain-string projection of PERMANENT_LLM_ERROR_CATEGORIES for comparison
+# against PlanDecision.llm_error_category (typed str, not LLMErrorCategory
+# — see apex_host/planning/models.py) without a per-call enum round-trip.
+_PERMANENT_LLM_ERROR_CATEGORY_VALUES: frozenset[str] = frozenset(
+    c.value for c in PERMANENT_LLM_ERROR_CATEGORIES
+)
 
 
 def _dup_entry(
@@ -118,6 +126,38 @@ async def _dispatch_tasks(
 
     decision: _PD | None = getattr(planner, "last_decision", None)
     decision_list: list[dict[str, Any]] = [decision.to_dict()] if decision is not None else []
+
+    # Phase 1 (post-live-test debugging) — explicit fail-fast policy for a
+    # CONFIRMED PERMANENT LLM provider misconfiguration. Only fires when
+    # the operator explicitly opted in via ApexConfig.llm_required=True
+    # (default False — existing silent-fallback behavior is otherwise
+    # completely unchanged). "Confirmed permanent" means the SAME category
+    # PlanningEngine already checked against LLMBudgetTracker
+    # .permanent_provider_error_category before even attempting this call
+    # (apex_host.llm.errors.PERMANENT_LLM_ERROR_CATEGORIES) — a transient
+    # failure (timeout/rate-limit/network) never sets this category and so
+    # never reaches this branch.
+    if (
+        getattr(deps.config, "llm_required", False)
+        and decision is not None
+        and decision.llm_error_category in _PERMANENT_LLM_ERROR_CATEGORY_VALUES
+    ):
+        logger.error(
+            "phase %s: LLM required (llm_required=True) but provider unavailable "
+            "(category=%s) — terminating engagement",
+            state["phase"], decision.llm_error_category,
+        )
+        return {
+            "current_task": None, "last_tool_result": None, "tool_results": None,
+            "last_error": f"LLM required but provider unavailable: {decision.llm_error_category}",
+            "planner_decisions": decision_list,
+            "outcome": EngagementOutcome.llm_unavailable.value,
+            "termination_reason": (
+                f"llm_required=True; confirmed permanent provider failure: "
+                f"{decision.llm_error_category}"
+            ),
+            "termination_phase": state["phase"],
+        }
 
     if isinstance(plan_result, AbandonSignal):
         logger.info("phase %s abandoned: %s", state["phase"], plan_result.reason)

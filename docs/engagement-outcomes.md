@@ -383,8 +383,8 @@ deterministic process exit code derived from `exit_code_for()`:
 
 | Code | Meaning | Outcomes |
 |---|---|---|
-| `0` | Success | `user_flag_verified`, `goal_completed` |
-| `1` | Exhausted / stalled / access-only | `validated_access` (Phase 18 — access alone, objective never verified), `max_turns_exhausted`, `phase_budget_exhausted`, `no_actionable_task`, `duplicate_task_stall` |
+| `0` | Success | `user_flag_verified` (the ONLY outcome mapped to exit 0 — see the Phase 25 correction note below) |
+| `1` | Exhausted / stalled / access-only | `validated_access` (Phase 18 — access alone, objective never verified), `goal_completed`, `max_turns_exhausted`, `phase_budget_exhausted`, `no_actionable_task`, `duplicate_task_stall` |
 | `2` | Configuration error | `configuration_failure` |
 | `3` | Policy blocked | `policy_blocked` |
 | `4` | Operational failure | `planner_failure`, `parser_failure`, `tool_failure`, `memory_failure`, `unknown_phase`, `internal_error` |
@@ -449,6 +449,18 @@ wrong, but the run is over."
   logic.** It exists in the model for forward-compatibility (a future,
   more elaborate phase ladder might reach an organic "done" from a phase
   other than `priv_esc`) but no code path produces it today.
+
+> **Correction (Phase 25):** `exit_code_for(EngagementOutcome.goal_completed)`
+> was `0` until this phase — a leftover from Phase 12C's original
+> definition (where `goal_completed` WAS the success outcome), never
+> updated when Phase 18 redefined success to `user_flag_verified` only
+> (`validated_access`'s exit code WAS updated at that time; this sibling
+> entry was missed). Corrected to `1`, matching its own "exhausted /
+> access-only" bucket and its already-correct `is_success_outcome() is
+> False` / `legacy_status_for() == "abandoned"` classification. Had no
+> live-run impact — `goal_completed` is unreachable today — but the
+> invariant "no outcome other than `user_flag_verified` maps to exit code
+> 0" must hold unconditionally, not only for currently-reachable outcomes.
 - **The `cancelled` terminal episode is best-effort.** When
   `asyncio.CancelledError` is caught in `ApexRuntime.run()`, the exact
   in-flight phase/turn is not recoverable without a configured

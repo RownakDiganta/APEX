@@ -186,6 +186,22 @@ class LLMBudgetTracker:
         # Stop-reason (set when the run-level budget is exhausted)
         self.stop_reason: str = ""
 
+        # A confirmed PERMANENT provider-configuration failure (one of
+        # apex_host.llm.errors.PERMANENT_LLM_ERROR_CATEGORIES — missing
+        # key, invalid model, auth failure, unsupported endpoint,
+        # malformed response) already observed once this run. "" means
+        # none confirmed yet. Set via record_permanent_provider_error()
+        # and checked by PlanningEngine BEFORE reserving a budget slot —
+        # once the SAME misconfiguration is confirmed, no further phase
+        # spends a real call (or a budget slot) re-discovering it. Shared
+        # across every PlanningEngine instance for the run (they all hold
+        # the SAME LLMBudgetTracker), so this is a run-wide, not
+        # per-phase, short-circuit — a stricter, more correct reading of
+        # "do not repeatedly consume budget for the same known provider
+        # configuration error" (the misconfiguration is a property of the
+        # run's shared ApexConfig, not of any one phase).
+        self._permanent_provider_error_category: str = ""
+
         # Atomic reservation lock — all reserve/release operations acquire this.
         self._lock: asyncio.Lock = asyncio.Lock()
 
@@ -423,6 +439,27 @@ class LLMBudgetTracker:
         """Record that the deterministic path was used without any LLM attempt."""
         self.fallbacks += 1
 
+    def record_permanent_provider_error(self, category: str) -> None:
+        """Record a CONFIRMED permanent provider-configuration failure
+        (first-write-wins — later calls to this method with a different
+        category are ignored; the FIRST confirmed misconfiguration is
+        what stops further wasted attempts). No-op for an empty/falsy
+        *category*.
+
+        Callers: ``PlanningEngine._plan_via_gateway`` after observing a
+        gateway result whose ``error_category`` is in
+        ``apex_host.llm.errors.PERMANENT_LLM_ERROR_CATEGORIES``.
+        """
+        if category and not self._permanent_provider_error_category:
+            self._permanent_provider_error_category = category
+
+    @property
+    def permanent_provider_error_category(self) -> str:
+        """The confirmed permanent provider-error category for this run,
+        or ``""`` if none has been confirmed yet. See
+        ``record_permanent_provider_error``'s docstring."""
+        return self._permanent_provider_error_category
+
     # ------------------------------------------------------------------ #
     # Properties
     # ------------------------------------------------------------------ #
@@ -458,6 +495,7 @@ class LLMBudgetTracker:
             "stop_reason": self.stop_reason,
             "phase_counts": dict(self._phase_counts),
             "repeated_skips": dict(self._repeated_counts),
+            "permanent_provider_error_category": self._permanent_provider_error_category,
         }
 
     @classmethod
@@ -483,4 +521,5 @@ class LLMBudgetTracker:
         tracker.stop_reason = str(d.get("stop_reason", ""))
         tracker._phase_counts = dict(d.get("phase_counts", {}))
         tracker._repeated_counts = dict(d.get("repeated_skips", {}))
+        tracker._permanent_provider_error_category = str(d.get("permanent_provider_error_category", ""))
         return tracker

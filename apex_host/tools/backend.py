@@ -51,6 +51,7 @@ __all__ = [
     "LocalToolBackend",
     "RemoteToolBackend",
     "VALID_TOOL_BACKENDS",
+    "backend_supports_raw_sockets",
     "select_tool_backend",
     "select_runtime_backend",
     "to_run_command_fn",
@@ -346,6 +347,41 @@ def select_tool_backend(config: "ApexConfig") -> ToolBackend:
         f"invalid ApexConfig.tool_backend {config.tool_backend!r}; must be one of "
         f"{sorted(VALID_TOOL_BACKENDS)} (case/whitespace-insensitive)"
     )
+
+
+def backend_supports_raw_sockets(config: "ApexConfig") -> bool:
+    """Capability seam: does the tool-execution backend named by
+    ``config.tool_backend`` have the OS privilege (``CAP_NET_RAW``, or
+    running as root) required for nmap's default SYN-scan (``-sS``, the
+    implicit default of plain ``-sV``) or other raw-socket scan modes?
+
+    This is the single, named source of truth planners consult before
+    choosing an nmap scan mode — never a scattered
+    ``if config.tool_backend == "remote"`` check inline in planner logic
+    (per the explicit "derive scan mode from backend capabilities rather
+    than scattering backend-name checks" requirement this function exists
+    to satisfy).
+
+    ``config.tool_backend_raw_socket_capable`` (an explicit tri-state
+    override — ``None`` is "derive automatically") always wins when set,
+    for the rare case an operator knows their specific deployment differs
+    from the default assumption below (e.g. a remote backend granted
+    ``NET_RAW``, or a sandboxed local backend that is *not* root).
+
+    Default assumption when no override is set: the Kali tool-service
+    container (``tool_backend="remote"``) is documented
+    (``docs/kali-container.md`` §5/§14) to run its restricted service as a
+    non-root user with zero added Linux capabilities — verified empirically
+    to lack raw-socket privilege — so ``remote`` defaults to ``False``.
+    Every other backend (``"local"``, ``"dry-run"``, and any future name)
+    defaults to ``True`` — the historical default before this capability
+    seam existed — so a local, potentially root-capable backend is never
+    unintentionally forced into TCP-connect-only mode.
+    """
+    override = getattr(config, "tool_backend_raw_socket_capable", None)
+    if override is not None:
+        return bool(override)
+    return _normalize_backend_name(config.tool_backend) != "remote"
 
 
 def select_runtime_backend(config: "ApexConfig") -> ToolBackend:

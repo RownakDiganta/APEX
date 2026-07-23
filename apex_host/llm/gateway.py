@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, cast
 
+from apex_host.llm.errors import classify_llm_exception, describe_for_diagnostics
 from apex_host.planning.engine import _LLMChatModel
 
 if TYPE_CHECKING:
@@ -136,6 +137,12 @@ class LLMCallResult:
     error: str = ""
     actual_input_tokens: int = 0
     actual_output_tokens: int = 0
+    # Fine-grained classification (apex_host.llm.errors.LLMErrorCategory
+    # value, or "") — populated only when status is provider_error/timeout.
+    # Distinct from `status` (a coarse LLMCallStatus): this field answers
+    # "missing key vs invalid model vs rate limit vs ..." — see
+    # apex_host/llm/errors.py module docstring.
+    error_category: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -144,6 +151,7 @@ class LLMCallResult:
             "blocked_reason": self.blocked_reason,
             "redaction_count": self.redaction_count,
             "error": self.error,
+            "error_category": self.error_category,
             "actual_input_tokens": self.actual_input_tokens,
             "actual_output_tokens": self.actual_output_tokens,
         }
@@ -160,6 +168,7 @@ class _AuditRecord:
     redaction_count: int
     blocked_reason: str
     error: str
+    error_category: str
     actual_input_tokens: int
     actual_output_tokens: int
     elapsed_seconds: float
@@ -213,6 +222,7 @@ class LLMGateway:
                 "redaction_count": r.redaction_count,
                 "blocked_reason": r.blocked_reason,
                 "error": r.error,
+                "error_category": r.error_category,
                 "actual_input_tokens": r.actual_input_tokens,
                 "actual_output_tokens": r.actual_output_tokens,
                 "elapsed_seconds": round(r.elapsed_seconds, 3),
@@ -315,6 +325,7 @@ class LLMGateway:
             result = LLMCallResult(
                 status=LLMCallStatus.timeout,
                 error=err_str,
+                error_category="timeout",
                 redaction_count=redaction_count,
             )
             self._record_audit(decision_id, ctx, result, time.monotonic() - t0)
@@ -328,21 +339,30 @@ class LLMGateway:
             raise
 
         except Exception as exc:
-            err_str = str(exc)
+            # Fine-grained, provider-agnostic classification (missing_key,
+            # authentication_failure, invalid_model, unsupported_endpoint,
+            # network_error, timeout, rate_limit, malformed_response, ...)
+            # — see apex_host/llm/errors.py. The ORIGINAL exception is never
+            # logged/stored verbatim; describe_for_diagnostics() bounds it
+            # to a short, secret-free summary (type name + message, never
+            # request headers or a stack trace).
+            category = classify_llm_exception(exc)
+            err_str = describe_for_diagnostics(exc)
             logger.warning(
-                "llm_gateway: provider error (purpose=%s phase=%s): %s",
-                ctx.purpose.value, ctx.phase, exc,
+                "llm_gateway: provider error (purpose=%s phase=%s category=%s): %s",
+                ctx.purpose.value, ctx.phase, category.value, err_str,
             )
             if reservation is not None:
                 await reservation.fail()
             status = (
                 LLMCallStatus.timeout
-                if "timeout" in err_str.lower()
+                if category.value == "timeout"
                 else LLMCallStatus.provider_error
             )
             result = LLMCallResult(
                 status=status,
                 error=err_str,
+                error_category=category.value,
                 redaction_count=redaction_count,
             )
             self._record_audit(decision_id, ctx, result, time.monotonic() - t0)
@@ -401,6 +421,7 @@ class LLMGateway:
             redaction_count=result.redaction_count,
             blocked_reason=result.blocked_reason,
             error=result.error,
+            error_category=result.error_category,
             actual_input_tokens=result.actual_input_tokens,
             actual_output_tokens=result.actual_output_tokens,
             elapsed_seconds=elapsed,

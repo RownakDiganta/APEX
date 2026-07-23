@@ -139,6 +139,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tool-service-timeout", dest="tool_service_timeout", type=float, default=None, metavar="SECS",
         help="Overall request timeout budget in seconds for the remote tool backend (default: 120.0).",
     )
+    raw_socket_group = parser.add_mutually_exclusive_group()
+    raw_socket_group.add_argument(
+        "--tool-backend-raw-socket-capable", dest="tool_backend_raw_socket_capable",
+        action="store_true", default=None,
+        help=(
+            "Override the automatic backend-capability seam: force nmap to assume "
+            "raw-socket privilege is available (default: auto-derived from --tool-backend; "
+            "'remote' is assumed non-root, 'local'/'dry-run' are assumed raw-socket-capable)."
+        ),
+    )
+    raw_socket_group.add_argument(
+        "--no-tool-backend-raw-socket-capable", dest="tool_backend_raw_socket_capable",
+        action="store_false",
+        help=(
+            "Override the automatic backend-capability seam: force nmap into TCP-connect "
+            "mode (-sT) regardless of the selected --tool-backend."
+        ),
+    )
     # LLM call budget flags — only relevant when --use-llm is set.
     parser.add_argument(
         "--max-llm-calls", dest="max_llm_calls", type=int, default=None, metavar="N",
@@ -163,6 +181,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-llm-stop-on-repeated-plan", dest="llm_stop_on_repeated_plan",
         action="store_false",
         help="Always call LLM even when context is unchanged.",
+    )
+    parser.add_argument(
+        "--llm-required", dest="llm_required", action="store_true", default=None,
+        help=(
+            "When set together with --use-llm, a CONFIRMED PERMANENT LLM provider "
+            "failure terminates the engagement with outcome=llm_unavailable instead "
+            "of silently falling back to deterministic planning. Default: off."
+        ),
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
     parser.add_argument(

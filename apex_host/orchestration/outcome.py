@@ -46,9 +46,10 @@ binding order (highest precedence first) — see ``evaluate_termination()``:
    ``apex_host.planners.objective.objective_status_from_subgraph``.
 2. An upstream node already produced a definitive terminal outcome this
    turn (``planner_failure``, ``parser_failure``, ``memory_failure``,
-   ``unknown_phase``) — the caller (``continuation_node.py``) detects this
-   via ``state.get("outcome")`` already being set and passes it straight
-   through; ``evaluate_termination()`` itself is only reached when no such
+   ``unknown_phase``, ``llm_unavailable``) — the caller
+   (``continuation_node.py``) detects this via ``state.get("outcome")``
+   already being set and passes it straight through;
+   ``evaluate_termination()`` itself is only reached when no such
    upstream outcome exists.
 3. Stall-derived outcomes (``duplicate_task_stall``, ``no_actionable_task``,
    ``policy_blocked``) — from ``apex_host.orchestration.stall.StallTracker``.
@@ -114,6 +115,19 @@ class EngagementOutcome(str, Enum):
     tool_failure = "tool_failure"
     memory_failure = "memory_failure"
     unknown_phase = "unknown_phase"
+    # Phase 1 (post-live-test debugging) — set only when ApexConfig
+    # .llm_required is True AND a CONFIRMED permanent LLM provider
+    # misconfiguration has been observed (missing key, invalid model,
+    # authentication failure, unsupported endpoint, malformed response —
+    # apex_host.llm.errors.PERMANENT_LLM_ERROR_CATEGORIES). Detected by
+    # apex_host.orchestration.dispatch_node._dispatch_tasks (an
+    # upstream-preset outcome, precedence level 2, same as
+    # planner_failure/parser_failure/memory_failure — never produced by
+    # evaluate_termination() itself). When llm_required is False (the
+    # default), the SAME permanent provider failure never produces this
+    # outcome — the engagement continues with deterministic fallback,
+    # exactly as before this phase.
+    llm_unavailable = "llm_unavailable"
     # Outside-the-graph outcomes — classified by ApexRuntime/CLI, never by
     # evaluate_termination().
     cancelled = "cancelled"
@@ -139,7 +153,18 @@ _EXIT_CODE_FOR_OUTCOME: dict[EngagementOutcome, int] = {
     # not benchmark success — bucketed with the other "nothing went wrong,
     # but the run did not achieve the objective" outcomes.
     EngagementOutcome.validated_access: 1,
-    EngagementOutcome.goal_completed: 0,
+    # Phase 25 audit fix: this entry was still 0 (a leftover from Phase
+    # 12C's original definition, where `goal_completed` WAS success) after
+    # Phase 18 redefined success — `validated_access`'s exit code was
+    # updated at that time but this one was missed, leaving
+    # `is_success_outcome(goal_completed) is False` inconsistent with an
+    # exit code of 0 (the CLI's own definition of "success" for any
+    # scripting/CI consumer). `goal_completed` is currently unreachable
+    # through GlobalPlanner (reserved for forward compatibility — see this
+    # module's own docstring), so this had no live-run impact, but the
+    # invariant "no outcome other than user_flag_verified maps to exit
+    # code 0" must hold unconditionally, not just for reachable outcomes.
+    EngagementOutcome.goal_completed: 1,
     EngagementOutcome.max_turns_exhausted: 1,
     EngagementOutcome.phase_budget_exhausted: 1,
     EngagementOutcome.no_actionable_task: 1,
@@ -151,6 +176,7 @@ _EXIT_CODE_FOR_OUTCOME: dict[EngagementOutcome, int] = {
     EngagementOutcome.tool_failure: 4,
     EngagementOutcome.memory_failure: 4,
     EngagementOutcome.unknown_phase: 4,
+    EngagementOutcome.llm_unavailable: 4,
     EngagementOutcome.internal_error: 4,
     EngagementOutcome.cancelled: 130,
 }
@@ -185,6 +211,7 @@ _LEGACY_STATUS_FOR_OUTCOME: dict[EngagementOutcome, str] = {
     EngagementOutcome.tool_failure: "stopped_error",
     EngagementOutcome.memory_failure: "stopped_error",
     EngagementOutcome.unknown_phase: "stopped_error",
+    EngagementOutcome.llm_unavailable: "stopped_error",
     EngagementOutcome.configuration_failure: "stopped_error",
     EngagementOutcome.internal_error: "stopped_error",
     EngagementOutcome.cancelled: "cancelled",

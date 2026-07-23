@@ -241,6 +241,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tool-service-timeout", dest="tool_service_timeout", type=float, default=None, metavar="SECS",
         help="Overall request timeout budget in seconds for the remote tool backend (default: 120.0).",
     )
+    raw_socket_group = parser.add_mutually_exclusive_group()
+    raw_socket_group.add_argument(
+        "--tool-backend-raw-socket-capable", dest="tool_backend_raw_socket_capable",
+        action="store_true", default=None,
+        help=(
+            "Override the automatic backend-capability seam: force nmap to assume "
+            "raw-socket privilege is available (default: auto-derived from --tool-backend; "
+            "'remote' is assumed non-root, 'local'/'dry-run' are assumed raw-socket-capable)."
+        ),
+    )
+    raw_socket_group.add_argument(
+        "--no-tool-backend-raw-socket-capable", dest="tool_backend_raw_socket_capable",
+        action="store_false",
+        help=(
+            "Override the automatic backend-capability seam: force nmap into TCP-connect "
+            "mode (-sT) regardless of the selected --tool-backend."
+        ),
+    )
     # LLM call budget flags — only relevant when --use-llm is set.
     parser.add_argument(
         "--max-llm-calls", dest="max_llm_calls", type=int, default=None, metavar="N",
@@ -271,8 +289,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Always call LLM even when context is unchanged.",
     )
     parser.add_argument(
+        "--llm-required", dest="llm_required", action="store_true", default=None,
+        help=(
+            "Phase 1 (post-live-test debugging): when set together with --use-llm, "
+            "a CONFIRMED PERMANENT LLM provider failure (missing key, invalid model, "
+            "authentication failure, unsupported endpoint, malformed response) "
+            "terminates the engagement immediately with outcome=llm_unavailable "
+            "instead of silently continuing in deterministic-fallback mode for the "
+            "rest of the run. Transient failures (timeout, rate limit, network "
+            "error) never trigger this. Default: off — existing silent-fallback "
+            "behavior is unchanged unless this flag is explicitly passed."
+        ),
+    )
+    parser.add_argument(
         "--preflight", action="store_true",
         help="Check which allowed tools are in PATH then exit",
+    )
+    parser.add_argument(
+        "--preflight-only", dest="preflight_only", action="store_true", default=False,
+        help=(
+            "Phase 25: run the full environment/policy/service readiness preflight "
+            "(apex_host.eval.preflight — configuration, report directory, compiled "
+            "knowledge, policy, LLM readiness, HTB profile, and — when tool_backend="
+            "'remote' or a VPN service is configured — Kali health, one harmless "
+            "smoke command, and VPN readiness) and exit. Never runs the engagement, "
+            "never attempts exploitation, never submits a payload, never retrieves "
+            "a flag. Distinct from --preflight (local allowed-tool binary check only)."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-live", dest="confirm_live", action="store_true", default=False,
+        help=(
+            "Phase 25: required (in addition to --no-dry-run) to run a real, "
+            "target-directed engagement. Cannot be satisfied by any environment "
+            "variable — must be passed explicitly on every live invocation. Has no "
+            "effect when dry_run is True (the default)."
+        ),
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     parser.add_argument(
@@ -520,6 +572,45 @@ async def _async_main(args: argparse.Namespace) -> int:
         print("\nAll allowed tools found.")
         return 0
 
+    if getattr(args, "preflight_only", False):
+        # Phase 25: the richer environment/policy/service readiness preflight
+        # (apex_host.eval.preflight), distinct from --preflight above (local
+        # allowed-tool binary check only). Never runs the engagement — this
+        # branch always returns before run_engagement() is ever imported.
+        from apex_host.eval.preflight import PreflightResult, run_local_checks, run_vpn_checks
+
+        checks = run_local_checks(
+            config, default_report_dir=(os.path.dirname(args.export_json) if args.export_json else None) or ".",
+            report_path=args.export_json, graph_path=args.export_graph,
+            policy_required=not config.dry_run,
+        )
+        if config.tool_backend == "remote":
+            from apex_host.eval.preflight import check_remote_smoke, check_tool_service_health
+            checks.append(await check_tool_service_health(config.tool_service_url))
+            checks.append(await check_remote_smoke(config))
+        checks.extend(await run_vpn_checks(config))
+        result = PreflightResult(checks)
+        print(result.format_text())
+        return 0 if result.passed else 1
+
+    if not config.dry_run:
+        # Phase 25: the ONE centralized live-run safety interlock — see
+        # apex_host.eval.live_interlock's own module docstring. Live
+        # execution must never be reachable from this entrypoint without
+        # every one of its independent confirmations passing. Never
+        # consulted for dry_run=True (the default) — dry-run behavior is
+        # completely unaffected by this block's existence.
+        from apex_host.eval.live_interlock import evaluate_live_interlock
+
+        interlock = await evaluate_live_interlock(
+            config, confirmed=getattr(args, "confirm_live", False),
+            default_report_dir=(os.path.dirname(args.export_json) if args.export_json else None) or ".",
+            report_path=args.export_json, graph_path=args.export_graph,
+        )
+        print(interlock.format_text())
+        if not interlock.permitted:
+            return exit_code_for(EngagementOutcome.configuration_failure)
+
     # Phase 17: wall-clock runtime measurement — the ONLY way to know how
     # long an engagement actually took (ApexGraphState tracks turn counts,
     # never real elapsed time — see apex_host/eval/benchmark.py module
@@ -533,90 +624,93 @@ async def _async_main(args: argparse.Namespace) -> int:
         return exit_code_for(EngagementOutcome.internal_error)
     total_runtime_seconds = time.monotonic() - engagement_start
 
-    subgraph = await runtime.api.get_subgraph(f"host:{config.target}", depth=10)
-
-    # Derive policy_source for the report (read from the loaded policy).
     try:
-        from apex_host.policy.policy_loader import load_policy
-        policy = load_policy(config)
-        policy_source = policy.policy_source
-    except Exception:  # noqa: BLE001
-        policy_source = "unknown"
+        subgraph = await runtime.api.get_subgraph(f"host:{config.target}", depth=10)
 
-    llm_budget = runtime.last_budget.to_dict() if runtime.last_budget is not None else None
-    # Phase 17: measure report-build+format time on a throwaway first pass,
-    # then rebuild once more so the printed/exported report itself reports
-    # an accurate report_generation_seconds. Both build_report() calls are
-    # pure (no I/O, no engagement re-run) — the cost of the extra pass is
-    # negligible relative to the engagement itself.
-    report_start = time.monotonic()
-    _timing_report = build_report(
-        final_state, subgraph, config,
-        seed_results=seed_results,
-        policy_source=policy_source,
-        llm_budget=llm_budget,
-        total_runtime_seconds=total_runtime_seconds,
-        htb_machine_name=args.htb_machine_name,
-        htb_difficulty=args.htb_difficulty,
-    )
-    format_text(_timing_report)
-    report_generation_seconds = time.monotonic() - report_start
-
-    report = build_report(
-        final_state, subgraph, config,
-        seed_results=seed_results,
-        policy_source=policy_source,
-        llm_budget=llm_budget,
-        total_runtime_seconds=total_runtime_seconds,
-        report_generation_seconds=report_generation_seconds,
-        htb_machine_name=args.htb_machine_name,
-        htb_difficulty=args.htb_difficulty,
-    )
-    print(format_text(report))
-
-    if args.compare_with:
+        # Derive policy_source for the report (read from the loaded policy).
         try:
-            with open(args.compare_with, encoding="utf-8") as fh:
-                baseline_json = json.load(fh)
-            baseline_input = comparison_input_from_json_export(baseline_json)
-            candidate_input = comparison_input_from_report(report)
-            comparison = compare_reports(baseline_input, candidate_input)
-            print("\n" + format_comparison_text(comparison))
-            if args.export_comparison:
-                with open(args.export_comparison, "w", encoding="utf-8") as fh:
-                    json.dump(comparison_to_json_dict(comparison), fh, indent=2, default=str)
-                print(f"Comparison exported to {args.export_comparison}")
-        except Exception as exc:  # noqa: BLE001 - comparison is advisory, never fatal
-            logger.warning("run comparison failed (non-fatal): %s", exc)
-            print(f"warning: could not compare with {args.compare_with!r}: {exc}", file=sys.stderr)
+            from apex_host.policy.policy_loader import load_policy
+            policy = load_policy(config)
+            policy_source = policy.policy_source
+        except Exception:  # noqa: BLE001
+            policy_source = "unknown"
 
-    if args.export_benchmark:
-        from apex_host.eval.benchmark import benchmark_to_json_dict, compute_benchmark
-        bench = compute_benchmark(
-            report,
-            total_runtime_seconds=report.benchmark_total_runtime_seconds,
-            report_generation_seconds=report.benchmark_report_generation_seconds,
-            task_latency_log=report.task_latency_log,
+        llm_budget = runtime.last_budget.to_dict() if runtime.last_budget is not None else None
+        # Phase 17: measure report-build+format time on a throwaway first pass,
+        # then rebuild once more so the printed/exported report itself reports
+        # an accurate report_generation_seconds. Both build_report() calls are
+        # pure (no I/O, no engagement re-run) — the cost of the extra pass is
+        # negligible relative to the engagement itself.
+        report_start = time.monotonic()
+        _timing_report = build_report(
+            final_state, subgraph, config,
+            seed_results=seed_results,
+            policy_source=policy_source,
+            llm_budget=llm_budget,
+            total_runtime_seconds=total_runtime_seconds,
+            htb_machine_name=args.htb_machine_name,
+            htb_difficulty=args.htb_difficulty,
         )
-        with open(args.export_benchmark, "w", encoding="utf-8") as fh:
-            json.dump(benchmark_to_json_dict(bench), fh, indent=2, default=str)
-        print(f"Benchmark exported to {args.export_benchmark}")
+        format_text(_timing_report)
+        report_generation_seconds = time.monotonic() - report_start
 
-    if args.export_graph:
-        from apex_host.eval.export_graph import write_json
-        ekg_data = await export_ekg(runtime.api, f"host:{config.target}")
-        write_json(ekg_data, args.export_graph)
-        print(f"EKG exported to {args.export_graph}")
+        report = build_report(
+            final_state, subgraph, config,
+            seed_results=seed_results,
+            policy_source=policy_source,
+            llm_budget=llm_budget,
+            total_runtime_seconds=total_runtime_seconds,
+            report_generation_seconds=report_generation_seconds,
+            htb_machine_name=args.htb_machine_name,
+            htb_difficulty=args.htb_difficulty,
+        )
+        print(format_text(report))
 
-    if args.export_json:
-        write_report_json(report, args.export_json)
-        print(f"Run report exported to {args.export_json}")
+        if args.compare_with:
+            try:
+                with open(args.compare_with, encoding="utf-8") as fh:
+                    baseline_json = json.load(fh)
+                baseline_input = comparison_input_from_json_export(baseline_json)
+                candidate_input = comparison_input_from_report(report)
+                comparison = compare_reports(baseline_input, candidate_input)
+                print("\n" + format_comparison_text(comparison))
+                if args.export_comparison:
+                    with open(args.export_comparison, "w", encoding="utf-8") as fh:
+                        json.dump(comparison_to_json_dict(comparison), fh, indent=2, default=str)
+                    print(f"Comparison exported to {args.export_comparison}")
+            except Exception as exc:  # noqa: BLE001 - comparison is advisory, never fatal
+                logger.warning("run comparison failed (non-fatal): %s", exc)
+                print(f"warning: could not compare with {args.compare_with!r}: {exc}", file=sys.stderr)
 
-    try:
-        resolved_outcome = EngagementOutcome(report.outcome) if report.outcome else EngagementOutcome.internal_error
-    except ValueError:
-        resolved_outcome = EngagementOutcome.internal_error
-    return exit_code_for(resolved_outcome)
+        if args.export_benchmark:
+            from apex_host.eval.benchmark import benchmark_to_json_dict, compute_benchmark
+            bench = compute_benchmark(
+                report,
+                total_runtime_seconds=report.benchmark_total_runtime_seconds,
+                report_generation_seconds=report.benchmark_report_generation_seconds,
+                task_latency_log=report.task_latency_log,
+            )
+            with open(args.export_benchmark, "w", encoding="utf-8") as fh:
+                json.dump(benchmark_to_json_dict(bench), fh, indent=2, default=str)
+            print(f"Benchmark exported to {args.export_benchmark}")
+
+        if args.export_graph:
+            from apex_host.eval.export_graph import write_json
+            ekg_data = await export_ekg(runtime.api, f"host:{config.target}")
+            write_json(ekg_data, args.export_graph)
+            print(f"EKG exported to {args.export_graph}")
+
+        if args.export_json:
+            write_report_json(report, args.export_json)
+            print(f"Run report exported to {args.export_json}")
+
+        try:
+            resolved_outcome = EngagementOutcome(report.outcome) if report.outcome else EngagementOutcome.internal_error
+        except ValueError:
+            resolved_outcome = EngagementOutcome.internal_error
+        return exit_code_for(resolved_outcome)
+    finally:
+        await runtime.aclose()
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -31,6 +31,7 @@ SESSION_REDACTED_PLACEHOLDER : str
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 REDACTED_PLACEHOLDER: str = "[redacted]"
@@ -105,3 +106,43 @@ def redact_user_flag_output(text: str) -> str:
     if not text:
         return text
     return USER_FLAG_OUTPUT_REDACTED_PLACEHOLDER
+
+
+# Pattern-based secret redaction — for text whose secret VALUE is not
+# already known to the caller (unlike redact_session_text's substring
+# replacement, which needs the exact password string in hand). This
+# covers the case a raw provider/LLM exception message happens to echo
+# back a credential-shaped string (some SDKs include the submitted API
+# key verbatim in an "invalid key" error, e.g. "Incorrect API key
+# provided: sk-abc...def") — apex_host.llm.errors.describe_for_diagnostics
+# uses this so a provider error can be safely preserved in structured
+# diagnostics without ever being able to leak the configured
+# OPENAI_API_KEY value, even though that module never holds the key
+# itself. Intentionally the same shape of pattern already used by
+# apex_host.policy.llm_guard.LLMPolicyGuard.sanitize_messages's private
+# _SECRET_PATTERNS (not imported from there — that module's patterns stay
+# private to avoid touching its already-tested redaction-count bookkeeping;
+# a future consolidation could route both through one shared pattern list).
+_PATTERN_REDACTIONS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"), "[REDACTED_API_KEY]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED_AWS_KEY]"),
+    (re.compile(r"Bearer\s+[A-Za-z0-9._\-]{20,}", re.IGNORECASE), "Bearer [REDACTED_TOKEN]"),
+    (re.compile(r"\bghp_[A-Za-z0-9]{36}\b"), "[REDACTED_GITHUB_TOKEN]"),
+    (
+        re.compile(r"-----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----"),
+        "[REDACTED_PRIVATE_KEY]",
+    ),
+]
+
+
+def redact_secret_patterns(text: str) -> str:
+    """Scrub any credential-shaped substring from *text* by PATTERN, not by
+    a known value — safe to call on untrusted text whose secret content
+    (if any) is not known in advance, such as a raw provider exception
+    message. Returns *text* unchanged when nothing matches."""
+    if not text:
+        return text
+    result = text
+    for pattern, replacement in _PATTERN_REDACTIONS:
+        result = pattern.sub(replacement, result)
+    return result
