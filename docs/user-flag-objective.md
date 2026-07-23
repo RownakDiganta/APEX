@@ -2773,3 +2773,19 @@ Docker/VPN/a real HTB machine.
   execution alone, and access alone, remain non-success — verified user
   flag remains the only exit-code-0 outcome. `memfabric/` was not
   modified.
+
+## 22. Phase 25 — Final Architecture Integration & Live-Readiness
+
+Phase 25 completes the current Phase 1–25 architecture roadmap by
+integrating and hardening everything §1–§21 built, for controlled,
+authorized live testing — it changes nothing about the objective/
+capability model documented above. See
+[`docs/phase25-release-readiness.md`](phase25-release-readiness.md) for
+the full record: the centralized live-run safety interlock, the
+synthetic release-gate suite, the truthful capability support matrix, and
+the corrected `EngagementOutcome.goal_completed` exit-code entry (was
+`0`, inconsistent with its own `is_success_outcome() is False`
+classification; corrected to `1` — see `docs/engagement-outcomes.md`'s
+own Phase 25 correction note). `verify_user_flag()` and
+`user_flag_verified` remain exactly as documented throughout this file —
+unchanged by Phase 25.

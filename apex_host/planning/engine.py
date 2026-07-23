@@ -58,6 +58,7 @@ from memfabric.types import (
 
 from memfabric.ids import now
 
+from apex_host.llm.errors import PERMANENT_LLM_ERROR_CATEGORIES
 from apex_host.planning.models import PlanDecision, PlannedTask, PlannerOutput
 from apex_host.planning.prompt_builder import PromptBuilder
 from apex_host.planning.validator import Validator
@@ -412,6 +413,26 @@ class PlanningEngine:
         """
         from apex_host.llm.gateway import LLMCallContext, LLMCallPurpose
 
+        # Known-permanent-provider-error short-circuit — checked BEFORE
+        # repeated-context detection and BEFORE any budget reservation.
+        # Once ANY phase this run has confirmed a permanent provider
+        # misconfiguration (missing key, invalid model, authentication
+        # failure, unsupported endpoint, malformed response — see
+        # apex_host/llm/errors.py), retrying the SAME broken configuration
+        # from a different phase can never succeed: skip straight to the
+        # deterministic fallback without spending a real call or a budget
+        # slot. See apex_host.planning.budget.LLMBudgetTracker
+        # .record_permanent_provider_error's own docstring.
+        if self._budget is not None and self._budget.permanent_provider_error_category:
+            known_category = self._budget.permanent_provider_error_category
+            self._budget.record_fallback_only()
+            self._record_fallback(
+                phase,
+                llm_error_category=known_category,
+                repeated_plan_action="skipped_known_provider_error",
+            )
+            return await self._fallback.plan(goal, subgraph, evidence)
+
         # Repeated-context detection — same logic as direct path.
         ctx_hash = _context_hash(subgraph, evidence)
         if self._budget is not None and self._budget.is_context_repeated(phase.value, ctx_hash):
@@ -448,18 +469,26 @@ class PlanningEngine:
                 # Gateway returned non-success (budget exhausted, blocked, error, etc.)
                 # Do not retry — the gateway already handles provider retries internally.
                 _checkpoint = "blocked" if result.status.is_blocked else ""
+                # Prefer the gateway's fine-grained classification
+                # (missing_key/invalid_model/authentication_failure/...)
+                # when available; fall back to the coarse LLMCallStatus
+                # value (budget_exhausted/prompt_blocked/...) otherwise —
+                # error_category is only populated for provider_error/timeout.
+                _category = result.error_category or result.status.value
                 logger.info(
-                    "planning_engine[gateway]: status=%s phase=%s — falling back",
-                    result.status.value, phase.value,
+                    "planning_engine[gateway]: status=%s category=%s phase=%s — falling back",
+                    result.status.value, _category, phase.value,
                 )
                 if self._budget is not None:
                     self._budget.record_fallback_only()
+                    if result.error_category in PERMANENT_LLM_ERROR_CATEGORIES:
+                        self._budget.record_permanent_provider_error(result.error_category)
                 self._record_fallback(
                     phase,
                     policy_checkpoint_status=_checkpoint,
                     redaction_count=result.redaction_count,
                     policy_block_reason=result.blocked_reason,
-                    llm_error_category=result.status.value,
+                    llm_error_category=_category,
                     llm_retry_count=_retry_count,
                 )
                 return await self._fallback.plan(goal, subgraph, evidence)

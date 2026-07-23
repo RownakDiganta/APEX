@@ -797,6 +797,33 @@ invalidates every live reference on shutdown. Dry-run guarantee: no
 `RuntimeReference` is ever minted while `config.dry_run=True`. Full
 design: [`docs/user-flag-objective.md`](docs/user-flag-objective.md) §21.
 
+**Final architecture integration & live-readiness (Phase 25):** completes
+the current Phase 1–25 architecture roadmap. A new centralized live-run
+safety interlock (`apex_host/eval/live_interlock.py`) is now the ONE place
+"may a live engagement start?" is decided — five independent
+confirmations (dry-run disabled, `--confirm-live`, a real in-scope
+target, a passing preflight), shared by both `container_entrypoint.py`
+and `run_htb_local.py` (which previously had no interlock at all). New
+`--preflight-only`/`--confirm-live` flags on `run_htb_local.py`, plus a
+runtime-cleanup fix (`runtime.aclose()` is now always called). A new
+synthetic release-gate suite (`uv run python -m apex_host.eval.release_gate`)
+runs twelve deterministic scenarios — SSH/DFR/remote-bounded-command
+success, no-capability failure, candidate-not-verified failure, runtime-
+reference expiry, authorization revocation, policy denial, dry-run,
+repair-path activation, duplicate evidence, restart/replay — proving the
+capability-evidence → discovery → runtime-activation → objective-
+verification pipeline behaves correctly (a test-suite result, never an
+engagement-success signal). `RunReport` gained `report_schema_version`. A
+real audit fix: `EngagementOutcome.goal_completed` mapped to exit code
+`0` despite already being correctly classified as non-success — corrected
+to `1`. **Completion of this phase makes APEX "a generic, capability-
+driven user-flag retrieval and verification framework for supported,
+already-obtained access paths" — not "a universal generic user-flag
+capturer for arbitrary machines."** Full design, capability support
+matrix, and the first-live-test runbook:
+[`docs/phase25-release-readiness.md`](docs/phase25-release-readiness.md),
+[`docs/first-live-test-runbook.md`](docs/first-live-test-runbook.md).
+
 **Safety**: `ApexConfig.dry_run` defaults to `True`. Every command execution
 path goes through `apex_host/tools/runner.py`, which checks
 `apex_host/tools/safety.py` first (allowlist + unconditional destructive-
@@ -913,6 +940,30 @@ work unprivileged inside this container (`-sT` is required) — see
 capability investigation. Full detail on every installed/excluded tool,
 the build design, and all nine parts of this phase's runtime validation:
 [`docs/kali-container.md`](docs/kali-container.md).
+
+**`-sT` is now emitted automatically (Phase 1 live-test fix).** The first
+authorized live HTB test confirmed this finding in practice: all six Nmap
+tasks executed through the Kali service failed (`Couldn't open a raw
+socket... QUITTING!`) because `ReconPlanner` had never been updated to
+account for it. `apex_host.tools.backend.backend_supports_raw_sockets(config)`
+is the single capability seam that now decides this — it returns `False`
+for `tool_backend="remote"` (assumed non-root, matching this container's
+own documented design) and `True` for `"local"`/`"dry-run"` (unchanged
+prior behavior), and `ReconPlanner` prepends `-sT` to its nmap args
+whenever it is `False`. Override the automatic derivation explicitly with
+`--tool-backend-raw-socket-capable` / `--no-tool-backend-raw-socket-capable`
+on `apex_host.main` or `apex_host.eval.run_htb_local` (or
+`ApexConfig.tool_backend_raw_socket_capable: bool | None`) if a specific
+deployment's real privilege differs from the default assumption (e.g. a
+remote backend explicitly granted `NET_RAW`). A failed nmap execution is
+also now classified into a bounded diagnostic vocabulary
+(`apex_host.parsers.nmap_parser.classify_nmap_error`) —
+`"raw_socket_permission_denied"` when the known permission-failure text is
+detected, `"nmap_execution_failed"` for any other nonzero-exit failure,
+`""` on success — surfaced as `error_category` on the tool result and
+therefore in the episode/report, never used to fabricate a fake successful
+port/service discovery (that remains driven entirely by whether the output
+text matches nmap's real format).
 
 **Docker Compose integration (Infra Phase 7):** `compose.yaml` wires the
 APEX application and Kali tool-service images together on a dedicated,
@@ -1290,6 +1341,101 @@ engine = PlanningEngine(
 `OpenAIModelRouter` reads `OPENAI_API_KEY` and `OPENAI_BASE_URL` from the
 environment — API keys are never hardcoded.
 
+### LLM error classification and readiness diagnostics (Phase 1 live-test fix)
+
+The first authorized live HTB test enabled the LLM (`--use-llm`) and saw
+all 4 calls fail with a generic `provider_error` category, then silently
+continue in deterministic mode with no operator-visible signal — root
+cause: `ApexConfig.planner_model` defaults to `"openai/gpt-5.5"`, an
+OpenRouter-style, vendor-prefixed model id, valid **only** through
+OpenRouter and rejected by the real OpenAI API as an invalid model. This
+section documents the resulting diagnostics.
+
+**Exact supported configuration surface** (canonical field names — see
+`apex_host/config.py`):
+
+| CLI flag | `ApexConfig` field | Env var | Default |
+|---|---|---|---|
+| `--use-llm` | `use_llm: bool` | — | `False` |
+| `--llm-provider PROVIDER` | `llm_provider: str` | — | `"fake"` (no real calls) |
+| `--llm-model MODEL` | `planner_model` / `executor_model` / `parser_model: str` (set simultaneously) | — | `"openai/gpt-5.5"` |
+| `--llm-base-url URL` | `llm_base_url: str \| None` | `OPENAI_BASE_URL` (fallback; the CLI flag/field takes precedence) | `None` → `https://api.openai.com/v1` |
+| — (no CLI flag; shell history/`ps` risk) | — | `OPENAI_API_KEY` | unset |
+| `--llm-required` | `llm_required: bool` | — | `False` |
+
+**Resolution order:** `OpenAIModelRouter._base_url` = `config.llm_base_url`
+if set, else `$OPENAI_BASE_URL`, else the real OpenAI API. The API key is
+**always** read from `$OPENAI_API_KEY` at the moment the client is
+constructed — never stored on `ApexConfig`, never accepted as a CLI flag,
+never logged. Export it once per shell session:
+
+```bash
+export OPENAI_API_KEY=sk-...          # never pass this as a CLI flag
+```
+
+**Fine-grained failure classification** (`apex_host/llm/errors.py`,
+`LLMErrorCategory`) replaces the old generic `provider_error`/`timeout`
+categories previously produced by the gateway path
+(`apex_host.llm.gateway.LLMGateway`, the only path production actually
+uses) with: `missing_key`, `authentication_failure`, `invalid_model`,
+`unsupported_endpoint`, `network_error`, `timeout`, `rate_limit`,
+`malformed_response`, `permanent_other`, `transient_other` — duck-typed
+from the raised exception's HTTP status / type name / message, without
+importing any provider SDK. **`missing_key` vs `invalid_model`:** the
+former means no credential was ever sent (nothing to authenticate);
+the latter means a credential **was** sent and the provider rejected the
+*model name* specifically — for the OpenRouter-style-id-against-real-OpenAI
+misconfiguration, the raised exception is a 404 whose message mentions the
+model, so it classifies as `invalid_model`, not `missing_key` or a generic
+`authentication_failure`. The original provider exception is preserved in
+diagnostics via `describe_for_diagnostics()`, bounded to 200 characters and
+pattern-scrubbed for credential-shaped substrings (`sk-...`, `AKIA...`,
+`Bearer ...`, `ghp_...`, private-key headers) via
+`apex_host.security.redaction.redact_secret_patterns` — the API key is
+never logged, whether by this module (which never holds it) or by a
+provider error message that happens to echo it back.
+
+**`--llm-required` fail-fast policy:** by default (`llm_required=False`,
+unchanged), any LLM failure — including a confirmed *permanent*
+misconfiguration — falls back to the deterministic planner silently, same
+as before this phase. Passing `--llm-required` together with `--use-llm`
+changes this: once a **permanent** category (`missing_key`,
+`authentication_failure`, `invalid_model`, `unsupported_endpoint`,
+`malformed_response`, `permanent_other` — never a transient one like
+`timeout`/`rate_limit`) is confirmed, the engagement terminates immediately
+with `outcome=llm_unavailable` (exit code `4`) instead of continuing to
+"pretend" to be LLM-guided after zero successful calls. This confirmation
+is shared across every phase's `PlanningEngine` instance
+(`LLMBudgetTracker.permanent_provider_error_category`) so a **second**
+phase never re-spends a budget slot or a real network call re-discovering
+the identical, already-known misconfiguration — it short-circuits straight
+to fallback (or, with `--llm-required`, straight to termination).
+
+**Bounded LLM readiness preflight** (`apex_host.eval.preflight`):
+- `check_llm_readiness(config)` — local only, no network — reports
+  provider, model, and base-URL **host** (never the full URL or the key
+  value) and whether `$OPENAI_API_KEY` is present.
+- `check_llm_model_compatibility(config)` — local only, no network — a
+  non-blocking **warning** (never a hard failure, to avoid rejecting a
+  valid-but-unusual configuration) when the configured model looks
+  OpenRouter-style but the base URL does not look like OpenRouter.
+- `probe_llm_readiness(config)` — the actual bounded network check: one
+  `GET {base_url}/models` request (the standard "list models" endpoint,
+  **zero completion tokens** — no chat/completion call is ever made),
+  distinguishing missing key / authentication failure / unsupported
+  endpoint / rate limit / network error / timeout, with a best-effort
+  (non-blocking) note when the configured model id is absent from the
+  returned list. Never run automatically as part of every preflight pass
+  (it is a real network call); `apex_host.eval.live_interlock
+  .evaluate_live_interlock()` adds it to the required checks only when
+  `config.llm_required=True`, so a live run that has declared it must be
+  LLM-guided cannot start against a confirmed-broken provider
+  configuration.
+
+Tests for all of the above never call the real OpenAI/OpenRouter API — see
+`tests/apex_host/test_phase1_live_debug.py`, which uses fake
+routers/LLMs and `httpx.MockTransport`-backed clients exclusively.
+
 ### Safety invariants
 
 - `PlanningEngine` is the **only** component that calls `ModelRouter.planner_llm()`.
@@ -1503,13 +1649,18 @@ python -m apex_host.eval.run_htb_local \
   --llm-model openai/gpt-5.5 \
   --llm-base-url https://openrouter.ai/api/v1
 
-# Via direct OpenAI API
+# Via direct OpenAI API — NOTE: the model id must be a bare OpenAI model
+# name (no "vendor/" prefix). "openai/gpt-5.5" is an OpenRouter-style id
+# and is REJECTED by the real OpenAI API as an invalid model — this is
+# the exact misconfiguration that caused the first live HTB test's LLM
+# calls to fail. See "LLM error classification and readiness diagnostics"
+# below.
 python -m apex_host.eval.run_htb_local \
   --target <HTB_TARGET_IP> \
   --payload-repo ./payloads \
   --dry-run \
   --use-llm \
-  --llm-model openai/gpt-5.5
+  --llm-model gpt-4o-mini
 ```
 
 Or in Python:

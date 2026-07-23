@@ -35,12 +35,14 @@ import httpx
 from apex_host.config import ApexConfig
 from apex_host.eval.check_config import validate_combinations
 from apex_host.knowledge.compiler.verify_compiled import verify_compiled
+from apex_host.llm.errors import base_url_host, looks_like_openrouter_style_model_id
 from apex_host.policy.policy_loader import _resolve_policy_path
 from apex_host.tools.backend import select_runtime_backend
 
 _HEALTH_TIMEOUT_SECONDS = 5.0
 _DEFAULT_SMOKE_TOOL = "curl"
 _DEFAULT_SMOKE_ARGS = ["--version"]
+_DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 
 # ---------------------------------------------------------------------------
@@ -472,8 +474,17 @@ def check_llm_readiness(config: ApexConfig) -> PreflightCheck:
     credential, no contact. When enabled with a real provider, verifies
     ``OPENAI_API_KEY`` is present (never its value) — never makes an
     external model request itself; that remains a separate, explicit
-    connectivity concern this function does not perform.
+    connectivity concern performed only by :func:`probe_llm_readiness`.
+
+    The ``detail`` string always reports, for operator visibility, the
+    resolved provider, the configured planner model identifier, and the
+    base URL *host only* (never the full URL — a base URL can carry a
+    path/query an operator might not expect to be echoed, and the host is
+    the only part that matters for "which provider am I actually talking
+    to"). The API key value itself is never included, only whether one is
+    present.
     """
+    host = base_url_host(config.llm_base_url or os.environ.get("OPENAI_BASE_URL") or _DEFAULT_OPENAI_BASE_URL)
     if not config.use_llm:
         return PreflightCheck(
             name="LLM readiness", passed=True,
@@ -484,14 +495,176 @@ def check_llm_readiness(config: ApexConfig) -> PreflightCheck:
             name="LLM readiness", passed=True,
             detail=f"llm_provider={config.llm_provider!r} — no credentials required",
         )
-    if not os.environ.get("OPENAI_API_KEY"):
+    key_present = bool(os.environ.get("OPENAI_API_KEY"))
+    if not key_present:
         return PreflightCheck(
             name="LLM readiness", passed=False,
-            detail=f"use_llm=True with llm_provider={config.llm_provider!r} requires $OPENAI_API_KEY",
+            detail=(
+                f"missing_key: use_llm=True with llm_provider={config.llm_provider!r} "
+                f"(model={config.planner_model!r}, base_url_host={host!r}) requires $OPENAI_API_KEY"
+            ),
         )
     return PreflightCheck(
         name="LLM readiness", passed=True,
-        detail=f"llm_provider={config.llm_provider!r}, credential present",
+        detail=(
+            f"llm_provider={config.llm_provider!r}, model={config.planner_model!r}, "
+            f"base_url_host={host!r}, credential present"
+        ),
+    )
+
+
+def check_llm_model_compatibility(config: ApexConfig) -> PreflightCheck:
+    """Non-blocking (``required=False``) warning for the specific
+    misconfiguration class observed in the first live HTB test: an
+    OpenRouter-style, vendor-prefixed model id (e.g. ``"openai/gpt-5.5"``,
+    the ``ApexConfig.planner_model`` default) submitted to a base URL that
+    does not look like OpenRouter — most commonly the real OpenAI API,
+    which rejects vendor-prefixed model ids as "invalid model" errors.
+
+    This is deliberately a **warning**, not a hard failure: the heuristic
+    (does the model id contain a ``/``, does the base URL host contain
+    ``openrouter``) can have false positives — a self-hosted or proxy
+    deployment may validly use a similar model-naming convention against a
+    non-OpenRouter host. A confident, blocking rejection would violate the
+    "do not hardcode one model name into planner logic" constraint by
+    effectively hardcoding an opinion about naming conventions; a
+    clearly-worded warning gives the operator the same signal without
+    silently blocking a valid, unusual configuration.
+    """
+    if not config.use_llm or config.llm_provider in ("fake", ""):
+        return PreflightCheck(
+            name="LLM model/provider compatibility", passed=True,
+            detail="use_llm=False or llm_provider='fake' — no compatibility check needed",
+            required=False,
+        )
+    base_url = config.llm_base_url or os.environ.get("OPENAI_BASE_URL") or _DEFAULT_OPENAI_BASE_URL
+    host = base_url_host(base_url)
+    model = config.planner_model
+    if looks_like_openrouter_style_model_id(model) and "openrouter" not in host:
+        return PreflightCheck(
+            name="LLM model/provider compatibility", passed=False,
+            detail=(
+                f"model={model!r} looks OpenRouter-style (vendor-prefixed) but base_url_host={host!r} "
+                "does not look like OpenRouter — if this base URL is the real OpenAI API, the model id "
+                "will likely be rejected as invalid; set --llm-model to a bare OpenAI model id, or set "
+                "--llm-base-url to an OpenRouter-compatible endpoint"
+            ),
+            required=False,
+        )
+    return PreflightCheck(
+        name="LLM model/provider compatibility", passed=True,
+        detail=f"model={model!r} and base_url_host={host!r} — no known mismatch",
+        required=False,
+    )
+
+
+async def probe_llm_readiness(
+    config: ApexConfig,
+    *,
+    timeout_seconds: float = _HEALTH_TIMEOUT_SECONDS,
+    client: httpx.AsyncClient | None = None,
+) -> PreflightCheck:
+    """Bounded, low-token LLM provider readiness probe: exactly one
+    ``GET {base_url}/models`` request — the standard OpenAI-compatible
+    "list models" endpoint, which costs **zero completion tokens** (no
+    chat/completion call is ever made) and is supported by both the real
+    OpenAI API and OpenRouter. Never performed automatically as part of
+    every preflight pass — unlike :func:`check_llm_readiness` (a purely
+    local, no-network check), this makes a real network call and depends
+    on external provider availability, so callers opt in explicitly
+    (:func:`apex_host.eval.live_interlock.evaluate_live_interlock` adds it
+    only when ``config.llm_required`` is set).
+
+    Distinguishes, via the response, the same failure categories
+    :mod:`apex_host.llm.errors` classifies at call time: missing key
+    (checked locally, no request made), authentication failure (401/403),
+    unsupported endpoint (404 — often means the base URL is wrong for this
+    provider), rate limit (429), network error, and timeout. On success,
+    best-effort (never a hard failure) notes when the configured planner
+    model id is not present in the returned model list — some providers'
+    list endpoints are incomplete or paginated, so absence from the list
+    is informational only, not proof the model is invalid.
+
+    The API key is read from the environment and is **never** included in
+    any request URL, header value logged, or returned detail string.
+
+    *client* is injectable for tests, matching every other network check
+    in this module — tests must never let this function reach the real
+    OpenAI/OpenRouter API.
+    """
+    if not config.use_llm or config.llm_provider in ("fake", ""):
+        return PreflightCheck(
+            name="LLM provider probe", passed=True,
+            detail="use_llm=False or llm_provider='fake' — no probe performed", required=False,
+        )
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return PreflightCheck(
+            name="LLM provider probe", passed=False,
+            detail="missing_key: $OPENAI_API_KEY is not set",
+        )
+    base_url = (config.llm_base_url or os.environ.get("OPENAI_BASE_URL") or _DEFAULT_OPENAI_BASE_URL).rstrip("/")
+    host = base_url_host(base_url)
+    url = f"{base_url}/models"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        if client is not None:
+            response = await client.get(url, headers=headers, timeout=timeout_seconds)
+        else:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as owned_client:
+                response = await owned_client.get(url, headers=headers)
+    except httpx.TimeoutException:
+        return PreflightCheck(
+            name="LLM provider probe", passed=False,
+            detail=f"timeout: GET /models at {host!r} did not respond within {timeout_seconds}s",
+        )
+    except httpx.RequestError as exc:
+        return PreflightCheck(
+            name="LLM provider probe", passed=False,
+            detail=f"network_error: GET /models at {host!r} failed: {exc.__class__.__name__}",
+        )
+
+    if response.status_code in (401, 403):
+        return PreflightCheck(
+            name="LLM provider probe", passed=False,
+            detail=f"authentication_failure: GET /models at {host!r} -> HTTP {response.status_code}",
+        )
+    if response.status_code == 404:
+        return PreflightCheck(
+            name="LLM provider probe", passed=False,
+            detail=(
+                f"unsupported_endpoint: GET /models at {host!r} -> HTTP 404 "
+                "(base URL may be wrong for this provider)"
+            ),
+        )
+    if response.status_code == 429:
+        return PreflightCheck(
+            name="LLM provider probe", passed=False,
+            detail=f"rate_limit: GET /models at {host!r} -> HTTP 429",
+        )
+    if response.status_code != 200:
+        return PreflightCheck(
+            name="LLM provider probe", passed=False,
+            detail=f"provider_error: GET /models at {host!r} -> HTTP {response.status_code}",
+        )
+
+    model_note = ""
+    try:
+        payload: Any = response.json()
+        if isinstance(payload, dict):
+            ids = {
+                str(item.get("id"))
+                for item in payload.get("data", [])
+                if isinstance(item, dict)
+            }
+            if ids and config.planner_model not in ids:
+                model_note = f"; note: configured model {config.planner_model!r} not found in the returned model list"
+    except ValueError:
+        pass
+
+    return PreflightCheck(
+        name="LLM provider probe", passed=True,
+        detail=f"GET /models at {host!r} -> HTTP 200, provider reachable and authenticated{model_note}",
     )
 
 
@@ -724,6 +897,7 @@ def run_local_checks(
         check_compiled_knowledge(config.knowledge_root),
         check_policy(config, required=policy_required),
         check_llm_readiness(config),
+        check_llm_model_compatibility(config),
         check_htb_profile_configured(config.htb_ovpn_path, required=htb_profile_required),
     ]
 

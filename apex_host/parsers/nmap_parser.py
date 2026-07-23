@@ -28,6 +28,56 @@ _PORT_RE = re.compile(
 # ambiguity exists; we include it so UDP recon is not silently dropped.
 _OPEN_STATES: frozenset[str] = frozenset({"open", "open|filtered"})
 
+# Substrings (matched case-insensitively) nmap prints to stderr when it
+# cannot open a raw socket — the exact failure mode of a non-root
+# execution backend (e.g. the Kali tool-service container, which runs as
+# a non-root user with zero added Linux capabilities — see
+# docs/kali-container.md §5/§14) attempting a scan mode that requires
+# CAP_NET_RAW/root (nmap's default "-sV" alone implies a SYN scan; it does
+# NOT automatically fall back to a TCP-connect scan on permission
+# failure — it exits nonzero and prints exactly this). Verified live text,
+# recorded in docs/kali-container.md §5:
+#   "Couldn't open a raw socket. Error: (1) Operation not permitted
+#    Couldn't open a raw socket or eth handle.
+#    QUITTING!"
+_RAW_SOCKET_PERMISSION_MARKERS: tuple[str, ...] = (
+    "couldn't open a raw socket",
+    "requires root privileges",
+)
+
+#: Fixed, small diagnostic-error vocabulary for nmap task results — used
+#: only for structured diagnostics (never for parsing/EKG-write decisions,
+#: which remain driven entirely by whether stdout actually matches
+#: ``_PORT_RE``). Empty string means "nmap reported success" (returncode 0
+#: and no transport-level error); every other value is a nonzero-exit
+#: failure, classified as precisely as the fixed vocabulary allows.
+NMAP_ERROR_CATEGORY_SUCCESS = ""
+NMAP_ERROR_CATEGORY_RAW_SOCKET_PERMISSION_DENIED = "raw_socket_permission_denied"
+NMAP_ERROR_CATEGORY_EXECUTION_FAILED = "nmap_execution_failed"
+
+
+def classify_nmap_error(returncode: int, stdout: str, stderr: str) -> str:
+    """Classify why an nmap invocation failed, for structured diagnostics
+    only — never affects EKG parsing, which is driven purely by whether
+    ``output`` matches the expected nmap text format (see
+    :meth:`NmapParser.parse_text`).
+
+    Returns :data:`NMAP_ERROR_CATEGORY_SUCCESS` (``""``) when *returncode*
+    is ``0`` — there is nothing to classify. Otherwise returns
+    :data:`NMAP_ERROR_CATEGORY_RAW_SOCKET_PERMISSION_DENIED` when *stderr*
+    (or, defensively, *stdout* — some environments interleave nmap's
+    diagnostic output onto stdout) contains one of the known raw-socket
+    permission-failure markers, or the generic
+    :data:`NMAP_ERROR_CATEGORY_EXECUTION_FAILED` for any other nonzero-exit
+    failure (host down, invalid target, unreachable network, ...).
+    """
+    if returncode == 0:
+        return NMAP_ERROR_CATEGORY_SUCCESS
+    combined = f"{stderr}\n{stdout}".lower()
+    if any(marker in combined for marker in _RAW_SOCKET_PERMISSION_MARKERS):
+        return NMAP_ERROR_CATEGORY_RAW_SOCKET_PERMISSION_DENIED
+    return NMAP_ERROR_CATEGORY_EXECUTION_FAILED
+
 
 def _extract_tech(version_str: str) -> tuple[str, str] | None:
     """Return (display_name, version_string) from an nmap version field, or None.

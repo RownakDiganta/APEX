@@ -62,12 +62,11 @@ from apex_host.config_env import (
     load_env_file,
     merge_log_level,
 )
+from apex_host.eval.live_interlock import evaluate_live_interlock
 from apex_host.eval.preflight import (
     PreflightResult,
-    check_live_confirmation,
     run_local_checks,
     run_smoke_checks,
-    run_vpn_checks,
 )
 
 _DEFAULT_REPORT_DIR = "/app/run_reports"
@@ -322,6 +321,13 @@ async def _handle_dry_run(args: argparse.Namespace) -> int:
 
 
 async def _handle_run(args: argparse.Namespace) -> int:
+    """Phase 25: dispatches through the ONE centralized live-run safety
+    interlock (``apex_host.eval.live_interlock.evaluate_live_interlock``)
+    rather than this function's own ad-hoc confirmation + preflight
+    sequence — ``apex_host.eval.run_htb_local``'s live-mode gate uses the
+    exact same function, so the two entrypoints can never drift apart on
+    what "may a live engagement start?" means.
+    """
     try:
         config = _build_config(args, require_target=True)
     except EnvConfigError as exc:
@@ -329,28 +335,15 @@ async def _handle_run(args: argparse.Namespace) -> int:
         return 2
     _print_config_summary(config)
 
-    live_check = check_live_confirmation(confirmed=args.confirm_live, dry_run=config.dry_run)
-    checks = [live_check]
-    if not live_check.passed:
-        result = PreflightResult(checks)
-        _emit_result(result, json_output=args.json_output)
-        return 1
-
-    checks.extend(run_local_checks(
-        config, default_report_dir=args.report_dir,
+    interlock = await evaluate_live_interlock(
+        config, confirmed=args.confirm_live, default_report_dir=args.report_dir,
         report_path=args.export_json, graph_path=args.export_graph,
-        policy_required=True,
-    ))
-    if config.tool_backend == "remote":
-        from apex_host.eval.preflight import check_remote_smoke, check_tool_service_health
-
-        checks.append(await check_tool_service_health(config.tool_service_url))
-        checks.append(await check_remote_smoke(config))
-    checks.extend(await run_vpn_checks(config))
-
-    result = PreflightResult(checks)
-    _emit_result(result, json_output=args.json_output)
-    if not result.passed:
+    )
+    if args.json_output:
+        print(json.dumps(interlock.to_dict(), indent=2, sort_keys=True))
+    else:
+        print(interlock.format_text())
+    if not interlock.permitted:
         return 1
     return await _run_engagement_and_report(config, args)
 

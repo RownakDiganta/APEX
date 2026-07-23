@@ -533,6 +533,10 @@ def test_arch_10_apex_config_construction_only_in_approved_files() -> None:
     approved = {
         "apex_host/config.py",           # from_cli_args classmethod
         "apex_host/eval/run_synthetic_machine.py",  # direct construction (minimal)
+        # Phase 25 — a synthetic, no-CLI evaluation harness exactly like
+        # run_synthetic_machine.py above; constructs ApexConfig directly
+        # for the same reason (no argparse.Namespace to build from).
+        "apex_host/eval/release_gate.py",
     }
     violations: list[str] = []
     for path in _apex_production_py_files():

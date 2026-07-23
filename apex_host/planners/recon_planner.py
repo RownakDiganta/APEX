@@ -66,9 +66,21 @@ _MAX_BANNER_TASKS: int = 3
 class _ReconDeterministic:
     """Pure rule-based recon planner — the fallback for PlanningEngine."""
 
-    def __init__(self, target: str, registry: ToolRegistry) -> None:
+    def __init__(
+        self, target: str, registry: ToolRegistry, *, raw_socket_capable: bool = True
+    ) -> None:
         self._target = target
         self._registry = registry
+        # Capability seam (apex_host.tools.backend.backend_supports_raw_sockets):
+        # when the execution backend lacks CAP_NET_RAW/root (the Kali
+        # tool-service container's own documented non-root, zero-capability
+        # design — docs/kali-container.md §5/§14), nmap's default scan mode
+        # ("-sV" alone implies a SYN scan) hard-fails with "Couldn't open a
+        # raw socket... QUITTING!" rather than falling back automatically.
+        # raw_socket_capable=True (the default) preserves the exact
+        # pre-existing scan args for every caller that does not pass this
+        # parameter explicitly.
+        self._raw_socket_capable = raw_socket_capable
 
     async def plan(
         self, goal: Goal, subgraph: SubgraphView, evidence: EvidenceBundle
@@ -89,6 +101,13 @@ class _ReconDeterministic:
         if self._registry.get("nmap") is None:
             return AbandonSignal(reason="nmap not available in allowed_tools")
         host_node_id = f"host:{self._target}"
+        # -sT (TCP connect scan) is required, not optional, when the
+        # backend cannot open raw sockets — without it nmap's default scan
+        # mode hard-fails with a permission error and produces no port/
+        # service data at all (nmap does not silently fall back to -sT on
+        # its own). Prepended, never appended, to match the documented
+        # `nmap -sT -sV -T4 <target>` command shape exactly.
+        scan_mode_args = [] if self._raw_socket_capable else ["-sT"]
         return [
             TaskSpec(
                 id=new_id(),
@@ -99,7 +118,7 @@ class _ReconDeterministic:
                     # -Pn skips host-discovery ping — required on HTB networks
                     # where ICMP is blocked; without it nmap reports "host down"
                     # and exits with rc=1 even when the target is reachable.
-                    "args": ["-sV", "-T4", "-Pn", self._target],
+                    "args": [*scan_mode_args, "-sV", "-T4", "-Pn", self._target],
                     "target": self._target,
                     "parser": "nmap",
                 },
@@ -193,8 +212,9 @@ class ReconPlanner:
         budget_tracker: "LLMBudgetTracker | None" = None,
         guard: "LLMPolicyGuard | None" = None,
         gateway: "LLMGateway | None" = None,
+        raw_socket_capable: bool = True,
     ) -> None:
-        self._core = _ReconDeterministic(target, registry)
+        self._core = _ReconDeterministic(target, registry, raw_socket_capable=raw_socket_capable)
         self._engine: PlanningEngine | None = None
         self._last_decision: PlanDecision | None = None
         if model_router is not None:

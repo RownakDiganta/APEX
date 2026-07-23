@@ -126,6 +126,12 @@ class RunReport:
     error_samples: list[str]            # up to 3 error strings from failed turns
     evidence_samples: list[str]         # text snippets from last evidence
     last_error: str | None
+    # Phase 25 — increment whenever a field is added, removed, or its
+    # meaning changes in a backward-incompatible way. Exposed in both
+    # format_text() and to_json_dict() so a downstream consumer (a CI
+    # pipeline, a comparison tool) can detect an incompatible report shape
+    # rather than silently misreading a renamed/missing field.
+    report_schema_version: str = "1"
     planner_decisions: list[dict[str, Any]] = field(default_factory=list)
     # Accumulated planner audit log: one PlanDecision.to_dict() per invocation.
 
@@ -994,6 +1000,7 @@ _OUTCOME_HEADLINE: dict[EngagementOutcome, tuple[str, str]] = {
     EngagementOutcome.tool_failure: ("FAILED", "tool/backend failure"),
     EngagementOutcome.memory_failure: ("FAILED", "memory failure"),
     EngagementOutcome.unknown_phase: ("FAILED", "unroutable phase"),
+    EngagementOutcome.llm_unavailable: ("FAILED", "LLM required but provider unavailable"),
     EngagementOutcome.configuration_failure: ("FAILED", "configuration error"),
     EngagementOutcome.internal_error: ("FAILED", "internal error"),
     EngagementOutcome.cancelled: ("CANCELLED", "user interrupted run"),
@@ -1024,7 +1031,7 @@ def format_text(report: RunReport) -> str:
     lines += [
         "",
         _SEP,
-        " APEX HTB Engagement Report",
+        f" APEX HTB Engagement Report (schema v{report.report_schema_version})",
         f" Target : {report.target}   Mode : {report.mode}",
         f" Status : {report.status.upper()}   Successful : {success_label}",
         f" Outcome: {outcome_headline(report)}",
@@ -1437,6 +1444,7 @@ def format_text(report: RunReport) -> str:
 def to_json_dict(report: RunReport) -> dict[str, Any]:
     """Return a JSON-serialisable dict of the full report."""
     return {
+        "report_schema_version": report.report_schema_version,
         "target": report.target,
         "mode": report.mode,
         "turns_used": report.turns_used,

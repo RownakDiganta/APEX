@@ -382,6 +382,10 @@ class TaskDispatcher:
         disposition: ExecutionDisposition
         tr_dict: dict[str, Any]
 
+        logger.info(
+            "dispatcher: executing [%s] tool=%r target=%r task_id=%s",
+            phase, tool, target, task.id,
+        )
         try:
             if tool == "browser":
                 tr_dict, disposition = await self._run_browser(task, context, args, target, parser, phase)
@@ -448,6 +452,18 @@ class TaskDispatcher:
                 repairable=False,
                 audit_metadata={"policy_decision": pd_meta},
             )
+
+        logger.info(
+            "dispatcher: completed [%s] tool=%r target=%r task_id=%s disposition=%s "
+            "returncode=%r error_category=%r timed_out=%r",
+            phase, tool, target, task.id, disposition.value,
+            tr_dict.get("returncode"), tr_dict.get("error_category", ""),
+            tr_dict.get("timed_out", False),
+        )
+        logger.debug(
+            "dispatcher: task_id=%s stdout=%r stderr=%r",
+            task.id, str(tr_dict.get("stdout", ""))[:500], str(tr_dict.get("stderr", ""))[:500],
+        )
 
         # ── 6. Record final status ────────────────────────────────────────
         final_status = (
@@ -527,6 +543,19 @@ class TaskDispatcher:
             # including dry-run, where it is ~0).
             "duration_seconds": result.duration_seconds,
         }
+        if tool == "nmap":
+            # Live-test debugging fix (Phase 1 of 4): classify WHY nmap
+            # failed (e.g. a raw-socket permission failure on a non-root
+            # backend) into a bounded diagnostic vocabulary, distinct from
+            # the generic "error"/"returncode" fields — flows automatically
+            # into episode.data via the existing tr-dict spread in
+            # apex_host/orchestration/memory_node.py, no further plumbing
+            # needed. Never affects parsing/EKG-write decisions.
+            from apex_host.parsers.nmap_parser import classify_nmap_error
+
+            tr["error_category"] = classify_nmap_error(
+                result.returncode, result.stdout, result.stderr
+            )
         return tr, disposition
 
     async def _run_telnet(
