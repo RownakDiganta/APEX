@@ -462,11 +462,22 @@ class TestLoadPolicy:
 
     def test_load_policy_no_file_conservative_default(self) -> None:
         # Ensure no YAML file interferes by using a non-existent path and no
-        # knowledge_root, and patching away the default fallback.
+        # knowledge_root, and patching away both the default fallback and
+        # its case-sensitive-filesystem fallback (the raw, git-tracked
+        # `Knowledge/` directory name — see policy_loader.py's module
+        # docstring) — both candidate paths must be neutralized, or the
+        # real, committed `Knowledge/policy_db/compiled/hackthebox_lab.yaml`
+        # would still resolve on a case-sensitive checkout.
         cfg = _make_config(target="10.10.10.14")
-        with patch(
-            "apex_host.policy.policy_loader._DEFAULT_POLICY_YAML",
-            pathlib.Path("/no/such/file.yaml"),
+        with (
+            patch(
+                "apex_host.policy.policy_loader._DEFAULT_POLICY_YAML",
+                pathlib.Path("/no/such/file.yaml"),
+            ),
+            patch(
+                "apex_host.policy.policy_loader._DEFAULT_POLICY_YAML_CASE_FALLBACK",
+                pathlib.Path("/no/such/file-case-fallback.yaml"),
+            ),
         ):
             policy = load_policy(cfg)
         assert policy.policy_loaded is False
