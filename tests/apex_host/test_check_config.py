@@ -187,8 +187,63 @@ class TestValidationRules:
     async def test_llm_enabled_with_real_provider_and_key_valid(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # Phase 5: use_llm=True with a real provider also requires an
+        # explicit native model — there is no provider-neutral default.
         monkeypatch.setenv("OPENAI_API_KEY", "sk-abc")
-        code, _, _ = await _run(["--use-llm", "--llm-provider", "openai"])
+        code, _, _ = await _run([
+            "--use-llm", "--llm-provider", "openai", "--llm-model", "gpt-4o-mini",
+        ])
+        assert code == 0
+
+    @pytest.mark.asyncio
+    async def test_llm_enabled_with_real_provider_and_key_but_no_model_fails(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Phase 5: a valid credential alone is not sufficient — an
+        explicit model is also required, since no provider-neutral default
+        model exists anywhere in this codebase."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-abc")
+        code, out, _ = await _run(["--use-llm", "--llm-provider", "openai"])
+        assert code == 1
+        assert "model" in out.lower()
+
+    @pytest.mark.asyncio
+    async def test_llm_enabled_openai_with_router_style_model_fails_as_mismatch(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Phase 5: the exact old root-cause configuration — provider=openai
+        with a router-style ("vendor/model") model identifier — is rejected
+        as a provider_model_mismatch, not silently accepted."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-abc")
+        code, out, _ = await _run([
+            "--use-llm", "--llm-provider", "openai", "--llm-model", "openai/gpt-5.5",
+        ])
+        assert code == 1
+        assert "provider_model_mismatch" in out
+
+    @pytest.mark.asyncio
+    async def test_llm_enabled_anthropic_requires_anthropic_key_not_openai_key(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Phase 5: credential isolation — an OPENAI_API_KEY present does
+        not satisfy provider='anthropic'; only ANTHROPIC_API_KEY does."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-abc-not-for-anthropic")
+        code, out, _ = await _run([
+            "--use-llm", "--llm-provider", "anthropic", "--llm-model", "claude-sonnet-4-5-20250929",
+        ])
+        assert code == 1
+        assert "ANTHROPIC_API_KEY" in out
+
+    @pytest.mark.asyncio
+    async def test_llm_enabled_anthropic_with_key_and_model_valid(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-abc")
+        code, _, _ = await _run([
+            "--use-llm", "--llm-provider", "anthropic",
+            "--llm-model", "claude-sonnet-4-5-20250929",
+        ])
         assert code == 0
 
     @pytest.mark.asyncio

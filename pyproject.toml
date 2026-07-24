@@ -15,7 +15,18 @@ dependencies = [
     "playwright>=1.40",
     "pydantic>=2.0",
     "langchain-core>=0.3",
-    "langchain-openai>=0.2",
+    # Phase 5 — native LLM provider adapters (apex_host/llm/providers/).
+    # langchain-openai was REMOVED here: it is no longer imported anywhere
+    # (apex_host/llm/router.py's OpenAIModelRouter previously built a
+    # LangChain ChatOpenAI object; it now builds
+    # apex_host.llm.providers.openai.OpenAIProvider directly against the
+    # official openai SDK). openai>=1.0 was already present transitively
+    # (via langchain-openai) but is now a direct, explicit dependency since
+    # apex_host/llm/providers/openai.py and openrouter.py import it
+    # directly. anthropic is a new direct dependency for
+    # apex_host/llm/providers/anthropic.py's native Messages API adapter.
+    "openai>=1.50",
+    "anthropic>=0.40",
     "python-dotenv>=1.0",
     "PyYAML>=6.0",
     "fastapi>=0.110",
@@ -52,7 +63,10 @@ python_version = "3.11"
 files = ["memfabric", "apex_host", "apex_tool_service"]
 
 [[tool.mypy.overrides]]
-module = ["langgraph.*", "faiss", "playwright.*", "langchain_core.*", "langchain_openai.*", "dotenv", "rank_bm25"]
+# openai and anthropic both ship inline type hints (py.typed) and are
+# intentionally NOT listed here — mypy --strict type-checks against them
+# directly once installed.
+module = ["langgraph.*", "faiss", "playwright.*", "langchain_core.*", "dotenv", "rank_bm25"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

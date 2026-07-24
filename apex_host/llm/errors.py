@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from enum import Enum
 
+from apex_host.llm.types import OFFICIAL_BASE_URL
+
 __all__ = [
     "LLMErrorCategory",
     "PERMANENT_LLM_ERROR_CATEGORIES",
@@ -33,6 +35,8 @@ __all__ = [
     "classify_llm_exception",
     "classify_missing_key",
     "describe_for_diagnostics",
+    "detect_provider_model_mismatch",
+    "detect_base_url_provider_mismatch",
 ]
 
 
@@ -80,6 +84,16 @@ class LLMErrorCategory(str, Enum):
     #: A transient-shaped (5xx, connection, or unclassified) error that
     #: does not match any more specific category above.
     transient_other = "transient_other"
+    #: Phase 5 (native OpenAI/Anthropic providers) — the configured
+    #: ``llm_provider`` and the configured model identifier are
+    #: syntactically incompatible (e.g. ``provider="openai"`` with a
+    #: router-style ``"vendor/model"`` identifier, or ``provider="openai"``/
+    #: ``"anthropic"`` with a base URL that looks like OpenRouter's own
+    #: endpoint). Detected BEFORE any network call — see
+    #: :func:`detect_provider_model_mismatch` /
+    #: :func:`detect_base_url_provider_mismatch`. Always permanent: no
+    #: retry of the same configuration can ever succeed.
+    provider_model_mismatch = "provider_model_mismatch"
 
 
 #: Categories for which retrying the exact same request can never
@@ -93,6 +107,7 @@ PERMANENT_LLM_ERROR_CATEGORIES: frozenset[LLMErrorCategory] = frozenset({
     LLMErrorCategory.unsupported_endpoint,
     LLMErrorCategory.malformed_response,
     LLMErrorCategory.permanent_other,
+    LLMErrorCategory.provider_model_mismatch,
 })
 
 #: Categories for which a later attempt (this call's bounded retry, or a
@@ -165,6 +180,16 @@ def classify_llm_exception(exc: Exception) -> LLMErrorCategory:
     exc_type = type(exc).__name__
     message = str(exc).lower()
 
+    # Phase 5 — checked first: these are our OWN raised exception types
+    # (apex_host.llm.providers.base), never a provider SDK's own exception,
+    # so they take unconditional priority over any status/message heuristic.
+    if exc_type == "ProviderModelMismatchError":
+        return LLMErrorCategory.provider_model_mismatch
+    if exc_type == "MissingCredentialError":
+        return LLMErrorCategory.missing_key
+    if exc_type == "EmptyResponseError":
+        return LLMErrorCategory.malformed_response
+
     if status == 401 or exc_type.endswith("AuthenticationError"):
         # A raised auth error with no key configured at all is reported
         # as missing_key (a clearer operator-facing signal than "the
@@ -178,7 +203,17 @@ def classify_llm_exception(exc: Exception) -> LLMErrorCategory:
         return LLMErrorCategory.unsupported_endpoint
     if status == 429 or exc_type.endswith("RateLimitError"):
         return LLMErrorCategory.rate_limit
-    if exc_type in ("TimeoutError", "ReadTimeout", "ConnectTimeout") or "timeout" in message or "timed out" in message:
+    if (
+        exc_type in ("TimeoutError", "ReadTimeout", "ConnectTimeout", "APITimeoutError")
+        or "timeout" in message
+        or "timed out" in message
+    ):
+        # APITimeoutError is the real exception type name raised by both the
+        # official openai and anthropic Python SDKs (each subclasses their
+        # own APIConnectionError for this specific case) — checked by exact
+        # type name, BEFORE the network_error branch below, since a bare
+        # endswith("ConnectionError") match would otherwise also catch it
+        # but classify it as the less specific network_error category.
         return LLMErrorCategory.timeout
     if exc_type.endswith(("ConnectionError", "APIConnectionError")) or any(
         marker in message for marker in _NETWORK_MARKERS
@@ -241,12 +276,89 @@ def base_url_host(base_url: str | None) -> str:
 def looks_like_openrouter_style_model_id(model: str) -> bool:
     """Heuristic: OpenRouter (and similar aggregators) use
     ``vendor/model`` identifiers (e.g. ``openai/gpt-5.5``,
-    ``anthropic/claude-3.5``); the real OpenAI API's own model IDs never
-    contain a ``/``. Used only to WARN — never to reject — when
-    ``llm_provider="openai"`` with no base-URL override is combined with
-    a slash-containing model name, since this exact combination is what
-    caused the live-test failure this phase investigates (the model ID
-    was valid for OpenRouter but invalid against the real
-    ``api.openai.com``).
+    ``anthropic/claude-3.5``); neither the real OpenAI API's nor the real
+    Anthropic API's own model IDs ever contain a ``/``. This is the same
+    heuristic :func:`detect_provider_model_mismatch` uses, now as a HARD,
+    unambiguous configuration failure for ``provider in ("openai",
+    "anthropic")`` (Phase 5) rather than only a warning — the live-test
+    failure this heuristic was originally added to investigate was exactly
+    this combination (a router-style model ID valid for OpenRouter but
+    invalid against the real ``api.openai.com``).
     """
     return "/" in model.strip()
+
+
+#: Providers whose native model identifiers never contain a "/" — the
+#: ONLY signal :func:`detect_provider_model_mismatch` checks. Deliberately
+#: narrow (see that function's docstring for why this is conservative,
+#: not a general punctuation ban). "openrouter" is excluded: router-style
+#: (vendor-prefixed) model ids are its NORMAL, expected shape.
+_SLASH_FREE_MODEL_PROVIDERS: frozenset[str] = frozenset({"openai", "anthropic"})
+
+
+def detect_provider_model_mismatch(provider: str, model: str) -> str:
+    """Return a human-readable mismatch reason, or ``""`` if none is detected.
+
+    Conservative by design: the ONLY signal checked is whether *model*
+    contains a ``/`` while *provider* is ``"openai"`` or ``"anthropic"`` —
+    neither provider's own native model catalog has ever used a ``/`` in a
+    model identifier (both use dash/dot-separated names, e.g.
+    ``gpt-4o-mini``, ``claude-opus-4-1-20250805``), so this is an
+    unambiguous namespace mistake, not a false-positive-prone general
+    punctuation check. ``provider="openrouter"`` is never flagged — a
+    ``vendor/model`` identifier is exactly what OpenRouter expects.
+
+    This is the exact condition the Phase 5 task brief describes as the
+    root cause of the original live-test failure:
+    ``provider=openai`` + ``model=openai/gpt-5.5``.
+    """
+    if provider in _SLASH_FREE_MODEL_PROVIDERS and "/" in model.strip():
+        return (
+            f"provider {provider!r} requires a native {provider} model identifier. "
+            f"The configured value {model!r} appears to be a router-style "
+            "(vendor-prefixed) model identifier. Select provider='openrouter' for "
+            f"router-style model names, or provide a native {provider} model "
+            "identifier (verify the exact spelling with your provider account — "
+            "APEX never assumes or hardcodes a specific model name)."
+        )
+    return ""
+
+
+def detect_base_url_provider_mismatch(provider: str, base_url: str | None) -> str:
+    """Return a human-readable mismatch reason, or ``""`` if none is detected.
+
+    Conservative: only flags the specific, well-known ``openrouter.ai``
+    hostname configured against ``provider in ("openai", "anthropic")`` —
+    the exact old anti-pattern this phase's task brief calls out
+    (``APEX_LLM_PROVIDER=openai`` + a base URL pointing at OpenRouter).
+    A generic custom/self-hosted proxy endpoint (Azure OpenAI, LiteLLM,
+    an internal gateway, ...) is never flagged — only OpenRouter's own
+    domain, since that is the one case APEX can identify with certainty
+    rather than guessing at an operator's proxy naming convention.
+    """
+    if not base_url or provider not in _SLASH_FREE_MODEL_PROVIDERS:
+        return ""
+    host = base_url_host(base_url)
+    if "openrouter" in host.lower():
+        return (
+            f"provider {provider!r} is configured with a base URL pointing at "
+            f"OpenRouter ({host!r}). Select provider='openrouter' instead — do not "
+            f"combine provider={provider!r} with an OpenRouter base URL; APEX will "
+            "not silently route a native provider's requests through a different "
+            "service."
+        )
+    return ""
+
+
+def endpoint_kind(provider: str, base_url: str | None) -> str:
+    """Return ``"custom"`` when *base_url* differs from *provider*'s own
+    official default, else ``"official_default"``. Used by
+    :class:`~apex_host.llm.types.ProviderReadiness` — never leaks the full
+    URL, only this coarse classification (the full host, when needed, is
+    reported separately via :func:`base_url_host`)."""
+    if not base_url:
+        return "official_default"
+    official = OFFICIAL_BASE_URL.get(provider, "")
+    if official and base_url.rstrip("/") == official.rstrip("/"):
+        return "official_default"
+    return "custom"

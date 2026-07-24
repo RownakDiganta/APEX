@@ -29,7 +29,7 @@ from memfabric.reflector.worker import ReflectorWorker
 
 from apex_host.config import ApexConfig
 from apex_host.graph import build_apex_graph
-from apex_host.llm.router import FakeModelRouter, ModelRouter, OpenAIModelRouter
+from apex_host.llm.router import ModelRouter, build_model_router
 from apex_host.graph_state import ApexGraphState
 from apex_host.knowledge.cve_patterns import default_identifier_patterns
 from apex_host.knowledge.seed_loader import (
@@ -200,17 +200,17 @@ class ApexRuntime:
         hot path) — it is the only component allowed to promote proposals
         (memfabric Invariant 4, CLAUDE.md §13.10).
         """
-        model_router: ModelRouter
+        # Phase 5 — build_model_router is the single factory that dispatches
+        # on config.llm_provider (openai/anthropic/openrouter/fake) and
+        # constructs the matching native provider adapter. Never hardcodes
+        # a specific provider class here — see apex_host/llm/router.py.
+        model_router: ModelRouter = build_model_router(self.config)
         if self.config.use_llm and self.config.llm_provider != "fake":
-            model_router = OpenAIModelRouter(self.config)
             logger.info(
-                "LLM planning enabled: provider=%s model=%s base_url=%s",
+                "LLM planning enabled: provider=%s model=%s",
                 self.config.llm_provider,
                 self.config.planner_model,
-                self.config.llm_base_url or "(env OPENAI_BASE_URL)",
             )
-        else:
-            model_router = FakeModelRouter()
 
         # Create the shared budget tracker for this run.  With FakeModelRouter
         # the tracker is constructed but its budget is never consulted (all

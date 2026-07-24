@@ -6,7 +6,24 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields as _dc_fields
 from os.path import basename as _basename
 
+from apex_host.llm.types import VALID_LLM_PROVIDERS, normalize_llm_provider
 from apex_host.security.redaction import REDACTED_PLACEHOLDER as _REDACTED
+
+
+def _normalize_and_validate_llm_provider(raw: str, *, use_llm: bool) -> str:
+    """Normalize *raw* case-insensitively; raise when *use_llm* is True and
+    the normalized value is not recognized. Never silently substitutes a
+    different provider — an invalid selection is a configuration error,
+    not a fallback trigger (see ``apex_host.llm.router.build_model_router``
+    for the analogous defense-in-depth check at router-construction time).
+    """
+    normalized = normalize_llm_provider(raw)
+    if use_llm and normalized not in VALID_LLM_PROVIDERS:
+        raise ValueError(
+            f"invalid llm_provider {raw!r} — expected one of: "
+            f"{', '.join(sorted(VALID_LLM_PROVIDERS))}"
+        )
+    return normalized
 
 
 @dataclass(slots=True)
@@ -20,9 +37,18 @@ class ApexConfig:
     # Mac-native tools: nmap (Homebrew), curl (built-in), python3 (built-in), nc (built-in).
     # Optional tools (ffuf, gobuster, searchsploit, netcat) must be installed separately
     # and added to this list explicitly.
-    planner_model: str = "openai/gpt-5.5"
-    executor_model: str = "openai/gpt-5.5"
-    parser_model: str = "openai/gpt-5.5"
+    # Phase 5 (native OpenAI/Anthropic providers) — deliberately empty by
+    # default. There is NO safe, provider-neutral default model: the old
+    # "openai/gpt-5.5" default was itself the root cause of the live-test
+    # failure this phase fixes (a router-style model id sent to the real
+    # OpenAI API). When use_llm=True with a real provider, the model MUST
+    # be explicitly configured (--llm-model / $APEX_LLM_MODEL) — enforced
+    # by apex_host.eval.preflight.check_llm_readiness and
+    # apex_host.llm.providers.*.generate()'s own pre-call check. Harmless
+    # when empty and use_llm=False (the default) or llm_provider="fake".
+    planner_model: str = ""
+    executor_model: str = ""
+    parser_model: str = ""
     dry_run: bool = True
     """Safety default. Real command execution requires the host to set this
     to False explicitly — see apex_host/tools/runner.py."""
@@ -75,15 +101,52 @@ class ApexConfig:
     # apex_host/execution/registry.py::TaskRegistry.attempt_count and
     # docs/action-fingerprint.md.
     max_fingerprint_retries: int = 1
+    # ---------------------------------------------------------------------------
+    # Phase 5 — native OpenAI/Anthropic/OpenRouter provider selection
+    # (apex_host/llm/router.py, apex_host/llm/providers/;
+    #  docs/llm-providers.md)
+    # ---------------------------------------------------------------------------
     # LLM runtime wiring — controlled by --use-llm CLI flag.
     # When use_llm=False (the default), FakeModelRouter is used and all planners
     # run in fully-deterministic mode with no API calls or network traffic.
-    # When use_llm=True, OpenAIModelRouter is constructed; llm_provider selects
-    # the implementation ("openai" is the only real provider today).
-    # llm_base_url overrides OPENAI_BASE_URL env var (useful for OpenRouter).
+    # When use_llm=True, apex_host.llm.router.build_model_router(config)
+    # constructs the router for llm_provider — one of "openai" (native
+    # OpenAI API, $OPENAI_API_KEY), "anthropic" (native Anthropic Messages
+    # API, $ANTHROPIC_API_KEY), "openrouter" (optional aggregator,
+    # $OPENROUTER_API_KEY), or "fake" (no network — the safe default).
+    # Provider names are validated case-insensitively at the CLI/env
+    # boundary (apex_host.config_env) against
+    # apex_host.llm.types.VALID_LLM_PROVIDERS and normalized to lowercase
+    # before reaching this field.
+    #
+    # There is NO generic, provider-neutral default model (see
+    # planner_model's own docstring above) and NO implicit routing through
+    # OpenRouter — each provider talks to its own official endpoint with
+    # its own credential unless a provider-specific base URL override is
+    # configured below.
     use_llm: bool = False
     llm_provider: str = "fake"
+    # llm_base_url: LEGACY generic override, kept for backward
+    # compatibility with existing --llm-base-url usage. Applies ONLY to
+    # whichever provider is currently selected (llm_provider) — it is
+    # NEVER carried across providers, and apex_host.llm.errors
+    # .detect_base_url_provider_mismatch() rejects the specific old
+    # anti-pattern of llm_provider="openai"/"anthropic" combined with a
+    # base URL that looks like OpenRouter's own endpoint. Prefer the
+    # provider-specific fields below for new configuration — this field
+    # exists only so an existing --llm-base-url invocation continues to
+    # work for whichever provider it is now paired with.
     llm_base_url: str | None = None
+    # Provider-specific base URL overrides — the PREFERRED, unambiguous
+    # mechanism. None (the default) means "use that provider's own SDK
+    # default endpoint" (never a base URL supplied by a DIFFERENT
+    # provider's field). Each is applied ONLY by its own provider's router
+    # (apex_host/llm/router.py) — see that module's per-router docstrings
+    # for the exact precedence against llm_base_url and the provider's own
+    # recognized environment variable.
+    llm_openai_base_url: str | None = None
+    llm_anthropic_base_url: str | None = None
+    llm_openrouter_base_url: str | None = None
     # External knowledge base root and per-family overrides.
     # When knowledge_root is set, each family defaults to <knowledge_root>/<family>.
     # Per-family overrides take precedence over the derived default.
@@ -114,7 +177,8 @@ class ApexConfig:
     # roles so these limits are never consulted in deterministic mode.
     # max_llm_calls_per_run: hard cap on total LLM calls across the entire run.
     # max_llm_calls_per_phase: hard cap per phase (recon, web, credential, …).
-    # llm_request_timeout_seconds: per-call timeout forwarded to ChatOpenAI.
+    # llm_request_timeout_seconds: per-call timeout forwarded to the native
+    #   provider adapter's SDK client (apex_host/llm/providers/*.py).
     # llm_stop_on_repeated_plan: skip LLM when context is unchanged since last
     #   call for the same phase (saves one API call per identical turn).
     max_llm_calls_per_run: int = 5
@@ -575,8 +639,20 @@ class ApexConfig:
             "use_llm": bool(_g("use_llm", False)),
             # llm_provider: CLI None → field default "fake".
             # The CLI flag must use default=None (not "openai") so this fallback fires.
-            "llm_provider": _g("llm_provider", "fake"),
+            # Phase 5 — normalized case-insensitively (see
+            # apex_host.llm.types.normalize_llm_provider) regardless of
+            # use_llm, and strictly validated against
+            # apex_host.llm.types.VALID_LLM_PROVIDERS only when use_llm is
+            # True (an irrelevant/inert value is harmless when the LLM path
+            # is disabled). Provider selection is never silently changed —
+            # an invalid value raises rather than falling back to "fake".
+            "llm_provider": _normalize_and_validate_llm_provider(
+                str(_g("llm_provider", "fake")), use_llm=bool(_g("use_llm", False))
+            ),
             "llm_base_url": _g("llm_base_url", None),
+            "llm_openai_base_url": _g("llm_openai_base_url", None),
+            "llm_anthropic_base_url": _g("llm_anthropic_base_url", None),
+            "llm_openrouter_base_url": _g("llm_openrouter_base_url", None),
             "knowledge_root": _g("knowledge_root", None),
             "policy_file": _g("policy_file", None),
             "llm_stop_on_repeated_plan": bool(_g("llm_stop_on_repeated_plan", True)),

@@ -84,6 +84,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     use_llm.add_argument("--no-use-llm", dest="use_llm", action="store_false")
     parser.add_argument("--llm-provider", dest="llm_provider", default=None, metavar="PROVIDER")
     parser.add_argument("--llm-model", dest="llm_model", default=None, metavar="MODEL")
+    parser.add_argument("--llm-openai-base-url", dest="llm_openai_base_url", default=None, metavar="URL")
+    parser.add_argument("--llm-anthropic-base-url", dest="llm_anthropic_base_url", default=None, metavar="URL")
+    parser.add_argument("--llm-openrouter-base-url", dest="llm_openrouter_base_url", default=None, metavar="URL")
     parser.add_argument(
         "--check-connectivity", dest="check_connectivity", action="store_true", default=False,
         help=(
@@ -130,11 +133,45 @@ def validate_combinations(config: ApexConfig) -> list[str]:
             )
 
     if config.use_llm and config.llm_provider not in ("fake", ""):
-        if not os.environ.get("OPENAI_API_KEY"):
+        # Phase 5 — provider-specific credential + model + provider/model
+        # mismatch validation. Delegates to the same pure functions
+        # apex_host.eval.preflight uses so the two "configuration
+        # validation" entry points can never disagree.
+        from apex_host.llm.errors import (
+            detect_base_url_provider_mismatch,
+            detect_provider_model_mismatch,
+        )
+        from apex_host.llm.types import CREDENTIAL_ENV_VAR, VALID_LLM_PROVIDERS
+
+        if config.llm_provider not in VALID_LLM_PROVIDERS:
             problems.append(
-                f"use_llm=True with llm_provider={config.llm_provider!r} requires $OPENAI_API_KEY "
-                "to be set (not required when llm_provider is 'fake' or --use-llm is not set)"
+                f"llm_provider={config.llm_provider!r} is not recognized (expected one of: "
+                f"{', '.join(sorted(VALID_LLM_PROVIDERS))})"
             )
+        else:
+            env_var = CREDENTIAL_ENV_VAR[config.llm_provider]
+            if not os.environ.get(env_var):
+                problems.append(
+                    f"use_llm=True with llm_provider={config.llm_provider!r} requires "
+                    f"${env_var} to be set (not required when llm_provider is 'fake' "
+                    "or --use-llm is not set)"
+                )
+            if not config.planner_model:
+                problems.append(
+                    f"use_llm=True with llm_provider={config.llm_provider!r} requires an "
+                    "explicit model (--llm-model / $APEX_LLM_MODEL) — there is no "
+                    "provider-neutral default"
+                )
+            else:
+                mismatch = detect_provider_model_mismatch(config.llm_provider, config.planner_model)
+                if mismatch:
+                    problems.append(f"provider_model_mismatch: {mismatch}")
+            provider_base_url = (
+                getattr(config, f"llm_{config.llm_provider}_base_url", None) or config.llm_base_url
+            )
+            base_mismatch = detect_base_url_provider_mismatch(config.llm_provider, provider_base_url)
+            if base_mismatch:
+                problems.append(f"provider_model_mismatch: {base_mismatch}")
 
     if config.max_turns < 1:
         problems.append(f"max_turns={config.max_turns} must be at least 1")
@@ -171,9 +208,16 @@ def _print_summary(config: ApexConfig, problems: list[str]) -> None:
         print(f"  {key}: {safe[key]!r}")
 
     token_state = "present" if os.environ.get(ENV_TOOL_SERVICE_TOKEN) or config.tool_service_token else "absent"
-    openai_key_state = "present" if os.environ.get("OPENAI_API_KEY") else "absent"
     print(f"  tool_service_token: {token_state} (never displayed)")
-    print(f"  OPENAI_API_KEY: {openai_key_state} (never displayed)")
+
+    from apex_host.llm.types import CREDENTIAL_ENV_VAR, VALID_LLM_PROVIDERS
+
+    if config.llm_provider in VALID_LLM_PROVIDERS and config.llm_provider != "fake":
+        env_var = CREDENTIAL_ENV_VAR[config.llm_provider]
+        state = "present" if os.environ.get(env_var) else "absent"
+        print(f"  {env_var}: {state} (never displayed)")
+    else:
+        print("  (no LLM credential variable applicable — llm_provider is 'fake' or unrecognized)")
 
     if problems:
         print("\nINVALID configuration:")

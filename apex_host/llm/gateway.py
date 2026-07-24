@@ -143,6 +143,16 @@ class LLMCallResult:
     # "missing key vs invalid model vs rate limit vs ..." — see
     # apex_host/llm/errors.py module docstring.
     error_category: str = ""
+    # Phase 5 (native OpenAI/Anthropic providers) — additive normalized
+    # response fields, populated only on success. Read (via getattr, with
+    # empty-string/0.0 defaults) from whatever object ModelRouter's
+    # RoleBoundProvider.invoke() returned; a legacy test double that only
+    # implements `.content` (no `.provider`/etc.) simply leaves these at
+    # their defaults — fully backward compatible.
+    provider: str = ""
+    actual_model: str = ""
+    finish_reason: str = ""
+    request_id: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -154,6 +164,10 @@ class LLMCallResult:
             "error_category": self.error_category,
             "actual_input_tokens": self.actual_input_tokens,
             "actual_output_tokens": self.actual_output_tokens,
+            "provider": self.provider,
+            "actual_model": self.actual_model,
+            "finish_reason": self.finish_reason,
+            "request_id": self.request_id,
         }
 
 
@@ -172,6 +186,9 @@ class _AuditRecord:
     actual_input_tokens: int
     actual_output_tokens: int
     elapsed_seconds: float
+    provider: str = ""
+    actual_model: str = ""
+    finish_reason: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +243,9 @@ class LLMGateway:
                 "actual_input_tokens": r.actual_input_tokens,
                 "actual_output_tokens": r.actual_output_tokens,
                 "elapsed_seconds": round(r.elapsed_seconds, 3),
+                "provider": r.provider,
+                "actual_model": r.actual_model,
+                "finish_reason": r.finish_reason,
             }
             for r in self._audit_log
         ]
@@ -303,6 +323,10 @@ class LLMGateway:
         raw: str = ""
         actual_in: int = 0
         actual_out: int = 0
+        resp_provider: str = ""
+        resp_actual_model: str = ""
+        resp_finish_reason: str = ""
+        resp_request_id: str = ""
         try:
             raw_response = await asyncio.wait_for(
                 asyncio.to_thread(chat_llm.invoke, messages),
@@ -316,6 +340,16 @@ class LLMGateway:
             if isinstance(usage, dict):
                 actual_in = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
                 actual_out = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+            # Phase 5 — additive normalized-response extraction. Every
+            # attribute is read via getattr with an empty-string default so
+            # a legacy test double that only implements `.content` never
+            # breaks; a real apex_host.llm.providers.base.InvokeResult
+            # (returned by every native RoleBoundProvider.invoke()) always
+            # sets all four.
+            resp_provider = str(getattr(raw_response, "provider", "") or "")
+            resp_actual_model = str(getattr(raw_response, "actual_model", "") or "")
+            resp_finish_reason = str(getattr(raw_response, "finish_reason", "") or "")
+            resp_request_id = str(getattr(raw_response, "request_id", "") or "")
 
         except asyncio.TimeoutError:
             err_str = f"provider timeout after {timeout}s"
@@ -401,6 +435,10 @@ class LLMGateway:
             redaction_count=redaction_count,
             actual_input_tokens=actual_in,
             actual_output_tokens=actual_out,
+            provider=resp_provider,
+            actual_model=resp_actual_model,
+            finish_reason=resp_finish_reason,
+            request_id=resp_request_id,
         )
         self._record_audit(decision_id, ctx, result, time.monotonic() - t0)
         return result
@@ -425,4 +463,7 @@ class LLMGateway:
             actual_input_tokens=result.actual_input_tokens,
             actual_output_tokens=result.actual_output_tokens,
             elapsed_seconds=elapsed,
+            provider=result.provider,
+            actual_model=result.actual_model,
+            finish_reason=result.finish_reason,
         ))

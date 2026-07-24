@@ -250,6 +250,24 @@ services:
       # EKG/episodic memory — see docs/knowledge-initialization.md
       # "Security considerations").
       APEX_KNOWLEDGE_CACHE_PATH: ${APEX_KNOWLEDGE_CACHE_PATH:-/app/knowledge_cache}
+      # Phase 5 (native OpenAI/Anthropic/OpenRouter providers) — passed
+      # through only so a host-exported value (or one set in a local `.env`
+      # copied from .env.example) actually reaches the container; every
+      # default below is the safe, no-LLM default (APEX_USE_LLM=false,
+      # provider=fake) and none of these change the default `smoke` command
+      # above, which never touches the LLM layer at all. Credentials use a
+      # blank (never baked-in) default — see docs/llm-providers.md
+      # "Security and redaction guarantees" for why none of these six
+      # values are ever logged, printed, or included in a report.
+      APEX_USE_LLM: ${APEX_USE_LLM:-false}
+      APEX_LLM_PROVIDER: ${APEX_LLM_PROVIDER:-fake}
+      APEX_LLM_MODEL: ${APEX_LLM_MODEL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      APEX_LLM_OPENAI_BASE_URL: ${APEX_LLM_OPENAI_BASE_URL:-}
+      APEX_LLM_ANTHROPIC_BASE_URL: ${APEX_LLM_ANTHROPIC_BASE_URL:-}
+      APEX_LLM_OPENROUTER_BASE_URL: ${APEX_LLM_OPENROUTER_BASE_URL:-}
     volumes:
       # Report persistence outside the container — a plain bind mount
       # (rather than a named volume) so an operator can inspect

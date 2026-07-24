@@ -477,6 +477,55 @@ def test_no_hardcoded_api_key() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 5 — native OpenAI/Anthropic/OpenRouter LLM env-var passthrough into
+# the apex service (so a host-exported value, or one set via a local .env
+# copied from .env.example, actually reaches the container).
+# ---------------------------------------------------------------------------
+
+def test_apex_service_passes_through_llm_env_vars_with_safe_blank_defaults() -> None:
+    import yaml
+
+    data = yaml.safe_load(_compose_text())
+    env = data["services"]["apex"]["environment"]
+    # Every credential defaults to a blank interpolation (never a baked-in
+    # value) — same "${VAR:-}" shape for all three providers, no favoritism.
+    for key in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"):
+        assert key in env, f"apex service must pass through {key}"
+        assert env[key] == "${%s:-}" % key
+    # Safe, no-LLM-by-default values for the selection fields.
+    assert env["APEX_USE_LLM"] == "${APEX_USE_LLM:-false}"
+    assert env["APEX_LLM_PROVIDER"] == "${APEX_LLM_PROVIDER:-fake}"
+    assert env["APEX_LLM_MODEL"] == "${APEX_LLM_MODEL:-}"
+    for key in (
+        "APEX_LLM_OPENAI_BASE_URL", "APEX_LLM_ANTHROPIC_BASE_URL", "APEX_LLM_OPENROUTER_BASE_URL",
+    ):
+        assert env[key] == "${%s:-}" % key
+
+
+def test_no_provider_credential_is_hardcoded_with_a_real_looking_value() -> None:
+    """No provider's own key/token is ever baked into compose.yaml with a
+    literal, secret-shaped value — every one is a blank-default env-var
+    interpolation, for all three providers, not just OpenAI."""
+    import re
+
+    text = _compose_text()
+    assert re.search(r"sk-ant-[A-Za-z0-9]{10,}", text) is None
+    assert re.search(r"sk-or-[A-Za-z0-9]{10,}", text) is None
+
+
+def test_default_smoke_command_never_enables_llm() -> None:
+    """The apex service's default command ('smoke') must remain unaffected
+    by the LLM env vars now being passed through — smoke mode never
+    constructs a real provider router (FakeModelRouter's safe defaults
+    above are what apply when nothing is set in the host environment)."""
+    import yaml
+
+    data = yaml.safe_load(_compose_text())
+    apex = data["services"]["apex"]
+    assert apex["command"] == ["smoke", "--knowledge-root", "/app/knowledge"]
+
+
+# ---------------------------------------------------------------------------
 # .dockerignore still permits both builds (shared file, unchanged by this phase)
 # ---------------------------------------------------------------------------
 

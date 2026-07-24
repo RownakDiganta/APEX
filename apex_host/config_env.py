@@ -20,11 +20,15 @@ Two narrow, deliberate exceptions are **not** handled here, by design:
   is empty. Duplicating that read here would create two independent
   sources of truth for the same secret; this module leaves
   ``tool_service_token`` alone entirely.
-- ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` continue to be read directly by
-  ``apex_host.llm.router.OpenAIModelRouter`` (pre-existing, unchanged).
-  Both are already documented in ``.env.example`` for operator convenience,
-  but this module does not re-read or re-validate them — that would be
-  scattering the same read across two places for no benefit.
+- ``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` / ``OPENROUTER_API_KEY`` (each
+  provider's own credential — Phase 5) continue to be read directly by
+  their respective native provider adapter
+  (``apex_host.llm.providers.{openai,anthropic,openrouter}``), never
+  through this module's generic merge — same rationale as
+  ``APEX_TOOL_SERVICE_TOKEN`` above (CLI args are visible in shell history
+  and `ps`; environment variables set via `export` are not). Each is
+  documented in ``.env.example`` for operator convenience, but this module
+  does not re-read or re-validate any of them.
 
 Everything else this module supports maps onto an existing
 ``ApexConfig``/CLI attribute name and is merged into an
@@ -73,6 +77,15 @@ ENV_TOOL_SERVICE_TIMEOUT_SECONDS = "APEX_TOOL_SERVICE_TIMEOUT_SECONDS"
 ENV_USE_LLM = "APEX_USE_LLM"
 ENV_LLM_PROVIDER = "APEX_LLM_PROVIDER"
 ENV_LLM_MODEL = "APEX_LLM_MODEL"
+# Phase 5 — provider-specific base URL overrides (the preferred,
+# unambiguous mechanism over the legacy generic APEX_LLM_BASE_URL / CLI
+# --llm-base-url, which is still read via ApexConfig.llm_base_url but
+# NOT merged from a dedicated env var here — it was never given one, and
+# introducing one now would just recreate the ambiguity these three exist
+# to remove. See docs/llm-providers.md "Base URL behavior".
+ENV_LLM_OPENAI_BASE_URL = "APEX_LLM_OPENAI_BASE_URL"
+ENV_LLM_ANTHROPIC_BASE_URL = "APEX_LLM_ANTHROPIC_BASE_URL"
+ENV_LLM_OPENROUTER_BASE_URL = "APEX_LLM_OPENROUTER_BASE_URL"
 
 # Infra Phase 10 — HTB VPN readiness configuration. See
 # docs/htb-vpn-container.md and apex_host/eval/preflight.py.
@@ -198,6 +211,22 @@ def validate_tool_backend(name: str, raw: str) -> str:
         raise EnvConfigError(
             f"{name}: invalid tool backend {raw!r} (expected one of: "
             f"{', '.join(sorted(_VALID_TOOL_BACKENDS))})"
+        )
+    return normalized
+
+
+def validate_llm_provider(name: str, raw: str) -> str:
+    """Phase 5 — validate + normalize an ``APEX_LLM_PROVIDER`` value
+    case-insensitively against ``apex_host.llm.types.VALID_LLM_PROVIDERS``.
+    Raises for anything else — provider selection is never silently
+    changed to a different value (e.g. falling back to "fake")."""
+    from apex_host.llm.types import VALID_LLM_PROVIDERS, normalize_llm_provider
+
+    normalized = normalize_llm_provider(raw)
+    if normalized not in VALID_LLM_PROVIDERS:
+        raise EnvConfigError(
+            f"{name}: invalid LLM provider {raw!r} (expected one of: "
+            f"{', '.join(sorted(VALID_LLM_PROVIDERS))})"
         )
     return normalized
 
@@ -398,8 +427,11 @@ def merge_env_into_args(
         lambda n, r: parse_float_strict(n, r, minimum=0.0),
     )
     _fill("use_llm", ENV_USE_LLM, parse_bool_strict)
-    _fill("llm_provider", ENV_LLM_PROVIDER, lambda n, r: normalize_backend_name(r))
+    _fill("llm_provider", ENV_LLM_PROVIDER, validate_llm_provider)
     _fill("llm_model", ENV_LLM_MODEL, lambda n, r: r)
+    _fill("llm_openai_base_url", ENV_LLM_OPENAI_BASE_URL, validate_url)
+    _fill("llm_anthropic_base_url", ENV_LLM_ANTHROPIC_BASE_URL, validate_url)
+    _fill("llm_openrouter_base_url", ENV_LLM_OPENROUTER_BASE_URL, validate_url)
     # export_json / export_graph: only present on run_htb_local's namespace,
     # not main.py's (which has no report-export flags at all) — silently
     # skipped there via the hasattr() guard above.
