@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # compile_knowledge.py and layout.py).
 # ---------------------------------------------------------------------------
 
-_FAMILY_JSONL: dict[str, list[str]] = {
+FAMILY_JSONL_FILES: dict[str, list[str]] = {
     "policy_db": ["policy_records.jsonl"],
     "methodology_db": ["methodology_chunks.jsonl"],
     "intel_db": [
@@ -49,6 +49,15 @@ _FAMILY_JSONL: dict[str, list[str]] = {
     ],
     "payload_db": ["payload_records.jsonl", "wordlist_manifest.jsonl"],
 }
+"""Public — the single source of truth for which compiled JSONL filenames
+belong to each knowledge family. Shared by ``load_compiled_family`` (below)
+and ``apex_host.knowledge.manifest`` (Phase 4) so the staging loader and the
+manifest/identity computer can never silently disagree about which files
+constitute a family."""
+
+# Backward-compatible private alias — kept in case any external code (or an
+# older test) still imports the old private name directly.
+_FAMILY_JSONL = FAMILY_JSONL_FILES
 
 # Source for all compiled knowledge entries — used as KnowledgeEntry.source.
 _COMPILED_SOURCE = "compiled_knowledge"
@@ -60,8 +69,9 @@ async def load_compiled_family(
     api: "MemoryAPI",
     *,
     confidence_override: float | None = None,
+    only_ids: set[str] | None = None,
 ) -> int:
-    """Stage all compiled JSONL records from *compiled_dir* for *family_name*.
+    """Stage compiled JSONL records from *compiled_dir* for *family_name*.
 
     Parameters
     ----------
@@ -79,6 +89,16 @@ async def load_compiled_family(
     confidence_override:
         When set, overrides the confidence value from the compiled record.
         Useful for loading untrusted or low-quality families at lower confidence.
+    only_ids:
+        Phase 4 incremental-staging support. When given, only records whose
+        own ``id`` field is a member of this set are proposed — every other
+        record in the family's compiled files is read (cheap) but skipped
+        (not staged, not counted). ``None`` (the default) stages every
+        valid record, exactly as before this parameter existed — fully
+        backward compatible. Used by
+        ``apex_host.knowledge.init_cache`` to stage only the records that
+        are new or content-changed relative to a prior, persisted run,
+        without needing a separate file-reading code path.
 
     Returns
     -------
@@ -90,7 +110,7 @@ async def load_compiled_family(
         logger.warning("compiled_loader: compiled dir does not exist: %s", src)
         return 0
 
-    filenames = _FAMILY_JSONL.get(family_name)
+    filenames = FAMILY_JSONL_FILES.get(family_name)
     if filenames is None:
         # Load all .jsonl files in the directory for unknown families.
         filenames = [p.name for p in src.glob("*.jsonl")]
@@ -101,7 +121,7 @@ async def load_compiled_family(
         if not path.exists():
             logger.debug("compiled_loader: %s not found, skipping", path)
             continue
-        count = await _load_jsonl_file(path, family_name, api, confidence_override)
+        count = await _load_jsonl_file(path, family_name, api, confidence_override, only_ids)
         total += count
         logger.debug("compiled_loader: staged %d records from %s", count, path.name)
 
@@ -114,6 +134,7 @@ async def _load_jsonl_file(
     family_name: str,
     api: "MemoryAPI",
     confidence_override: float | None,
+    only_ids: set[str] | None = None,
 ) -> int:
     """Read one JSONL file and propose each record via MemoryAPI."""
     count = 0
@@ -139,6 +160,8 @@ async def _load_jsonl_file(
 
         entry = _record_to_knowledge_entry(record, family_name, confidence_override)
         if entry is None:
+            continue
+        if only_ids is not None and entry.id not in only_ids:
             continue
         try:
             await api.propose_knowledge(entry)

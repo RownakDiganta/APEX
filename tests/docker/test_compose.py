@@ -373,14 +373,60 @@ def test_kali_has_no_volumes_at_all() -> None:
 def test_no_duplicate_knowledge_volume_mount() -> None:
     """Compiled knowledge is baked into the apex image (docker/apex/Dockerfile);
     this file must not additionally mount a second, possibly differently-cased
-    knowledge path over it."""
+    knowledge path OVER IT (i.e. targeting /app/knowledge or re-mounting the
+    source ./Knowledge or ./knowledge directory).
+
+    Phase 4 (post-live-test debugging) added a DISTINCT, deliberate
+    knowledge-initialization-CACHE volume at /app/knowledge_cache (never
+    /app/knowledge) — narrowed from a blanket "no 'knowledge' substring
+    anywhere" check to this precise target-path check so that addition
+    does not collide with this test's actual, original intent."""
     data = _compose_dict()
     apex = data["services"]["apex"]
     for vol in apex.get("volumes", []):
         vol_str = str(vol).lower()
-        assert "knowledge" not in vol_str, (
-            f"unexpected knowledge-related volume mount on apex: {vol!r}"
+        assert not vol_str.startswith("./knowledge:"), (
+            f"unexpected raw ./knowledge source mount on apex: {vol!r}"
         )
+        assert ":/app/knowledge:" not in vol_str and not vol_str.endswith(":/app/knowledge"), (
+            f"unexpected second mount over the baked-in /app/knowledge path: {vol!r}"
+        )
+
+
+def test_knowledge_cache_volume_is_named_not_bind_mounted() -> None:
+    """Phase 4 — the knowledge-initialization cache uses a Docker-managed
+    named volume (apex-knowledge-cache), never a host bind mount: it is
+    opaque, container-internal bookkeeping with no reason for an operator
+    to browse it from the host the way ./run_reports is meant to be."""
+    data = _compose_dict()
+    apex = data["services"]["apex"]
+    volumes = apex.get("volumes", [])
+    matches = [v for v in volumes if "apex-knowledge-cache" in str(v)]
+    assert len(matches) == 1, f"expected exactly one apex-knowledge-cache mount, found: {matches}"
+    assert ":/app/knowledge_cache" in str(matches[0])
+    assert "apex-knowledge-cache" in (data.get("volumes") or {}), (
+        "apex-knowledge-cache must be declared as a top-level named volume"
+    )
+
+
+def test_kali_has_no_knowledge_cache_volume() -> None:
+    """Only apex uses the knowledge-initialization cache; kali has no reason
+    to read or write it."""
+    data = _compose_dict()
+    kali = data["services"]["kali"]
+    for vol in kali.get("volumes", []):
+        assert "knowledge-cache" not in str(vol) and "knowledge_cache" not in str(vol)
+
+
+def test_apex_knowledge_cache_path_env_matches_volume_target() -> None:
+    """APEX_KNOWLEDGE_CACHE_PATH must point INSIDE the mounted volume, or the
+    cache would silently write to non-persisted container-local storage."""
+    data = _compose_dict()
+    apex = data["services"]["apex"]
+    env = apex.get("environment", {})
+    assert "APEX_KNOWLEDGE_CACHE_PATH" in env
+    raw = str(env["APEX_KNOWLEDGE_CACHE_PATH"])
+    assert "/app/knowledge_cache" in raw
 
 
 # ---------------------------------------------------------------------------

@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from apex_host.knowledge.payload_repo_loader import PayloadRepoLoader
+from memfabric.reflector.gates import classify_unpromoted_knowledge, classify_unpromoted_skill
 from memfabric.reflector.worker import ReflectorWorker
 
 if TYPE_CHECKING:
@@ -79,6 +80,18 @@ class PromotionSummary:
     passes_run: int
     stop_reason: str
     elapsed_seconds: float
+    blocked_reason_counts: dict[str, int] = None  # type: ignore[assignment]
+    """Bounded summary of *records_remaining*, grouped by why each one did
+    not promote (Phase 4). Never a per-record ID list — see
+    ``_classify_remaining_staged`` for the classification rules and
+    ``docs/knowledge-initialization.md`` "Promotion-loop diagnostics" for
+    the full rationale. ``None`` only for callers that construct this
+    dataclass directly without the classification step (defaults to ``{}``
+    in ``__post_init__``)."""
+
+    def __post_init__(self) -> None:
+        if self.blocked_reason_counts is None:
+            self.blocked_reason_counts = {}
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -88,6 +101,7 @@ class PromotionSummary:
             "passes_run": self.passes_run,
             "stop_reason": self.stop_reason,
             "elapsed_seconds": round(self.elapsed_seconds, 3),
+            "blocked_reason_counts": dict(self.blocked_reason_counts),
         }
 
 
@@ -135,8 +149,20 @@ async def promote_staged_knowledge_until_stable(
 
     # Count only un-promoted entries: promoted ones stay in the staging dict
     # (for auditability) but are already indexed and need no further action.
-    initial_staged = sum(1 for e in await api.get_staged_knowledge() if not e.promoted)
-    initial_skills = sum(1 for s in await api.get_staged_skills() if not s.promoted and not s.quarantined)
+    #
+    # Phase 4 knowledge-initialization performance fix: uses the cheap
+    # count_staged_*() accessors (attribute scan only, no per-entry
+    # copy.deepcopy) instead of deep-copying every staged entry just to
+    # count a subset — see memfabric.api.MemoryAPI.count_staged_knowledge's
+    # docstring. This is the dominant fix for the "1757 seconds spent
+    # promoting" live-test finding: the OLD code deep-copied the ENTIRE
+    # staging dict (promoted + unpromoted) on every one of ~1,300 calls
+    # across a ~638-pass loop — roughly 40 million dataclass deep-copies for
+    # a 63,783-record corpus. The new code below is O(remaining) per call,
+    # so the SUM across the whole loop is O(total staged) once, not
+    # O(total staged × passes).
+    initial_staged = await api.count_staged_knowledge(promoted=False)
+    initial_skills = await api.count_staged_skills(promoted=False, quarantined=False)
     total_initial = initial_staged + initial_skills
 
     if mode == "disabled":
@@ -165,8 +191,8 @@ async def promote_staged_knowledge_until_stable(
             break
 
         staged_before = (
-            sum(1 for e in await api.get_staged_knowledge() if not e.promoted)
-            + sum(1 for s in await api.get_staged_skills() if not s.promoted and not s.quarantined)
+            await api.count_staged_knowledge(promoted=False)
+            + await api.count_staged_skills(promoted=False, quarantined=False)
         )
         if staged_before == 0:
             stop_reason = "exhausted"
@@ -176,17 +202,20 @@ async def promote_staged_knowledge_until_stable(
         passes_run += 1
 
         staged_after = (
-            sum(1 for e in await api.get_staged_knowledge() if not e.promoted)
-            + sum(1 for s in await api.get_staged_skills() if not s.promoted and not s.quarantined)
+            await api.count_staged_knowledge(promoted=False)
+            + await api.count_staged_skills(promoted=False, quarantined=False)
         )
         promoted_this_pass = staged_before - staged_after
         total_promoted += promoted_this_pass
 
         if promoted_this_pass == 0:
-            # Quality gate is blocking all remaining entries — no point looping.
+            # Quality gate is blocking all remaining entries — no point
+            # looping further; classify_remaining below determines exactly
+            # why (below_min_confidence / below_min_evidence / etc.).
             logger.warning(
                 "promote_staged_knowledge_until_stable: no progress after pass %d "
-                "(%d records remain staged — likely below min_confidence threshold); stopping",
+                "(%d records remain staged); stopping — see blocked_reason_counts "
+                "for why each one is blocked",
                 passes_run, staged_after,
             )
             stop_reason = "no_progress"
@@ -206,10 +235,19 @@ async def promote_staged_knowledge_until_stable(
             break
 
     remaining = (
-        sum(1 for e in await api.get_staged_knowledge() if not e.promoted)
-        + sum(1 for s in await api.get_staged_skills() if not s.promoted and not s.quarantined)
+        await api.count_staged_knowledge(promoted=False)
+        + await api.count_staged_skills(promoted=False, quarantined=False)
     )
     elapsed = time.monotonic() - t0
+
+    # One bounded classification pass over ONLY the remaining unpromoted
+    # entries (never the whole corpus) — grouped-by-reason, never a
+    # per-record ID list (CLAUDE.md-style "do not serialize tens of
+    # thousands of record IDs into the ordinary report" constraint from
+    # this phase's own task). Skipped entirely when nothing remains.
+    blocked_reason_counts: dict[str, int] = {}
+    if remaining > 0:
+        blocked_reason_counts = await classify_remaining_staged(api, config=worker.config)
 
     summary = PromotionSummary(
         records_staged_initial=total_initial,
@@ -218,14 +256,46 @@ async def promote_staged_knowledge_until_stable(
         passes_run=passes_run,
         stop_reason=stop_reason,
         elapsed_seconds=elapsed,
+        blocked_reason_counts=blocked_reason_counts,
     )
     logger.info(
         "Reflector bootstrap: passes=%d promoted=%d remaining=%d "
-        "stop_reason=%s elapsed=%.1fs",
+        "stop_reason=%s elapsed=%.1fs blocked_reasons=%s",
         summary.passes_run, summary.records_promoted, summary.records_remaining,
-        summary.stop_reason, summary.elapsed_seconds,
+        summary.stop_reason, summary.elapsed_seconds, summary.blocked_reason_counts,
     )
     return summary
+
+
+async def classify_remaining_staged(api: "MemoryAPI", *, config: "Config") -> dict[str, int]:
+    """Return a bounded ``{reason: count}`` summary of un-promoted staged entries.
+
+    Called once, after a promotion loop stops, over ONLY the un-promoted
+    subset (cheap — see ``get_staged_knowledge(promoted=False)``'s
+    docstring). Never returns per-record identifiers, only aggregate counts,
+    so this is safe to embed in an ordinary run report even for a
+    corpus-sized remainder.
+
+    Reason categories are produced by ``memfabric.reflector.gates
+    .classify_unpromoted_knowledge`` / ``classify_unpromoted_skill`` — see
+    those functions' docstrings for the full category list and which ones
+    are permanent (will never resolve without new evidence or a config
+    change) versus transient (may resolve on a future pass given more
+    budget). ``docs/knowledge-initialization.md`` "Blocked-record
+    diagnostics" documents the operator-facing meaning of each category.
+    """
+    counts: dict[str, int] = {}
+    for entry in await api.get_staged_knowledge(promoted=False):
+        reason = classify_unpromoted_knowledge(entry, min_confidence=config.min_confidence)
+        counts[reason] = counts.get(reason, 0) + 1
+    for skill in await api.get_staged_skills(promoted=False, quarantined=False):
+        reason = classify_unpromoted_skill(
+            skill,
+            min_evidence_count=config.min_evidence_count,
+            min_confidence=config.min_confidence,
+        )
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -307,14 +377,7 @@ async def seed_compiled_knowledge_full(
 
     counts: dict[str, int] = {}
 
-    root = pathlib.Path(apex_config.knowledge_root) if apex_config.knowledge_root else None
-
-    family_paths: dict[str, pathlib.Path | None] = {
-        "policy_db": _resolve_compiled(apex_config.policy_db_path, root, "policy_db"),
-        "methodology_db": _resolve_compiled(apex_config.methodology_db_path, root, "methodology_db"),
-        "intel_db": _resolve_compiled(apex_config.intel_db_path, root, "intel_db"),
-        "payload_db": _resolve_compiled(apex_config.payload_db_path, root, "payload_db"),
-    }
+    family_paths = resolve_family_paths(apex_config)
 
     total = 0
     for family, compiled_dir in family_paths.items():
@@ -352,6 +415,27 @@ async def seed_compiled_knowledge_full(
     )
 
     return counts, summary
+
+
+# ---------------------------------------------------------------------------
+# Public path-resolution helper (shared with apex_host.knowledge.init_cache)
+# ---------------------------------------------------------------------------
+
+def resolve_family_paths(apex_config: "ApexConfig") -> dict[str, pathlib.Path | None]:
+    """Resolve the four known families' compiled/ directories from *apex_config*.
+
+    Single source of truth for family-path resolution — shared by
+    ``seed_compiled_knowledge_full`` (above) and
+    ``apex_host.knowledge.init_cache`` (Phase 4) so the two code paths can
+    never disagree about where a family's compiled files live.
+    """
+    root = pathlib.Path(apex_config.knowledge_root) if apex_config.knowledge_root else None
+    return {
+        "policy_db": _resolve_compiled(apex_config.policy_db_path, root, "policy_db"),
+        "methodology_db": _resolve_compiled(apex_config.methodology_db_path, root, "methodology_db"),
+        "intel_db": _resolve_compiled(apex_config.intel_db_path, root, "intel_db"),
+        "payload_db": _resolve_compiled(apex_config.payload_db_path, root, "payload_db"),
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -118,6 +118,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "conservative default."
         ),
     )
+    # Phase 4 (post-live-test debugging) — persistent, incremental
+    # knowledge-initialization cache (apex_host/knowledge/init_cache.py).
+    parser.add_argument(
+        "--knowledge-cache-path", dest="knowledge_cache_path", default=None, metavar="DIR",
+        help=(
+            "Durable directory for cross-run knowledge-initialization "
+            "caching (survives disposable container restarts — see "
+            "compose.yaml's apex-knowledge-cache volume). When unset, no "
+            "cross-run persistence is used and every startup re-stages "
+            "compiled knowledge from scratch (still fast; see "
+            "docs/knowledge-initialization.md)."
+        ),
+    )
+    parser.add_argument(
+        "--no-knowledge-cache", dest="no_knowledge_cache", action="store_true",
+        help="Disable the knowledge-initialization cache even if --knowledge-cache-path is set.",
+    )
+    parser.add_argument(
+        "--knowledge-cache-lock-timeout", dest="knowledge_cache_lock_timeout_seconds",
+        type=float, default=None, metavar="SECONDS",
+        help="Seconds to wait for the cross-process cache lock before degrading to uncached (default 30.0).",
+    )
+    parser.add_argument(
+        "--reset-knowledge-cache", dest="reset_knowledge_cache", default=None,
+        nargs="?", const="__all__", metavar="FAMILY",
+        help=(
+            "Delete persisted knowledge-cache state before running, forcing a full "
+            "rebuild. Bare flag resets every family; pass a family name "
+            "(policy_db|methodology_db|intel_db|payload_db) to reset only that one."
+        ),
+    )
     # Infra Phase 4 — tool-execution backend selection.
     # No --tool-service-token flag exists on purpose: CLI arguments are
     # visible in shell history and `ps` output. Set the bearer token via the
@@ -386,6 +417,18 @@ async def run(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 - any construction failure is a config error
         print(f"error: invalid configuration: {exc}", file=sys.stderr)
         return exit_code_for(EngagementOutcome.configuration_failure)
+
+    reset_target = getattr(args, "reset_knowledge_cache", None)
+    if reset_target is not None:
+        if not config.knowledge_cache_path:
+            print("error: --reset-knowledge-cache requires --knowledge-cache-path", file=sys.stderr)
+            return exit_code_for(EngagementOutcome.configuration_failure)
+        from apex_host.knowledge.init_cache import reset_knowledge_cache
+        family = None if reset_target == "__all__" else reset_target
+        removed = await reset_knowledge_cache(config.knowledge_cache_path, family)
+        print(f"knowledge cache reset: removed {removed} file(s) (family={family or 'all'})")
+        if not args.preflight:
+            return 0
 
     if args.preflight:
         from apex_host.tools.preflight import check_local_tools

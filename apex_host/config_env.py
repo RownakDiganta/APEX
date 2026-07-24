@@ -62,6 +62,8 @@ ENV_LOG_LEVEL = "APEX_LOG_LEVEL"
 ENV_MAX_TURNS = "APEX_MAX_TURNS"
 ENV_TARGET = "APEX_TARGET"
 ENV_KNOWLEDGE_ROOT = "APEX_KNOWLEDGE_ROOT"
+ENV_KNOWLEDGE_CACHE_PATH = "APEX_KNOWLEDGE_CACHE_PATH"
+ENV_KNOWLEDGE_CACHE_LOCK_TIMEOUT_SECONDS = "APEX_KNOWLEDGE_CACHE_LOCK_TIMEOUT_SECONDS"
 ENV_POLICY_FILE = "APEX_POLICY_FILE"
 ENV_REPORT_PATH = "APEX_REPORT_PATH"
 ENV_GRAPH_PATH = "APEX_GRAPH_PATH"
@@ -383,6 +385,11 @@ def merge_env_into_args(
 
     _fill("max_turns", ENV_MAX_TURNS, lambda n, r: parse_int_strict(n, r, minimum=1))
     _fill("knowledge_root", ENV_KNOWLEDGE_ROOT, lambda n, r: r)
+    _fill("knowledge_cache_path", ENV_KNOWLEDGE_CACHE_PATH, lambda n, r: r)
+    _fill(
+        "knowledge_cache_lock_timeout_seconds", ENV_KNOWLEDGE_CACHE_LOCK_TIMEOUT_SECONDS,
+        lambda n, r: parse_float_strict(n, r, minimum=0.0),
+    )
     _fill("policy_file", ENV_POLICY_FILE, lambda n, r: r)
     _fill("tool_backend", ENV_TOOL_BACKEND, validate_tool_backend)
     _fill("tool_service_url", ENV_TOOL_SERVICE_URL, validate_url)
