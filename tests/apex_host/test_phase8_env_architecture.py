@@ -23,8 +23,18 @@ _APPROVED_ENV_READERS = {
     "apex_host/config_env.py",
     # Pre-existing (Infra Phase 4): APEX_TOOL_SERVICE_TOKEN fallback.
     "apex_host/tools/remote_backend.py",
-    # Pre-existing (Infra Phase 5-era): OPENAI_API_KEY / OPENAI_BASE_URL.
+    # Phase 5 (native OpenAI/Anthropic/OpenRouter providers): the shared
+    # base-URL-override precedence resolver reads each provider's own
+    # SDK-recognized env var (OPENAI_BASE_URL / ANTHROPIC_BASE_URL /
+    # OPENROUTER_BASE_URL) as the last fallback before that provider's
+    # official default — never a credential.
     "apex_host/llm/router.py",
+    # Phase 5: apex_host.llm.providers.base.read_credential() is the ONE
+    # place any of the three provider credential env vars
+    # (OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENROUTER_API_KEY) is actually
+    # read — called by each native provider adapter's own __init__/
+    # generate()/check_readiness(), never by a planner or the gateway.
+    "apex_host/llm/providers/base.py",
     # Entry points: build the {file, **os.environ} mapping for --env-file,
     # per apex_host/config_env.py::load_env_file's own documented contract.
     "apex_host/main.py",

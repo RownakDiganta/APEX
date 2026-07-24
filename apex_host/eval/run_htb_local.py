@@ -186,15 +186,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--llm-provider", dest="llm_provider", default=None, metavar="PROVIDER",
-        help="LLM provider when --use-llm is set (default: fake/deterministic; use 'openai' for real LLM)",
+        help=(
+            "LLM provider when --use-llm is set: 'openai' (native OpenAI API, "
+            "$OPENAI_API_KEY), 'anthropic' (native Anthropic Messages API, "
+            "$ANTHROPIC_API_KEY), 'openrouter' (optional aggregator, "
+            "$OPENROUTER_API_KEY), or 'fake' (default: fully deterministic, "
+            "no network). Validated case-insensitively; see docs/llm-providers.md."
+        ),
     )
     parser.add_argument(
         "--llm-model", dest="llm_model", default=None, metavar="MODEL",
-        help="Model for LLM planning (e.g. openai/gpt-5.5); sets planner/executor/parser models",
+        help=(
+            "Model identifier for LLM planning, passed to the selected provider "
+            "EXACTLY as given (never rewritten). Required when --use-llm is set "
+            "with a real provider — there is no provider-neutral default. Verify "
+            "the exact model id with your provider account."
+        ),
     )
     parser.add_argument(
         "--llm-base-url", dest="llm_base_url", default=None, metavar="URL",
-        help="Override LLM API base URL (e.g. https://openrouter.ai/api/v1)",
+        help=(
+            "Legacy generic override for the CURRENTLY selected provider's "
+            "endpoint. Prefer --llm-openai-base-url / --llm-anthropic-base-url / "
+            "--llm-openrouter-base-url for new configuration."
+        ),
+    )
+    parser.add_argument(
+        "--llm-openai-base-url", dest="llm_openai_base_url", default=None, metavar="URL",
+        help="Custom base URL for provider=openai only (default: official OpenAI API).",
+    )
+    parser.add_argument(
+        "--llm-anthropic-base-url", dest="llm_anthropic_base_url", default=None, metavar="URL",
+        help="Custom base URL for provider=anthropic only (default: official Anthropic API).",
+    )
+    parser.add_argument(
+        "--llm-openrouter-base-url", dest="llm_openrouter_base_url", default=None, metavar="URL",
+        help="Custom base URL for provider=openrouter only (default: https://openrouter.ai/api/v1).",
     )
     parser.add_argument(
         "--knowledge-root", dest="knowledge_root", default=None, metavar="DIR",

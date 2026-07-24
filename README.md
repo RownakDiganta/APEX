@@ -1301,6 +1301,19 @@ PlanningEngine.plan(goal, phase, subgraph, evidence)
 
 ### Provider configuration
 
+**Full architecture, configuration matrix, and migration guide:
+[`docs/llm-providers.md`](docs/llm-providers.md).** This section is a
+summary.
+
+Phase 5 replaced the original OpenAI-only, LangChain-backed router with
+native adapters for the official OpenAI and Anthropic APIs, plus an
+optional OpenRouter adapter — each its own provider identity, with its own
+credential, its own default endpoint, and its own model-naming rules.
+**Neither OpenAI nor Anthropic requires OpenRouter.** `apex_host.llm.router
+.build_model_router(config)` is the single factory that selects the right
+one from `ApexConfig.use_llm`/`llm_provider` — never hardcode a specific
+router class.
+
 #### No LLM (dry-run / tests)
 
 The default `FakeModelRouter` returns `None` for every role.  `PlanningEngine`
@@ -1319,78 +1332,148 @@ engine = PlanningEngine(
 )
 ```
 
-#### OpenAI / OpenRouter
+#### Native OpenAI
 
 ```bash
 export OPENAI_API_KEY=sk-...
-# Optional: point to OpenRouter or any OpenAI-compatible endpoint
-export OPENAI_BASE_URL=https://openrouter.ai/api/v1
 ```
 
 ```python
-from apex_host.llm.router import OpenAIModelRouter
+from apex_host.config import ApexConfig
+from apex_host.llm.router import build_model_router
+from apex_host.planning import PlanningEngine
 
+config = ApexConfig(
+    target="<IP>", use_llm=True, llm_provider="openai",
+    planner_model="<VALID_NATIVE_OPENAI_MODEL_ID>",  # a bare OpenAI model id, e.g. "gpt-4o-mini" — verify against your account
+)
 engine = PlanningEngine(
-    model_router=OpenAIModelRouter(config),
+    model_router=build_model_router(config),
     fallback_planner=recon_planner,
     allowed_tools=config.allowed_tools,
     target=config.target,
 )
 ```
 
-`OpenAIModelRouter` reads `OPENAI_API_KEY` and `OPENAI_BASE_URL` from the
-environment — API keys are never hardcoded.
+`OpenAIProvider` (`apex_host/llm/providers/openai.py`) reads `OPENAI_API_KEY`
+from the environment and uses the official OpenAI SDK's own default endpoint
+(`https://api.openai.com/v1`) unless `llm_openai_base_url`/`--llm-openai-base-url`
+is explicitly set — never OpenRouter, never a shared/ambiguous base URL.
 
-### LLM error classification and readiness diagnostics (Phase 1 live-test fix)
+#### Native Anthropic
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+```python
+config = ApexConfig(
+    target="<IP>", use_llm=True, llm_provider="anthropic",
+    planner_model="<VALID_NATIVE_ANTHROPIC_MODEL_ID>",  # e.g. "claude-sonnet-4-5-20250929" — verify against your account
+)
+engine = PlanningEngine(
+    model_router=build_model_router(config),
+    fallback_planner=recon_planner,
+    allowed_tools=config.allowed_tools,
+    target=config.target,
+)
+```
+
+`AnthropicProvider` (`apex_host/llm/providers/anthropic.py`) uses the
+**official Anthropic Messages API directly** — never an OpenAI-compatibility
+shim. System-role messages are translated into Anthropic's own top-level
+`system=` parameter; a response's content blocks are filtered for `type
+="text"` only (a Claude response can include non-text blocks such as
+`thinking`/`tool_use`, and this adapter never assumes the first block is
+plain text).
+
+#### Optional OpenRouter
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+```
+
+```python
+config = ApexConfig(
+    target="<IP>", use_llm=True, llm_provider="openrouter",
+    planner_model="<VALID_OPENROUTER_ROUTE_ID>",  # a router-style "vendor/model" id, e.g. "openai/gpt-4o" — only valid for this provider
+)
+```
+
+Router-style (`vendor/model`) identifiers are OpenRouter's normal, expected
+shape — and are **only** accepted when `llm_provider="openrouter"`. APEX
+never infers OpenRouter merely because a model string contains a `/`, and
+never routes an Anthropic or OpenAI request through OpenRouter implicitly.
+
+### LLM error classification and readiness diagnostics
 
 The first authorized live HTB test enabled the LLM (`--use-llm`) and saw
 all 4 calls fail with a generic `provider_error` category, then silently
 continue in deterministic mode with no operator-visible signal — root
-cause: `ApexConfig.planner_model` defaults to `"openai/gpt-5.5"`, an
-OpenRouter-style, vendor-prefixed model id, valid **only** through
-OpenRouter and rejected by the real OpenAI API as an invalid model. This
-section documents the resulting diagnostics.
+cause: the old `ApexConfig.planner_model` default was `"openai/gpt-5.5"`,
+an OpenRouter-style, vendor-prefixed model id sent directly to the real
+OpenAI API, which rejected it as an invalid model. Phase 5 fixes this at
+the architecture level: there is no longer a provider-neutral default
+model anywhere in this codebase, and the exact old misconfiguration
+(`provider=openai` + a router-style model, or `provider=openai` + an
+OpenRouter base URL) is now a hard, fail-fast `provider_model_mismatch`
+rather than a silent, misclassified provider error.
 
 **Exact supported configuration surface** (canonical field names — see
 `apex_host/config.py`):
 
 | CLI flag | `ApexConfig` field | Env var | Default |
 |---|---|---|---|
-| `--use-llm` | `use_llm: bool` | — | `False` |
-| `--llm-provider PROVIDER` | `llm_provider: str` | — | `"fake"` (no real calls) |
-| `--llm-model MODEL` | `planner_model` / `executor_model` / `parser_model: str` (set simultaneously) | — | `"openai/gpt-5.5"` |
-| `--llm-base-url URL` | `llm_base_url: str \| None` | `OPENAI_BASE_URL` (fallback; the CLI flag/field takes precedence) | `None` → `https://api.openai.com/v1` |
-| — (no CLI flag; shell history/`ps` risk) | — | `OPENAI_API_KEY` | unset |
+| `--use-llm` | `use_llm: bool` | `APEX_USE_LLM` | `False` |
+| `--llm-provider PROVIDER` | `llm_provider: str` | `APEX_LLM_PROVIDER` | `"fake"` (no real calls) |
+| `--llm-model MODEL` | `planner_model` / `executor_model` / `parser_model: str` (set simultaneously) | `APEX_LLM_MODEL` | `""` (no provider-neutral default) |
+| `--llm-openai-base-url URL` | `llm_openai_base_url: str \| None` | `APEX_LLM_OPENAI_BASE_URL` | `None` → OpenAI's own official default |
+| `--llm-anthropic-base-url URL` | `llm_anthropic_base_url: str \| None` | `APEX_LLM_ANTHROPIC_BASE_URL` | `None` → Anthropic's own official default |
+| `--llm-openrouter-base-url URL` | `llm_openrouter_base_url: str \| None` | `APEX_LLM_OPENROUTER_BASE_URL` | `None` → `https://openrouter.ai/api/v1` |
+| — (no CLI flag; shell history/`ps` risk) | — | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` (one per provider, no fallback between them) | unset |
 | `--llm-required` | `llm_required: bool` | — | `False` |
 
-**Resolution order:** `OpenAIModelRouter._base_url` = `config.llm_base_url`
-if set, else `$OPENAI_BASE_URL`, else the real OpenAI API. The API key is
-**always** read from `$OPENAI_API_KEY` at the moment the client is
+`--llm-base-url` (`llm_base_url`) remains as a legacy, generic CLI-only
+override (deliberately given no dedicated environment variable, to avoid
+recreating the exact ambiguity the three provider-specific variables above
+exist to remove) — it only ever applies to whichever provider is currently
+selected, and the provider-specific fields above always take precedence
+over it. Prefer the provider-specific flags for new configuration.
+
+**Resolution order** (`apex_host.llm.router.resolve_base_url_for_provider`,
+shared by every native router and by preflight): the provider-specific
+field (e.g. `llm_openai_base_url`) → the legacy generic `llm_base_url` →
+that provider's own SDK-recognized environment variable (`OPENAI_BASE_URL`
+/ `ANTHROPIC_BASE_URL` / `OPENROUTER_BASE_URL`) → the provider's own
+official SDK default. The API key is **always** read directly from that
+provider's own environment variable at the moment its client is
 constructed — never stored on `ApexConfig`, never accepted as a CLI flag,
-never logged. Export it once per shell session:
+never logged, and never shared between providers:
 
 ```bash
 export OPENAI_API_KEY=sk-...          # never pass this as a CLI flag
+export ANTHROPIC_API_KEY=sk-ant-...
+export OPENROUTER_API_KEY=sk-or-...
 ```
 
 **Fine-grained failure classification** (`apex_host/llm/errors.py`,
-`LLMErrorCategory`) replaces the old generic `provider_error`/`timeout`
-categories previously produced by the gateway path
-(`apex_host.llm.gateway.LLMGateway`, the only path production actually
-uses) with: `missing_key`, `authentication_failure`, `invalid_model`,
+`LLMErrorCategory`) is provider-agnostic and duck-typed (HTTP status code /
+exception type name / message substring — never a provider SDK import):
+`missing_key`, `authentication_failure`, `invalid_model`,
 `unsupported_endpoint`, `network_error`, `timeout`, `rate_limit`,
-`malformed_response`, `permanent_other`, `transient_other` — duck-typed
-from the raised exception's HTTP status / type name / message, without
-importing any provider SDK. **`missing_key` vs `invalid_model`:** the
-former means no credential was ever sent (nothing to authenticate);
-the latter means a credential **was** sent and the provider rejected the
-*model name* specifically — for the OpenRouter-style-id-against-real-OpenAI
-misconfiguration, the raised exception is a 404 whose message mentions the
-model, so it classifies as `invalid_model`, not `missing_key` or a generic
-`authentication_failure`. The original provider exception is preserved in
-diagnostics via `describe_for_diagnostics()`, bounded to 200 characters and
-pattern-scrubbed for credential-shaped substrings (`sk-...`, `AKIA...`,
-`Bearer ...`, `ghp_...`, private-key headers) via
+`malformed_response`, `permanent_other`, `transient_other`, and (Phase 5)
+`provider_model_mismatch` — the syntactic, pre-call-detected condition
+described above. **`missing_key` vs `invalid_model` vs
+`provider_model_mismatch`:** `missing_key` means no credential was ever
+sent; `invalid_model` means a credential **was** sent and the provider
+itself rejected the model name (a real network round trip happened);
+`provider_model_mismatch` is detected **before any network call at all** —
+the model/provider or base-URL/provider combination is syntactically
+unambiguous nonsense (e.g. `provider=openai` + `model=openai/gpt-5.5`), so
+APEX never even attempts the request. The original provider exception is
+preserved in diagnostics via `describe_for_diagnostics()`, bounded to 200
+characters and pattern-scrubbed for credential-shaped substrings (`sk-...`,
+`AKIA...`, `Bearer ...`, `ghp_...`, private-key headers) via
 `apex_host.security.redaction.redact_secret_patterns` — the API key is
 never logged, whether by this module (which never holds it) or by a
 provider error message that happens to echo it back.
@@ -1401,40 +1484,44 @@ misconfiguration — falls back to the deterministic planner silently, same
 as before this phase. Passing `--llm-required` together with `--use-llm`
 changes this: once a **permanent** category (`missing_key`,
 `authentication_failure`, `invalid_model`, `unsupported_endpoint`,
-`malformed_response`, `permanent_other` — never a transient one like
-`timeout`/`rate_limit`) is confirmed, the engagement terminates immediately
-with `outcome=llm_unavailable` (exit code `4`) instead of continuing to
-"pretend" to be LLM-guided after zero successful calls. This confirmation
-is shared across every phase's `PlanningEngine` instance
-(`LLMBudgetTracker.permanent_provider_error_category`) so a **second**
-phase never re-spends a budget slot or a real network call re-discovering
-the identical, already-known misconfiguration — it short-circuits straight
-to fallback (or, with `--llm-required`, straight to termination).
+`malformed_response`, `permanent_other`, `provider_model_mismatch` — never
+a transient one like `timeout`/`rate_limit`) is confirmed, the engagement
+terminates immediately with `outcome=llm_unavailable` (exit code `4`)
+instead of continuing to "pretend" to be LLM-guided after zero successful
+calls. This confirmation is shared across every phase's `PlanningEngine`
+instance (`LLMBudgetTracker.permanent_provider_error_category`) so a
+**second** phase never re-spends a budget slot or a real network call
+re-discovering the identical, already-known misconfiguration — it
+short-circuits straight to fallback (or, with `--llm-required`, straight to
+termination).
 
 **Bounded LLM readiness preflight** (`apex_host.eval.preflight`):
-- `check_llm_readiness(config)` — local only, no network — reports
+- `check_llm_readiness(config)` — local only, no network — validates the
+  provider is recognized, a model is configured, the provider/model and
+  provider/base-URL combinations have no syntactic mismatch (a **hard**
+  failure as of Phase 5 — previously only a warning), and the resolved
+  provider's own credential environment variable is present. Reports
   provider, model, and base-URL **host** (never the full URL or the key
-  value) and whether `$OPENAI_API_KEY` is present.
-- `check_llm_model_compatibility(config)` — local only, no network — a
-  non-blocking **warning** (never a hard failure, to avoid rejecting a
-  valid-but-unusual configuration) when the configured model looks
-  OpenRouter-style but the base URL does not look like OpenRouter.
+  value) and the credential variable **name** (never its value).
+- `check_llm_model_compatibility(config)` — kept for backward compatibility;
+  a non-blocking, informational restatement of the same mismatch detection
+  (`check_llm_readiness` above already enforces it as a hard failure).
 - `probe_llm_readiness(config)` — the actual bounded network check: one
-  `GET {base_url}/models` request (the standard "list models" endpoint,
-  **zero completion tokens** — no chat/completion call is ever made),
-  distinguishing missing key / authentication failure / unsupported
-  endpoint / rate limit / network error / timeout, with a best-effort
-  (non-blocking) note when the configured model id is absent from the
-  returned list. Never run automatically as part of every preflight pass
+  minimal, official model-access request (e.g. `GET /models`, **zero
+  completion tokens** — no chat/completion call is ever made) through the
+  selected provider's own native adapter, distinguishing missing key /
+  authentication failure / unsupported endpoint / rate limit / network
+  error / timeout. Never run automatically as part of every preflight pass
   (it is a real network call); `apex_host.eval.live_interlock
   .evaluate_live_interlock()` adds it to the required checks only when
-  `config.llm_required=True`, so a live run that has declared it must be
-  LLM-guided cannot start against a confirmed-broken provider
-  configuration.
+  `config.llm_required=True`.
 
-Tests for all of the above never call the real OpenAI/OpenRouter API — see
-`tests/apex_host/test_phase1_live_debug.py`, which uses fake
-routers/LLMs and `httpx.MockTransport`-backed clients exclusively.
+Tests for all of the above never call the real OpenAI/Anthropic/OpenRouter
+API — every native-provider test mocks the official SDK's own async client
+class (`openai.AsyncOpenAI` / `anthropic.AsyncAnthropic`) directly at the
+adapter boundary. See `tests/apex_host/test_llm_providers.py` (the
+dedicated Phase 5 provider suite) and `tests/apex_host/test_phase1_live_debug.py`
+(readiness/preflight diagnostics).
 
 ### Safety invariants
 
@@ -1509,10 +1596,13 @@ Each domain planner follows the `_<Name>Deterministic` + thin wrapper pattern:
 # Without LLM (default — fully deterministic)
 planner = ReconPlanner(target, registry)
 
-# With LLM (optional — falls back to deterministic on any failure)
+# With LLM (optional — falls back to deterministic on any failure).
+# build_model_router(config) selects the correct native adapter
+# (OpenAIModelRouter/AnthropicModelRouter/OpenRouterModelRouter) from
+# config.llm_provider — never hardcode a specific provider class.
 planner = ReconPlanner(
     target, registry,
-    model_router=OpenAIModelRouter(config),
+    model_router=build_model_router(config),
     allowed_tools=config.allowed_tools,
     confidence_threshold=0.4,   # from config.planning_confidence_threshold
     max_retries=1,              # from config.max_planning_retries
@@ -1523,15 +1613,16 @@ planner = ReconPlanner(
 
 ```python
 from apex_host.graph import build_apex_graph
-from apex_host.llm.router import OpenAIModelRouter
+from apex_host.llm.router import build_model_router
 
 # Deterministic-only (default, safe)
 graph = build_apex_graph(api, registry, config)
 
-# LLM-backed planning (opt-in)
+# LLM-backed planning (opt-in) — config.use_llm=True + config.llm_provider
+# selects the right native adapter automatically
 graph = build_apex_graph(
     api, registry, config,
-    model_router=OpenAIModelRouter(config),
+    model_router=build_model_router(config),
 )
 ```
 
@@ -1634,34 +1725,48 @@ uv run pytest tests/apex_host/test_repair_engine.py -v
 ### Enabling the LLM planning layer
 
 The system defaults to fully deterministic mode (no LLM calls, no API key
-required). Enable LLM planning via CLI:
+required). Enable LLM planning via CLI — a real, native provider AND an
+explicit model for that provider are both required (there is no
+provider-neutral default model):
 
 ```bash
+# Native OpenAI
 export OPENAI_API_KEY=sk-...
-
-# Via OpenRouter (recommended — access many models with one key)
 python -m apex_host.eval.run_htb_local \
   --target <HTB_TARGET_IP> \
   --payload-repo ./payloads \
   --dry-run \
   --use-llm \
   --llm-provider openai \
-  --llm-model openai/gpt-5.5 \
-  --llm-base-url https://openrouter.ai/api/v1
+  --llm-model <VALID_NATIVE_OPENAI_MODEL_ID>
 
-# Via direct OpenAI API — NOTE: the model id must be a bare OpenAI model
-# name (no "vendor/" prefix). "openai/gpt-5.5" is an OpenRouter-style id
-# and is REJECTED by the real OpenAI API as an invalid model — this is
-# the exact misconfiguration that caused the first live HTB test's LLM
-# calls to fail. See "LLM error classification and readiness diagnostics"
-# below.
+# Native Anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
 python -m apex_host.eval.run_htb_local \
   --target <HTB_TARGET_IP> \
   --payload-repo ./payloads \
   --dry-run \
   --use-llm \
-  --llm-model gpt-4o-mini
+  --llm-provider anthropic \
+  --llm-model <VALID_NATIVE_ANTHROPIC_MODEL_ID>
+
+# Optional OpenRouter — router-style "vendor/model" ids are ONLY valid here
+export OPENROUTER_API_KEY=sk-or-...
+python -m apex_host.eval.run_htb_local \
+  --target <HTB_TARGET_IP> \
+  --payload-repo ./payloads \
+  --dry-run \
+  --use-llm \
+  --llm-provider openrouter \
+  --llm-model <VALID_OPENROUTER_ROUTE_ID>
 ```
+
+Passing a router-style model to `--llm-provider openai`/`anthropic` (or
+pointing either at an OpenRouter base URL) is rejected at startup with a
+`provider_model_mismatch` error instructing `--llm-provider openrouter`
+instead — this is the exact misconfiguration that caused the first live
+HTB test's LLM calls to fail; see "LLM error classification and readiness
+diagnostics" above.
 
 Or in Python:
 
@@ -1672,11 +1777,10 @@ from apex_host.runtime import build_runtime
 config = ApexConfig(
     target="<IP>",
     use_llm=True,
-    llm_provider="openai",
-    llm_base_url="https://openrouter.ai/api/v1",  # optional; overrides OPENAI_BASE_URL
-    planner_model="openai/gpt-5.5",
+    llm_provider="anthropic",
+    planner_model="<VALID_NATIVE_ANTHROPIC_MODEL_ID>",
 )
-runtime = build_runtime(config)   # wires OpenAIModelRouter automatically
+runtime = build_runtime(config)   # build_model_router() wires the right native adapter automatically
 ```
 
 When `use_llm=False` (the default) or `llm_provider="fake"`, `FakeModelRouter`
@@ -1701,14 +1805,14 @@ python -m apex_host.eval.run_htb_local \
   --password ""
 
 # Step 3: real run WITH LLM planning (HTB VPN + OPENAI_API_KEY required)
+export OPENAI_API_KEY=sk-...
 python -m apex_host.eval.run_htb_local \
   --target <HTB_TARGET_IP> \
   --payload-repo ./payloads \
   --no-dry-run \
   --use-llm \
   --llm-provider openai \
-  --llm-model openai/gpt-5.5 \
-  --llm-base-url https://openrouter.ai/api/v1 \
+  --llm-model <VALID_NATIVE_OPENAI_MODEL_ID> \
   --username root \
   --password ""
 ```

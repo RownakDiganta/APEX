@@ -193,6 +193,42 @@ class RunReport:
     # --use-llm is set.  Empty dict when running in deterministic mode.
     llm_usage: dict[str, Any] = field(default_factory=dict)
 
+    # Phase 5 (native OpenAI/Anthropic/OpenRouter providers) — additive
+    # provider identity + readiness + attempt/fallback summary, derived
+    # from config (static, this engagement's configuration) and
+    # planner_decisions (dynamic, this engagement's actual planner calls).
+    # Never includes a credential value — only the variable NAME.
+    # llm_configured_provider/model: "" when use_llm=False or provider="fake".
+    # llm_endpoint_kind: "official_default" | "custom" | "" (not applicable).
+    # llm_readiness: apex_host.llm.types.ProviderReadiness.to_dict() from
+    #   the LAST local (no-network) readiness check performed this run, or
+    #   {} if none was performed (readiness is a CLI/preflight-time
+    #   concern — see docs/llm-providers.md "Readiness" — so this is
+    #   typically populated by the caller, e.g. run_htb_local.py, rather
+    #   than derived from final_state).
+    # llm_attempts/successes/failures: derived from planner_decisions —
+    #   see build_report()'s own comment for the exact (best-effort,
+    #   documented) definition of "attempt".
+    # llm_fallback_used: True if ANY planner_decisions entry has
+    #   fallback_used=True.
+    # llm_fallback_reason: the most recent non-empty llm_error_category
+    #   across all decisions, or "" if every decision succeeded/never
+    #   attempted the LLM.
+    # llm_required_terminated: True when this engagement's outcome is
+    #   EngagementOutcome.llm_unavailable (Phase 1) — llm_required's
+    #   fail-fast path actually fired.
+    llm_configured_provider: str = ""
+    llm_configured_model: str = ""
+    llm_endpoint_kind: str = ""
+    llm_credential_variable: str = ""
+    llm_readiness: dict[str, Any] = field(default_factory=dict)
+    llm_attempts: int = 0
+    llm_successes: int = 0
+    llm_failures: int = 0
+    llm_fallback_used: bool = False
+    llm_fallback_reason: str = ""
+    llm_required_terminated: bool = False
+
     # Duplicate action summary — populated from state["duplicate_actions"].
     # duplicate_action_count: total tasks skipped by the duplicate gate.
     # duplicate_action_entries: the raw audit entries (one per skipped task).
@@ -587,6 +623,7 @@ def build_report(
     seed_results: dict[str, Any] | None = None,
     policy_source: str = "",
     llm_budget: dict[str, Any] | None = None,
+    llm_readiness: dict[str, Any] | None = None,
     total_runtime_seconds: float = 0.0,
     report_generation_seconds: float = 0.0,
     htb_machine_name: str | None = None,
@@ -616,6 +653,17 @@ def build_report(
                               target or EKG content.
         htb_difficulty:       Phase 17 — operator-supplied HTB difficulty
                               label (e.g. "Easy", "Medium").
+        llm_readiness:        Phase 5 — optional
+                              ``apex_host.llm.types.ProviderReadiness.to_dict()``
+                              from a readiness check the caller already ran
+                              (e.g. ``apex_host.eval.preflight
+                              .check_llm_readiness``/``probe_llm_readiness``).
+                              ``build_report`` never performs its own
+                              readiness check (that would be a network/
+                              config side effect inside report building);
+                              omitted (``None``) means "not checked this
+                              run" — an empty ``{}`` on the resulting report,
+                              not a failure.
     """
     # Phase 3 (post-live-test debugging): findings are deduplicated to the
     # unique-entity view here — raw_findings (the append-only observation
@@ -713,6 +761,72 @@ def build_report(
     )
     completed_successfully = is_success_outcome(resolved_outcome)
     status = legacy_status_for(resolved_outcome)
+
+    # Phase 5 (native OpenAI/Anthropic/OpenRouter providers) — provider
+    # identity + attempt/fallback summary. Static fields (provider, model,
+    # endpoint kind, credential variable) come from config; dynamic
+    # counts come from planner_decisions (already extracted above).
+    #
+    # "Attempt" definition (best-effort, documented — planner_decisions
+    # does not carry an explicit "was the provider actually called" flag):
+    # a decision counts as an LLM attempt when planner_model == "llm"
+    # (a response was received, whether ultimately accepted or overridden
+    # by low confidence), OR when fallback_used is True with a non-empty
+    # llm_error_category that is NOT one of the "never actually called"
+    # skip markers (budget exhaustion, no router/model configured, a
+    # blocked prompt, or the known-permanent-error short-circuit — all of
+    # which mean the call was deliberately skipped, not attempted and
+    # failed).
+    _llm_skip_only_categories = frozenset({
+        "budget_exhausted", "fallback_no_router", "fallback_no_model", "prompt_blocked",
+    })
+    llm_attempts = 0
+    llm_successes = 0
+    llm_failures = 0
+    llm_fallback_used = False
+    llm_fallback_reason = ""
+    for _d in planner_decisions:
+        _is_llm = _d.get("planner_model") == "llm"
+        _fallback = bool(_d.get("fallback_used"))
+        _err_cat = str(_d.get("llm_error_category") or "")
+        if _fallback:
+            llm_fallback_used = True
+        if _is_llm:
+            llm_attempts += 1
+            if _fallback:
+                # An LLM response was received but overridden (low
+                # confidence, or validator rejection across all retries) —
+                # a genuine attempt and the engine's own fallback path, but
+                # not a hard provider failure, so it is not counted in
+                # llm_failures. Still recorded as the fallback reason when
+                # no harder failure has been seen yet.
+                if not llm_fallback_reason:
+                    llm_fallback_reason = _err_cat or "low_confidence_or_validation"
+            else:
+                llm_successes += 1
+        elif _fallback and _err_cat and _err_cat not in _llm_skip_only_categories:
+            llm_attempts += 1
+            llm_failures += 1
+            llm_fallback_reason = _err_cat
+
+    llm_configured_provider = config.llm_provider if config.use_llm else ""
+    llm_configured_model = (
+        config.planner_model if config.use_llm and config.llm_provider not in ("fake", "") else ""
+    )
+    llm_endpoint_kind = ""
+    llm_credential_variable = ""
+    if config.use_llm and config.llm_provider not in ("fake", ""):
+        try:
+            from apex_host.llm.errors import endpoint_kind as _endpoint_kind_fn
+            from apex_host.llm.router import resolve_base_url_for_provider
+            from apex_host.llm.types import CREDENTIAL_ENV_VAR as _CRED_VAR
+
+            _base_url = resolve_base_url_for_provider(config, config.llm_provider)
+            llm_endpoint_kind = _endpoint_kind_fn(config.llm_provider, _base_url)
+            llm_credential_variable = _CRED_VAR.get(config.llm_provider, "")
+        except Exception:  # noqa: BLE001 — reporting must never fail the build
+            pass
+    llm_required_terminated = resolved_outcome == EngagementOutcome.llm_unavailable
 
     # Policy gate summary
     raw_pd = list(final_state.get("policy_decisions") or [])
@@ -1060,6 +1174,17 @@ def build_report(
         knowledge_init=knowledge_init,
         policy_source=policy_source,
         llm_usage=llm_budget if llm_budget is not None else {},
+        llm_configured_provider=llm_configured_provider,
+        llm_configured_model=llm_configured_model,
+        llm_endpoint_kind=llm_endpoint_kind,
+        llm_credential_variable=llm_credential_variable,
+        llm_readiness=dict(llm_readiness) if llm_readiness is not None else {},
+        llm_attempts=llm_attempts,
+        llm_successes=llm_successes,
+        llm_failures=llm_failures,
+        llm_fallback_used=llm_fallback_used,
+        llm_fallback_reason=llm_fallback_reason,
+        llm_required_terminated=llm_required_terminated,
         duplicate_action_count=len(raw_dup),
         duplicate_action_entries=raw_dup,
         backend_usage=backend_usage,
@@ -1651,6 +1776,27 @@ def format_text(report: RunReport) -> str:
         for reason in report.last_blocked_reasons:
             lines.append(f"    {reason[:120]}")
 
+    # LLM Provider identity (Phase 5 — shown whenever a real provider was
+    # configured this run, regardless of whether any call was attempted)
+    if report.llm_configured_provider and report.llm_configured_provider != "fake":
+        lines.append("\nLLM Provider")
+        lines.append(f"  Provider          : {report.llm_configured_provider}")
+        lines.append(f"  Model             : {report.llm_configured_model!r}")
+        lines.append(f"  Endpoint          : {report.llm_endpoint_kind or 'n/a'}")
+        lines.append(f"  Credential var    : {report.llm_credential_variable or 'n/a'}")
+        lines.append(f"  Attempts/success/fail : {report.llm_attempts}/{report.llm_successes}/{report.llm_failures}")
+        lines.append(f"  Fallback used     : {report.llm_fallback_used}")
+        if report.llm_fallback_reason:
+            lines.append(f"  Fallback reason   : {report.llm_fallback_reason}")
+        if report.llm_required_terminated:
+            lines.append("  llm_required TERMINATED this engagement (EngagementOutcome.llm_unavailable)")
+        if report.llm_readiness:
+            r = report.llm_readiness
+            lines.append(
+                f"  Readiness         : configuration_valid={r.get('configuration_valid')} "
+                f"network_checked={r.get('network_checked')} reachable={r.get('reachable')}"
+            )
+
     # LLM Usage (shown only when LLM planning was active this run)
     if report.llm_usage:
         u = report.llm_usage
@@ -1773,6 +1919,19 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
             "initialization": report.knowledge_init,
         },
         "llm_usage": report.llm_usage,
+        "llm_provider": {
+            "configured_provider": report.llm_configured_provider,
+            "configured_model": report.llm_configured_model,
+            "endpoint_kind": report.llm_endpoint_kind,
+            "credential_variable": report.llm_credential_variable,
+            "readiness": report.llm_readiness,
+            "attempts": report.llm_attempts,
+            "successes": report.llm_successes,
+            "failures": report.llm_failures,
+            "fallback_used": report.llm_fallback_used,
+            "fallback_reason": report.llm_fallback_reason,
+            "llm_required_terminated": report.llm_required_terminated,
+        },
         "duplicate_actions": {
             "total_skipped": report.duplicate_action_count,
             "entries": report.duplicate_action_entries,

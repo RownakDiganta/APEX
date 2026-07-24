@@ -23,7 +23,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import httpx
 import pytest
 
 from memfabric.api import MemoryAPI
@@ -756,14 +755,17 @@ class TestPreflightLLMReadiness:
         assert check.required is False
 
     def test_missing_key_reports_provider_model_and_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Phase 5: a native model identifier — "openai/gpt-5.5" is now a
+        # provider_model_mismatch, checked BEFORE the credential check, so
+        # this test uses a valid native-shaped model to reach missing_key.
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        config = ApexConfig(target=_TARGET, use_llm=True, llm_provider="openai", planner_model="openai/gpt-5.5")
+        config = ApexConfig(target=_TARGET, use_llm=True, llm_provider="openai", planner_model="gpt-4o-mini")
         check = check_llm_readiness(config)
         assert check.passed is False
         assert check.required is True
         assert "missing_key" in check.detail
-        assert "openai/gpt-5.5" in check.detail
-        assert "api.openai.com" in check.detail
+        assert "gpt-4o-mini" in check.detail
+        assert "OPENAI_API_KEY" in check.detail
 
     def test_key_present_reports_readiness_without_leaking_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-super-secret-value-should-never-appear-1234")
@@ -772,6 +774,21 @@ class TestPreflightLLMReadiness:
         assert check.passed is True
         assert "sk-super-secret-value-should-never-appear-1234" not in check.detail
         assert "credential present" in check.detail
+
+    def test_readiness_hard_rejects_openrouter_style_model_against_openai(self) -> None:
+        """Phase 5: what used to be a warning is now a hard
+        provider_model_mismatch failure on the REQUIRED readiness check —
+        this is the exact root-cause configuration from the original
+        live-test failure this module documents."""
+        config = ApexConfig(
+            target=_TARGET, use_llm=True, llm_provider="openai",
+            planner_model="openai/gpt-5.5", llm_base_url=None,
+        )
+        check = check_llm_readiness(config)
+        assert check.required is True
+        assert check.passed is False
+        assert "provider_model_mismatch" in check.detail
+        assert "openai/gpt-5.5" in check.detail
 
     def test_model_compatibility_warns_on_openrouter_style_model_against_openai(self) -> None:
         config = ApexConfig(
@@ -788,13 +805,39 @@ class TestPreflightLLMReadiness:
         check = check_llm_model_compatibility(config)
         assert check.passed is True
 
-    def test_model_compatibility_passes_for_openrouter_style_model_with_openrouter_base_url(self) -> None:
+    def test_openai_provider_with_openrouter_base_url_is_rejected_with_migration_message(self) -> None:
+        """Phase 5: the old mixed configuration (provider='openai' pointed
+        at an OpenRouter base URL) is no longer silently treated as
+        compatible — it is rejected on BOTH the required readiness check
+        and the informational compatibility check, with a message
+        instructing the operator to select provider='openrouter' instead.
+        This is the exact "reject with precise migration message" behavior
+        the Phase 5 task brief requires."""
         config = ApexConfig(
             target=_TARGET, use_llm=True, llm_provider="openai",
             planner_model="openai/gpt-5.5", llm_base_url="https://openrouter.ai/api/v1",
         )
-        check = check_llm_model_compatibility(config)
-        assert check.passed is True
+        readiness = check_llm_readiness(config)
+        assert readiness.passed is False
+        assert readiness.required is True
+
+        compatibility = check_llm_model_compatibility(config)
+        assert compatibility.passed is False
+        assert "openrouter" in compatibility.detail.lower()
+        assert "provider='openrouter'" in compatibility.detail
+
+    def test_openai_provider_with_openrouter_base_url_rejected_even_with_native_model(self) -> None:
+        """A native-shaped model does not save an OpenRouter base URL
+        combined with provider='openai' — the base-URL/provider mismatch
+        is an independent, unconditional check."""
+        config = ApexConfig(
+            target=_TARGET, use_llm=True, llm_provider="openai",
+            planner_model="gpt-4o-mini", llm_base_url="https://openrouter.ai/api/v1",
+        )
+        check = check_llm_readiness(config)
+        assert check.passed is False
+        assert "provider_model_mismatch" in check.detail
+        assert "openrouter" in check.detail.lower()
 
     def test_model_compatibility_is_never_blocking(self) -> None:
         """A model/provider mismatch is a WARNING, never a hard rejection
@@ -805,72 +848,104 @@ class TestPreflightLLMReadiness:
 
     @pytest.mark.asyncio
     async def test_probe_missing_key_fails_without_network_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Phase 5: each native provider adapter constructs its own SDK
+        client internally rather than accepting an injected httpx client
+        — mocked at the adapter boundary (the real openai.AsyncOpenAI
+        class) so a missing key is caught before any client is ever
+        constructed."""
+        import openai
+
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        config = ApexConfig(target=_TARGET, use_llm=True, llm_provider="openai")
+        config = ApexConfig(target=_TARGET, use_llm=True, llm_provider="openai", planner_model="gpt-4o-mini")
 
-        def _never_called(request: httpx.Request) -> httpx.Response:
-            raise AssertionError("must never make a network call without a key")
+        def _never_construct(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("must never construct an SDK client without a key")
 
-        client = httpx.AsyncClient(transport=httpx.MockTransport(_never_called))
-        try:
-            check = await probe_llm_readiness(config, client=client)
-        finally:
-            await client.aclose()
+        monkeypatch.setattr(openai, "AsyncOpenAI", _never_construct)
+
+        check = await probe_llm_readiness(config)
         assert check.passed is False
         assert "missing_key" in check.detail
 
     @pytest.mark.asyncio
-    async def test_probe_never_contacts_real_openai_uses_injected_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """This is the load-bearing test proving tests never call the
-        real OpenAI API — the mock transport asserts on the exact URL."""
+    async def test_probe_never_contacts_real_openai_mocked_at_sdk_boundary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """This is the load-bearing test proving tests never call the real
+        OpenAI API — the openai SDK's own AsyncOpenAI client class is
+        mocked at the adapter boundary (Phase 5's required test pattern),
+        never a raw httpx transport underneath a real SDK client."""
+        import openai
+
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key-not-real-1234567890")
         config = ApexConfig(target=_TARGET, use_llm=True, llm_provider="openai", planner_model="gpt-4o-mini")
 
-        seen_urls: list[str] = []
+        construct_calls: list[dict[str, Any]] = []
 
-        def _handler(request: httpx.Request) -> httpx.Response:
-            seen_urls.append(str(request.url))
-            assert "api.openai.com" in str(request.url)
-            assert request.headers.get("Authorization") == "Bearer sk-test-key-not-real-1234567890"
-            return httpx.Response(200, json={"data": [{"id": "gpt-4o-mini"}]})
+        class _FakeModels:
+            async def list(self) -> Any:
+                return type("R", (), {"data": [{"id": "gpt-4o-mini"}]})()
 
-        client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
-        try:
-            check = await probe_llm_readiness(config, client=client)
-        finally:
-            await client.aclose()
+        class _FakeAsyncOpenAI:
+            def __init__(self, **kwargs: Any) -> None:
+                construct_calls.append(kwargs)
+                self.models = _FakeModels()
+
+            async def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(openai, "AsyncOpenAI", _FakeAsyncOpenAI)
+
+        check = await probe_llm_readiness(config)
         assert check.passed is True
-        assert len(seen_urls) == 1
+        assert len(construct_calls) == 1
+        assert construct_calls[0]["api_key"] == "sk-test-key-not-real-1234567890"
 
     @pytest.mark.asyncio
     async def test_probe_401_classified_as_authentication_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import openai
+
         monkeypatch.setenv("OPENAI_API_KEY", "sk-bad-key-0000000000000000000000")
-        config = ApexConfig(target=_TARGET, use_llm=True, llm_provider="openai")
+        config = ApexConfig(target=_TARGET, use_llm=True, llm_provider="openai", planner_model="gpt-4o-mini")
 
-        def _handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(401, json={"error": "invalid key"})
+        class _FakeModels:
+            async def list(self) -> Any:
+                raise _AuthenticationError("invalid key", status_code=401)
 
-        client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
-        try:
-            check = await probe_llm_readiness(config, client=client)
-        finally:
-            await client.aclose()
+        class _FakeAsyncOpenAI:
+            def __init__(self, **kwargs: Any) -> None:
+                self.models = _FakeModels()
+
+            async def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(openai, "AsyncOpenAI", _FakeAsyncOpenAI)
+
+        check = await probe_llm_readiness(config)
         assert check.passed is False
         assert "authentication_failure" in check.detail
 
     @pytest.mark.asyncio
     async def test_probe_404_classified_as_unsupported_endpoint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import openai
+
         monkeypatch.setenv("OPENAI_API_KEY", "sk-key-0000000000000000000000000")
-        config = ApexConfig(target=_TARGET, use_llm=True, llm_provider="openai")
+        config = ApexConfig(target=_TARGET, use_llm=True, llm_provider="openai", planner_model="gpt-4o-mini")
 
-        def _handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(404)
+        class _FakeModels:
+            async def list(self) -> Any:
+                raise _NotFoundError("", status_code=404)
 
-        client = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
-        try:
-            check = await probe_llm_readiness(config, client=client)
-        finally:
-            await client.aclose()
+        class _FakeAsyncOpenAI:
+            def __init__(self, **kwargs: Any) -> None:
+                self.models = _FakeModels()
+
+            async def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(openai, "AsyncOpenAI", _FakeAsyncOpenAI)
+
+        check = await probe_llm_readiness(config)
         assert check.passed is False
         assert "unsupported_endpoint" in check.detail
 

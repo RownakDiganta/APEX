@@ -1,17 +1,24 @@
 # test_llm_wiring.py
 # Tests for LLM wiring: CLI flag parsing, ApexConfig fields, ModelRouter construction, and fallback behavior.
-"""Tests for the LLM wiring layer added in Phase 6.
+"""Tests for the LLM wiring layer (Phase 6), updated for Phase 5's native
+OpenAI/Anthropic/OpenRouter provider architecture.
 
 Covers:
 - ApexConfig carries use_llm, llm_provider, llm_base_url with safe defaults.
-- Model names updated to openai/gpt-5.5.
+- planner_model/executor_model/parser_model default to "" (no provider-neutral
+  default model exists anywhere in this codebase — Phase 5).
 - Both CLI entry points (main.py and run_htb_local.py) expose --use-llm,
-  --llm-provider, --llm-model, --llm-base-url and wire them into ApexConfig.
-- OpenAIModelRouter respects config.llm_base_url over OPENAI_BASE_URL env var.
+  --llm-provider, --llm-model, --llm-base-url (plus the three new
+  --llm-{openai,anthropic,openrouter}-base-url flags) and wire them into
+  ApexConfig.
+- build_model_router() (the Phase 5 factory) selects FakeModelRouter for
+  use_llm=False / provider=fake, and the correct native router class
+  (OpenAIModelRouter / AnthropicModelRouter / OpenRouterModelRouter)
+  otherwise — this is the ONE place apex_host.runtime delegates to; it no
+  longer hardcodes a specific provider class or imports FakeModelRouter/
+  OpenAIModelRouter directly by name.
 - FakeModelRouter always returns None (safe default for tests and dry-run).
-- ApexRuntime.run() uses FakeModelRouter when use_llm=False (default).
-- ApexRuntime.run() constructs OpenAIModelRouter when use_llm=True and
-  llm_provider != "fake".
+- ApexRuntime.run() calls build_model_router() exactly once per run().
 - PlanningEngine receives the router and falls back to deterministic when LLM
   returns invalid output.
 - dry_run=True engagement completes with no real subprocess calls regardless
@@ -25,7 +32,15 @@ from unittest.mock import patch
 import pytest
 
 from apex_host.config import ApexConfig
-from apex_host.llm.router import FakeModelRouter, OpenAIModelRouter
+from apex_host.llm.router import (
+    AnthropicModelRouter,
+    FakeModelRouter,
+    ModelRouter,
+    OpenAIModelRouter,
+    OpenRouterModelRouter,
+    build_model_router,
+    resolve_base_url_for_provider,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,19 +72,49 @@ class TestApexConfigLLMFields:
         config = ApexConfig(target="10.0.0.1", llm_base_url="https://openrouter.ai/api/v1")
         assert config.llm_base_url == "https://openrouter.ai/api/v1"
 
+    def test_provider_specific_base_url_fields_default_none(self) -> None:
+        config = ApexConfig(target="10.0.0.1")
+        assert config.llm_openai_base_url is None
+        assert config.llm_anthropic_base_url is None
+        assert config.llm_openrouter_base_url is None
+
+    def test_can_set_provider_specific_base_url_fields(self) -> None:
+        config = ApexConfig(
+            target="10.0.0.1",
+            llm_openai_base_url="https://openai.example",
+            llm_anthropic_base_url="https://anthropic.example",
+            llm_openrouter_base_url="https://openrouter.example",
+        )
+        assert config.llm_openai_base_url == "https://openai.example"
+        assert config.llm_anthropic_base_url == "https://anthropic.example"
+        assert config.llm_openrouter_base_url == "https://openrouter.example"
+
 
 class TestApexConfigModelNames:
-    def test_planner_model_default(self) -> None:
-        config = ApexConfig(target="10.0.0.1")
-        assert config.planner_model == "openai/gpt-5.5"
+    """Phase 5: there is no provider-neutral default model. Every model
+    field defaults to the empty string — use_llm=True requires an explicit
+    model for the selected provider, or readiness/config validation fails
+    fast with a provider_model_mismatch-style diagnostic."""
 
-    def test_executor_model_default(self) -> None:
+    def test_planner_model_default_is_empty(self) -> None:
         config = ApexConfig(target="10.0.0.1")
-        assert config.executor_model == "openai/gpt-5.5"
+        assert config.planner_model == ""
 
-    def test_parser_model_default(self) -> None:
+    def test_executor_model_default_is_empty(self) -> None:
         config = ApexConfig(target="10.0.0.1")
-        assert config.parser_model == "openai/gpt-5.5"
+        assert config.executor_model == ""
+
+    def test_parser_model_default_is_empty(self) -> None:
+        config = ApexConfig(target="10.0.0.1")
+        assert config.parser_model == ""
+
+    def test_can_set_native_openai_model(self) -> None:
+        config = ApexConfig(target="10.0.0.1", planner_model="gpt-4o-mini")
+        assert config.planner_model == "gpt-4o-mini"
+
+    def test_can_set_native_anthropic_model(self) -> None:
+        config = ApexConfig(target="10.0.0.1", planner_model="claude-sonnet-4-5-20250929")
+        assert config.planner_model == "claude-sonnet-4-5-20250929"
 
 
 # ---------------------------------------------------------------------------
@@ -91,44 +136,119 @@ class TestFakeModelRouter:
 
 
 # ---------------------------------------------------------------------------
-# OpenAIModelRouter base-URL precedence
+# build_model_router() — the Phase 5 provider-selection factory
 # ---------------------------------------------------------------------------
 
-class TestOpenAIModelRouterBaseURL:
-    def test_config_base_url_takes_precedence_over_env(
+class TestBuildModelRouter:
+    def test_use_llm_false_returns_fake(self) -> None:
+        config = ApexConfig(target="10.0.0.1", use_llm=False, llm_provider="openai")
+        assert isinstance(build_model_router(config), FakeModelRouter)
+
+    def test_use_llm_true_provider_fake_returns_fake(self) -> None:
+        config = ApexConfig(target="10.0.0.1", use_llm=True, llm_provider="fake")
+        assert isinstance(build_model_router(config), FakeModelRouter)
+
+    def test_provider_openai_returns_openai_router(self) -> None:
+        config = ApexConfig(
+            target="10.0.0.1", use_llm=True, llm_provider="openai", planner_model="gpt-4o-mini",
+        )
+        assert isinstance(build_model_router(config), OpenAIModelRouter)
+
+    def test_provider_anthropic_returns_anthropic_router(self) -> None:
+        config = ApexConfig(
+            target="10.0.0.1", use_llm=True, llm_provider="anthropic",
+            planner_model="claude-sonnet-4-5-20250929",
+        )
+        assert isinstance(build_model_router(config), AnthropicModelRouter)
+
+    def test_provider_openrouter_returns_openrouter_router(self) -> None:
+        config = ApexConfig(
+            target="10.0.0.1", use_llm=True, llm_provider="openrouter",
+            planner_model="openai/gpt-4o-mini",
+        )
+        assert isinstance(build_model_router(config), OpenRouterModelRouter)
+
+    def test_unrecognized_provider_raises(self) -> None:
+        # Defense-in-depth only — apex_host.config_env already validates
+        # llm_provider before an ApexConfig with use_llm=True is normally
+        # constructed. Direct construction bypasses that, so build_model_router
+        # itself must still refuse rather than silently falling back.
+        config = ApexConfig(target="10.0.0.1", use_llm=True, llm_provider="not-a-real-provider")
+        with pytest.raises(ValueError, match="unrecognized llm_provider"):
+            build_model_router(config)
+
+
+# ---------------------------------------------------------------------------
+# Native provider router base-URL precedence
+# ---------------------------------------------------------------------------
+
+class TestNativeRouterBaseURL:
+    def test_openai_config_base_url_takes_precedence_over_env(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("OPENAI_BASE_URL", "https://env-base")
         config = ApexConfig(
-            target="10.0.0.1", use_llm=True, llm_base_url="https://config-base"
+            target="10.0.0.1", use_llm=True, llm_provider="openai",
+            llm_openai_base_url="https://specific-base",
+            llm_base_url="https://legacy-base",
         )
-        router = OpenAIModelRouter(config)
-        assert router._base_url == "https://config-base"
+        assert resolve_base_url_for_provider(config, "openai") == "https://specific-base"
 
-    def test_env_base_url_used_when_config_is_none(
+    def test_openai_legacy_base_url_wins_over_env_when_specific_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://env-base")
+        config = ApexConfig(target="10.0.0.1", use_llm=True, llm_base_url="https://legacy-base")
+        assert resolve_base_url_for_provider(config, "openai") == "https://legacy-base"
+
+    def test_openai_env_base_url_used_when_config_is_none(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("OPENAI_BASE_URL", "https://env-base")
         config = ApexConfig(target="10.0.0.1", use_llm=True, llm_base_url=None)
-        router = OpenAIModelRouter(config)
-        assert router._base_url == "https://env-base"
+        assert resolve_base_url_for_provider(config, "openai") == "https://env-base"
 
-    def test_empty_base_url_falls_back_to_env(
+    def test_openai_none_falls_back_to_sdk_default(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         config = ApexConfig(target="10.0.0.1", use_llm=True, llm_base_url=None)
+        assert resolve_base_url_for_provider(config, "openai") is None
+
+    def test_anthropic_base_url_isolated_from_openai(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://openai-env-base")
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+        config = ApexConfig(target="10.0.0.1", use_llm=True, llm_provider="anthropic")
+        assert resolve_base_url_for_provider(config, "anthropic") is None
+
+    def test_openai_router_stores_resolved_base_url(self) -> None:
+        config = ApexConfig(
+            target="10.0.0.1", use_llm=True, llm_provider="openai",
+            llm_openai_base_url="https://custom.example/v1", planner_model="gpt-4o-mini",
+        )
         router = OpenAIModelRouter(config)
-        assert router._base_url is None
+        assert router._base_url == "https://custom.example/v1"
+
+    def test_anthropic_router_stores_resolved_base_url(self) -> None:
+        config = ApexConfig(
+            target="10.0.0.1", use_llm=True, llm_provider="anthropic",
+            llm_anthropic_base_url="https://custom-anthropic.example",
+            planner_model="claude-sonnet-4-5-20250929",
+        )
+        router = AnthropicModelRouter(config)
+        assert router._base_url == "https://custom-anthropic.example"
 
     def test_planner_model_used_in_build(self) -> None:
         config = ApexConfig(
-            target="10.0.0.1", use_llm=True, planner_model="openai/gpt-5.5"
+            target="10.0.0.1", use_llm=True, llm_provider="openai", planner_model="gpt-4o-mini",
         )
         router = OpenAIModelRouter(config)
-        # Access the _config to confirm model is stored correctly; _build would
-        # need langchain_openai installed, so we only test the routing layer here.
-        assert router._config.planner_model == "openai/gpt-5.5"
+        # Constructing the router never contacts the network or requires a
+        # real API key — the SDK client itself is only constructed inside
+        # generate()/check_readiness(). We only verify the model is stored.
+        assert router._config.planner_model == "gpt-4o-mini"
 
 
 # ---------------------------------------------------------------------------
@@ -159,35 +279,66 @@ class TestMainParseCLI:
 
     def test_llm_model_flag(self) -> None:
         from apex_host.main import parse_args
-        args = parse_args(["--target", "10.0.0.1", "--llm-model", "openai/gpt-5.5"])
-        assert args.llm_model == "openai/gpt-5.5"
+        args = parse_args(["--target", "10.0.0.1", "--llm-model", "gpt-4o-mini"])
+        assert args.llm_model == "gpt-4o-mini"
 
     def test_llm_base_url_flag(self) -> None:
         from apex_host.main import parse_args
         args = parse_args([
             "--target", "10.0.0.1",
-            "--llm-base-url", "https://openrouter.ai/api/v1",
+            "--llm-base-url", "https://custom.example/v1",
         ])
-        assert args.llm_base_url == "https://openrouter.ai/api/v1"
+        assert args.llm_base_url == "https://custom.example/v1"
+
+    def test_llm_openai_base_url_flag(self) -> None:
+        from apex_host.main import parse_args
+        args = parse_args([
+            "--target", "10.0.0.1",
+            "--llm-openai-base-url", "https://custom-openai.example/v1",
+        ])
+        assert args.llm_openai_base_url == "https://custom-openai.example/v1"
+
+    def test_llm_anthropic_base_url_flag(self) -> None:
+        from apex_host.main import parse_args
+        args = parse_args([
+            "--target", "10.0.0.1",
+            "--llm-anthropic-base-url", "https://custom-anthropic.example",
+        ])
+        assert args.llm_anthropic_base_url == "https://custom-anthropic.example"
+
+    def test_llm_openrouter_base_url_flag(self) -> None:
+        from apex_host.main import parse_args
+        args = parse_args([
+            "--target", "10.0.0.1",
+            "--llm-openrouter-base-url", "https://custom-openrouter.example/api/v1",
+        ])
+        assert args.llm_openrouter_base_url == "https://custom-openrouter.example/api/v1"
 
     def test_all_llm_flags_together(self) -> None:
         from apex_host.main import parse_args
         args = parse_args([
             "--target", "10.0.0.1",
             "--use-llm",
-            "--llm-provider", "openai",
-            "--llm-model", "openai/gpt-5.5",
-            "--llm-base-url", "https://openrouter.ai/api/v1",
+            "--llm-provider", "anthropic",
+            "--llm-model", "claude-sonnet-4-5-20250929",
+            "--llm-anthropic-base-url", "https://custom-anthropic.example",
         ])
         assert args.use_llm is True
-        assert args.llm_provider == "openai"
-        assert args.llm_model == "openai/gpt-5.5"
-        assert args.llm_base_url == "https://openrouter.ai/api/v1"
+        assert args.llm_provider == "anthropic"
+        assert args.llm_model == "claude-sonnet-4-5-20250929"
+        assert args.llm_anthropic_base_url == "https://custom-anthropic.example"
 
     def test_llm_model_none_by_default(self) -> None:
         from apex_host.main import parse_args
         args = parse_args(["--target", "10.0.0.1"])
         assert args.llm_model is None
+
+    def test_provider_specific_base_url_flags_none_by_default(self) -> None:
+        from apex_host.main import parse_args
+        args = parse_args(["--target", "10.0.0.1"])
+        assert args.llm_openai_base_url is None
+        assert args.llm_anthropic_base_url is None
+        assert args.llm_openrouter_base_url is None
 
 
 # ---------------------------------------------------------------------------
@@ -211,21 +362,29 @@ class TestRunHTBLocalParseCLI:
 
     def test_llm_provider_flag(self) -> None:
         from apex_host.eval.run_htb_local import parse_args
-        args = parse_args(["--target", "10.0.0.1", "--llm-provider", "openai"])
-        assert args.llm_provider == "openai"
+        args = parse_args(["--target", "10.0.0.1", "--llm-provider", "anthropic"])
+        assert args.llm_provider == "anthropic"
 
     def test_llm_model_flag(self) -> None:
         from apex_host.eval.run_htb_local import parse_args
-        args = parse_args(["--target", "10.0.0.1", "--llm-model", "openai/gpt-5.5"])
-        assert args.llm_model == "openai/gpt-5.5"
+        args = parse_args(["--target", "10.0.0.1", "--llm-model", "claude-sonnet-4-5-20250929"])
+        assert args.llm_model == "claude-sonnet-4-5-20250929"
 
     def test_llm_base_url_flag(self) -> None:
         from apex_host.eval.run_htb_local import parse_args
         args = parse_args([
             "--target", "10.0.0.1",
-            "--llm-base-url", "https://openrouter.ai/api/v1",
+            "--llm-base-url", "https://custom.example/v1",
         ])
-        assert args.llm_base_url == "https://openrouter.ai/api/v1"
+        assert args.llm_base_url == "https://custom.example/v1"
+
+    def test_llm_openrouter_base_url_flag(self) -> None:
+        from apex_host.eval.run_htb_local import parse_args
+        args = parse_args([
+            "--target", "10.0.0.1",
+            "--llm-openrouter-base-url", "https://custom-openrouter.example/api/v1",
+        ])
+        assert args.llm_openrouter_base_url == "https://custom-openrouter.example/api/v1"
 
     def test_all_llm_flags_together(self) -> None:
         from apex_host.eval.run_htb_local import parse_args
@@ -233,17 +392,18 @@ class TestRunHTBLocalParseCLI:
             "--target", "10.0.0.1",
             "--use-llm",
             "--llm-provider", "openai",
-            "--llm-model", "openai/gpt-5.5",
-            "--llm-base-url", "https://openrouter.ai/api/v1",
+            "--llm-model", "gpt-4o-mini",
+            "--llm-openai-base-url", "https://custom-openai.example/v1",
         ])
         assert args.use_llm is True
         assert args.llm_provider == "openai"
-        assert args.llm_model == "openai/gpt-5.5"
-        assert args.llm_base_url == "https://openrouter.ai/api/v1"
+        assert args.llm_model == "gpt-4o-mini"
+        assert args.llm_openai_base_url == "https://custom-openai.example/v1"
 
 
 # ---------------------------------------------------------------------------
-# Config construction from CLI args (model override)
+# Config construction from CLI args (model override) — via the canonical
+# ApexConfig.from_cli_args() factory, not manual dict construction.
 # ---------------------------------------------------------------------------
 
 class TestConfigFromCLIArgs:
@@ -251,128 +411,107 @@ class TestConfigFromCLIArgs:
         """--llm-model sets planner_model, executor_model, and parser_model."""
         from apex_host.main import parse_args
 
-        args = parse_args(["--target", "10.0.0.1", "--llm-model", "openai/gpt-5.5"])
-        config_kwargs: dict[str, object] = dict(
-            target=args.target,
-            use_llm=args.use_llm,
-            llm_provider=args.llm_provider,
-            llm_base_url=args.llm_base_url,
-        )
-        if args.llm_model:
-            config_kwargs["planner_model"] = args.llm_model
-            config_kwargs["executor_model"] = args.llm_model
-            config_kwargs["parser_model"] = args.llm_model
-        config = ApexConfig(**config_kwargs)  # type: ignore[arg-type]
+        args = parse_args(["--target", "10.0.0.1", "--llm-model", "gpt-4o-mini"])
+        config = ApexConfig.from_cli_args(args)
 
-        assert config.planner_model == "openai/gpt-5.5"
-        assert config.executor_model == "openai/gpt-5.5"
-        assert config.parser_model == "openai/gpt-5.5"
+        assert config.planner_model == "gpt-4o-mini"
+        assert config.executor_model == "gpt-4o-mini"
+        assert config.parser_model == "gpt-4o-mini"
 
-    def test_no_llm_model_keeps_default(self) -> None:
-        """Without --llm-model, planner_model is the default "openai/gpt-5.5"."""
+    def test_no_llm_model_keeps_empty_default(self) -> None:
+        """Without --llm-model, planner_model stays the empty-string default
+        — there is no provider-neutral default model (Phase 5)."""
         from apex_host.main import parse_args
 
         args = parse_args(["--target", "10.0.0.1"])
-        config_kwargs: dict[str, object] = dict(
-            target=args.target,
-            use_llm=args.use_llm,
-            llm_provider=args.llm_provider,
-            llm_base_url=args.llm_base_url,
-        )
-        config = ApexConfig(**config_kwargs)  # type: ignore[arg-type]
+        config = ApexConfig.from_cli_args(args)
 
-        assert config.planner_model == "openai/gpt-5.5"
+        assert config.planner_model == ""
+
+    def test_provider_normalized_case_insensitively(self) -> None:
+        from apex_host.main import parse_args
+
+        args = parse_args(["--target", "10.0.0.1", "--llm-provider", "OpenAI"])
+        config = ApexConfig.from_cli_args(args)
+        assert config.llm_provider == "openai"
+
+    def test_invalid_provider_with_use_llm_raises(self) -> None:
+        from apex_host.main import parse_args
+
+        args = parse_args([
+            "--target", "10.0.0.1", "--use-llm", "--llm-provider", "not-a-real-provider",
+        ])
+        with pytest.raises(ValueError, match="invalid llm_provider|unrecognized"):
+            ApexConfig.from_cli_args(args)
 
 
 # ---------------------------------------------------------------------------
-# Runtime wiring: router selected based on use_llm
+# Runtime wiring: apex_host.runtime delegates to build_model_router() —
+# the ONE factory function, never a hardcoded provider class by name.
 # ---------------------------------------------------------------------------
 
 class TestRuntimeRouterWiring:
-    async def test_fake_router_used_by_default(self) -> None:
-        """use_llm=False (default) → FakeModelRouter → no LLM calls during run."""
+    async def test_build_model_router_called_once_per_run(self) -> None:
+        """apex_host.runtime.ApexRuntime.run() calls build_model_router(config)
+        exactly once, and uses whatever it returns (never constructs a
+        specific provider router class directly)."""
         from apex_host.runtime import build_runtime
 
         config = ApexConfig(target="127.0.0.1", dry_run=True, max_turns=1)
         runtime = build_runtime(config)
 
-        routers_constructed: list[str] = []
+        calls: list[ApexConfig] = []
+        real_build = build_model_router
 
-        _real_fake = FakeModelRouter
-        _real_openai = OpenAIModelRouter
+        def spy(cfg: ApexConfig) -> ModelRouter:
+            calls.append(cfg)
+            return real_build(cfg)
 
-        def fake_fake() -> FakeModelRouter:
-            routers_constructed.append("fake")
-            return _real_fake()
-
-        def fake_openai(cfg: ApexConfig) -> OpenAIModelRouter:
-            routers_constructed.append("openai")
-            return _real_openai(cfg)
-
-        with (
-            patch("apex_host.runtime.FakeModelRouter", fake_fake),
-            patch("apex_host.runtime.OpenAIModelRouter", fake_openai),
-        ):
+        with patch("apex_host.runtime.build_model_router", spy):
             await runtime.run()
 
-        assert "fake" in routers_constructed
-        assert "openai" not in routers_constructed
+        assert calls == [config]
 
-    async def test_openai_router_used_when_use_llm_and_provider_openai(self) -> None:
-        """use_llm=True + llm_provider='openai' → OpenAIModelRouter constructed.
+    def test_fake_router_returned_when_use_llm_false(self) -> None:
+        config = ApexConfig(target="127.0.0.1", use_llm=False)
+        assert isinstance(build_model_router(config), FakeModelRouter)
 
-        We intercept the constructor call and return a FakeModelRouter so no
-        real API key or network is needed — we only verify the constructor was
-        reached, not that a live LLM call succeeded.
-        """
+    def test_fake_router_returned_when_provider_fake_even_with_use_llm_true(self) -> None:
+        config = ApexConfig(target="127.0.0.1", use_llm=True, llm_provider="fake")
+        assert isinstance(build_model_router(config), FakeModelRouter)
+
+    async def test_dry_run_engagement_completes_with_fake_router(self) -> None:
+        """use_llm=False (default) -> FakeModelRouter -> no LLM calls,
+        engagement still completes end-to-end in dry-run mode."""
         from apex_host.runtime import build_runtime
 
-        config = ApexConfig(
-            target="127.0.0.1",
-            dry_run=True,
-            max_turns=1,
-            use_llm=True,
-            llm_provider="openai",
-        )
+        config = ApexConfig(target="127.0.0.1", dry_run=True, max_turns=1)
         runtime = build_runtime(config)
+        final = await runtime.run()
+        assert final["completed"] is True
 
-        routers_constructed: list[str] = []
-
-        def fake_openai(cfg: ApexConfig) -> FakeModelRouter:
-            routers_constructed.append("openai")
-            return FakeModelRouter()  # safe stand-in; avoids API key requirement
-
-        with patch("apex_host.runtime.OpenAIModelRouter", fake_openai):
-            await runtime.run()
-
-        assert "openai" in routers_constructed
-
-    async def test_fake_router_when_use_llm_but_provider_fake(self) -> None:
-        """use_llm=True + llm_provider='fake' still uses FakeModelRouter."""
-        from apex_host.runtime import build_runtime
-
-        config = ApexConfig(
-            target="127.0.0.1",
-            dry_run=True,
-            max_turns=1,
-            use_llm=True,
-            llm_provider="fake",
+    async def test_one_providers_failure_does_not_affect_a_differently_configured_runtime(
+        self,
+    ) -> None:
+        """Constructing a router for one provider must not leave any shared,
+        process-global state that a subsequent, differently-configured
+        runtime could inherit — each build_model_router() call is
+        independent."""
+        openai_config = ApexConfig(
+            target="127.0.0.1", use_llm=True, llm_provider="openai", planner_model="gpt-4o-mini",
         )
-        runtime = build_runtime(config)
+        anthropic_config = ApexConfig(
+            target="127.0.0.1", use_llm=True, llm_provider="anthropic",
+            planner_model="claude-sonnet-4-5-20250929",
+        )
 
-        openai_constructed = False
+        openai_router = build_model_router(openai_config)
+        anthropic_router = build_model_router(anthropic_config)
 
-        _real_openai = OpenAIModelRouter
-
-        def fake_openai(cfg: ApexConfig) -> OpenAIModelRouter:
-            nonlocal openai_constructed
-            openai_constructed = True
-            return _real_openai(cfg)
-
-        with patch("apex_host.runtime.OpenAIModelRouter", fake_openai):
-            await runtime.run()
-
-        assert not openai_constructed
+        assert isinstance(openai_router, OpenAIModelRouter)
+        assert isinstance(anthropic_router, AnthropicModelRouter)
+        assert openai_router._config.llm_provider == "openai"
+        assert anthropic_router._config.llm_provider == "anthropic"
 
 
 # ---------------------------------------------------------------------------

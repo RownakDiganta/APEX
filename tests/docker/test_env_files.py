@@ -98,7 +98,11 @@ def test_env_example_committed_not_ignored() -> None:
 _REQUIRED_VARIABLES = {
     "APEX_DRY_RUN", "APEX_TARGET", "APEX_TOOL_BACKEND", "APEX_TOOL_SERVICE_URL",
     "APEX_TOOL_SERVICE_TOKEN", "APEX_USE_LLM", "APEX_LLM_PROVIDER", "APEX_LLM_MODEL",
-    "OPENAI_API_KEY", "OPENAI_BASE_URL",
+    # Phase 5 — native OpenAI/Anthropic/OpenRouter providers: one credential
+    # variable per provider (never a shared/fallback credential), plus
+    # provider-specific (never generic/ambiguous) base URL overrides.
+    "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
+    "APEX_LLM_OPENAI_BASE_URL", "APEX_LLM_ANTHROPIC_BASE_URL", "APEX_LLM_OPENROUTER_BASE_URL",
 }
 
 
@@ -143,6 +147,18 @@ def test_openai_api_key_is_blank() -> None:
     active = _active_assignments()
     assert "OPENAI_API_KEY" in active
     assert active["OPENAI_API_KEY"] == ""
+
+
+def test_anthropic_api_key_is_blank() -> None:
+    active = _active_assignments()
+    assert "ANTHROPIC_API_KEY" in active
+    assert active["ANTHROPIC_API_KEY"] == ""
+
+
+def test_openrouter_api_key_is_blank() -> None:
+    active = _active_assignments()
+    assert "OPENROUTER_API_KEY" in active
+    assert active["OPENROUTER_API_KEY"] == ""
 
 
 def test_no_target_provided() -> None:
@@ -262,6 +278,53 @@ def test_apex_tool_backend_default_is_remote_for_compose() -> None:
 def test_apex_tool_service_url_matches_compose_service_name() -> None:
     active = _active_assignments()
     assert active["APEX_TOOL_SERVICE_URL"] == "http://kali:8080"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — native OpenAI/Anthropic/OpenRouter provider configuration
+# ---------------------------------------------------------------------------
+
+
+def test_provider_specific_base_url_vars_documented_but_commented_out() -> None:
+    """The three provider-specific base URL overrides are documented (so an
+    operator can find and uncomment them) but inactive by default — leaving
+    all three unset means every provider uses its own official SDK
+    default endpoint."""
+    active = _active_assignments()
+    all_names = {name for name, _ in _all_assignments_including_commented()}
+    for name in (
+        "APEX_LLM_OPENAI_BASE_URL", "APEX_LLM_ANTHROPIC_BASE_URL", "APEX_LLM_OPENROUTER_BASE_URL",
+    ):
+        assert name in all_names, f"missing documented variable: {name}"
+        assert name not in active, f"{name} must not be active by default"
+
+
+def test_no_stale_openai_base_url_variable() -> None:
+    """The old, single ambiguous OPENAI_BASE_URL variable (which used to
+    double as "point OpenAI at OpenRouter") no longer exists anywhere in
+    the template — replaced by the three provider-specific variables
+    above, each scoped to exactly one provider."""
+    all_names = {name for name, _ in _all_assignments_including_commented()}
+    assert "OPENAI_BASE_URL" not in all_names
+
+
+def test_no_stale_router_style_model_example_in_active_llm_model_value() -> None:
+    """APEX_LLM_MODEL's active (uncommented) value must be blank — never a
+    leftover router-style example value such as "openai/gpt-5.5" baked in
+    as an active default."""
+    active = _active_assignments()
+    assert active.get("APEX_LLM_MODEL", "") == ""
+
+
+def test_llm_section_mentions_no_provider_neutral_default() -> None:
+    text = _env_example_text()
+    assert "no provider-neutral default" in text.lower()
+
+
+def test_llm_section_documents_all_three_provider_names() -> None:
+    text = _env_example_text()
+    for provider in ("openai", "anthropic", "openrouter"):
+        assert f"provider={provider}" in text.lower() or f"apex_llm_provider={provider}" in text.lower()
 
 
 # ---------------------------------------------------------------------------

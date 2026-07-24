@@ -179,16 +179,27 @@ class TestLLMReadiness:
         assert check_llm_readiness(config).passed is True
 
     def test_real_provider_without_key_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Phase 5: an explicit native model is required to reach the
+        # credential check at all — there is no provider-neutral default.
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        config = ApexConfig(target="x", use_llm=True, llm_provider="openai")
+        config = ApexConfig(target="x", use_llm=True, llm_provider="openai", planner_model="gpt-4o-mini")
         result = check_llm_readiness(config)
         assert result.passed is False
         assert "OPENAI_API_KEY" in result.detail
 
     def test_real_provider_with_key_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-abc")
-        config = ApexConfig(target="x", use_llm=True, llm_provider="openai")
+        config = ApexConfig(target="x", use_llm=True, llm_provider="openai", planner_model="gpt-4o-mini")
         assert check_llm_readiness(config).passed is True
+
+    def test_real_provider_without_model_fails_as_mismatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Phase 5: a valid key alone is not sufficient — an explicit model
+        is also required, reported as a provider_model_mismatch."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-abc")
+        config = ApexConfig(target="x", use_llm=True, llm_provider="openai")
+        result = check_llm_readiness(config)
+        assert result.passed is False
+        assert "provider_model_mismatch" in result.detail
 
 
 # ---------------------------------------------------------------------------
