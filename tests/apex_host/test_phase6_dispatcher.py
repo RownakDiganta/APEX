@@ -142,6 +142,9 @@ class _FakeConfig:
     target: str = "10.10.10.10"
     dry_run: bool = True
     max_command_seconds: int = 30
+    tool_backend: str = "local"
+    tool_backend_raw_socket_capable: bool | None = None
+    max_fingerprint_retries: int = 1
 
 
 @dataclass
@@ -1038,8 +1041,9 @@ class TestFingerprintUpgrade:
         assert all(c in "0123456789abcdef" for c in fp)
 
     def test_fingerprint_is_sha256_based(self) -> None:
-        # Empty args → ",".join([]) = "" → key = "recon|nmap||10.10.10.10||"
-        key = "recon|nmap||10.10.10.10||"
+        # Empty args → ",".join([]) = "" → key = "recon|nmap||10.10.10.10|||"
+        # (trailing empty fields: parser, executor_domain, capability_mode)
+        key = "recon|nmap||10.10.10.10|||"
         expected = hashlib.sha256(key.encode()).hexdigest()[:16]
         fp = task_fingerprint("recon", "nmap", [], "10.10.10.10")
         assert fp == expected
@@ -1052,8 +1056,13 @@ class TestFingerprintUpgrade:
         assert task_fingerprint("recon", "nmap", [], "1.2.3.4") != \
                task_fingerprint("web", "nmap", [], "1.2.3.4")
 
-    def test_arg_order_invariant(self) -> None:
-        assert task_fingerprint("recon", "nmap", ["-sV", "-T4"], "x") == \
+    def test_arg_order_matters(self) -> None:
+        # Phase 2 correction: order is no longer normalized away — see
+        # apex_host/planning/fingerprint.py module docstring and
+        # tests/apex_host/test_duplicate_actions.py
+        # ::test_reordered_flag_value_pairs_are_not_conflated for the
+        # concrete over-normalization bug this prevents.
+        assert task_fingerprint("recon", "nmap", ["-sV", "-T4"], "x") != \
                task_fingerprint("recon", "nmap", ["-T4", "-sV"], "x")
 
     def test_dispatcher_uses_16_char_fingerprint(self) -> None:

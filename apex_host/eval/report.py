@@ -1428,10 +1428,17 @@ def format_text(report: RunReport) -> str:
         for ph, cnt in sorted(phase_dups.items()):
             lines.append(f"  {ph:<16}: {cnt}")
         for e in report.duplicate_action_entries[:3]:
-            lines.append(
+            detail = (
                 f"  [{e.get('phase','?'):<12}] fp={e.get('fingerprint','?')} "
                 f"tool={e.get('tool','?')!r} {e.get('reason','')[:60]}"
             )
+            if e.get("previous_status"):
+                detail += f" prev_status={e.get('previous_status')}"
+            if e.get("retry_count"):
+                detail += f" retries={e.get('retry_count')}"
+            if "repair_changed_action" in e:
+                detail += f" repair_changed_action={e.get('repair_changed_action')}"
+            lines.append(detail)
 
     lines += ["", _SEP, ""]
     return "\n".join(lines)

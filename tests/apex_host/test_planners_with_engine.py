@@ -608,18 +608,37 @@ class TestGlobalPlannerBudget:
         gp.record_turn(ApexPhase.recon)
         assert gp.budget_remaining(ApexPhase.recon) == before - 1
 
-    def test_budget_exhausted_triggers_phase_advance(self) -> None:
-        # Set a tiny recon budget so it exhausts immediately
+    def test_budget_exhausted_with_no_service_terminates_instead_of_fabricating_evidence(self) -> None:
+        """Phase 2 (post-live-test debugging) correction — supersedes the
+        old (buggy) expectation that recon force-advances to web/credential
+        on budget exhaustion alone. The live-test evidence showed exactly
+        this: recon's budget (6 turns, matching the six identical Nmap
+        failures) exhausted with no service ever discovered, and the
+        engagement force-advanced into credential on a host-only graph.
+        Recon's own budget exhaustion with NO real service now terminates
+        the engagement directly (phase_budget_exhausted) rather than
+        fabricating a "service" node type to unlock a capability-dependent
+        phase that has no real evidence to act on."""
         gp = GlobalPlanner(max_turns=100, phase_budgets={ApexPhase.recon.value: 1})
         gp.record_turn(ApexPhase.recon)  # exhaust the budget
-        # With budget exhausted, recon should force-advance to web
-        # (even though only host is present, service requirement would normally hold us)
         phase = gp.decide_phase(
             node_types_seen={"host"},
             turn_count=1,
             current_phase=ApexPhase.recon.value,
         )
-        # Force-advance: recon completion node "service" is injected → go to web
+        assert phase == ApexPhase.done
+
+    def test_budget_exhausted_with_real_service_still_advances(self) -> None:
+        """The fix is scoped to the NO-EVIDENCE case only — once a real
+        service genuinely exists, recon's own budget exhaustion still
+        force-advances normally (unchanged behavior)."""
+        gp = GlobalPlanner(max_turns=100, phase_budgets={ApexPhase.recon.value: 1})
+        gp.record_turn(ApexPhase.recon)
+        phase = gp.decide_phase(
+            node_types_seen={"host", "service"},
+            turn_count=1,
+            current_phase=ApexPhase.recon.value,
+        )
         assert phase == ApexPhase.web
 
     def test_budget_not_exhausted_stays_in_recon(self) -> None:

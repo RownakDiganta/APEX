@@ -1840,6 +1840,110 @@ bypassing the transactional path. Full design, precedence rules, stall
 semantics, report field reference, and current limitations:
 [`docs/engagement-outcomes.md`](docs/engagement-outcomes.md).
 
+> Note: the "15-member enum" / "success means a validated `access_state`"
+> text above predates two later phases (Phase 18 redefined success as
+> `user_flag_verified`; Phase 1 of the post-live-test debugging track added
+> `llm_unavailable` — 17 members total today) and is left as an
+> already-known staleness issue outside this section's own scope — see
+> `apex_host/orchestration/outcome.py`'s module docstring for the current,
+> authoritative precedence and success definition.
+
+## Action Fingerprinting, Retry, and Repair Semantics (Phase 2 live-test fix)
+
+The second authorized HTB live test showed the exact same Nmap action
+executed six times: the fingerprint was computed correctly and repeated
+every turn, but `duplicate_actions.total_skipped` stayed at zero — the
+identical, already-failed action kept re-executing until the run's
+turn/repair budgets ran out. Root cause and full design:
+[`docs/action-fingerprint.md`](docs/action-fingerprint.md). Summary:
+
+**Canonical action fingerprint** (`apex_host.planning.fingerprint.task_fingerprint`)
+— a stable 16-char SHA-256 hash of the SEMANTIC action identity:
+
+| Included (stable, hashed) | Excluded (ephemeral, never hashed) |
+|---|---|
+| `phase`, `tool`, `parser`, `executor_domain`, `target` (lower-cased, stripped) | `task.id` (a fresh UUID per `TaskSpec`) |
+| `args` (whitespace-stripped, **order preserved**) | any timestamp |
+| `capability_mode` (`"raw_socket"` / `"tcp_connect"` — see `apex_host.tools.backend.backend_capability_mode`) | any trace/run ID |
+
+**Task ID vs action identity:** two `TaskSpec` objects with different
+`.id` values but identical `tool`/`args`/`target`/`phase`/`parser`/
+`executor_domain`/capability-mode produce the byte-identical fingerprint —
+a fresh UUID per planner call can never be used to bypass duplicate
+suppression.
+
+**Argument-order correction:** the pre-Phase-2 fingerprint sorted `args`
+before hashing (order-invariant). This was itself an over-normalization
+bug for flag/value pairs — `["-p", "80", "--exclude", "443"]` and
+`["-p", "443", "--exclude", "80"]` (semantically opposite commands) sorted
+to the identical token multiset. Order is now preserved; only incidental
+whitespace is normalized.
+
+**Root cause of the six-repeat bug:** `TaskDispatcher.dispatch()` assigned
+`TaskStatus.FAILED_RETRYABLE` (which does **not** suppress resubmission)
+to every `EXECUTED_FAILURE` disposition based on the disposition's coarse
+*shape*, ignoring what `apex_host.execution.dispositions.classify_retry()`
+had already determined about the SPECIFIC error (an nmap raw-socket
+permission failure classifies `may_retry=False` — not retryable at all).
+The dispatcher now computes `classify_retry()` first and uses its actual
+decision to choose the final status.
+
+**Bounded retry status taxonomy** (`apex_host.execution.registry.TaskStatus`):
+
+| Status | Suppresses resubmission? | Meaning |
+|---|---|---|
+| `PENDING` / `EXECUTING` | Yes | Currently reserved / in flight |
+| `COMPLETED` | Yes | Succeeded |
+| `FAILED_RETRYABLE` | No | Transient failure, bounded retry still available |
+| `TIMED_OUT` | No | Executor's own timeout fired, bounded retry still available |
+| `FAILED_TERMINAL` | Yes | Not retryable, or the retry bound is exhausted |
+| `POLICY_BLOCKED` | — | Denied by `PolicyAdvisor` before any I/O (never registered — see `TaskDispatcher`'s own "Security invariants" docstring) |
+| `CANCELLED` | No | Task cancelled — operator/caller controls resubmission |
+| `SKIPPED_DUPLICATE` | No | This attempt itself was a suppressed duplicate |
+| `SUPERSEDED` | Yes | A materially-changed repaired action addressed this fingerprint's failure |
+
+A transiently-failing action (`classify_retry(...).may_retry=True`, e.g.
+"connection refused") is permitted `ApexConfig.max_fingerprint_retries`
+(default `1`) additional resubmissions under the SAME fingerprint before
+it, too, is forced to `FAILED_TERMINAL` — "one bounded retry", never
+unbounded.
+
+**Repair vs `repair_no_change`:** `apex_host.orchestration.repair_node`
+computes the canonical fingerprint of both the failed task and
+`RepairEngine`'s proposed correction. If they are the SAME action, the
+turn is classified `repair_no_change` and rejected **before** dispatch —
+no execution turn is consumed, no episode is written, and the entry is
+recorded in `duplicate_actions` with `repair_changed_action: false`. If
+the repaired task is materially different, it is dispatched normally and
+the ORIGINAL fingerprint is marked `TaskStatus.SUPERSEDED` (still
+suppressed, but audit-distinguishable from an unresolved failure). A
+confirmed permanent LLM provider misconfiguration (Phase 1;
+`apex_host.llm.errors.PERMANENT_LLM_ERROR_CATEGORIES`) short-circuits
+`RepairEngine.repair()` immediately — it never burns a repair attempt
+re-discovering the same broken configuration.
+
+**Phase-transition evidence requirement:** `GlobalPlanner` used to
+fabricate a `"service"` node type once recon's turn budget was exhausted,
+so the engagement force-advanced into the CREDENTIAL phase on a host-only
+graph — no service had ever actually been discovered. Recon's own
+budget exhaustion with no real service now terminates the engagement
+directly (`phase_budget_exhausted`, reason `"no services discovered —
+recon exhausted its turn budget with no service evidence"`) instead of
+fabricating evidence for a later, capability-dependent phase. `web` and
+`credential` retain their existing forced-advance behavior — by the time
+either phase's own budget is checked, the prerequisite evidence for being
+in that phase already exists for real.
+
+**Report fields** — every `duplicate_actions` entry (`RunReport
+.duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
+now carries `fingerprint`, `previous_status`, `previous_disposition`,
+`retry_count`, `reason`, and (for `repair_no_change` entries)
+`repair_changed_action: false`. `duplicate_actions.total_skipped` reflects
+BOTH ordinary duplicate skips and `repair_no_change` rejections. Secret
+argument values are never exposed — `duplicate_actions` entries only ever
+carry `tool`/`target`/`fingerprint`/status metadata, never raw command
+output.
+
 ## Privilege Escalation Planning Framework
 
 The `priv_esc` phase is a **planning framework, not privilege escalation.**

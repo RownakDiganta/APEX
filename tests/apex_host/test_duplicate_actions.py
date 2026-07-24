@@ -37,9 +37,61 @@ class TestTaskFingerprint:
         fp2 = task_fingerprint("recon", "nmap", ["-sV", "10.10.10.10"], "10.10.10.10")
         assert fp1 == fp2
 
-    def test_argument_order_invariant(self) -> None:
+    def test_argument_order_matters_for_flag_value_pairs(self) -> None:
+        """Phase 2 correction: argument order is no longer normalized away.
+
+        The pre-Phase-2 implementation sorted args, so
+        ["-sV", "-T4"] and ["-T4", "-sV"] produced the same fingerprint —
+        harmless for a fixed flag set with no positional values, but a
+        real over-normalization bug for flag/value pairs (see
+        test_reordered_flag_value_pairs_are_not_conflated below). Order
+        is now preserved; a genuine reordering produces a DIFFERENT
+        fingerprint.
+        """
         fp1 = task_fingerprint("recon", "nmap", ["-sV", "-T4"], "10.10.10.10")
         fp2 = task_fingerprint("recon", "nmap", ["-T4", "-sV"], "10.10.10.10")
+        assert fp1 != fp2
+
+    def test_reordered_flag_value_pairs_are_not_conflated(self) -> None:
+        """The concrete over-normalization bug the order-preserving fix
+        prevents: two semantically OPPOSITE commands (scan port 80 while
+        excluding 443, vs the reverse) that happen to share the same
+        token multiset must never collide onto one fingerprint."""
+        fp1 = task_fingerprint("recon", "nmap", ["-p", "80", "--exclude", "443"], "10.10.10.10")
+        fp2 = task_fingerprint("recon", "nmap", ["-p", "443", "--exclude", "80"], "10.10.10.10")
+        assert fp1 != fp2
+
+    def test_capability_mode_contributes_to_fingerprint(self) -> None:
+        fp1 = task_fingerprint("recon", "nmap", ["-sV"], "10.10.10.10", capability_mode="raw_socket")
+        fp2 = task_fingerprint("recon", "nmap", ["-sV"], "10.10.10.10", capability_mode="tcp_connect")
+        assert fp1 != fp2
+
+    def test_capability_mode_default_empty_is_stable(self) -> None:
+        fp1 = task_fingerprint("recon", "nmap", ["-sV"], "10.10.10.10")
+        fp2 = task_fingerprint("recon", "nmap", ["-sV"], "10.10.10.10", capability_mode="")
+        assert fp1 == fp2
+
+    def test_different_task_ids_never_change_fingerprint(self) -> None:
+        """task_fingerprint has no task-id parameter at all — two TaskSpec
+        instances with different .id values but identical semantic action
+        fields always produce the identical fingerprint (Phase 2:
+        "Do not allow task UUID changes to bypass duplicate suppression")."""
+        from memfabric.ids import new_id
+        from memfabric.types import TaskSpec
+
+        t1 = TaskSpec(
+            id=new_id(), goal_id="g", executor_domain="recon",
+            params={"tool": "nmap", "args": ["-sV", "-T4"], "target": "10.10.10.10", "parser": "nmap"},
+            subgraph_anchor="host:10.10.10.10", phase="recon",
+        )
+        t2 = TaskSpec(
+            id=new_id(), goal_id="g", executor_domain="recon",
+            params={"tool": "nmap", "args": ["-sV", "-T4"], "target": "10.10.10.10", "parser": "nmap"},
+            subgraph_anchor="host:10.10.10.10", phase="recon",
+        )
+        assert t1.id != t2.id
+        fp1 = task_fingerprint("recon", str(t1.params["tool"]), list(t1.params["args"]), str(t1.params["target"]), parser=str(t1.params["parser"]), executor_domain=t1.executor_domain)
+        fp2 = task_fingerprint("recon", str(t2.params["tool"]), list(t2.params["args"]), str(t2.params["target"]), parser=str(t2.params["parser"]), executor_domain=t2.executor_domain)
         assert fp1 == fp2
 
     def test_different_tools_differ(self) -> None:

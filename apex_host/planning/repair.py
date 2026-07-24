@@ -288,6 +288,27 @@ class RepairEngine:
             logger.debug("repair_engine: no gateway/router configured — skipping repair")
             return None
 
+        # Phase 2 (post-live-test debugging): a CONFIRMED permanent LLM
+        # provider misconfiguration (missing key, invalid model,
+        # authentication failure, unsupported endpoint, malformed
+        # response — apex_host.llm.errors.PERMANENT_LLM_ERROR_CATEGORIES)
+        # already observed anywhere this run (PlanningEngine records it on
+        # the SAME shared LLMBudgetTracker — see
+        # apex_host.planning.budget.LLMBudgetTracker
+        # .permanent_provider_error_category's docstring) can never be
+        # fixed by retrying the identical broken configuration from the
+        # repair path either. Without this check, every failed task in a
+        # live run with a broken LLM configuration would independently
+        # attempt (and burn a real, doomed network call on) repair —
+        # "A provider configuration error must not trigger repeated repair
+        # attempts."
+        if self._budget is not None and self._budget.permanent_provider_error_category:
+            logger.debug(
+                "repair_engine: skipping — confirmed permanent provider error %r already observed this run",
+                self._budget.permanent_provider_error_category,
+            )
+            return None
+
         ekg_summary = summarize_subgraph(subgraph)
         messages = _build_repair_messages(
             failed_task, error, phase, ekg_summary, self._allowed_tools
