@@ -9,7 +9,20 @@ a compiled policy YAML file in the following order:
 2. ``<knowledge_root>/policy_db/compiled/hackthebox_lab.yaml``
    (when ``config.knowledge_root`` is set)
 3. ``knowledge/policy_db/compiled/hackthebox_lab.yaml``
-   (relative to the current working directory — works for local development)
+   (relative to the current working directory — works for local development
+   and for a container/deployment image, which always copies the compiled
+   knowledge tree to a deliberately lowercase ``knowledge/`` destination —
+   see ``docker/apex/Dockerfile``)
+4. ``Knowledge/policy_db/compiled/hackthebox_lab.yaml`` (relative to the
+   current working directory — the raw, git-tracked source directory name;
+   see CLAUDE.md §18's case-sensitivity note. On a case-insensitive
+   filesystem (macOS/APFS) this is the identical inode to #3 above and
+   never actually adds a second lookup; on a case-sensitive filesystem
+   (Linux — every CI runner, and any non-macOS contributor's checkout)
+   only this capitalized path exists in a bare `git checkout` with no
+   Docker build/copy step, so this fallback is required for
+   ``check_policy(required=True)``/the live-run interlock to resolve the
+   same conservative-vs-loaded policy state consistently across platforms)
 
 When no file is found the function returns the **conservative default**:
   - Only ``config.target`` is allowed as a scan target.
@@ -47,8 +60,18 @@ _ALWAYS_BLOCKED_TOOLS: frozenset[str] = frozenset({
     "msfconsole", "msfvenom",
 })
 
-# Default path relative to CWD for local development.
+# Default path relative to CWD for local development / a deployment image
+# (docker/apex/Dockerfile always copies the compiled knowledge tree to this
+# lowercase destination, regardless of source capitalization).
 _DEFAULT_POLICY_YAML = pathlib.Path("knowledge/policy_db/compiled/hackthebox_lab.yaml")
+
+# Case-sensitive-filesystem fallback: the raw, git-tracked source directory
+# is `Knowledge/` (capital K) — see CLAUDE.md §18's documented correction.
+# On macOS/APFS (case-insensitive) this resolves to the same inode as
+# _DEFAULT_POLICY_YAML above and is never reached as a distinct path. On a
+# case-sensitive filesystem (every CI runner) a bare `git checkout` with no
+# Docker build/copy step only ever produces this capitalized path.
+_DEFAULT_POLICY_YAML_CASE_FALLBACK = pathlib.Path("Knowledge/policy_db/compiled/hackthebox_lab.yaml")
 
 
 def load_policy(config: "ApexConfig") -> ScopePolicy:
@@ -117,8 +140,14 @@ def _resolve_policy_path(config: "ApexConfig") -> pathlib.Path | None:
         candidate = pathlib.Path(config.knowledge_root) / "policy_db" / "compiled" / "hackthebox_lab.yaml"
         return candidate
 
-    # Priority 3: conventional local-development path
+    # Priority 3: conventional local-development / deployment-image path
     if _DEFAULT_POLICY_YAML.exists():
         return _DEFAULT_POLICY_YAML
+
+    # Priority 4: same conventional path, case-sensitive-filesystem fallback
+    # (the raw git-tracked capitalization — see the module docstring and
+    # CLAUDE.md §18). No-op on macOS/APFS; required on Linux CI.
+    if _DEFAULT_POLICY_YAML_CASE_FALLBACK.exists():
+        return _DEFAULT_POLICY_YAML_CASE_FALLBACK
 
     return None
