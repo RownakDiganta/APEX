@@ -632,7 +632,11 @@ class TestReporting:
             error_samples=[], evidence_samples=[], last_error=None,
         )
         d = to_json_dict(report)
-        assert d["report_schema_version"] == "1"
+        # Phase 3 (post-live-test debugging) bumped the default schema
+        # version to "2" — see docs/report-schema.md "Schema version 2
+        # migration" for what changed (findings deduplication,
+        # phases_reached's corrected derivation).
+        assert d["report_schema_version"] == "2"
 
     def test_format_text_includes_schema_version(self) -> None:
         from apex_host.eval.report import format_text
@@ -644,7 +648,7 @@ class TestReporting:
             error_samples=[], evidence_samples=[], last_error=None,
         )
         text = format_text(report)
-        assert "schema v1" in text
+        assert "schema v2" in text
 
     def test_json_output_deterministic_key_set(self) -> None:
         report = RunReport(

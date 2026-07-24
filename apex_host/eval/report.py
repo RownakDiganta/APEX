@@ -43,6 +43,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from apex_host.eval.findings import deduplicate_findings
+from apex_host.eval.report_invariants import check_report_invariants
 from apex_host.orchestration.outcome import (
     EngagementOutcome,
     is_success_outcome,
@@ -111,9 +113,26 @@ class RunReport:
     # status: "success" | "stopped_max_turns" | "stopped_error" | "abandoned"
     status: str
     completed_successfully: bool        # True only when terminal success condition exists
+    # final_phase: the raw terminal ApexGraphState["phase"] value — always
+    # "done" once completed=True. Phase 3: kept unchanged for backward
+    # compatibility; final_runtime_state (below) is the same value under a
+    # clearer name — the two are guaranteed to always be equal.
     final_phase: str
-    phases_reached: list[str]           # unique phases seen in findings
+    # phases_reached: Phase 3 CORRECTED semantic (report_schema_version 2).
+    # Before this phase, this was derived from state["findings"]' own
+    # "phase" field — a phase the planner entered but which never produced
+    # a parseable node delta (e.g. CredentialPlanner returning an
+    # AbandonSignal on a host-only graph) was silently absent, even though
+    # planner_decisions and termination_phase both showed it was entered.
+    # This field is now IDENTICAL to phases_attempted (see below) — kept
+    # under its original name for backward compatibility. See
+    # docs/report-schema.md "Schema version 2" for the full migration note.
+    phases_reached: list[str]
     finding_count: int
+    # findings: the DEDUPLICATED, unique-entity view (Phase 3) — one entry
+    # per unique finding "id" (the EKG node ID), never one entry per raw
+    # observation. See apex_host.eval.findings.deduplicate_findings and
+    # `observation_count` below for the raw, pre-dedup count.
     findings: list[dict[str, Any]]
     node_counts: dict[str, int]         # by node type
     edge_counts: dict[str, int]         # by edge type
@@ -131,7 +150,18 @@ class RunReport:
     # format_text() and to_json_dict() so a downstream consumer (a CI
     # pipeline, a comparison tool) can detect an incompatible report shape
     # rather than silently misreading a renamed/missing field.
-    report_schema_version: str = "1"
+    #
+    # Phase 3 (post-live-test debugging) bumped this to "2": `findings`
+    # changed from a raw, possibly-repeated observation list to a
+    # deduplicated unique-entity list; `phases_reached`'s derivation
+    # changed from "phases with a parseable finding" to "phases the
+    # planner actually entered". Every OTHER field on this dataclass is
+    # purely additive (new fields, all with safe defaults) — a schema-v1
+    # consumer reading a schema-v2 JSON export will not KeyError on
+    # missing fields, but should not assume `findings`/`phases_reached`
+    # still mean what they meant under v1. See docs/report-schema.md
+    # "Schema version 2 migration" for the full compatibility note.
+    report_schema_version: str = "2"
     planner_decisions: list[dict[str, Any]] = field(default_factory=list)
     # Accumulated planner audit log: one PlanDecision.to_dict() per invocation.
 
@@ -409,6 +439,78 @@ class RunReport:
     evaluation_machine_name: str = ""
     evaluation_difficulty: str = ""
 
+    # ------------------------------------------------------------------
+    # Phase 3 (post-live-test debugging) — execution diagnostics, finding
+    # observation count, phase semantics, and report-consistency fields.
+    # See docs/report-schema.md for the full design record.
+    # ------------------------------------------------------------------
+
+    # One bounded, redacted apex_host.execution.diagnostics
+    # .build_execution_diagnostic() record per ACTUAL tool execution
+    # (never for a skipped-duplicate or repair_no_change non-execution).
+    # This is what a report needs to diagnose a specific failed execution
+    # — returncode, a bounded/redacted stderr sample, timeout state, the
+    # unified diagnostic_category (apex_host.execution.error_classifier),
+    # and the tool-specific error_category when a finer-grained tool
+    # classifier (e.g. nmap's) already ran. Never the complete raw output.
+    execution_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+
+    # observation_count: the RAW, pre-deduplication count of finding
+    # observations (len(state["findings"]) before dedup) — preserved for
+    # transparency even though `findings`/`finding_count` above are now
+    # the deduplicated, unique-entity view. A report showing
+    # observation_count=6, finding_count=1 tells the whole story: one
+    # real entity, observed six times.
+    observation_count: int = 0
+
+    # Phase semantics (see module docstring "Phase semantics" and
+    # docs/report-schema.md for the full definitions):
+    # - phases_attempted: every phase whose own agent node actually ran
+    #   this engagement (derived from planner_decisions' "phase" field,
+    #   union termination_phase) — regardless of whether that phase
+    #   selected or executed any task.
+    # - phases_entered: identical to phases_attempted in this
+    #   architecture. Documented, deliberate choice: APEX's graph routes
+    #   directly into each selected phase's own agent node — there is no
+    #   "planned but not entered" distinction to represent separately
+    #   (see docs/report-schema.md). Kept as a separate field name for
+    #   forward compatibility and because the requirement that motivated
+    #   this phase named both explicitly.
+    # - phases_completed: phases_attempted MINUS termination_phase — every
+    #   attempted phase other than the one the engagement was still in
+    #   when it stopped is considered to have been left behind
+    #   (completed), matching this architecture's mostly-monotonic phase
+    #   ladder (GlobalPlanner never regresses to an earlier phase).
+    phases_attempted: list[str] = field(default_factory=list)
+    phases_entered: list[str] = field(default_factory=list)
+    phases_completed: list[str] = field(default_factory=list)
+
+    # final_runtime_state: identical to final_phase (the raw terminal
+    # ApexGraphState["phase"] value) under an explicitly clearer name —
+    # "the state the RUNTIME (LangGraph) ended in", as distinct from
+    # termination_phase ("the phase GlobalPlanner was IN when the decision
+    # to terminate was made") and phases_reached/phases_attempted ("every
+    # phase visited over the whole run"). final_phase is retained,
+    # unchanged, for backward compatibility; the two are guaranteed equal.
+    final_runtime_state: str = ""
+
+    # completion_summary: a single, human-readable sentence disambiguating
+    # `completed` / `completed_successfully` / `status` / `outcome` for an
+    # operator who does not want to cross-reference four separate fields —
+    # see build_report()'s construction of this string and
+    # docs/report-schema.md "Top-level field semantics".
+    completion_summary: str = ""
+
+    # invariant_violations: apex_host.eval.report_invariants
+    # .check_report_invariants(report)'s own output, run automatically by
+    # build_report(). Empty list means the report is internally
+    # consistent. NEVER causes build_report() to raise — "prefer a safe
+    # diagnostic status rather than crashing after an engagement". Tests
+    # that want strict enforcement call
+    # apex_host.eval.report_invariants.assert_report_invariants(report)
+    # explicitly.
+    invariant_violations: list[str] = field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # Canonical outcome resolution
@@ -508,10 +610,36 @@ def build_report(
         htb_difficulty:       Phase 17 — operator-supplied HTB difficulty
                               label (e.g. "Easy", "Medium").
     """
-    phases_reached = sorted({
-        str(f.get("phase", "unknown"))
-        for f in final_state["findings"]
-    })
+    # Phase 3 (post-live-test debugging): findings are deduplicated to the
+    # unique-entity view here — raw_findings (the append-only observation
+    # log) is preserved only as a count (observation_count below), never
+    # mutated or discarded. See apex_host.eval.findings.deduplicate_findings.
+    raw_findings = list(final_state["findings"])
+    deduped_findings = deduplicate_findings(raw_findings)
+
+    # planner_decisions is needed early for phase-semantics computation —
+    # the SAME list is reused below for the planner-decision summary.
+    planner_decisions = list(final_state.get("planner_decisions") or [])
+    _termination_phase_early = str(final_state.get("termination_phase") or "")
+
+    # Phase 3: phases_attempted/phases_entered/phases_completed replace the
+    # old finding-derived phases_reached computation (a phase entered by
+    # the planner but which produced no parseable finding — e.g.
+    # CredentialPlanner abandoning on a host-only graph — was silently
+    # absent under the old definition; see docs/report-schema.md "Schema
+    # version 2 migration"). A phase counts as "attempted"/"entered" the
+    # moment its own agent node ran (one planner_decisions entry recorded
+    # for it), regardless of whether it selected or executed any task —
+    # entering is a documented, deliberate choice distinct from "produced
+    # a finding". termination_phase is always included even when no
+    # planner_decisions entry exists for it (e.g. an upstream failure).
+    phases_attempted = sorted(
+        {str(d.get("phase")) for d in planner_decisions if d.get("phase")}
+        | ({_termination_phase_early} if _termination_phase_early else set())
+    )
+    phases_entered = list(phases_attempted)
+    phases_completed = sorted(set(phases_attempted) - {_termination_phase_early})
+    phases_reached = phases_attempted
 
     node_counts: dict[str, int] = dict(
         collections.Counter(n.type for n in subgraph.nodes)
@@ -540,11 +668,37 @@ def build_report(
     script_error_count = sum(1 for e in error_episodes if e.get("outcome") == "script_error")
     fixable_count = sum(1 for e in error_episodes if e.get("outcome") == "fixable")
     fundamental_count = sum(1 for e in error_episodes if e.get("outcome") == "fundamental")
-    error_samples = [
-        str(e["error"])
-        for e in error_episodes
-        if e.get("error")
-    ][:3]
+    # Phase 3 (post-live-test debugging) fix: an ordinary nonzero-exit tool
+    # failure with no transport-level exception (e.g. nmap's raw-socket
+    # permission error) always has error_episodes[i]["error"] == None — the
+    # OLD error_samples computation (`if e.get("error")`) silently dropped
+    # every such entry, so a report could show script_error_count=6 with
+    # error_samples=[] (the confirmed live-test defect: "error_samples was
+    # empty" / "the final report did not expose the bounded return code/
+    # stderr needed to diagnose Nmap"). Falls back to the bounded, redacted
+    # returncode/diagnostic_category/stderr_sample fields
+    # apex_host.orchestration.memory_node now always attaches to a failed
+    # entry (see that module's own error_entries.append call) whenever
+    # "error" itself is empty.
+    error_samples: list[str] = []
+    for e in error_episodes:
+        if len(error_samples) >= 3:
+            break
+        if e.get("error"):
+            error_samples.append(str(e["error"]))
+            continue
+        returncode = e.get("returncode")
+        category = str(e.get("diagnostic_category", "") or "")
+        stderr_sample = str(e.get("stderr_sample", "") or "")
+        if returncode in (0, None) and not category and not stderr_sample:
+            continue
+        tool = str(e.get("tool", "unknown"))
+        parts = [f"{tool}: {category}" if category else tool]
+        if returncode not in (0, None):
+            parts.append(f"returncode={returncode}")
+        if stderr_sample:
+            parts.append(f"stderr={stderr_sample[:120]!r}")
+        error_samples.append(" ".join(parts))
 
     resolved_outcome = _resolve_outcome(
         final_state, node_counts, turns_used, config.max_turns,
@@ -552,8 +706,6 @@ def build_report(
     )
     completed_successfully = is_success_outcome(resolved_outcome)
     status = legacy_status_for(resolved_outcome)
-
-    planner_decisions = list(final_state.get("planner_decisions") or [])
 
     # Policy gate summary
     raw_pd = list(final_state.get("policy_decisions") or [])
@@ -841,7 +993,30 @@ def build_report(
     learning_recommendations = [exp.recommendation for exp in ranked_experiences][:5]
     learning_summary = dict(final_state.get("learning_summary") or {})
 
-    return RunReport(
+    # Phase 3: raw, bounded, redacted per-execution diagnostic records —
+    # see apex_host.execution.diagnostics.build_execution_diagnostic and
+    # apex_host.orchestration.memory_node (the sole producer).
+    execution_diagnostics = list(final_state.get("execution_diagnostics") or [])
+
+    # Phase 3: a single, human-readable sentence disambiguating the four
+    # top-level completion/status fields for an operator who does not want
+    # to cross-reference them — see docs/report-schema.md "Top-level field
+    # semantics".
+    _runtime_clause = (
+        "runtime reached a terminal state" if final_state["completed"]
+        else "runtime has NOT yet reached a terminal state"
+    )
+    _objective_clause = (
+        "the configured objective was verified" if completed_successfully
+        else "the configured objective was NOT verified"
+    )
+    completion_summary = (
+        f"{_runtime_clause} (completed={final_state['completed']!s}); "
+        f"{_objective_clause} (completed_successfully={completed_successfully!s}); "
+        f"status={status!r}; outcome={resolved_outcome.value!r}."
+    )
+
+    report = RunReport(
         target=config.target,
         mode="dry-run" if config.dry_run else "live",
         turns_used=turns_used,
@@ -850,8 +1025,8 @@ def build_report(
         completed_successfully=completed_successfully,
         final_phase=final_state["phase"],
         phases_reached=phases_reached,
-        finding_count=len(final_state["findings"]),
-        findings=list(final_state["findings"]),
+        finding_count=len(deduped_findings),
+        findings=deduped_findings,
         node_counts=node_counts,
         edge_counts=edge_counts,
         total_nodes=len(subgraph.nodes),
@@ -968,7 +1143,24 @@ def build_report(
         benchmark_report_generation_seconds=report_generation_seconds,
         evaluation_machine_name=htb_machine_name or "",
         evaluation_difficulty=htb_difficulty or "",
+        execution_diagnostics=execution_diagnostics,
+        observation_count=len(raw_findings),
+        phases_attempted=phases_attempted,
+        phases_entered=phases_entered,
+        phases_completed=phases_completed,
+        final_runtime_state=final_state["phase"],
+        completion_summary=completion_summary,
     )
+
+    # Phase 3: run the report-consistency invariants exactly once, here —
+    # the SOLE place build_report() ever validates itself. Never raises in
+    # production ("prefer a safe diagnostic status rather than crashing
+    # after an engagement"); a non-empty list IS the safe diagnostic
+    # signal. Tests that want strict enforcement call
+    # apex_host.eval.report_invariants.assert_report_invariants(report)
+    # explicitly on the returned report.
+    report.invariant_violations = check_report_invariants(report)
+    return report
 
 
 def _samples_from_summary(final_state: "ApexGraphState") -> list[str]:
@@ -1038,8 +1230,14 @@ def format_text(report: RunReport) -> str:
         f" Turns  : {report.turns_used}   "
         f"Final phase : {report.final_phase}   "
         f"Completed : {'Yes' if report.completed else 'No'}",
+        f" Summary: {report.completion_summary}",
         _SEP,
     ]
+
+    if report.invariant_violations:
+        lines.append("\n/!\\ REPORT INVARIANT VIOLATIONS — treat this report's contents with caution:")
+        for violation in report.invariant_violations:
+            lines.append(f"  - {violation}")
 
     # Engagement Outcome detail (Phase 12C — the canonical model; always
     # shown, even for a run that never terminated cleanly, so `outcome`
@@ -1058,6 +1256,16 @@ def format_text(report: RunReport) -> str:
         )
     if report.no_action_count:
         lines.append(f"  No-action turns   : {report.no_action_count}")
+
+    # Phase semantics (Phase 3) — always shown when at least one phase was
+    # attempted, so an operator can immediately see the difference between
+    # "attempted" (planner ran), "completed" (moved past), and the single
+    # phase the engagement was still in when it stopped.
+    if report.phases_attempted:
+        lines.append("\nPhases")
+        lines.append(f"  Attempted  : {', '.join(report.phases_attempted)}")
+        lines.append(f"  Completed  : {', '.join(report.phases_completed) or '(none)'}")
+        lines.append(f"  Findings   : {report.finding_count} unique ({report.observation_count} observations)")
 
     # Objective Summary (Phase 18 — the authoritative benchmark-success
     # breakdown: access alone is never enough. Always shown, since
@@ -1325,6 +1533,28 @@ def format_text(report: RunReport) -> str:
             for sample in report.error_samples:
                 lines.append(f"    {sample[:120]}")
 
+    # Execution Diagnostics (Phase 3) — bounded, redacted per-execution
+    # records; shown only for the non-success ones (a full listing of every
+    # successful execution belongs in the episodic log, not this summary).
+    # See docs/report-schema.md "Diagnosing a failed tool execution".
+    failed_diagnostics = [
+        d for d in report.execution_diagnostics if d.get("diagnostic_category") not in ("success", "")
+    ]
+    if failed_diagnostics:
+        lines.append("\nExecution Diagnostics (failed executions)")
+        for d in failed_diagnostics[:5]:
+            lines.append(
+                f"  [{d.get('phase', '?')}] {d.get('tool', '?')} target={d.get('target', '?')} "
+                f"backend={d.get('backend', '?')} returncode={d.get('returncode')} "
+                f"timed_out={d.get('timed_out')} category={d.get('diagnostic_category', '?')}"
+                + (f" tool_category={d['tool_error_category']}" if d.get("tool_error_category") else "")
+            )
+            if d.get("stderr_sample"):
+                trunc = " (truncated)" if d.get("stderr_truncated") else ""
+                lines.append(f"      stderr: {str(d['stderr_sample'])[:200]}{trunc}")
+        if len(failed_diagnostics) > 5:
+            lines.append(f"  ... and {len(failed_diagnostics) - 5} more (see execution_diagnostics in JSON export)")
+
     # Evidence samples
     if report.evidence_samples:
         lines.append("\nRetrieved Evidence (last turn)")
@@ -1459,9 +1689,16 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
         "status": report.status,
         "completed_successfully": report.completed_successfully,
         "final_phase": report.final_phase,
+        "final_runtime_state": report.final_runtime_state,
         "phases_reached": report.phases_reached,
+        "phases_attempted": report.phases_attempted,
+        "phases_entered": report.phases_entered,
+        "phases_completed": report.phases_completed,
         "finding_count": report.finding_count,
         "findings": report.findings,
+        "observation_count": report.observation_count,
+        "completion_summary": report.completion_summary,
+        "invariant_violations": report.invariant_violations,
         "ekg": {
             "total_nodes": report.total_nodes,
             "total_edges": report.total_edges,
@@ -1475,6 +1712,7 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
             "fundamental": report.fundamental_count,
         },
         "error_samples": report.error_samples,
+        "execution_diagnostics": report.execution_diagnostics,
         "evidence_samples": report.evidence_samples,
         "last_error": report.last_error,
         "planner_decisions": report.planner_decisions,

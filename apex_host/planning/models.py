@@ -90,6 +90,22 @@ class PlanDecision:
     llm_error_category: str = ""
     llm_http_status: int | None = None
     llm_retry_count: int = 0
+    # Phase 3 (post-live-test debugging): the ACTUAL number of tasks the
+    # deterministic fallback planner produced when this decision fell back
+    # (0 for an LLM-backed decision — see PlanningEngine._record_llm,
+    # which continues to use selected_task_count for that case).
+    # selected_task_count stays 0 for every fallback decision by its own,
+    # correct, pre-existing definition ("how many tasks did the LLM
+    # select" — genuinely zero when the LLM path was never used or never
+    # produced anything) — this is a SEPARATE field, not a redefinition,
+    # so no existing consumer of selected_task_count's meaning breaks.
+    # apex_host/eval/report.py and apex_host/eval/report_invariants.py
+    # read BOTH fields together (whichever is nonzero) to reconcile
+    # planner decisions with real executions — see the confirmed
+    # live-test defect this closes: "planner decisions showed
+    # selected_task_count: 0, while benchmark totals said six tasks were
+    # selected and executed."
+    fallback_task_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable dict (for state and report storage)."""
