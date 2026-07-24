@@ -237,6 +237,11 @@ class TaskDispatcher:
         target = str(task.params.get("target", self._config.target))
         parser = str(task.params.get("parser", "command"))
         phase = context.phase
+        # Phase 3 (post-live-test debugging): captured once, threaded into
+        # the final tool_result dict at step 6 below so every execution
+        # path (policy-blocked, duplicate-skipped, or actually executed)
+        # can report a start/end timestamp for diagnostics.
+        _dispatch_start_ts = now()
 
         # ── 1. Policy gate ────────────────────────────────────────────────
         pd = self._advisor.review_task(task, phase, context.evidence, self._config)
@@ -538,6 +543,26 @@ class TaskDispatcher:
             disposition=disposition.value,
             retry_count=attempt_count - 1,
         )
+
+        # Phase 3 (post-live-test debugging): thread the canonical action
+        # fingerprint, retry index, wall-clock timestamps, the classifier's
+        # own reason string, and the final disposition into the SAME
+        # tool_result dict every downstream consumer (write_memory,
+        # apex_host.execution.diagnostics.build_execution_diagnostic) already
+        # reads — one insertion point covers every executor path (this
+        # method is reached from every _run_* branch via the shared
+        # tr_dict/disposition tuple). Never overwrites a key an executor
+        # already set (e.g. a structured executor's own "agent"-shaped
+        # value), only fills in what dispatch() alone knows.
+        tr_dict.setdefault("fingerprint", fingerprint)
+        tr_dict.setdefault("retry_index", max(0, attempt_count - 1))
+        tr_dict.setdefault("start_timestamp", _dispatch_start_ts)
+        tr_dict.setdefault("end_timestamp", now())
+        tr_dict.setdefault("classifier_reason", retry_decision.reason)
+        tr_dict.setdefault("final_disposition", disposition.value)
+        tr_dict.setdefault("agent", f"apex.{phase}")
+        if pd.rule_name:
+            tr_dict.setdefault("policy_rule", pd.rule_name)
 
         return DispatchResult(
             disposition=disposition,

@@ -232,6 +232,16 @@ class ApexGraphState(TypedDict):
     # raw evidence content, a secret, or a runtime object. Feeds
     # apex_host/eval/report.py's Capability Discovery Summary section.
     capability_discovery_log: Annotated[list[dict[str, Any]], operator.add]
+    # Phase 3 (post-live-test debugging) — one bounded, redacted
+    # apex_host.execution.diagnostics.build_execution_diagnostic() record
+    # per ACTUAL tool execution (never for a skipped-duplicate or
+    # repair_no_change non-execution — see apex_host.orchestration
+    # .memory_node.make_memory_node). Distinct from execution_backend_log
+    # (a narrower, pre-existing summary) — this is the comprehensive,
+    # per-execution diagnostic record the run report's new "Execution
+    # Diagnostics" section reads. Never contains a password/API-key/
+    # bearer-token/cookie — see that module's own redaction guarantees.
+    execution_diagnostics: Annotated[list[dict[str, Any]], operator.add]
 
 
 CompiledApexGraph = Any

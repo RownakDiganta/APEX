@@ -1944,6 +1944,113 @@ argument values are never exposed — `duplicate_actions` entries only ever
 carry `tool`/`target`/`fingerprint`/status metadata, never raw command
 output.
 
+## Report Diagnostics, Finding Deduplication, and Phase Semantics (Phase 3 live-test fix)
+
+The second authorized HTB live test's own generated report was, in six
+separate ways, misleading about an engagement that had actually run
+correctly: `error_samples` was empty despite six real tool failures; the
+same host finding appeared six times while the exported EKG correctly
+had one node; `phases_reached` omitted a phase `planner_decisions` and
+`termination_phase` both showed was entered; the top-level completion
+fields (`completed`/`status`/`completed_successfully`) were individually
+correct but not obviously reconciled for a reader; and
+`selected_task_count: 0` on every planner decision contradicted the
+benchmark's own total of six executed tasks. None of these were engine
+bugs — the report BUILT FROM a correct run was the defect. Full schema
+reference, field-by-field semantics, redaction/truncation behavior, the
+schema-v2 migration note, and a worked synthetic example:
+[`docs/report-schema.md`](docs/report-schema.md). Summary:
+
+**Execution diagnostics** — `RunReport.execution_diagnostics`
+(`to_json_dict()["execution_diagnostics"]`) now carries one bounded,
+redacted record per actual tool execution (`apex_host.execution
+.diagnostics.build_execution_diagnostic`, reusing the existing dispatcher
+`tool_result` shape — no new, competing execution-result model): action
+fingerprint, phase, agent, tool, target, backend, timestamps, duration,
+`returncode`, `timed_out`, a 500-char redacted `stdout_sample`/
+`stderr_sample` with a deterministic truncation flag, `diagnostic_category`,
+`retry_index`, and `final_disposition`. `error_samples` now falls back to
+`returncode`/`diagnostic_category`/`stderr_sample` whenever the
+transport-level `error` field itself is empty (an ordinary nonzero-exit
+tool failure never populates that field) — the exact gap that left
+`error_samples` empty despite six real failures.
+
+**Diagnostic classification** (`apex_host.execution.error_classifier`,
+9 categories: `success` / `script_error` / `fixable` / `fundamental` /
+`provider_error` / `policy_block` / `backend_error` / `timeout` /
+`capability_missing`) is a report-facing layer on top of, and never a
+replacement for, `memfabric.types.Outcome`'s own domain-agnostic 4-value
+enum — it is never consumed by memfabric and never drives a retry/repair
+decision. The original Nmap raw-socket failure remains correctly
+`Outcome.script_error` for repair-eligibility purposes (a corrected
+command genuinely resolves it); the report-facing classifier now labels
+it more precisely as `fundamental` (an environment/privilege constraint,
+not a simple arg typo) purely for operator diagnosis.
+
+**Finding deduplication** (`apex_host.eval.findings.deduplicate_findings`)
+collapses the raw, append-only observation log to one entry per unique
+finding `id` (the same content-addressed EKG node ID `apex_host.graph_ids`
+already produces) before it becomes `RunReport.findings` — six identical
+observations of one host now produce one finding with
+`observation_count=6`, `first_seen`/`last_seen`, merged `sources`, and
+MAXIMUM confidence across all observations. The raw observation log
+itself (`ApexGraphState["findings"]`) is never mutated — deduplication is
+a report-time view, preserving the append-only episodic-history
+convention. Graph export (`export_ekg`) was always correct; only the
+un-deduplicated report finding list ever disagreed with it.
+
+**Phase semantics** — `phases_attempted`/`phases_entered` (identical by
+documented design choice — this architecture always dispatches directly
+into a `GlobalPlanner`-selected phase's own agent node) are now derived
+from `planner_decisions`' own `"phase"` field, union `termination_phase`
+— not from `findings`, which silently hid any phase that produced no
+parseable node delta (e.g. `CredentialPlanner` returning an
+`AbandonSignal`). `phases_completed` = `phases_attempted` minus
+`termination_phase`. `phases_reached` (the pre-existing field name) keeps
+its name but now carries the corrected value.
+
+**Top-level completion semantics** — `completed` (runtime reached a
+terminal state), `completed_successfully` (the objective was verified),
+`status` (the legacy four-value projection of `outcome`), and `outcome`
+(`EngagementOutcome`, unchanged) remain individually well-defined; the
+new `RunReport.completion_summary` is one generated sentence
+disambiguating all four together, e.g. *"runtime reached a terminal state
+(completed=True); the configured objective was NOT verified
+(completed_successfully=False); status='abandoned';
+outcome='no_actionable_task'."*
+
+**Planner/benchmark reconciliation** — `PlanDecision` gained
+`fallback_task_count`, populated by calling the fallback planner FIRST
+inside `PlanningEngine._record_fallback()` (now `async`) and recording
+its real result. `selected_task_count` correctly stays `0` for a fallback
+decision (the LLM selected nothing); `fallback_task_count` is the new,
+separate signal for what the deterministic fallback planner actually
+produced — closing the gap where a report showed six tasks executed
+against `benchmark.tasks_executed` while every individual planner
+decision showed `selected_task_count: 0` with no field explaining why.
+
+**Report invariants** (`apex_host.eval.report_invariants`) — a pure
+function run automatically inside `build_report()`, populating
+`RunReport.invariant_violations` (never raising in production — "prefer
+a safe diagnostic status rather than crashing after an engagement, while
+recording invariant violations"). Checks include: finding count matches
+the serialized list; `completed_successfully` implies `completed`;
+`objective_verified` implies `success` and vice versa; a failed
+turn implies a corresponding non-success `execution_diagnostics` entry
+exists; a real execution implies at least one planner decision shows a
+nonzero `selected_task_count` or `fallback_task_count`. The test-only
+`assert_report_invariants()` raises `AssertionError` and is used
+exclusively in tests.
+
+**Schema version 2** — `RunReport.report_schema_version` bumped from
+`"1"` to `"2"`. `findings`/`phases_reached` are the two backward-
+incompatible semantic changes (both corrections, not omissions); every
+other new field (`execution_diagnostics`, `observation_count`,
+`phases_attempted`/`phases_entered`/`phases_completed`,
+`final_runtime_state`, `completion_summary`, `invariant_violations`,
+`PlanDecision.fallback_task_count`) is purely additive with a safe
+default. Full migration note: [`docs/report-schema.md`](docs/report-schema.md) §9.
+
 ## Privilege Escalation Planning Framework
 
 The `priv_esc` phase is a **planning framework, not privilege escalation.**

@@ -22,10 +22,12 @@ from typing import TYPE_CHECKING, Any
 
 from memfabric.types import Episode, Outcome
 
+from apex_host.execution.diagnostics import STDERR_SAMPLE_LIMIT, build_execution_diagnostic
+from apex_host.execution.error_classifier import classify_execution_diagnostic
 from apex_host.graph_state import ApexGraphState
 from apex_host.orchestration.completion import outcome_for
 from apex_host.orchestration.outcome import EngagementOutcome
-from apex_host.security.redaction import redact_user_flag_output
+from apex_host.security.redaction import redact_secret_patterns, redact_user_flag_output
 from apex_host.types import AccessCapabilityType
 
 if TYPE_CHECKING:
@@ -67,7 +69,9 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
         backend_entries: list[dict[str, Any]] = []
         credential_entries: list[dict[str, Any]] = []
         latency_entries: list[dict[str, Any]] = []
+        diagnostic_entries: list[dict[str, Any]] = []
         direct_file_read_entries: list[dict[str, Any]] = []
+        _passwords = list(getattr(deps.config, "password_candidates", None) or [])
         bounded_command_entries: list[dict[str, Any]] = []
         for tr in results_to_write:
             # F13: skipped-duplicate tasks never executed — skip episode creation.
@@ -123,14 +127,41 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
                     failure_result["direct_file_read_log"] = direct_file_read_entries
                 if bounded_command_entries:
                     failure_result["bounded_command_log"] = bounded_command_entries
+                if diagnostic_entries:
+                    failure_result["execution_diagnostics"] = diagnostic_entries
                 return failure_result
 
+            # Phase 3 (post-live-test debugging): one bounded, redacted
+            # diagnostic record per ACTUAL execution — built from
+            # episode_data (already safely-redacted for user_flag_verify's
+            # own candidate-output case above), never the raw tr when they
+            # differ. Never built for a skipped-duplicate (already
+            # `continue`d above) or a repair_no_change entry (those never
+            # reach write_memory as a tool_result in the first place — see
+            # apex_host.orchestration.repair_node).
+            diagnostic_entries.append(
+                build_execution_diagnostic(episode_data, phase=state["phase"], passwords=_passwords)
+            )
+
             if o != Outcome.success:
+                stderr_sample = redact_secret_patterns(str(tr.get("stderr", "")))[:STDERR_SAMPLE_LIMIT]
                 error_entries.append({
                     "outcome": o.value,
                     "tool": tr.get("tool", tr.get("kind", "unknown")),
                     "error": tr.get("error") or state.get("last_error"),
                     "phase": state["phase"],
+                    # Phase 3: the returncode/stderr/diagnostic_category
+                    # needed to actually diagnose a failure whose
+                    # transport-level "error" field is None (the common
+                    # case for an ordinary nonzero-exit tool failure, e.g.
+                    # nmap's raw-socket permission error — see
+                    # apex_host/execution/error_classifier.py). error_samples
+                    # (apex_host/eval/report.py) is built from these fields,
+                    # never from "error" alone.
+                    "returncode": tr.get("returncode"),
+                    "stderr_sample": stderr_sample,
+                    "diagnostic_category": classify_execution_diagnostic(tr),
+                    "timed_out": bool(tr.get("timed_out", False)),
                 })
 
             # Infra Phase 4: only generic-command results carry a "backend"
@@ -244,6 +275,8 @@ def make_memory_node(deps: "OrchestrationDeps") -> Any:
             result["direct_file_read_log"] = direct_file_read_entries
         if bounded_command_entries:
             result["bounded_command_log"] = bounded_command_entries
+        if diagnostic_entries:
+            result["execution_diagnostics"] = diagnostic_entries
         return result
 
     return write_memory

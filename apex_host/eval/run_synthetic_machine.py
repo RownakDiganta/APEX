@@ -131,6 +131,7 @@ async def run_synthetic_machine(*, max_turns: int = 5) -> EngagementMetrics:
         "direct_file_read_log": [],
         "bounded_command_log": [],
         "capability_discovery_log": [],
+        "execution_diagnostics": [],
     }
     final_state: ApexGraphState = await graph.ainvoke(initial)
     return summarize(final_state)

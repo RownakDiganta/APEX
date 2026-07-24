@@ -274,6 +274,7 @@ class ApexRuntime:
             "direct_file_read_log": [],
             "bounded_command_log": [],
             "capability_discovery_log": [],
+            "execution_diagnostics": [],
         }
         invoke_config: dict[str, Any] = {
             "configurable": {"thread_id": run_id},

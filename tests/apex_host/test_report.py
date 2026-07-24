@@ -53,6 +53,8 @@ def _state(
     last_error: str | None = None,
     evidence_summary: str = "",
     error_episodes: list[dict[str, Any]] | None = None,
+    planner_decisions: list[dict[str, Any]] | None = None,
+    termination_phase: str = "",
 ) -> ApexGraphState:
     return {
         "run_id": "test-run-1",
@@ -67,6 +69,8 @@ def _state(
         "last_error": last_error,
         "completed": completed,
         "turn_count": turn_count,
+        "planner_decisions": planner_decisions or [],
+        "termination_phase": termination_phase,
     }
 
 
@@ -155,33 +159,75 @@ class TestBuildReport:
 
 
 # ---------------------------------------------------------------------------
-# build_report: phases_reached derived from findings
+# build_report: phases_reached / phases_attempted derived from
+# planner_decisions (Phase 3 corrected semantic — report_schema_version 2).
+#
+# Before this phase, phases_reached was derived from state["findings"]'
+# own "phase" field — a phase the planner entered but which produced no
+# parseable finding (e.g. CredentialPlanner abandoning on a host-only
+# graph) was silently absent. It is now derived from planner_decisions
+# (which phase's own agent node actually ran), union termination_phase.
 # ---------------------------------------------------------------------------
 
+def _decision(phase: str, selected_task_count: int = 1) -> dict[str, Any]:
+    return {"phase": phase, "planner_model": "deterministic", "selected_task_count": selected_task_count}
+
+
 class TestPhasesReached:
-    def test_phases_derived_from_findings(self) -> None:
-        findings = [
-            _finding("recon"),
-            _finding("web"),
-            _finding("recon"),   # duplicate — should appear once
-        ]
-        report = build_report(_state(findings=findings), _subgraph(), _config())
+    def test_phases_derived_from_planner_decisions(self) -> None:
+        decisions = [_decision("recon"), _decision("web"), _decision("recon")]
+        report = build_report(_state(planner_decisions=decisions), _subgraph(), _config())
         assert sorted(report.phases_reached) == ["recon", "web"]
 
-    def test_phases_empty_when_no_findings(self) -> None:
-        report = build_report(_state(findings=[]), _subgraph(), _config())
+    def test_phases_empty_when_no_planner_decisions_or_termination_phase(self) -> None:
+        report = build_report(_state(planner_decisions=[]), _subgraph(), _config())
         assert report.phases_reached == []
 
     def test_phases_sorted_alphabetically(self) -> None:
-        findings = [_finding("web"), _finding("credential"), _finding("recon")]
-        report = build_report(_state(findings=findings), _subgraph(), _config())
+        decisions = [_decision("web"), _decision("credential"), _decision("recon")]
+        report = build_report(_state(planner_decisions=decisions), _subgraph(), _config())
         assert report.phases_reached == sorted(report.phases_reached)
 
-    def test_phases_not_taken_from_final_phase(self) -> None:
-        # final_phase="done" but no finding with phase="done" → "done" not in phases_reached
-        report = build_report(_state(phase="done", findings=[_finding("recon")]), _subgraph(), _config())
-        assert "done" not in report.phases_reached
-        assert "recon" in report.phases_reached
+    def test_phases_not_taken_from_findings(self) -> None:
+        # A finding with phase="recon" but NO planner_decisions/termination_phase
+        # entry for it must NOT appear — findings no longer drive this field.
+        report = build_report(
+            _state(phase="done", findings=[_finding("recon")], planner_decisions=[]),
+            _subgraph(), _config(),
+        )
+        assert report.phases_reached == []
+
+    def test_phase_with_no_finding_still_counted_as_attempted(self) -> None:
+        """The exact confirmed live-test defect: a phase (credential) whose
+        planner ran and abandoned — producing no finding — must still show
+        up in phases_reached/phases_attempted."""
+        decisions = [_decision("recon"), _decision("credential", selected_task_count=0)]
+        report = build_report(
+            _state(findings=[_finding("recon")], planner_decisions=decisions, termination_phase="credential"),
+            _subgraph(), _config(),
+        )
+        assert "credential" in report.phases_reached
+        assert "credential" in report.phases_attempted
+        assert "credential" in report.phases_entered
+
+    def test_termination_phase_always_included(self) -> None:
+        report = build_report(
+            _state(planner_decisions=[], termination_phase="recon"), _subgraph(), _config(),
+        )
+        assert "recon" in report.phases_attempted
+
+    def test_phases_completed_excludes_termination_phase(self) -> None:
+        decisions = [_decision("recon"), _decision("web"), _decision("credential")]
+        report = build_report(
+            _state(planner_decisions=decisions, termination_phase="credential"), _subgraph(), _config(),
+        )
+        assert sorted(report.phases_completed) == ["recon", "web"]
+        assert "credential" not in report.phases_completed
+
+    def test_phases_entered_equals_phases_attempted(self) -> None:
+        decisions = [_decision("recon"), _decision("web")]
+        report = build_report(_state(planner_decisions=decisions), _subgraph(), _config())
+        assert report.phases_entered == report.phases_attempted
 
 
 # ---------------------------------------------------------------------------

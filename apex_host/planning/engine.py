@@ -319,9 +319,12 @@ class PlanningEngine:
         """
         return self._last_decision
 
-    def _record_fallback(
+    async def _record_fallback(
         self,
         phase: ApexPhase,
+        goal: Goal,
+        subgraph: SubgraphView,
+        evidence: EvidenceBundle,
         *,
         policy_checkpoint_status: str = "",
         redaction_count: int = 0,
@@ -332,8 +335,25 @@ class PlanningEngine:
         llm_error_category: str = "",
         llm_http_status: int | None = None,
         llm_retry_count: int = 0,
-    ) -> None:
-        """Record a deterministic-fallback decision (no LLM output available)."""
+    ) -> "list[TaskSpec] | AbandonSignal":
+        """Call the deterministic fallback planner, record the decision
+        with the REAL resulting task count, and return its result.
+
+        Phase 3 (post-live-test debugging): before this phase,
+        ``selected_task_count`` was unconditionally recorded as ``0`` for
+        every fallback decision — correct in isolation ("the LLM selected
+        zero tasks"), but the report's only per-decision task count, so a
+        report showed ``selected_task_count: 0`` on every planner decision
+        even when the fallback planner went on to select and execute six
+        real tasks (the confirmed live-test defect). This method now calls
+        the fallback planner FIRST, so ``fallback_task_count`` on the
+        recorded ``PlanDecision`` reflects what the fallback planner
+        actually produced — ``selected_task_count`` remains ``0`` for
+        every fallback decision, unchanged, since that field's own
+        meaning ("what the LLM selected") is still correctly zero.
+        """
+        fallback_result = await self._fallback.plan(goal, subgraph, evidence)
+        fallback_task_count = 0 if isinstance(fallback_result, AbandonSignal) else len(fallback_result)
         self._last_decision = PlanDecision(
             planner_model="deterministic",
             confidence=1.0,
@@ -352,7 +372,9 @@ class PlanningEngine:
             llm_error_category=llm_error_category,
             llm_http_status=llm_http_status,
             llm_retry_count=llm_retry_count,
+            fallback_task_count=fallback_task_count,
         )
+        return fallback_result
 
     def _record_llm(
         self,
@@ -426,25 +448,23 @@ class PlanningEngine:
         if self._budget is not None and self._budget.permanent_provider_error_category:
             known_category = self._budget.permanent_provider_error_category
             self._budget.record_fallback_only()
-            self._record_fallback(
-                phase,
+            return await self._record_fallback(
+                phase, goal, subgraph, evidence,
                 llm_error_category=known_category,
                 repeated_plan_action="skipped_known_provider_error",
             )
-            return await self._fallback.plan(goal, subgraph, evidence)
 
         # Repeated-context detection — same logic as direct path.
         ctx_hash = _context_hash(subgraph, evidence)
         if self._budget is not None and self._budget.is_context_repeated(phase.value, ctx_hash):
             repeated_count = self._budget.record_repeated_skip(phase.value)
             self._budget.record_fallback_only()
-            self._record_fallback(
-                phase,
+            return await self._record_fallback(
+                phase, goal, subgraph, evidence,
                 repeated_plan_detected=True,
                 repeated_plan_count=repeated_count,
                 repeated_plan_action="skipped_llm",
             )
-            return await self._fallback.plan(goal, subgraph, evidence)
 
         # Build prompt messages.
         ekg_summary = summarize_subgraph(subgraph)
@@ -483,15 +503,14 @@ class PlanningEngine:
                     self._budget.record_fallback_only()
                     if result.error_category in PERMANENT_LLM_ERROR_CATEGORIES:
                         self._budget.record_permanent_provider_error(result.error_category)
-                self._record_fallback(
-                    phase,
+                return await self._record_fallback(
+                    phase, goal, subgraph, evidence,
                     policy_checkpoint_status=_checkpoint,
                     redaction_count=result.redaction_count,
                     policy_block_reason=result.blocked_reason,
                     llm_error_category=_category,
                     llm_retry_count=_retry_count,
                 )
-                return await self._fallback.plan(goal, subgraph, evidence)
 
             raw = result.raw_text
             _redaction_count = result.redaction_count
@@ -508,14 +527,13 @@ class PlanningEngine:
                 if attempt < self._max_retries:
                     _retry_count += 1
                     continue
-                self._record_fallback(
-                    phase,
+                return await self._record_fallback(
+                    phase, goal, subgraph, evidence,
                     policy_checkpoint_status=_checkpoint_status,
                     redaction_count=_redaction_count,
                     llm_error_category="validation",
                     llm_retry_count=_retry_count,
                 )
-                return await self._fallback.plan(goal, subgraph, evidence)
 
             # Low confidence — epistemic signal, not transient; fallback immediately.
             if output.confidence < self._confidence_threshold:
@@ -556,14 +574,13 @@ class PlanningEngine:
                 if attempt < self._max_retries:
                     _retry_count += 1
                     continue
-                self._record_fallback(
-                    phase,
+                return await self._record_fallback(
+                    phase, goal, subgraph, evidence,
                     policy_checkpoint_status=_checkpoint_status,
                     redaction_count=_redaction_count,
                     llm_error_category="validation",
                     llm_retry_count=_retry_count,
                 )
-                return await self._fallback.plan(goal, subgraph, evidence)
 
             # Success — convert to TaskSpecs.
             task_specs = [
@@ -581,8 +598,9 @@ class PlanningEngine:
             return task_specs
 
         # Exhausted retries.
-        self._record_fallback(phase, llm_retry_count=_retry_count)
-        return await self._fallback.plan(goal, subgraph, evidence)
+        return await self._record_fallback(
+            phase, goal, subgraph, evidence, llm_retry_count=_retry_count
+        )
 
     async def plan(
         self,
@@ -618,8 +636,9 @@ class PlanningEngine:
             logger.debug("planning_engine: no LLM configured — using fallback planner")
             if self._budget is not None:
                 self._budget.record_fallback_only()
-            self._record_fallback(phase)
-            return await self._fallback.plan(goal, subgraph, evidence)
+            return await self._record_fallback(
+                phase, goal, subgraph, evidence
+            )
 
         # ------------------------------------------------------------------ #
         # Budget check
@@ -632,8 +651,9 @@ class PlanningEngine:
                     budget_reason,
                 )
                 self._budget.record_fallback_only()
-                self._record_fallback(phase, llm_error_category="budget_exhausted")
-                return await self._fallback.plan(goal, subgraph, evidence)
+                return await self._record_fallback(
+                    phase, goal, subgraph, evidence, llm_error_category="budget_exhausted"
+                )
 
         # ------------------------------------------------------------------ #
         # Repeated-context detection (skip LLM when nothing changed)
@@ -642,13 +662,12 @@ class PlanningEngine:
         if self._budget is not None and self._budget.is_context_repeated(phase.value, ctx_hash):
             repeated_count = self._budget.record_repeated_skip(phase.value)
             self._budget.record_fallback_only()
-            self._record_fallback(
-                phase,
+            return await self._record_fallback(
+                phase, goal, subgraph, evidence,
                 repeated_plan_detected=True,
                 repeated_plan_count=repeated_count,
                 repeated_plan_action="skipped_llm",
             )
-            return await self._fallback.plan(goal, subgraph, evidence)
 
         # ------------------------------------------------------------------ #
         # Prompt building and guard sanitization
@@ -676,13 +695,12 @@ class PlanningEngine:
                 )
                 if self._budget is not None:
                     self._budget.record_fallback_only()
-                self._record_fallback(
-                    phase,
+                return await self._record_fallback(
+                    phase, goal, subgraph, evidence,
                     policy_checkpoint_status="blocked",
                     redaction_count=_redaction_count,
                     policy_block_reason=prompt_reason,
                 )
-                return await self._fallback.plan(goal, subgraph, evidence)
 
         # ------------------------------------------------------------------ #
         # Consume budget slot — we are committed to attempting the LLM call
@@ -725,15 +743,14 @@ class PlanningEngine:
                         self._budget.record_failure(
                             phase.value, elapsed, "permanent", http_status, _model_name,
                         )
-                    self._record_fallback(
-                        phase,
+                    return await self._record_fallback(
+                        phase, goal, subgraph, evidence,
                         policy_checkpoint_status=_checkpoint_status,
                         redaction_count=_redaction_count,
                         llm_error_category="permanent",
                         llm_http_status=http_status,
                         llm_retry_count=_retry_count,
                     )
-                    return await self._fallback.plan(goal, subgraph, evidence)
 
                 # Transient error — retry if attempts remain.
                 logger.warning(
@@ -752,15 +769,14 @@ class PlanningEngine:
                     self._budget.record_failure(
                         phase.value, elapsed, "transient", http_status, _model_name,
                     )
-                self._record_fallback(
-                    phase,
+                return await self._record_fallback(
+                    phase, goal, subgraph, evidence,
                     policy_checkpoint_status=_checkpoint_status,
                     redaction_count=_redaction_count,
                     llm_error_category="transient",
                     llm_http_status=http_status,
                     llm_retry_count=_retry_count,
                 )
-                return await self._fallback.plan(goal, subgraph, evidence)
 
             # ---------------------------------------------------------------- #
             # Post-output guard check
@@ -785,15 +801,14 @@ class PlanningEngine:
                         self._budget.record_failure(
                             phase.value, elapsed, "validation", None, _model_name,
                         )
-                    self._record_fallback(
-                        phase,
+                    return await self._record_fallback(
+                        phase, goal, subgraph, evidence,
                         policy_checkpoint_status="blocked",
                         redaction_count=_redaction_count,
                         policy_block_reason=out_reason,
                         llm_error_category="validation",
                         llm_retry_count=_retry_count,
                     )
-                    return await self._fallback.plan(goal, subgraph, evidence)
 
             output: PlannerOutput | None = self._validator.validate(
                 raw, self._allowed_tools
@@ -815,14 +830,13 @@ class PlanningEngine:
                     self._budget.record_failure(
                         phase.value, elapsed, "validation", None, _model_name,
                     )
-                self._record_fallback(
-                    phase,
+                return await self._record_fallback(
+                    phase, goal, subgraph, evidence,
                     policy_checkpoint_status=_checkpoint_status,
                     redaction_count=_redaction_count,
                     llm_error_category="validation",
                     llm_retry_count=_retry_count,
                 )
-                return await self._fallback.plan(goal, subgraph, evidence)
 
             last_output = output
 
@@ -885,14 +899,13 @@ class PlanningEngine:
                     self._budget.record_failure(
                         phase.value, elapsed, "validation", None, _model_name,
                     )
-                self._record_fallback(
-                    phase,
+                return await self._record_fallback(
+                    phase, goal, subgraph, evidence,
                     policy_checkpoint_status=_checkpoint_status,
                     redaction_count=_redaction_count,
                     llm_error_category="validation",
                     llm_retry_count=_retry_count,
                 )
-                return await self._fallback.plan(goal, subgraph, evidence)
 
             # ---------------------------------------------------------------- #
             # Success path
@@ -935,15 +948,24 @@ class PlanningEngine:
                 redaction_count=_redaction_count,
                 llm_retry_count=_retry_count,
             )
-        else:
-            if self._budget is not None:
-                self._budget.record_failure(
-                    phase.value, elapsed, "transient", None, _model_name,
-                )
-            self._record_fallback(
-                phase,
-                policy_checkpoint_status=_checkpoint_status,
-                redaction_count=_redaction_count,
-                llm_retry_count=_retry_count,
+            # last_output was produced but never accepted (validator kept
+            # rejecting across every retry) — falls back to the
+            # deterministic planner exactly like the else branch below,
+            # but the PlanDecision has already been recorded above (via
+            # _record_llm, fallback_used=True) with the LLM's own output
+            # for audit purposes, so the plain (non-recording) fallback
+            # call is used here rather than _record_fallback (which would
+            # overwrite that already-correct decision with a generic
+            # deterministic one).
+            return await self._fallback.plan(goal, subgraph, evidence)
+
+        if self._budget is not None:
+            self._budget.record_failure(
+                phase.value, elapsed, "transient", None, _model_name,
             )
-        return await self._fallback.plan(goal, subgraph, evidence)
+        return await self._record_fallback(
+            phase, goal, subgraph, evidence,
+            policy_checkpoint_status=_checkpoint_status,
+            redaction_count=_redaction_count,
+            llm_retry_count=_retry_count,
+        )
