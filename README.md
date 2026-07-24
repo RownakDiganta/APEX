@@ -2051,6 +2051,81 @@ other new field (`execution_diagnostics`, `observation_count`,
 `PlanDecision.fallback_task_count`) is purely additive with a safe
 default. Full migration note: [`docs/report-schema.md`](docs/report-schema.md) §9.
 
+## Persistent, Incremental Knowledge Initialization (Phase 4 live-test fix)
+
+The second authorized HTB live test showed almost the entire ~1,785-second
+engagement runtime spent seeding compiled knowledge: 63,783 records staged,
+63,764 promoted, 19 remained, 639 promotion passes, `stop_reason=
+no_progress`, `elapsed_seconds≈1,757.752` — repeated in full on **every**
+run, even when the compiled knowledge files had not changed at all. Two
+independent root causes, both fixed. Full design, manifest identity,
+corruption recovery, and a measured before/after benchmark:
+[`docs/knowledge-initialization.md`](docs/knowledge-initialization.md).
+Summary:
+
+**Root cause 1 — the promotion loop was accidentally O(records × passes).**
+`ReflectorWorker._apply_promotion_gate()` and the startup promotion loop
+both deep-copied the ENTIRE staged corpus (including already-promoted
+entries) on every single pass, just to find the ~100 unpromoted ones each
+pass needed. `MemoryAPI` gained predicate-based, non-copying selection
+(`select_unpromoted_knowledge_ids`/`select_unpromoted_active_skill_ids`,
+evaluated directly against live staged objects — no object ever leaves the
+call) plus cheap filtered/counting accessors
+(`get_staged_knowledge(promoted=False)`, `count_staged_knowledge(...)`)
+backed by an incrementally-maintained pending-id index. Measured on a
+synthetic reproduction of the exact reported scale: the promotion loop
+alone dropped from an estimated ~1,758s to **0.22s** — the same 63,764
+promoted, 19 remaining below `min_confidence` (a `KnowledgeEntry`'s
+confidence is fixed at staging time and never changes, so this is a
+*permanent*, correctly-reported classification — not a bug), 639 passes,
+`stop_reason=no_progress`.
+
+**Root cause 2 — no cross-run persistence.** Even at 0.22s, every
+disposable APEX container re-did the (now-fast) work from scratch, since
+none of the in-memory reference stores this codebase wires up survive a
+process restart. `apex_host/knowledge/init_cache.py` adds a deterministic,
+content-hash-based (never file-modification-time) per-family manifest
+(`apex_host/knowledge/manifest.py`); when a family's compiled input is
+byte-for-byte identical to what was staged and Reflector-promoted in a
+prior run, its promoted documents are reloaded directly into a fresh
+`BM25LexicalIndex` and staging/promotion is skipped entirely for that
+family — cold/warm/incremental/resumed/rebuild modes, all still going
+through the exact same `propose_knowledge()` → `ReflectorWorker.run_once()`
+path for anything new or changed (never a second write path, never a
+Reflector bypass — see the doc's "Why this does not violate any Memory
+Fabric invariant" section for the full, invariant-by-invariant argument).
+
+**Measured benchmark** (same 63,783-record synthetic corpus, same 19
+permanently-blocked records interspersed):
+
+| Run | Mode | records staged | wall time |
+|---|---|---|---|
+| Clean cold init | `cold` | 63,783 | 1.693s |
+| Immediate second (unchanged) | `reused` | 0 | 0.662s |
+| One family changed (+1 record) | `incremental` | 1 | 0.691s |
+
+The warm run is not "free" — it still reads and content-hashes all 63,783
+compiled records to compute the comparison manifest — but it performs
+**zero** `propose_knowledge()`/`promote_knowledge()` calls, eliminating
+the dominant cost entirely rather than merely reducing it.
+
+**Interrupted-run correctness** (found and fixed during this phase's own
+testing): a budget-interrupted promotion pass
+(`stop_reason` in `max_passes`/`timeout`/`max_records`) leaves that
+family's `init_state.json` status at `"in_progress"` — never falsely
+`"complete"` — and, critically, its `family_<name>.json` payload is also
+**not** rewritten on an interrupted run, since its digests would otherwise
+make a future resumed run believe "staged but never promoted" records
+were already fully handled and silently skip them forever.
+
+**Docker volume:** one new, minimum-necessary named volume,
+`apex-knowledge-cache:/app/knowledge_cache` on the `apex` service — holds
+only small manifest/digest/promoted-document bookkeeping, never secrets,
+never raw compiled-knowledge source (still baked into the image), never
+engagement- or target-specific state. Reset with `docker volume rm
+apex-knowledge-cache` (stack stopped) or `docker compose down -v`, or
+in-process via `--reset-knowledge-cache [FAMILY]`.
+
 ## Privilege Escalation Planning Framework
 
 The `priv_esc` phase is a **planning framework, not privilege escalation.**

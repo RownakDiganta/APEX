@@ -124,6 +124,62 @@ def should_quarantine(
     return rate < winrate_floor
 
 
+def classify_unpromoted_knowledge(entry: KnowledgeEntry, *, min_confidence: float) -> str:
+    """Return why *entry* has not (yet) been promoted.
+
+    Pure diagnostic predicate — no state mutation, no I/O. Companion to
+    ``should_promote_knowledge``; the two are kept in sync deliberately so a
+    caller that wants a *reason* rather than a bool always gets a category
+    consistent with what the actual gate decision would be.
+
+    Categories:
+    - ``"promoted"`` — already promoted; nothing left to explain.
+    - ``"below_min_confidence"`` — ``entry.confidence < min_confidence``. A
+      ``KnowledgeEntry``'s confidence is fixed at proposal time; nothing in
+      this codebase mutates it afterward, so this is a **permanent**
+      blocker for the current run — re-running the promotion pass on this
+      entry can never change the outcome. The caller (typically a bounded
+      promotion loop) should stop retrying an entry in this category rather
+      than re-evaluating it on every subsequent pass.
+    - ``"eligible_pending_pass"`` — clears the gate but has not been
+      promoted yet (e.g. a per-pass promotion cap was reached before this
+      entry was reached). Not permanent; a future pass may promote it.
+    """
+    if entry.promoted:
+        return "promoted"
+    if entry.confidence < min_confidence:
+        return "below_min_confidence"
+    return "eligible_pending_pass"
+
+
+def classify_unpromoted_skill(
+    skill: Skill, *, min_evidence_count: int, min_confidence: float
+) -> str:
+    """Return why *skill* has not (yet) been promoted. See ``classify_unpromoted_knowledge``.
+
+    Categories:
+    - ``"promoted"`` — already promoted.
+    - ``"quarantined"`` — will never be promoted while quarantined.
+    - ``"below_min_evidence"`` — ``evidence_count < min_evidence_count``.
+      Not necessarily permanent: evidence accumulates as the Reflector
+      merges more matching chains (``MemoryAPI.merge_skill_candidate``).
+    - ``"below_min_confidence"`` — ``confidence < min_confidence``. Also not
+      necessarily permanent for a skill (unlike a ``KnowledgeEntry``),
+      since a merge can raise confidence over time.
+    - ``"eligible_pending_pass"`` — clears the gate but has not been
+      promoted yet (per-pass cap reached first).
+    """
+    if skill.promoted:
+        return "promoted"
+    if skill.quarantined:
+        return "quarantined"
+    if skill.evidence_count < min_evidence_count:
+        return "below_min_evidence"
+    if skill.confidence < min_confidence:
+        return "below_min_confidence"
+    return "eligible_pending_pass"
+
+
 def classify_skill_outcome(
     outcome: Outcome,
     *,

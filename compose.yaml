@@ -236,6 +236,20 @@ services:
       APEX_TOOL_BACKEND: ${APEX_TOOL_BACKEND:-remote}
       APEX_TOOL_SERVICE_URL: ${APEX_TOOL_SERVICE_URL:-http://kali:8080}
       APEX_TOOL_SERVICE_TOKEN: ${APEX_TOOL_SERVICE_TOKEN:?APEX_TOOL_SERVICE_TOKEN must be set — see docs/docker-compose.md}
+      # Phase 4 (post-live-test debugging) — persistent, incremental
+      # knowledge-initialization cache (apex_host/knowledge/init_cache.py;
+      # docs/knowledge-initialization.md). Points at the named volume
+      # mounted below so the cache survives `docker compose down && up`
+      # (container recreation) — only `docker compose down -v` (or an
+      # explicit `--reset-knowledge-cache` run) actually clears it. This is
+      # the minimum durable volume this feature needs: it holds only the
+      # small init_state.json bookkeeping file plus one small
+      # family_<name>.json payload file per compiled-knowledge family —
+      # never secrets, never engagement/target-specific state (that stays
+      # exclusively in ./run_reports and the in-container, non-persisted
+      # EKG/episodic memory — see docs/knowledge-initialization.md
+      # "Security considerations").
+      APEX_KNOWLEDGE_CACHE_PATH: ${APEX_KNOWLEDGE_CACHE_PATH:-/app/knowledge_cache}
     volumes:
       # Report persistence outside the container — a plain bind mount
       # (rather than a named volume) so an operator can inspect
@@ -247,6 +261,14 @@ services:
       # docs/docker-compose.md "Report persistence" for the macOS
       # bind-mount UID finding).
       - ./run_reports:/app/run_reports
+      # Named (not bind-mounted) volume, deliberately: the knowledge cache
+      # is opaque, container-internal bookkeeping with no reason for an
+      # operator to browse it from the host the way ./run_reports is meant
+      # to be browsed — a named volume is the correct minimum-durable-
+      # storage primitive here (Docker-managed lifecycle, survives
+      # container recreation, isolated from the host filesystem). See the
+      # top-level `volumes:` block below for the declaration.
+      - apex-knowledge-cache:/app/knowledge_cache
     # Compiled knowledge is available exactly once: baked into the
     # `apex` image itself at /app/knowledge (docker/apex/Dockerfile,
     # docs/apex-container.md §9) — this file does NOT additionally mount
@@ -273,6 +295,23 @@ services:
     # --knowledge-root points at this image's own baked-in compiled
     # knowledge, matching docker/apex/Dockerfile's own default CMD.
     command: ["smoke", "--knowledge-root", "/app/knowledge"]
+
+volumes:
+  # Phase 4 (post-live-test debugging) — the ONE durable volume this
+  # feature adds. Holds only apex_host/knowledge/init_cache.py's own small
+  # bookkeeping files (init_state.json + one family_<name>.json per
+  # compiled-knowledge family: manifest identity, content-hash digests,
+  # and the promoted document text/metadata needed to reload a
+  # BM25LexicalIndex — never secrets, never raw compiled-knowledge source
+  # files, never engagement/target-specific state). Reset with
+  # `docker compose down -v` (removes ALL named volumes for this project)
+  # or, to reset only this one without touching anything else,
+  # `docker volume rm apex-knowledge-cache` while the stack is stopped —
+  # see docs/knowledge-initialization.md "Reset and rebuild" for both
+  # commands plus the in-container `--reset-knowledge-cache` alternative
+  # that does not require a Compose/volume-level operation at all.
+  apex-knowledge-cache:
+    name: apex-knowledge-cache
 
 networks:
   # A single, dedicated, internal-by-convention network — Compose does not

@@ -81,6 +81,16 @@ def _add_common_config_flags(parser: argparse.ArgumentParser) -> None:
     so ``apex_host.config_env.merge_env_into_args`` can fill them from the
     environment without a concrete CLI default masking it."""
     parser.add_argument("--knowledge-root", dest="knowledge_root", default=None, metavar="DIR")
+    # Phase 4 (post-live-test debugging) — persistent, incremental
+    # knowledge-initialization cache. --knowledge-cache-path should point at
+    # the mounted apex-knowledge-cache volume (/app/knowledge_cache in the
+    # apex image — see compose.yaml) so cache state survives container
+    # recreation. default=None lets APEX_KNOWLEDGE_CACHE_PATH fill it via
+    # merge_env_into_args, matching every other flag in this function.
+    parser.add_argument("--knowledge-cache-path", dest="knowledge_cache_path", default=None, metavar="DIR")
+    parser.add_argument(
+        "--no-knowledge-cache", dest="no_knowledge_cache", action="store_true", default=False,
+    )
     parser.add_argument("--policy-file", dest="policy_file", default=None, metavar="PATH")
     parser.add_argument(
         "--tool-backend", dest="tool_backend", default=None,

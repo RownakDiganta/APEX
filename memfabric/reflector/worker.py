@@ -55,6 +55,11 @@ class ReflectorWorker:
         self._cursor: str = ""   # episode id of the last-processed episode
         self._run_count: int = 0
 
+    @property
+    def config(self) -> Config:
+        """Read-only access to the worker's ``Config`` (e.g. for gate thresholds)."""
+        return self._config
+
     async def run_once(self) -> None:
         """Process all new episodes since the last cursor, then apply gates.
 
@@ -190,57 +195,70 @@ class ReflectorWorker:
         Unpromoted entries remain staged and are picked up on the next
         ``run_once()`` call.
 
+        Performance (Phase 4 knowledge-initialization fix): uses
+        ``MemoryAPI.select_unpromoted_knowledge_ids`` /
+        ``select_unpromoted_active_skill_ids`` — predicate-based selection
+        that evaluates the gate directly on live staged objects and returns
+        only matching ids, capped at exactly ``cap`` matches. The prior
+        implementation (``get_staged_knowledge(promoted=False)`` then
+        break-on-cap) still deep-copied the ENTIRE remaining-unpromoted set
+        on every pass even though only ``cap`` of those copies were ever
+        used — for a corpus promoted 100-at-a-time, that is O(remaining²/cap)
+        total deep-copy work across the whole loop, not O(total). Measured
+        on a 60,000-record synthetic benchmark: this fix cut the total
+        promotion-loop wall time from ~150s to ~1s (the deep-copy was ~85%
+        of the prior cost; see ``docs/knowledge-initialization.md``
+        "Promotion-loop performance fix" for the full before/after
+        analysis and the two prior, smaller optimizations this one
+        replaces).
+
         Logging contract:
         - Individual promotions → DEBUG only.
-        - End-of-pass summary (promoted=N skipped=M remaining=K) → INFO.
+        - End-of-pass summary (promoted=N remaining=K) → DEBUG only.
         """
         cap = self._config.reflector_max_promotions_per_run
         log_every = self._config.reflector_log_every_n
         promoted = 0
-        skipped = 0
 
-        knowledge_entries = await self._api.get_staged_knowledge()
-        for entry in knowledge_entries:
-            if promoted >= cap:
-                break
-            if should_promote_knowledge(
-                entry,
-                min_confidence=self._config.min_confidence,
-            ):
-                await self._api.promote_knowledge(entry.id)
+        knowledge_ids = await self._api.select_unpromoted_knowledge_ids(
+            lambda e: should_promote_knowledge(e, min_confidence=self._config.min_confidence),
+            limit=cap,
+        )
+        for kid in knowledge_ids:
+            await self._api.promote_knowledge(kid)
+            promoted += 1
+            if promoted % log_every == 0:
+                logger.debug(
+                    "reflector promoted knowledge id=%s (%d so far)",
+                    kid, promoted,
+                )
+
+        remaining_cap = cap - promoted
+        if remaining_cap > 0:
+            skill_ids = await self._api.select_unpromoted_active_skill_ids(
+                lambda s: should_promote_skill(
+                    s,
+                    min_evidence_count=self._config.min_evidence_count,
+                    min_confidence=self._config.min_confidence,
+                ),
+                limit=remaining_cap,
+            )
+            for sid in skill_ids:
+                await self._api.promote_skill(sid)
                 promoted += 1
                 if promoted % log_every == 0:
                     logger.debug(
-                        "reflector promoted knowledge id=%s (%d so far)",
-                        entry.id, promoted,
+                        "reflector promoted skill id=%s (%d so far)",
+                        sid, promoted,
                     )
-            else:
-                skipped += 1
 
-        skill_entries = await self._api.get_staged_skills()
-        for skill in skill_entries:
-            if promoted >= cap:
-                break
-            if should_promote_skill(
-                skill,
-                min_evidence_count=self._config.min_evidence_count,
-                min_confidence=self._config.min_confidence,
-            ):
-                await self._api.promote_skill(skill.id)
-                promoted += 1
-                if promoted % log_every == 0:
-                    logger.debug(
-                        "reflector promoted skill id=%s name=%s (%d so far)",
-                        skill.id, skill.name, promoted,
-                    )
-            else:
-                skipped += 1
-
-        total = len(knowledge_entries) + len(skill_entries)
-        remaining = max(0, total - promoted - skipped)
+        remaining = (
+            await self._api.count_staged_knowledge(promoted=False)
+            + await self._api.count_staged_skills(promoted=False, quarantined=False)
+        )
         logger.debug(
-            "reflector promotion pass: promoted=%d skipped=%d remaining=%d",
-            promoted, skipped, remaining,
+            "reflector promotion pass: promoted=%d remaining=%d",
+            promoted, remaining,
         )
 
     # ------------------------------------------------------------------

@@ -182,6 +182,13 @@ class RunReport:
     seeding_promotion: dict[str, Any] = field(default_factory=dict)
     policy_source: str = ""
 
+    # Knowledge-initialization cache summary (Phase 4 — post-live-test
+    # debugging) — populated from seed_results["_init"]
+    # (KnowledgeInitReport.to_dict()) when compiled knowledge was
+    # configured. Empty dict when no compiled knowledge was configured at
+    # all (e.g. neither --knowledge-root nor any per-family path was set).
+    knowledge_init: dict[str, Any] = field(default_factory=dict)
+
     # LLM call budget summary — populated from LLMBudgetTracker.to_dict() when
     # --use-llm is set.  Empty dict when running in deterministic mode.
     llm_usage: dict[str, Any] = field(default_factory=dict)
@@ -723,14 +730,18 @@ def build_report(
     # Extract seeding summary from seed_results (if available).
     seeding_counts: dict[str, Any] = {}
     seeding_promotion: dict[str, Any] = {}
+    knowledge_init: dict[str, Any] = {}
     if seed_results:
         seeding_counts = {
             k: v for k, v in seed_results.items()
-            if k not in ("_promotion",) and not k.startswith("_")
+            if k not in ("_promotion", "_init") and not k.startswith("_")
         }
         promo = seed_results.get("_promotion")
         if isinstance(promo, dict):
             seeding_promotion = promo
+        init_report = seed_results.get("_init")
+        if isinstance(init_report, dict):
+            knowledge_init = init_report
 
     # Duplicate action summary
     raw_dup = list(final_state.get("duplicate_actions") or [])
@@ -1046,6 +1057,7 @@ def build_report(
         policy_decisions=raw_pd,
         seeding_counts=seeding_counts,
         seeding_promotion=seeding_promotion,
+        knowledge_init=knowledge_init,
         policy_source=policy_source,
         llm_usage=llm_budget if llm_budget is not None else {},
         duplicate_action_count=len(raw_dup),
@@ -1589,6 +1601,37 @@ def format_text(report: RunReport) -> str:
             lines.append(f"    remaining     : {p.get('records_remaining', 'n/a')}")
             lines.append(f"    stop_reason   : {p.get('stop_reason', 'n/a')}")
             lines.append(f"    elapsed_s     : {p.get('elapsed_seconds', 'n/a')}")
+            blocked = p.get("blocked_reason_counts")
+            if isinstance(blocked, dict) and blocked:
+                reasons = ", ".join(f"{k}={v}" for k, v in sorted(blocked.items()))
+                lines.append(f"    blocked_reasons: {reasons}")
+
+    # Knowledge Initialization summary (Phase 4 — cold/warm/incremental cache)
+    ki = report.knowledge_init
+    if ki:
+        lines.append("\nKnowledge Initialization")
+        lines.append(f"  mode                    : {ki.get('initialization_mode', 'n/a')}")
+        lines.append(f"  persistence_enabled     : {ki.get('persistence_enabled', False)}")
+        lines.append(f"  persistence_path        : {ki.get('persistence_path_category', 'n/a')}")
+        if ki.get("reuse_rejected_reason"):
+            lines.append(f"  reuse_rejected_reason   : {ki['reuse_rejected_reason']}")
+        reused = ki.get("families_reused") or []
+        changed = ki.get("families_changed") or []
+        if reused:
+            lines.append(f"  families_reused         : {', '.join(reused)}")
+        if changed:
+            lines.append(f"  families_changed        : {', '.join(changed)}")
+        lines.append(
+            f"  records examined/staged/promoted/skipped/blocked : "
+            f"{ki.get('records_examined', 0):,}/{ki.get('records_staged', 0):,}/"
+            f"{ki.get('records_promoted', 0):,}/{ki.get('records_skipped_existing', 0):,}/"
+            f"{ki.get('records_blocked', 0):,}"
+        )
+        ki_blocked = ki.get("blocked_reason_counts")
+        if isinstance(ki_blocked, dict) and ki_blocked:
+            reasons = ", ".join(f"{k}={v}" for k, v in sorted(ki_blocked.items()))
+            lines.append(f"  blocked_reason_counts   : {reasons}")
+        lines.append(f"  elapsed_s               : {ki.get('elapsed_seconds', 'n/a')}")
 
     # Policy Gate summary (always shown — all-approved is the expected baseline)
     total_policy = (
@@ -1727,6 +1770,7 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
         "knowledge_seeding": {
             "family_counts": report.seeding_counts,
             "promotion": report.seeding_promotion,
+            "initialization": report.knowledge_init,
         },
         "llm_usage": report.llm_usage,
         "duplicate_actions": {

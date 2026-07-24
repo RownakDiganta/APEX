@@ -21,6 +21,26 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 # ---------------------------------------------------------------------------
+# Compiled-record schema version (Phase 4 — knowledge initialization cache)
+# ---------------------------------------------------------------------------
+
+COMPILER_SCHEMA_VERSION = "1"
+"""Version of the ``CompiledKnowledgeRecord`` shape (fields, required keys,
+`id` derivation via ``stable_record_id``) that this codebase's compiler
+scripts and the runtime loader/manifest system understand.
+
+Bump this when the compiled-record SHAPE changes in a way that would make a
+previously-compiled JSONL file, or a previously-persisted knowledge-
+initialization cache entry, incompatible with the current code (e.g. a
+required field is added/renamed, or ``stable_record_id``'s input fields
+change). ``apex_host.knowledge.manifest.FamilyManifest`` records this value
+alongside each family's content hash; ``apex_host.knowledge.init_cache``
+treats a persisted manifest whose ``schema_version`` differs from this
+constant as unconditionally stale (never reused), regardless of whether the
+content hash happens to match — see ``docs/knowledge-initialization.md``
+"Manifest identity"."""
+
+# ---------------------------------------------------------------------------
 # Source-family and source-type enumerations
 # ---------------------------------------------------------------------------
 

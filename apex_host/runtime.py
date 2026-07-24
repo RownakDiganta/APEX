@@ -58,6 +58,20 @@ class ApexRuntime:
     config: ApexConfig
     memfabric_config: Config
     registry: ToolRegistry
+    # Phase 4 (knowledge-initialization cache) — a direct reference to the
+    # SAME lexical index instance already wired into `api`, held here so
+    # `seed_all()` can call the cache orchestrator
+    # (apex_host.knowledge.init_cache.initialize_compiled_knowledge), which
+    # needs to import a persisted document snapshot directly into the
+    # index on a cache-hit. This is a lifecycle/wiring reference, not a
+    # second state-access path — every document that ever enters this
+    # index still goes through the index's own add()/import_documents()
+    # methods, exactly as memfabric Invariant 1 requires; nothing here
+    # reads or writes graph/episodic/knowledge state directly. Optional
+    # (defaults to None) purely so existing test fixtures that construct
+    # ApexRuntime directly (bypassing build_runtime()) continue to work
+    # unchanged — such fixtures simply get the "no persistence" fallback.
+    lexical: BM25LexicalIndex | None = None
     # Populated by run() after the graph completes; None before the first run.
     last_budget: LLMBudgetTracker | None = None
     # Phase 24 — constructed explicitly (rather than left to
@@ -124,11 +138,21 @@ class ApexRuntime:
         - ``"_promotion"`` (dict) → ``PromotionSummary.to_dict()`` when compiled
           families were staged (absent when no compiled families are configured
           or the total staged count is 0).
+        - ``"_init"`` (dict) → ``KnowledgeInitReport.to_dict()`` (Phase 4) —
+          always present when compiled families are configured, regardless
+          of whether persistence is enabled; describes cold/warm/incremental
+          behavior, per-family reuse, and blocked-record diagnostics.
 
         When ``knowledge_root`` is None and no per-family paths are configured,
         the compiled-knowledge families are skipped gracefully (count 0).
         Backward-compatible: integer-keyed family counts are present as before;
-        the ``"_promotion"`` key is additive.
+        ``"_promotion"``/``"_init"`` are additive keys.
+
+        When ``self.lexical`` is None (a test fixture constructed ``ApexRuntime``
+        directly rather than via ``build_runtime()``), falls back to the
+        pre-Phase-4 unconditional ``seed_compiled_knowledge_full()`` path —
+        correct, just without cross-run persistence, exactly as if no
+        ``knowledge_cache_path`` were configured.
         """
         results: dict[str, Any] = {}
 
@@ -144,7 +168,17 @@ class ApexRuntime:
             or self.config.intel_db_path is not None
             or self.config.payload_db_path is not None
         )
-        if _has_knowledge:
+        if _has_knowledge and self.lexical is not None:
+            from apex_host.knowledge.init_cache import initialize_compiled_knowledge
+
+            compiled_counts, init_report = await initialize_compiled_knowledge(
+                self.api, self.lexical, self.config, self.memfabric_config
+            )
+            results.update(compiled_counts)
+            results["_init"] = init_report.to_dict()
+            if init_report.promotion:
+                results["_promotion"] = init_report.promotion
+        elif _has_knowledge:
             compiled_counts, promo_summary = await seed_compiled_knowledge_full(
                 self.api, self.config, self.memfabric_config
             )
@@ -404,4 +438,7 @@ def build_runtime(config: ApexConfig) -> ApexRuntime:
 
     registry = ToolRegistry.from_config(config)
 
-    return ApexRuntime(api=api, config=config, memfabric_config=memfabric_config, registry=registry)
+    return ApexRuntime(
+        api=api, config=config, memfabric_config=memfabric_config, registry=registry,
+        lexical=lexical,
+    )

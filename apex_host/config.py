@@ -474,6 +474,39 @@ class ApexConfig:
     # naturally bounded by the engagement's own process lifetime.
     capability_runtime_reference_ttl_seconds: float = 0.0
 
+    # ---------------------------------------------------------------------------
+    # Phase 4 (post-live-test debugging) — persistent, incremental knowledge
+    # initialization cache (apex_host/knowledge/init_cache.py;
+    # docs/knowledge-initialization.md). Fixes a live-test finding where
+    # ~1,758 of ~1,785 total startup seconds were spent re-staging and
+    # re-Reflector-promoting a 63,783-record compiled knowledge corpus on
+    # EVERY run, even when the compiled files had not changed.
+    # ---------------------------------------------------------------------------
+    # knowledge_cache_path: a durable directory (surviving disposable
+    # container restarts — see compose.yaml's apex-knowledge-cache named
+    # volume) where the small init_state.json bookkeeping file and one
+    # family_<name>.json payload file per compiled-knowledge family are
+    # persisted. None (the default) means NO cross-run persistence — every
+    # startup performs a full (but now fast — see
+    # apex_host.execution.error_classifier's sibling fix in
+    # memfabric.api.MemoryAPI.select_unpromoted_knowledge_ids) re-stage.
+    # CLI: --knowledge-cache-path. Env: APEX_KNOWLEDGE_CACHE_PATH.
+    knowledge_cache_path: str | None = None
+    # knowledge_cache_enabled: explicit kill switch — when False, behaves
+    # exactly as if knowledge_cache_path were None, even if a path is
+    # configured (useful for a --no-knowledge-cache override without
+    # having to unset the path). CLI: --no-knowledge-cache.
+    knowledge_cache_enabled: bool = True
+    # knowledge_cache_lock_timeout_seconds: how long a process will wait to
+    # acquire the cross-process cache-directory lock before degrading to an
+    # uncached (correct, bounded, but non-persistent) initialization for
+    # this run only. CLI: --knowledge-cache-lock-timeout.
+    knowledge_cache_lock_timeout_seconds: float = 30.0
+    # knowledge_cache_stale_lock_seconds: a lock file older than this is
+    # treated as abandoned (its holder crashed without releasing it) and
+    # reclaimed by the next waiter — see apex_host/knowledge/init_lock.py.
+    knowledge_cache_stale_lock_seconds: float = 300.0
+
     # Configuration schema version — increment when the config format changes in a
     # backward-incompatible way (new required fields, renamed fields, type changes).
     # Exposed via to_safe_dict() so consumers can detect incompatible changes.
@@ -601,7 +634,15 @@ class ApexConfig:
             "capability_evidence_ttl_seconds": _g("capability_evidence_ttl_seconds", 0.0),
             "capability_discovery_max_evidence_per_cycle": _g("capability_discovery_max_evidence_per_cycle", 50),
             "capability_runtime_reference_ttl_seconds": _g("capability_runtime_reference_ttl_seconds", 0.0),
+            # Phase 4 — knowledge-initialization cache. None means "no
+            # persistence" (the safe, pre-existing default behavior).
+            "knowledge_cache_path": _g("knowledge_cache_path", None),
+            "knowledge_cache_enabled": bool(_g("knowledge_cache_enabled", True)),
+            "knowledge_cache_lock_timeout_seconds": _g("knowledge_cache_lock_timeout_seconds", 30.0),
+            "knowledge_cache_stale_lock_seconds": _g("knowledge_cache_stale_lock_seconds", 300.0),
         }
+        if getattr(args, "no_knowledge_cache", False):
+            kwargs["knowledge_cache_enabled"] = False
         user_flag_filenames = getattr(args, "user_flag_candidate_filenames", None)
         if user_flag_filenames:
             kwargs["user_flag_candidate_filenames"] = list(user_flag_filenames)
