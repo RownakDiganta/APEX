@@ -25,6 +25,7 @@ from memfabric.types import Episode, TaskSpec
 
 from apex_host.execution.context import ExecutionContext
 from apex_host.execution.dispositions import ExecutionDisposition
+from apex_host.execution.registry import TaskStatus
 from apex_host.graph_state import ApexGraphState
 from apex_host.orchestration.completion import outcome_for
 from apex_host.orchestration.parsing_node import (
@@ -32,11 +33,30 @@ from apex_host.orchestration.parsing_node import (
     parse_result_and_collect_evidence,
     run_pending_capability_discovery,
 )
+from apex_host.planning.fingerprint import task_fingerprint
+from apex_host.tools.backend import backend_capability_mode
 
 if TYPE_CHECKING:
     from apex_host.orchestration.dependencies import OrchestrationDeps
 
 logger = logging.getLogger(__name__)
+
+
+def _action_fingerprint(task: TaskSpec, phase: str, capability_mode: str) -> str:
+    """Compute the SAME canonical action fingerprint
+    ``TaskDispatcher.dispatch()`` computes for *task* — used here, before
+    dispatch, to detect whether a repaired task is a materially different
+    action from the one that just failed (Phase 2, post-live-test
+    debugging)."""
+    return task_fingerprint(
+        phase,
+        str(task.params.get("tool", "")),
+        [str(a) for a in task.params.get("args", [])],
+        str(task.params.get("target", "")),
+        parser=str(task.params.get("parser", "command")),
+        executor_domain=task.executor_domain,
+        capability_mode=capability_mode,
+    )
 
 
 def make_repair_node(deps: "OrchestrationDeps") -> Any:
@@ -76,6 +96,48 @@ def make_repair_node(deps: "OrchestrationDeps") -> Any:
         repaired_task: TaskSpec = repair_result.repaired_task
         r_tool = str(repaired_task.params.get("tool", ""))
         r_target = str(repaired_task.params.get("target", deps.config.target))
+
+        # Phase 2 (post-live-test debugging): if the repaired task is the
+        # EXACT SAME canonical action as the one that just failed (same
+        # tool, normalized args, target, phase, parser, executor_domain,
+        # backend capability mode — see
+        # apex_host.planning.fingerprint.task_fingerprint), classify it as
+        # repair_no_change and reject it BEFORE dispatch — it must not
+        # consume another execution turn, and must not silently re-run
+        # the identical failing command. Recorded in duplicate_actions
+        # (never as an execution episode) so the report shows exactly why
+        # no new action was taken.
+        capability_mode = backend_capability_mode(deps.config)
+        original_fp = _action_fingerprint(failed_task, state["phase"], capability_mode)
+        repaired_fp = _action_fingerprint(repaired_task, state["phase"], capability_mode)
+
+        if repaired_fp == original_fp:
+            logger.info(
+                "repair_agent: repair produced no change (fingerprint=%s phase=%s) — "
+                "rejecting before dispatch",
+                repaired_fp, state["phase"],
+            )
+            no_change_entry = {
+                "fingerprint": repaired_fp,
+                "tool": r_tool,
+                "target": r_target,
+                "phase": state["phase"],
+                "disposition": "repair_no_change",
+                "reason": "repair produced the same normalized action as the original failure",
+                "meaningful_state_change": False,
+                "repair_changed_action": False,
+            }
+            return {
+                "repair_count": new_repair_count,
+                "duplicate_actions": [no_change_entry],
+            }
+
+        # Repair produced a materially different action — mark the
+        # ORIGINAL fingerprint as superseded (audit-distinguishable from
+        # an unresolved terminal failure; still suppresses future blind
+        # resubmission of the SAME original action) before dispatching
+        # the repaired one.
+        await deps.dispatcher.task_registry.update_status(original_fp, TaskStatus.SUPERSEDED)
 
         repair_ctx = ExecutionContext(
             run_id=state["run_id"], phase=state["phase"], turn_number=state["turn_count"],

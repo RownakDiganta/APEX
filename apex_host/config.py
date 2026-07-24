@@ -61,6 +61,20 @@ class ApexConfig:
     # is configured (FakeModelRouter), so this counter is only relevant in
     # live mode with a real model router.
     max_repair_attempts: int = 1
+    # Phase 2 (post-live-test debugging) — canonical action fingerprint /
+    # bounded-retry model. A task whose specific failure is classified as
+    # retryable (apex_host.execution.dispositions.classify_retry — e.g. a
+    # transient network error) may be resubmitted under the SAME action
+    # fingerprint at most this many additional times before
+    # TaskDispatcher forces it to TaskStatus.FAILED_TERMINAL (suppressing
+    # further resubmission) regardless of the per-error retry
+    # classification. Default 1 means "one bounded retry": the first
+    # attempt plus one retry, then stop. Non-retryable failures (e.g. an
+    # nmap raw-socket permission error) are never subject to this bound —
+    # they are terminal on the FIRST attempt. See
+    # apex_host/execution/registry.py::TaskRegistry.attempt_count and
+    # docs/action-fingerprint.md.
+    max_fingerprint_retries: int = 1
     # LLM runtime wiring — controlled by --use-llm CLI flag.
     # When use_llm=False (the default), FakeModelRouter is used and all planners
     # run in fully-deterministic mode with no API calls or network traffic.

@@ -43,6 +43,7 @@ from apex_host.execution.dispositions import ExecutionDisposition, classify_retr
 from apex_host.execution.errors import ErrorCategory, ExecutionError
 from apex_host.execution.registry import TaskRegistry, TaskStatus
 from apex_host.planning.fingerprint import task_fingerprint
+from apex_host.tools.backend import backend_capability_mode
 
 if TYPE_CHECKING:
     from apex_host.agents.browser_executor import BrowserExecutor
@@ -207,6 +208,15 @@ class TaskDispatcher:
         self._priv_esc_enum_executor = priv_esc_enum_executor
         self._user_flag_executor = user_flag_executor
 
+    @property
+    def task_registry(self) -> TaskRegistry:
+        """The ``TaskRegistry`` this dispatcher reserves fingerprints
+        against. Exposed (Phase 2, post-live-test debugging) so
+        ``apex_host.orchestration.repair_node`` can mark a superseded
+        fingerprint's status after a materially-changed repair is
+        dispatched — never used to bypass ``dispatch()``'s own gates."""
+        return self._registry
+
     async def dispatch(
         self,
         task: TaskSpec,
@@ -326,8 +336,16 @@ class TaskDispatcher:
             )
 
         # ── 3. Duplicate gate (TaskRegistry, atomic check-and-reserve) ───
+        # Phase 2 (post-live-test debugging): capability_mode is part of the
+        # canonical action identity — a task planned identically but under a
+        # different backend capability assumption (e.g. raw-socket-capable
+        # vs TCP-connect-only) is a distinct action. See
+        # apex_host.tools.backend.backend_capability_mode.
         executor_domain = str(task.params.get("executor_domain", phase))
-        fingerprint = task_fingerprint(phase, tool, args, target, parser, executor_domain)
+        capability_mode = backend_capability_mode(self._config)
+        fingerprint = task_fingerprint(
+            phase, tool, args, target, parser, executor_domain, capability_mode
+        )
 
         ts = now()
         reserved, existing = await self._registry.reserve(
@@ -341,9 +359,12 @@ class TaskDispatcher:
 
         if not reserved:
             prior_task_id = existing.task_id if existing else ""
+            prior_status = existing.status.value if existing else ""
+            prior_disposition = existing.disposition if existing else ""
+            prior_attempts = self._registry.attempt_count(fingerprint)
             logger.info(
-                "dispatcher: duplicate [%s] fingerprint=%s prior=%s",
-                phase, fingerprint, prior_task_id,
+                "dispatcher: duplicate [%s] fingerprint=%s prior=%s prior_status=%s attempts=%d",
+                phase, fingerprint, prior_task_id, prior_status, prior_attempts,
             )
             err = ExecutionError(
                 category=ErrorCategory.DUPLICATE_TASK,
@@ -358,6 +379,14 @@ class TaskDispatcher:
             )
             tr["skipped_duplicate"] = True
             tr["duplicate_fingerprint"] = fingerprint
+            # Phase 2 (post-live-test debugging): carried through so
+            # apex_host.orchestration.dispatch_node._dup_entry and the
+            # report builder can show WHY this specific action is being
+            # suppressed (previous outcome, attempt count) — not just that
+            # it was suppressed.
+            tr["duplicate_previous_status"] = prior_status
+            tr["duplicate_previous_disposition"] = prior_disposition
+            tr["duplicate_attempt_count"] = prior_attempts
             tr["returncode"] = 0
             tr["error"] = None
             return DispatchResult(
@@ -466,18 +495,50 @@ class TaskDispatcher:
         )
 
         # ── 6. Record final status ────────────────────────────────────────
-        final_status = (
-            TaskStatus.COMPLETED if disposition.is_success
-            else TaskStatus.FAILED_RETRYABLE if disposition.is_retryable
-            else TaskStatus.FAILED_TERMINAL
-        )
+        # Phase 2 (post-live-test debugging) fix: the SPECIFIC retry
+        # decision from classify_retry() — which inspects the actual error
+        # text (e.g. "connection refused" vs an nmap raw-socket permission
+        # failure) — now drives TaskRegistry suppression, not the coarse
+        # disposition.is_retryable "shape" check. The old code treated
+        # EVERY EXECUTED_FAILURE as retryable-shaped regardless of whether
+        # classify_retry() had already determined the specific error was
+        # NOT retryable, so a genuinely non-retryable failure (like a raw-
+        # socket permission error) never suppressed resubmission — the
+        # identical failing action re-executed every turn (the confirmed
+        # live-test bug: six identical Nmap failures, duplicate_actions
+        # .total_skipped stayed zero). classify_retry() is computed FIRST
+        # so the real decision, not the shape, drives status assignment.
+        #
+        # Bounded retries: even a genuinely retryable (transient) failure
+        # is only permitted ApexConfig.max_fingerprint_retries additional
+        # resubmissions under the SAME fingerprint before it, too, is
+        # forced to FAILED_TERMINAL — "one bounded retry", never unbounded.
+        retry_decision = classify_retry(disposition, tr_dict.get("error") or "")
+        attempt_count = self._registry.attempt_count(fingerprint)
+        bounded_retry_available = attempt_count <= self._config.max_fingerprint_retries
+
+        if disposition.is_success:
+            final_status = TaskStatus.COMPLETED
+        elif disposition is ExecutionDisposition.TIMED_OUT:
+            final_status = (
+                TaskStatus.TIMED_OUT if bounded_retry_available else TaskStatus.FAILED_TERMINAL
+            )
+        elif retry_decision.may_retry and bounded_retry_available:
+            final_status = TaskStatus.FAILED_RETRYABLE
+        else:
+            final_status = TaskStatus.FAILED_TERMINAL
+            if retry_decision.may_retry and not bounded_retry_available:
+                # Genuinely transient per classify_retry(), but this
+                # fingerprint's bounded retry budget is exhausted — record
+                # WHY it is terminal now, distinct from "never retryable".
+                tr_dict["retry_budget_exhausted"] = True
+
         await self._registry.update_status(
             fingerprint, final_status,
             disposition=disposition.value,
-            retry_count=context.retry_count,
+            retry_count=attempt_count - 1,
         )
 
-        retry_decision = classify_retry(disposition, tr_dict.get("error") or "")
         return DispatchResult(
             disposition=disposition,
             task_id=task.id,

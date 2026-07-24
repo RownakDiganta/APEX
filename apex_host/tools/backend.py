@@ -52,6 +52,9 @@ __all__ = [
     "RemoteToolBackend",
     "VALID_TOOL_BACKENDS",
     "backend_supports_raw_sockets",
+    "backend_capability_mode",
+    "CAPABILITY_MODE_RAW_SOCKET",
+    "CAPABILITY_MODE_TCP_CONNECT",
     "select_tool_backend",
     "select_runtime_backend",
     "to_run_command_fn",
@@ -382,6 +385,30 @@ def backend_supports_raw_sockets(config: "ApexConfig") -> bool:
     if override is not None:
         return bool(override)
     return _normalize_backend_name(config.tool_backend) != "remote"
+
+
+#: Fixed, reportable vocabulary for the "relevant backend capability mode"
+#: component of a canonical action fingerprint (Phase 2, post-live-test
+#: debugging — see apex_host.planning.fingerprint.task_fingerprint). Two
+#: values only: this is deliberately not an open string so the fingerprint
+#: component stays a small, auditable enum-like vocabulary rather than an
+#: unbounded set of ad-hoc labels.
+CAPABILITY_MODE_RAW_SOCKET = "raw_socket"
+CAPABILITY_MODE_TCP_CONNECT = "tcp_connect"
+
+
+def backend_capability_mode(config: "ApexConfig") -> str:
+    """Return the fixed capability-mode label for *config*'s tool backend —
+    ``CAPABILITY_MODE_RAW_SOCKET`` or ``CAPABILITY_MODE_TCP_CONNECT`` — a
+    thin, named wrapper around :func:`backend_supports_raw_sockets` so
+    that ``TaskDispatcher`` can include the "relevant backend capability
+    mode" component of a canonical action fingerprint without duplicating
+    the derivation logic. A task planned identically but under a DIFFERENT
+    capability mode is treated as a distinct action — see
+    ``apex_host.planning.fingerprint.task_fingerprint``'s ``capability_mode``
+    parameter.
+    """
+    return CAPABILITY_MODE_RAW_SOCKET if backend_supports_raw_sockets(config) else CAPABILITY_MODE_TCP_CONNECT
 
 
 def select_runtime_backend(config: "ApexConfig") -> ToolBackend:

@@ -1005,13 +1005,24 @@ class TestRepairNodeCapabilityEvidence:
                 return RepairRequest(
                     original_task_id="t-1",
                     repaired_task=TaskSpec(
+                        # Phase 2: args=["-p", "2222"] makes this a
+                        # materially different canonical action from the
+                        # original (args=[]) — a genuine repair, not a
+                        # repair_no_change rejection.
                         id="t-1", goal_id="g", executor_domain="credential",
-                        params={"tool": "ssh_access", "target": _TARGET}, subgraph_anchor=_ANCHOR, phase="credential",
+                        params={"tool": "ssh_access", "args": ["-p", "2222"], "target": _TARGET},
+                        subgraph_anchor=_ANCHOR, phase="credential",
                     ),
                     repair_attempt=0, failure_reason="transient", phase="credential", target=_TARGET,
                 )
 
+        class _StubTaskRegistry:
+            async def update_status(self, *a: Any, **k: Any) -> None:
+                return None
+
         class _StubDispatcher:
+            task_registry = _StubTaskRegistry()
+
             async def dispatch(self, *a: Any, **k: Any) -> Any:
                 return _StubDispatchResult()
 
@@ -1022,7 +1033,10 @@ class TestRepairNodeCapabilityEvidence:
         state = _make_initial_state(_TARGET)
         state["phase"] = "credential"
         state["last_tool_result"] = {"tool": "ssh_access", "error": "transient", "task_id": "t-1"}
-        state["current_task"] = {"params": {"tool": "ssh_access", "target": _TARGET}, "executor_domain": "credential"}
+        state["current_task"] = {
+            "params": {"tool": "ssh_access", "args": [], "target": _TARGET},
+            "executor_domain": "credential",
+        }
 
         result = await node(state)
         assert "capability_discovery_log" in result

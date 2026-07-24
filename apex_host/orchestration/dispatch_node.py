@@ -60,8 +60,25 @@ _PERMANENT_LLM_ERROR_CATEGORY_VALUES: frozenset[str] = frozenset(
 
 
 def _dup_entry(
-    task: TaskSpec, fingerprint: str, phase: str, config_target: str
+    task: TaskSpec,
+    fingerprint: str,
+    phase: str,
+    config_target: str,
+    tool_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Build one ``duplicate_actions`` report entry.
+
+    Phase 2 (post-live-test debugging): *tool_result* is the dispatcher's
+    own ``tr`` dict for a ``SKIPPED_DUPLICATE`` disposition, which carries
+    ``duplicate_previous_status``/``duplicate_previous_disposition``/
+    ``duplicate_attempt_count`` (see ``TaskDispatcher.dispatch``) — surfaced
+    here so the report shows WHY an action was skipped (previous outcome,
+    retry count already spent), not merely that it was. ``None`` is
+    accepted for backward compatibility with any caller that has not been
+    updated to pass it; the new fields default to empty/zero in that case.
+    """
+    tr = tool_result or {}
+    previous_status = str(tr.get("duplicate_previous_status", ""))
     return {
         "fingerprint": fingerprint,
         "tool": str(task.params.get("tool", "")),
@@ -70,6 +87,9 @@ def _dup_entry(
         "disposition": "skip_task",
         "reason": f"task matched completed fingerprint={fingerprint}",
         "meaningful_state_change": False,
+        "previous_status": previous_status,
+        "previous_disposition": str(tr.get("duplicate_previous_disposition", "")),
+        "retry_count": int(tr.get("duplicate_attempt_count", 0) or 0),
     }
 
 
@@ -192,7 +212,10 @@ async def _dispatch_tasks(
             pd_entry = dict(dr.audit_metadata.get("policy_decision") or {})
             dup_list: list[dict[str, Any]] = []
             if dr.disposition is ExecutionDisposition.SKIPPED_DUPLICATE:
-                dup_list = [_dup_entry(task, dr.fingerprint, state["phase"], deps.config.target)]
+                dup_list = [_dup_entry(
+                    task, dr.fingerprint, state["phase"], deps.config.target,
+                    dr.tool_result_dict,
+                )]
             return dr.tool_result_dict, pd_entry, dup_list
 
     raw = list(await asyncio.gather(*[_run_one(t) for t in tasks], return_exceptions=True))

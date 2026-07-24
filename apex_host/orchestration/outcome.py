@@ -285,11 +285,26 @@ def evaluate_termination(
         # max_turns, without access_state) is the organic
         # _select_phase() fallback — currently unreachable in practice,
         # documented in the module docstring as `goal_completed`.
-        if current_phase == "priv_esc":
+        #
+        # Phase 2 (post-live-test debugging): recon reaching "done" here
+        # means its own turn budget was exhausted with no service ever
+        # discovered — GlobalPlanner.decide_phase() now terminates
+        # directly from recon instead of fabricating "service" evidence to
+        # force-advance into credential (see global_planner.py's
+        # _PHASE_COMPLETION_NODE docstring). Surface the precise blocker
+        # ("no services discovered") rather than the generic
+        # goal_completed/"without validated access" text, which would be
+        # actively misleading here (the engagement got no evidence at
+        # all, not merely no *validated access*).
+        if current_phase in ("priv_esc", "recon"):
+            reason = (
+                "no services discovered — recon exhausted its turn budget with no service evidence"
+                if current_phase == "recon"
+                else f"phase {current_phase!r} exhausted its turn budget with no further useful phase to advance to"
+            )
             return TerminationDecision(
                 terminate=True, outcome=EngagementOutcome.phase_budget_exhausted, success=False,
-                reason=f"phase {current_phase!r} exhausted its turn budget with no further useful phase to advance to",
-                phase=current_phase, turn=turn_count,
+                reason=reason, phase=current_phase, turn=turn_count,
             )
         return TerminationDecision(
             terminate=True, outcome=EngagementOutcome.goal_completed, success=False,

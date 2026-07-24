@@ -27,16 +27,36 @@ logger = logging.getLogger(__name__)
 
 
 class TaskStatus(str, Enum):
-    """Lifecycle state of a registered task."""
+    """Lifecycle state of a registered task — the canonical action-outcome
+    taxonomy (Phase 2, post-live-test debugging).
+
+    ``PENDING``/``EXECUTING`` together represent "currently reserved / in
+    flight" (a reservation has been made but the executor has not yet
+    returned a terminal result). ``TIMED_OUT`` and ``FAILED_RETRYABLE``
+    are both non-suppressing (retry-eligible) but distinct: ``TIMED_OUT``
+    specifically means the executor's own timeout fired (as opposed to a
+    non-timeout transient failure such as "connection refused", which is
+    still recorded as ``FAILED_RETRYABLE``). ``SUPERSEDED`` means a
+    RepairEngine-produced, materially-different action addressed this
+    fingerprint's failure — the original fingerprint stays suppressed
+    (its own broken action must never be blindly resubmitted) but is
+    audit-distinguishable from an unresolved terminal failure. See
+    ``apex_host.execution.dispatcher.TaskDispatcher.dispatch`` (status
+    assignment) and ``apex_host.orchestration.repair_node`` (SUPERSEDED
+    marking) for where each value is actually produced.
+    """
 
     PENDING = "pending"
     EXECUTING = "executing"
     COMPLETED = "completed"
     FAILED_RETRYABLE = "failed_retryable"
     FAILED_TERMINAL = "failed_terminal"
+    TIMED_OUT = "timed_out"
     BLOCKED = "blocked"
+    POLICY_BLOCKED = "policy_blocked"
     CANCELLED = "cancelled"
     SKIPPED_DUPLICATE = "skipped_duplicate"
+    SUPERSEDED = "superseded"
 
     @property
     def suppresses_new_submission(self) -> bool:
@@ -46,6 +66,7 @@ class TaskStatus(str, Enum):
             TaskStatus.EXECUTING,
             TaskStatus.COMPLETED,
             TaskStatus.FAILED_TERMINAL,
+            TaskStatus.SUPERSEDED,
         )
 
 
@@ -110,6 +131,16 @@ class TaskRegistry:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._records: dict[str, TaskRecord] = {}
+        # Phase 2 (post-live-test debugging) — cumulative, 1-based attempt
+        # count per fingerprint, incremented on every SUCCESSFUL reserve()
+        # (whether the first-ever attempt or a legitimate resubmission
+        # after a FAILED_RETRYABLE/TIMED_OUT status). Never decremented —
+        # this is a lifetime counter for the fingerprint's action
+        # identity, used by TaskDispatcher to bound how many times a
+        # transiently-failing action may be resubmitted before it is
+        # forced to FAILED_TERMINAL regardless of the per-attempt retry
+        # classification (ApexConfig.max_fingerprint_retries).
+        self._attempt_counts: dict[str, int] = {}
 
     async def reserve(
         self,
@@ -140,6 +171,7 @@ class TaskRegistry:
                 )
                 return False, existing
 
+            self._attempt_counts[fingerprint] = self._attempt_counts.get(fingerprint, 0) + 1
             record = TaskRecord(
                 fingerprint=fingerprint,
                 task_id=task_id,
@@ -151,10 +183,18 @@ class TaskRegistry:
             )
             self._records[fingerprint] = record
             logger.debug(
-                "registry: reserved fingerprint=%s task_id=%s",
-                fingerprint, task_id,
+                "registry: reserved fingerprint=%s task_id=%s attempt=%d",
+                fingerprint, task_id, self._attempt_counts[fingerprint],
             )
             return True, record
+
+    def attempt_count(self, fingerprint: str) -> int:
+        """Total number of times *fingerprint* has ever been successfully
+        reserved (1-based; 0 if never reserved). Never reset by eviction —
+        this is a lifetime counter for the run, used to bound resubmission
+        of a transiently-failing action (see ``ApexConfig
+        .max_fingerprint_retries``)."""
+        return self._attempt_counts.get(fingerprint, 0)
 
     async def update_status(
         self,

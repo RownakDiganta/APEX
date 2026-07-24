@@ -84,8 +84,26 @@ _DEFAULT_PHASE_BUDGETS: dict[str, int] = {
 # past credential on budget exhaustion must use the same field that
 # legitimately signals success, so a forced skip and a real success are
 # handled by exactly one gate in _select_phase.
+#
+# recon is DELIBERATELY absent (Phase 2, post-live-test debugging fix).
+# Before this fix, recon mapped to "service" here, so an exhausted recon
+# budget fabricated a "service" node type for _select_phase's own gate —
+# advancing straight into the CREDENTIAL phase on a host-only graph where
+# no service was ever actually discovered. Confirmed against live-test
+# evidence: six repeated (duplicate-unsuppressed) Nmap failures exhausted
+# recon's default 6-turn budget with zero real service evidence, and the
+# engagement then force-advanced into credential/objective/priv_esc,
+# producing a string of "no action" turns (no capability ever matched a
+# real service) rather than a precise, immediate stop. Recon's own
+# turn-budget exhaustion is now handled directly in decide_phase() as an
+# explicit termination — see the "recon budget exhausted, no service
+# found" check below — never as fabricated evidence for a later,
+# capability-dependent phase. Web and credential retain their forced
+# advance: by the time either phase's OWN budget is checked, the
+# PREREQUISITE evidence for entering it (a real service, for web; being
+# in credential at all) already exists for real — forcing past THEM does
+# not fabricate evidence for a phase that has no prerequisite of its own.
 _PHASE_COMPLETION_NODE: dict[str, str] = {
-    ApexPhase.recon.value: "service",
     ApexPhase.web.value: "endpoint",
     ApexPhase.credential.value: "access_state",
 }
@@ -211,6 +229,19 @@ class GlobalPlanner:
             parameter existed.
         """
         if turn_count >= self._max_turns:
+            return ApexPhase.done
+
+        # Phase 2 (post-live-test debugging): recon's own turn budget
+        # exhausted with no real service ever discovered terminates
+        # immediately here — it must NOT fall through to _select_phase and
+        # force-advance into a capability-dependent phase (credential)
+        # that requires evidence recon never produced. "host" alone (a
+        # target that merely responded) is not sufficient; this only fires
+        # once recon has genuinely used its full turn allowance. Precise
+        # reason surfaced via EngagementOutcome.phase_budget_exhausted /
+        # evaluate_termination()'s phase-specific reason text — see
+        # apex_host/orchestration/outcome.py.
+        if self.budget_remaining(ApexPhase.recon.value) == 0 and "service" not in node_types_seen:
             return ApexPhase.done
 
         # Force past any budget-tracked phase whose own persistent budget

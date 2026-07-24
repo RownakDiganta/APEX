@@ -76,6 +76,9 @@ class _FakeConfig:
     target: str = _TARGET
     dry_run: bool = False
     max_command_seconds: int = 30
+    tool_backend: str = "local"
+    tool_backend_raw_socket_capable: bool | None = None
+    max_fingerprint_retries: int = 1
 
 
 def _make_episode_result(*, success: bool, protocol: str) -> Any:
