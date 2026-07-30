@@ -642,22 +642,54 @@ async def _async_main(args: argparse.Namespace) -> int:
         print("\nAll allowed tools found.")
         return 0
 
+    # Issue 4: the report-output directory validated by preflight is resolved
+    # deterministically — the parent of an explicit --export-json/--export-graph
+    # file, else the documented default (/app/run_reports in the container,
+    # ./run_reports otherwise). Never the application working directory ".",
+    # which is not writable by the non-root container user.
+    from apex_host.eval.preflight import resolve_report_dir
+    export_json = getattr(args, "export_json", None)
+    export_graph = getattr(args, "export_graph", None)
+    default_report_dir = resolve_report_dir(report_path=export_json, graph_path=export_graph)
+
     if getattr(args, "preflight_only", False):
         # Phase 25: the richer environment/policy/service readiness preflight
         # (apex_host.eval.preflight), distinct from --preflight above (local
         # allowed-tool binary check only). Never runs the engagement — this
         # branch always returns before run_engagement() is ever imported.
+        if not config.dry_run:
+            # Issue 3: a live (--no-dry-run) preflight performs a REAL remote
+            # execution — the harmless `curl --version` smoke command through
+            # the real backend. Real execution, even harmless, must never
+            # bypass the centralized live-run interlock: it requires
+            # --confirm-live and an in-scope target exactly like a real
+            # engagement. The interlock runs the full preflight itself
+            # (configuration, report dir, knowledge, policy, Kali health, the
+            # remote smoke, and VPN readiness), so no check is skipped.
+            from apex_host.eval.live_interlock import evaluate_live_interlock
+
+            interlock = await evaluate_live_interlock(
+                config, confirmed=getattr(args, "confirm_live", False),
+                default_report_dir=default_report_dir,
+                report_path=export_json, graph_path=export_graph,
+            )
+            print(interlock.format_text())
+            return 0 if interlock.permitted else 1
+
+        # Dry-run preflight: purely local + inert checks. No real execution,
+        # no target contact, no --confirm-live required. The remote smoke is
+        # deliberately NOT attempted here — in dry-run the backend always
+        # resolves to the dry-run backend, so a smoke command could only ever
+        # report the misleading "backend resolved to dry-run" failure that
+        # Issue 3 observed. Verify the real remote path with a live preflight
+        # (--no-dry-run --confirm-live) instead.
         from apex_host.eval.preflight import PreflightResult, run_local_checks, run_vpn_checks
 
         checks = run_local_checks(
-            config, default_report_dir=(os.path.dirname(args.export_json) if args.export_json else None) or ".",
-            report_path=args.export_json, graph_path=args.export_graph,
-            policy_required=not config.dry_run,
+            config, default_report_dir=default_report_dir,
+            report_path=export_json, graph_path=export_graph,
+            policy_required=False,
         )
-        if config.tool_backend == "remote":
-            from apex_host.eval.preflight import check_remote_smoke, check_tool_service_health
-            checks.append(await check_tool_service_health(config.tool_service_url))
-            checks.append(await check_remote_smoke(config))
         checks.extend(await run_vpn_checks(config))
         result = PreflightResult(checks)
         print(result.format_text())
@@ -674,8 +706,8 @@ async def _async_main(args: argparse.Namespace) -> int:
 
         interlock = await evaluate_live_interlock(
             config, confirmed=getattr(args, "confirm_live", False),
-            default_report_dir=(os.path.dirname(args.export_json) if args.export_json else None) or ".",
-            report_path=args.export_json, graph_path=args.export_graph,
+            default_report_dir=default_report_dir,
+            report_path=export_json, graph_path=export_graph,
         )
         print(interlock.format_text())
         if not interlock.permitted:

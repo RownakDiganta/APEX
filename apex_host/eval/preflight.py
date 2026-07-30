@@ -49,6 +49,70 @@ _HEALTH_TIMEOUT_SECONDS = 5.0
 _DEFAULT_SMOKE_TOOL = "curl"
 _DEFAULT_SMOKE_ARGS = ["--version"]
 
+# Deterministic report/output directory defaults (Issue 4 fix).
+#
+# The single source of truth for "where do engagement reports go when the
+# operator did not name an explicit --export-json/--export-graph file?".
+# In the APEX container the report mount is /app/run_reports (created and
+# chowned to the non-root ``apex`` user at image build time — see
+# docker/apex/Dockerfile — and bind-mounted from the host's ./run_reports by
+# compose.yaml). Outside the container the repository convention is a local
+# ./run_reports (README "Running an authorized HTB machine"). It is NEVER "."
+# — the application working directory (/app inside the container) is
+# intentionally not writable by the non-root user, which is the exact defect
+# Issue 4 reported.
+_CONTAINER_REPORT_DIR = "/app/run_reports"
+_LOCAL_REPORT_DIR = "run_reports"
+
+
+def _running_in_container() -> bool:
+    """Deterministically decide whether we are inside the APEX container: the
+    already-mounted ``/app/run_reports`` directory exists, or Docker's own
+    ``/.dockerenv`` marker file is present. Never a guess, never a filesystem
+    write."""
+    return Path(_CONTAINER_REPORT_DIR).is_dir() or Path("/.dockerenv").exists()
+
+
+def default_report_directory() -> str:
+    """Return the documented fallback report/output directory for the current
+    environment: ``/app/run_reports`` inside the APEX container, ``run_reports``
+    (relative to the working directory) otherwise. Never ``"."``.
+    """
+    if _running_in_container():
+        return _CONTAINER_REPORT_DIR
+    return _LOCAL_REPORT_DIR
+
+
+def resolve_report_dir(
+    *, report_path: str | None = None, graph_path: str | None = None
+) -> str:
+    """Deterministically resolve the report-output directory to validate for
+    writability.
+
+    Resolution order (Issue 4):
+
+    1. If ``report_path`` (``--export-json``) is supplied, its parent
+       directory.
+    2. Else if ``graph_path`` (``--export-graph``) is supplied, its parent
+       directory.
+    3. Else the documented :func:`default_report_directory`.
+
+    A bare filename with no directory component (e.g. ``run.json``) has an
+    empty parent and therefore falls through to the documented default rather
+    than resolving to ``"."``. The returned value is never ``"."``.
+
+    :func:`check_report_directory` still independently validates the parent of
+    every explicitly-requested export file, so this function only chooses the
+    single *default* directory to test when no export parent is otherwise in
+    play — it never suppresses a per-file parent check.
+    """
+    for candidate in (report_path, graph_path):
+        if candidate:
+            parent = os.path.dirname(candidate)
+            if parent:
+                return parent
+    return default_report_directory()
+
 
 # ---------------------------------------------------------------------------
 # Result models
@@ -68,6 +132,12 @@ class PreflightCheck:
     passed: bool
     detail: str
     required: bool = True
+    # Display hint only (not serialized): when True, ``format_text`` also
+    # prints ``detail`` for a *passing* check so the operator can see, for
+    # example, exactly which directory the report-directory check validated
+    # (Issue 4). Defaults False so every other check's passing output is
+    # unchanged.
+    show_detail_on_pass: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -115,7 +185,7 @@ class PreflightResult:
         for c in self.checks:
             tag = "PASS" if c.passed else ("WARN" if not c.required else "FAIL")
             lines.append(f"[{tag}] {c.name}")
-            if not c.passed:
+            if not c.passed or c.show_detail_on_pass:
                 lines.append(f"       {c.detail}")
         lines.append("")
         if self.passed:
@@ -205,9 +275,11 @@ def check_report_directory(
                 name="report directory", passed=False,
                 detail=f"{directory} exists but is not writable: {exc}",
             )
+    checked = ", ".join(str(c) for c in sorted(candidates))
     return PreflightCheck(
         name="report directory", passed=True,
-        detail=f"writable: {', '.join(str(c) for c in sorted(candidates))}",
+        detail=f"{checked} is writable",
+        show_detail_on_pass=True,
     )
 
 

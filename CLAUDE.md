@@ -1602,6 +1602,39 @@ OpenVPN connection (or another explicitly authorized lab environment).** All
 commands are still safety-gated by `apex_host/tools/safety.py` — the
 allowlist and destructive-command block apply even in real-execution mode.
 
+### Canonical authorized HTB Docker workflow (single source of truth: `README.md`)
+
+The one authoritative, start-from-scratch authorized-HTB procedure lives in
+`README.md` → "Authorized HTB run — canonical Docker workflow" (with the
+operator-facing counterpart in `docs/first-live-test-runbook.md`). Keep those
+in sync with the actual CLI; the load-bearing, correctness-critical facts are:
+
+- **Report directory:** when neither `--export-json` nor `--export-graph` is
+  supplied, `run_htb_local`'s preflight validates the documented default report
+  directory (`/app/run_reports` in the container, `./run_reports` on the host)
+  via `apex_host.eval.preflight.resolve_report_dir()` — **never** the working
+  directory `"."` (which is `/app`, not writable by the non-root container
+  user). There is **no** `--report-dir` flag on `run_htb_local` — use
+  `--export-json`/`--export-graph` (or their `APEX_REPORT_PATH`/`APEX_GRAPH_PATH`
+  env equivalents). `--report-dir` exists only on `apex_host.container_entrypoint`.
+- **Live preflight requires both flags:** a live preflight that exercises the
+  real remote-tool path (`--preflight-only --no-dry-run`) is routed through the
+  centralized live-run interlock and therefore also requires `--confirm-live`.
+  `--tool-backend remote` alone never disables dry-run; `APEX_DRY_RUN=false`
+  alone can never enable real execution or substitute for `--confirm-live`. A
+  dry-run `--preflight-only` never attempts the remote smoke (it would only
+  ever report the misleading "backend resolved to dry-run").
+- **VPN route check:** `python -m apex_host.eval.vpn_route_check` **requires**
+  `--vpn-service-url` on every invocation (no default). In the HTB Docker
+  workflow the readiness server is `http://vpn:8090` (reachable only inside the
+  Compose network — it is not host-published). A successful route lookup alone
+  does not prove target reachability; add `--port` for one bounded TCP connect.
+- **Native OpenAI model names:** for `--llm-provider openai` (and `anthropic`)
+  use a **native** model id with **no `vendor/` prefix** (e.g. `gpt-5.5`,
+  account-specific — never hardcoded/assumed). A router-style `openai/gpt-*` is
+  rejected with a `provider_model_mismatch` error pointing at
+  `--llm-provider openrouter`; APEX never strips the prefix or reroutes. See §24.
+
 ---
 
 ### 12.15 Safe Web Probing

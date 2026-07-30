@@ -1095,6 +1095,173 @@ architecture: [`docs/htb-vpn-container.md`](docs/htb-vpn-container.md).
 Exact remaining steps for an operator with a real profile:
 [`docs/htb-vpn-manual-validation.md`](docs/htb-vpn-manual-validation.md).
 
+### Authorized HTB run — canonical Docker workflow
+
+One authoritative, start-from-scratch procedure for an **authorized** HTB
+engagement over the HTB VPN, on macOS/Linux with Docker Desktop. Every command
+is copy-pasteable. The operator's own runbook counterpart is
+[`docs/first-live-test-runbook.md`](docs/first-live-test-runbook.md).
+
+> **Authorization is non-negotiable.** Only ever pass `--no-dry-run` against a
+> machine you are explicitly authorized to test — an HTB machine reached over
+> the official HTB VPN, or another explicitly authorized lab. HTB may assign a
+> **new** target IP each time a machine is restarted; always use the IP the
+> HTB UI currently shows.
+
+**1. Stop any prior APEX resources (clean slate):**
+
+```bash
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb down --remove-orphans
+```
+
+**2. Confirm Docker is running, and the required files exist:**
+
+```bash
+docker info >/dev/null && echo "docker ok"
+test -f compose.yaml && test -f compose.htb.yaml && test -f secrets/htb.ovpn && echo "files ok"
+```
+
+(`secrets/htb.ovpn` is your authorized HTB profile — never committed;
+`secrets/` is git-ignored. Set `APEX_HTB_OVPN_PATH` to it in step 5.)
+
+**3. Create the report directory (no `chmod 777`):**
+
+```bash
+mkdir -p run_reports
+```
+
+This host directory is bind-mounted to `/app/run_reports` in the `apex`
+container, which is already owned by the container's non-root user — no
+permission changes are needed.
+
+**4. Export the current target IP (from the running HTB instance):**
+
+```bash
+export HTB_TARGET="10.129.x.x"
+```
+
+**5. Export secrets into this shell only (never into a committed file):**
+
+```bash
+export APEX_TOOL_SERVICE_TOKEN="$(openssl rand -hex 32)"
+export APEX_HTB_OVPN_PATH="./secrets/htb.ovpn"
+export OPENAI_API_KEY="sk-..."   # only if you enable LLM planning
+test -n "$OPENAI_API_KEY" && echo "OPENAI_API_KEY is set" || echo "OPENAI_API_KEY is missing"
+```
+
+Secrets must **never** be committed, pasted into `README.md`/`CLAUDE.md`, put
+in a tracked `.env`, or printed into logs/reports. The check above confirms the
+key is set without printing it.
+
+**6. Build from a clean state, then start the long-running services:**
+
+```bash
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb build
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb up -d vpn kali
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb ps
+```
+
+`apex` is a one-shot command container (run with `run --rm` below), so only
+`vpn` and `kali` are started as services. Wait for both to report healthy in
+`ps`.
+
+**7. Verify the VPN route** (route-table lookup only — no packet to the target;
+the readiness port `8090` is reachable only inside the Compose network, hence
+`http://vpn:8090`):
+
+```bash
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
+  run --rm --entrypoint python apex \
+  -m apex_host.eval.vpn_route_check \
+  --vpn-service-url http://vpn:8090 --target "$HTB_TARGET"
+```
+
+Expect `lookup ok: True`, `would use route: True`, `device: tun0`. A good route
+lookup alone does **not** prove the target is reachable. To also attempt one
+bounded TCP connection to a port you expect open, add `--port` (a failed
+individual port is not by itself a VPN failure — the machine may not have that
+port open):
+
+```bash
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
+  run --rm --entrypoint python apex \
+  -m apex_host.eval.vpn_route_check \
+  --vpn-service-url http://vpn:8090 --target "$HTB_TARGET" --port 80
+```
+
+**8. Live preflight** (validates configuration/report-dir/knowledge/policy/LLM,
+Kali health, and one harmless `curl --version` through the real remote backend
+— then exits without any engagement). It is routed through the live-run
+interlock, so it requires **both** `--no-dry-run` and `--confirm-live`:
+`--tool-backend remote` alone never disables dry-run. It writes **no** report
+files; the report directory it validates defaults to `/app/run_reports`
+(no `--export-json` needed). Replace `gpt-5.5` with a native OpenAI model your
+account can access (no `vendor/` prefix — see the LLM section below):
+
+```bash
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
+  run --rm apex exec -- \
+  python -m apex_host.eval.run_htb_local \
+  --target "$HTB_TARGET" \
+  --knowledge-root /app/knowledge \
+  --policy-file /app/knowledge/policy_db/compiled/hackthebox_lab.yaml \
+  --tool-backend remote \
+  --tool-service-url http://vpn:8080 \
+  --tool-service-timeout 120 \
+  --use-llm --llm-provider openai --llm-model gpt-5.5 \
+  --max-turns 20 \
+  --no-dry-run --confirm-live --preflight-only \
+  -v
+```
+
+Expect all required checks to pass, e.g.:
+
+```text
+[PASS] configuration
+[PASS] report directory
+[PASS] compiled knowledge
+[PASS] policy
+[PASS] LLM readiness
+[PASS] LLM model/provider compatibility
+[PASS] HTB profile configured
+[PASS] Kali health
+[PASS] remote tool smoke
+```
+
+(In HTB mode the interlock also adds VPN-readiness checks; the exact set of
+checks may evolve — treat any `[FAIL]` on a required check as blocking.)
+
+**9. Full authorized live run** — only after the preflight passes. Same command
+without `--preflight-only`, keeping `--no-dry-run --confirm-live`, and writing
+reports under the mounted `/app/run_reports`:
+
+```bash
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
+  run --rm apex exec -- \
+  python -m apex_host.eval.run_htb_local \
+  --target "$HTB_TARGET" \
+  --knowledge-root /app/knowledge \
+  --policy-file /app/knowledge/policy_db/compiled/hackthebox_lab.yaml \
+  --tool-backend remote \
+  --tool-service-url http://vpn:8080 \
+  --tool-service-timeout 120 \
+  --use-llm --llm-provider openai --llm-model gpt-5.5 \
+  --max-turns 20 \
+  --export-json /app/run_reports/live.json \
+  --export-graph /app/run_reports/live_graph.json \
+  --no-dry-run --confirm-live \
+  -v
+```
+
+Reports land in `./run_reports/` on the host. `user_flag_verified` is the only
+benchmark-success outcome.
+
+**10. Clean shutdown:**
+
+```bash
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb down --remove-orphans
+```
+
 **GitHub Actions CI and GHCR publishing (Infra Phase 11):**
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) validates every
 pull request and push to the default branch — lock-file check, frozen

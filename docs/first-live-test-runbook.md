@@ -84,18 +84,31 @@ it in a password manager and paste it fresh each session rather than
 the codebase's own convention is a real, exported shell environment variable,
 not a committed file value.
 
-**Provider distinction (unchanged since CLAUDE.md §17):**
+**Provider distinction (native providers — see `docs/llm-providers.md` §24
+and CLAUDE.md §24):** each provider is its own identity with its own
+credential and its own model-naming rules. There is no shared fallback and
+no silent rewriting — the configured model string is sent to the provider
+byte-for-byte.
 
-| Path | `APEX_LLM_PROVIDER` | Env var for the key | `APEX_LLM_MODEL` example |
+| Path | `APEX_LLM_PROVIDER` | Env var for the key | `APEX_LLM_MODEL` (model-name shape) |
 |---|---|---|---|
-| OpenAI direct API | `openai` | `OPENAI_API_KEY` (your real OpenAI key) | `openai/gpt-5.5` |
-| OpenRouter-compatible API | `openai` (same — OpenRouter speaks the OpenAI-compatible protocol) | `OPENAI_API_KEY` (your OpenRouter key, e.g. `sk-or-...`) plus `OPENAI_BASE_URL=https://openrouter.ai/api/v1` | `openai/gpt-5.5` |
+| OpenAI direct API | `openai` | `OPENAI_API_KEY` | a **native** OpenAI model id — **no `vendor/` prefix**, e.g. `gpt-5.5` (illustrative — use a model your OpenAI account can access) |
+| Anthropic direct API | `anthropic` | `ANTHROPIC_API_KEY` | a **native** Anthropic model id — no `vendor/` prefix, e.g. `claude-...` (use a model your account can access) |
+| OpenRouter (aggregator) | `openrouter` | `OPENROUTER_API_KEY` | a **router-style** `vendor/model` id, e.g. `openai/gpt-4o` |
 | Deterministic (no LLM) | `fake` (the default) | none required | unused |
 
-Do not set `APEX_LLM_MODEL` to a name this codebase does not actually
-support — `apex_host.llm.router.OpenAIModelRouter` passes the string straight
-through to the configured API; an unsupported model name fails at the
-provider, not in APEX itself.
+Native model names for `openai`/`anthropic` **never contain a `/`**. Passing a
+router-style `vendor/model` id (e.g. `openai/gpt-5.5`) to `--llm-provider openai`
+or `anthropic` is rejected up front with a `provider_model_mismatch` error that
+tells you to select `--llm-provider openrouter` instead — APEX will **not**
+silently strip the prefix or reroute the request. Likewise, do **not** point
+`provider=openai`/`anthropic` at an OpenRouter base URL; use `provider=openrouter`
+for OpenRouter.
+
+Do not set `APEX_LLM_MODEL` to a name your provider account cannot access —
+`apex_host.llm.providers.*` passes the string straight through to the configured
+API, so an unsupported model name fails at the provider, not in APEX itself.
+APEX never hardcodes or assumes a specific model is available.
 
 ## 7. Generate the tool-service token
 
@@ -143,17 +156,42 @@ docker compose -f compose.yaml -f compose.htb.yaml --profile htb up -d vpn
 ```
 
 Wait for the `vpn` service's own healthcheck to report healthy
-(`docker compose ps`), then check tunnel/route readiness directly:
+(`docker compose ps`), then check tunnel/route readiness. The VPN readiness
+server (port `8090`) is **not** published to the host — run the check from
+inside the `apex` container over the Compose network, where it is reachable
+at `http://vpn:8090`. `--vpn-service-url` is **required** on every invocation
+(there is no default):
 
 ```bash
-uv run python -m apex_host.eval.vpn_route_check \
-  --vpn-service-url http://localhost:8090 --target <HTB_TARGET_IP>
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
+  run --rm --entrypoint python apex \
+  -m apex_host.eval.vpn_route_check \
+  --vpn-service-url http://vpn:8090 --target "$HTB_TARGET"
 ```
 
-(Adjust the URL/port to match how you've exposed the `vpn` service's
-readiness port for host-side access, or run this check from inside the
-`apex` container on the same Compose network — see
-`docs/htb-vpn-container.md`.)
+**Route lookup vs. a real connection.** By default this command performs a
+*route-table lookup only* — it asks the VPN container whether traffic to the
+target *would* use the tunnel route (`would use route: True`, `device: tun0`,
+`gateway: ...`). It sends **no packet to the target**, so a successful route
+lookup alone does **not** prove the target is up or reachable. To also attempt
+exactly one bounded TCP connection, add `--port` with a port you expect open
+on that machine:
+
+```bash
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
+  run --rm --entrypoint python apex \
+  -m apex_host.eval.vpn_route_check \
+  --vpn-service-url http://vpn:8090 --target "$HTB_TARGET" --port 80
+```
+
+The `--port` outcome distinguishes: `connected` (TCP succeeded), `refused`
+(host up, port closed), `timeout` (silent — likely filtered or host down),
+and `unreachable` (`EHOSTUNREACH`/`ENETUNREACH` — no route to host). A failed
+*individual* port does not by itself mean the VPN is broken: the machine may
+simply not have that port open. Only treat a persistent `unreachable`/`timeout`
+across multiple ports (with a good route lookup) as a VPN- or target-side
+problem — see `docs/htb-vpn-manual-validation.md` for the full troubleshooting
+table.
 
 ## 12. Export your target IP
 
@@ -174,7 +212,18 @@ uv run python -m apex_host.eval.run_htb_local \
 ```
 
 Expect a PASS/WARN/FAIL table (§4 of `docs/phase25-release-readiness.md`)
-and exit code `0` if everything required passes.
+and exit code `0` if everything required passes. In dry-run (the default here)
+this is a purely local check — no target contact, no real command execution,
+and the report directory it validates is the documented default
+(`/app/run_reports` in the container, `./run_reports` on the host), never the
+working directory.
+
+A **live** preflight that also exercises the real remote-tool path (one harmless
+`curl --version` through the Kali service) requires `--no-dry-run --confirm-live`
+— it is routed through the same live-run interlock as a real engagement, so
+`--tool-backend remote` alone never turns off dry-run. The canonical Docker
+form of that live preflight is documented in `README.md`
+("Authorized HTB run — canonical Docker workflow").
 
 ## 15. Dry-run target run
 
