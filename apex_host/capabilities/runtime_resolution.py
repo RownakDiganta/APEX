@@ -48,6 +48,15 @@ def ssh_port_for_capability(subgraph: "SubgraphView") -> str:
     return sorted(caps, key=lambda c: int(c.port) if c.port.isdigit() else 22)[0].port or "22"
 
 
+def telnet_port_for_capability(subgraph: "SubgraphView") -> str:
+    """Lowest-port ``access_validate_telnet`` capability's port, or the
+    telnet default (23) — the telnet analogue of ``ssh_port_for_capability``."""
+    caps = [c for c in capabilities_from_subgraph(subgraph) if c.name == "access_validate_telnet"]
+    if not caps:
+        return "23"
+    return sorted(caps, key=lambda c: int(c.port) if c.port.isdigit() else 23)[0].port or "23"
+
+
 def register_capability_adapter(
     *,
     config: "ApexConfig",
@@ -67,6 +76,8 @@ def register_capability_adapter(
     """
     if cap.capability_type is AccessCapabilityType.ssh_command:
         return _register_ssh_adapter(config, capability_registry, subgraph, target, cap)
+    if cap.capability_type is AccessCapabilityType.telnet_command:
+        return _register_telnet_adapter(config, capability_registry, subgraph, target, cap)
     if cap.capability_type in (
         AccessCapabilityType.arbitrary_file_read,
         AccessCapabilityType.api_file_read,
@@ -93,6 +104,32 @@ def _register_ssh_adapter(
         cap.capability_id,
         target=target,
         port=ssh_port_for_capability(subgraph),
+        username=cap.principal,
+        password=passwords[0],
+        config=config,
+    )
+    return True
+
+
+def _register_telnet_adapter(
+    config: "ApexConfig",
+    capability_registry: "CapabilityRuntimeRegistry",
+    subgraph: "SubgraphView",
+    target: str,
+    cap: "AccessCapability",
+) -> bool:
+    """Telnet analogue of ``_register_ssh_adapter``: pairs the validated
+    capability with the SAME operator-supplied credentials
+    (``--username``/``--password``) already used to validate it, and the
+    telnet port from the EKG."""
+    usernames = list(getattr(config, "username_candidates", None) or [])
+    passwords = list(getattr(config, "password_candidates", None) or [])
+    if not usernames or not passwords or cap.principal != usernames[0]:
+        return False
+    capability_registry.ensure_telnet(
+        cap.capability_id,
+        target=target,
+        port=telnet_port_for_capability(subgraph),
         username=cap.principal,
         password=passwords[0],
         config=config,

@@ -34,6 +34,7 @@ from apex_host.parsers.capability_parser import (
     _MIN_COMMAND_CAPABILITY_CONFIDENCE,
     _MIN_DIRECT_FILE_READ_CONFIDENCE,
     _SSH_CAPABILITY_CONFIDENCE,
+    _TELNET_CAPABILITY_CONFIDENCE,
 )
 from apex_host.types import AccessCapabilityType
 
@@ -46,6 +47,10 @@ if TYPE_CHECKING:
 #: provider enforces the SAME floor for automatically-derived evidence so a
 #: weaker signal can never masquerade as a real validated login).
 _MIN_SSH_CONFIDENCE = _SSH_CAPABILITY_CONFIDENCE
+
+#: Telnet's own floor — same basis as SSH (a real, executor-validated
+#: authenticated shell); mirrors ``CapabilityParser``'s fixed telnet value.
+_MIN_TELNET_CONFIDENCE = _TELNET_CAPABILITY_CONFIDENCE
 
 
 def _existing_capability_confidence(context: "CapabilityDiscoveryContext", capability_id: str) -> float | None:
@@ -192,6 +197,51 @@ class SSHCapabilityProvider:
         return _base_decision(
             evidence, provider_name=name, status=status, capability_id=capability_id,
             confidence=confidence, sanitized_reason="authenticated ssh operation validated",
+        )
+
+
+class TelnetCapabilityProvider:
+    """Accepts only evidence proving an authenticated Telnet operation with a
+    runtime reference available — the telnet analogue of
+    ``SSHCapabilityProvider``. Rejects: discovered-but-untested credentials,
+    an open port 23, a telnet banner, a failed login, dry-run evidence
+    (rejected centrally), or an LLM assertion (never an accepted
+    ``validation_method``)."""
+
+    supported_evidence_types = frozenset({CapabilityEvidenceType.TELNET_AUTHENTICATED_COMMAND})
+    accepted_capability_families = frozenset({AccessCapabilityType.telnet_command})
+
+    def evaluate(
+        self, evidence: CapabilityEvidence, context: "CapabilityDiscoveryContext",
+    ) -> CapabilityDerivationDecision:
+        name = type(self).__name__
+        if not _evidence_type_accepted(evidence, self.supported_evidence_types):
+            return _base_decision(
+                evidence, provider_name=name, status=CapabilityDerivationStatus.rejected,
+                capability_id="", confidence=0.0, sanitized_reason="unsupported_evidence",
+            )
+        if evidence.capability_family is not AccessCapabilityType.telnet_command:
+            return _base_decision(
+                evidence, provider_name=name, status=CapabilityDerivationStatus.rejected,
+                capability_id="", confidence=0.0, sanitized_reason="unsupported_evidence",
+            )
+        if not evidence.principal:
+            return _base_decision(
+                evidence, provider_name=name, status=CapabilityDerivationStatus.rejected,
+                capability_id="", confidence=0.0, sanitized_reason="target_mismatch",
+            )
+        if evidence.confidence < _MIN_TELNET_CONFIDENCE:
+            return _base_decision(
+                evidence, provider_name=name, status=CapabilityDerivationStatus.rejected,
+                capability_id="", confidence=0.0, sanitized_reason="confidence_below_threshold",
+            )
+        capability_id = access_capability_id(
+            evidence.target_host_id.removeprefix("host:"), AccessCapabilityType.telnet_command.value, evidence.principal,
+        )
+        status, confidence = _classify_against_existing(evidence, context, capability_id=capability_id)
+        return _base_decision(
+            evidence, provider_name=name, status=status, capability_id=capability_id,
+            confidence=confidence, sanitized_reason="authenticated telnet operation validated",
         )
 
 
@@ -400,6 +450,7 @@ class WebCommandCapabilityProvider:
 #: instance per family. Adding a new provider means adding one entry here.
 DEFAULT_PROVIDERS: tuple[CapabilityProvider, ...] = (
     SSHCapabilityProvider(),
+    TelnetCapabilityProvider(),
     DirectFileReadCapabilityProvider(),
     LocalCommandCapabilityProvider(),
     RemoteCommandCapabilityProvider(),

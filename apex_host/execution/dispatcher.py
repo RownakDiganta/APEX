@@ -664,30 +664,12 @@ class TaskDispatcher:
             return tr, ExecutionDisposition.TOOL_UNAVAILABLE
 
         result = await self._telnet_executor.run(task, context.evidence)
-        ep_data = result.episode.data
-        outcome_is_success = result.episode.outcome.value == "success"
-        stdout = str(ep_data.get("stdout", ""))
-        raw_error: object = ep_data.get("error")
-        if not outcome_is_success and raw_error is None:
-            raw_error = "login failed"
-        error_str: str | None = str(raw_error) if raw_error is not None else None
-
-        disposition = (
-            ExecutionDisposition.EXECUTED_SUCCESS
-            if outcome_is_success
-            else ExecutionDisposition.EXECUTED_VALID_NEGATIVE
-        )
-        tr = {
-            "task_id": task.id, "tool": "telnet_access", "args": [],
-            "target": target, "parser": parser, "stdout": stdout,
-            "stderr": "", "returncode": 0 if outcome_is_success else 1,
-            "dry_run": bool(ep_data.get("dry_run", False)),
-            "error": error_str, "phase": phase,
-            "username": str(task.params.get("username", "")),
-            "port": str(task.params.get("port", "")),
-            "proto": "tcp",
-        }
-        return tr, disposition
+        # Telnet now emits the SAME structured episode-data shape as SSH/FTP
+        # (protocol/success/authenticated/error_category/response_summary/...),
+        # so it flows through the shared builder and AccessParser.parse_structured
+        # — a live telnet success creates an access_state (previously impossible,
+        # because the raw session was redacted before the text heuristic ran).
+        return _credential_result_to_tr(task, result, "telnet_access", target, parser, phase)
 
     async def _run_ssh(
         self,

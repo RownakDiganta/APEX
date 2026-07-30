@@ -24,7 +24,10 @@ from memfabric.ids import now
 from memfabric.types import ParsedObservation, RawObservation
 
 from apex_host.capabilities.discovery import CapabilityDiscoveryContext, run_capability_discovery
-from apex_host.capabilities.emission import evidence_from_ssh_validation
+from apex_host.capabilities.emission import (
+    evidence_from_ssh_validation,
+    evidence_from_telnet_validation,
+)
 from apex_host.capabilities.evidence import CapabilityEvidence
 from apex_host.parsers.access_parser import AccessParser
 from apex_host.parsers.banner_parser import BannerParser
@@ -106,11 +109,17 @@ def parse_single_result(
         return _BANNER.parse_text(stdout, target=target, source=tool_name, port=port), tool_name
     if parser_name == "access":
         username = str(tool_result.get("username", ""))
-        if tool_name in ("ssh_access", "ftp_access"):
+        if tool_name in ("ssh_access", "ftp_access", "telnet_access"):
             # Phase 12B — SSH/FTP results are already classified by the
             # executor (success/authenticated determined via a typed
             # exception or protocol response code, never a text heuristic).
-            default_protocol = "ssh" if tool_name == "ssh_access" else "ftp"
+            # Telnet now joins this structured path too (see TelnetExecutor):
+            # a redacted raw session can never be re-classified by a text
+            # heuristic, so the executor's own success flag is authoritative.
+            _default_protocols = {
+                "ssh_access": "ssh", "ftp_access": "ftp", "telnet_access": "telnet",
+            }
+            default_protocol = _default_protocols[tool_name]
             protocol = str(tool_result.get("protocol", default_protocol)) or default_protocol
             operation = str(tool_result.get("operation", ""))
             success = bool(tool_result.get("success", False))
@@ -283,6 +292,46 @@ def ssh_capability_evidence_for_result(
     )
 
 
+def telnet_capability_evidence_for_result(
+    tool_result: dict[str, Any], *, target: str,
+) -> CapabilityEvidence | None:
+    """Build ``TELNET_AUTHENTICATED_COMMAND`` evidence from one successful
+    ``telnet_access`` tool_result, or ``None`` when it does not qualify.
+
+    The telnet analogue of :func:`ssh_capability_evidence_for_result` — a
+    second live, organic evidence source (the same structural pattern the
+    Phase 24 emission seam anticipated: a real typed result plus a call
+    site, never touching ``providers``/``discovery``). Rejects a
+    non-``telnet_access`` tool, a failed login, or a missing username.
+    """
+    if tool_result.get("tool") != "telnet_access" or not tool_result.get("success"):
+        return None
+    username = str(tool_result.get("username", ""))
+    if not username:
+        return None
+    result = CredentialValidationResult(
+        protocol="telnet",
+        target=target,
+        port=str(tool_result.get("port", "")),
+        username=username,
+        success=True,
+        authenticated=bool(tool_result.get("authenticated", True)),
+        operation=str(tool_result.get("operation", "")),
+        response_summary="",
+        error_category=str(tool_result.get("error_category", "")),
+        error_detail="",
+        duration_seconds=float(tool_result.get("duration_seconds", 0.0) or 0.0),
+        timed_out=bool(tool_result.get("timed_out", False)),
+        executor="telnet",
+    )
+    return evidence_from_telnet_validation(
+        result,
+        task_id=str(tool_result.get("task_id", "")),
+        target=target,
+        is_dry_run=bool(tool_result.get("dry_run", False)),
+    )
+
+
 def findings_from_parsed(
     parsed: ParsedObservation, *, phase: str, source: str, timestamp: str
 ) -> list[dict[str, Any]]:
@@ -319,7 +368,10 @@ def parse_result_and_collect_evidence(
     vs. ``memory_failure`` — see ``apex_host.orchestration.outcome``).
     Raises whatever ``parse_single_result`` raises.
     """
-    evidence = ssh_capability_evidence_for_result(tool_result, target=target)
+    evidence = (
+        ssh_capability_evidence_for_result(tool_result, target=target)
+        or telnet_capability_evidence_for_result(tool_result, target=target)
+    )
     parsed, source = parse_single_result(tool_result, state)
     return parsed, source, evidence
 

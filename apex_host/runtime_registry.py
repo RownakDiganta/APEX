@@ -294,6 +294,28 @@ class CapabilityRuntimeRegistry:
         )
         return self._ensure(capability_id, adapter)
 
+    def ensure_telnet(
+        self,
+        capability_id: str,
+        *,
+        target: str,
+        port: str,
+        username: str,
+        password: str,
+        config: "ApexConfig",
+    ) -> FlagReadCapability:
+        """Idempotently register (and return) a ``TelnetCapabilityAdapter``
+        for *capability_id*. Mirrors ``ensure_ssh`` exactly — a repeat call
+        with the same ``capability_id`` returns the existing adapter
+        unchanged; construction performs no network I/O."""
+        existing = self._adapters.get(capability_id)
+        if existing is not None:
+            return existing
+        adapter: FlagReadCapability = TelnetCapabilityAdapter(
+            target=target, port=port, username=username, password=password, config=config,
+        )
+        return self._ensure(capability_id, adapter)
+
     def ensure_direct_file_read(
         self, capability_id: str, *, primitive: "DirectFileReadPrimitive",
     ) -> FlagReadCapability:
@@ -442,6 +464,60 @@ def _read_ssh_file_sync(
         return True, out_text, None
     finally:
         client.close()
+
+
+# ---------------------------------------------------------------------------
+# Telnet adapter — the fourth concrete adapter. Backed by the same
+# IAC-aware bounded transport TelnetExecutor uses for credential validation
+# (apex_host.agents.telnet_transport). Stateless per read: holds only
+# connection parameters, never a live socket across calls (memfabric
+# Invariant 6). The ONLY command it ever runs is a fixed
+# ``cat -- <validated-path>`` (the path is bounded/validated upstream by the
+# objective planner + policy, exactly as for the SSH adapter), bracketed
+# with fixed sentinels so the file content is isolated from the interactive
+# session's echo/prompt noise. The password is held only as a plain
+# constructor argument — never logged, never returned, never in the EKG.
+# ---------------------------------------------------------------------------
+
+class TelnetCapabilityAdapter:
+    """``FlagReadCapability`` adapter backed by bounded telnet."""
+
+    def __init__(
+        self, *, target: str, port: str, username: str, password: str, config: "ApexConfig",
+    ) -> None:
+        self._target = target
+        self._port = port
+        self._username = username
+        self._password = password
+        self._read_timeout = float(getattr(config, "telnet_read_timeout_seconds", 10.0))
+        self._max_seconds = float(getattr(config, "user_flag_read_timeout_seconds", 35.0))
+        self._login_timeout = float(min(int(getattr(config, "max_command_seconds", 30)), 15))
+        self._max_bytes = int(getattr(config, "user_flag_max_output_bytes", 4096) or 4096)
+
+    async def read_bounded_file(self, path: str) -> BoundedReadResult:
+        from apex_host.agents.telnet_transport import telnet_session
+
+        try:
+            port = int(self._port)
+        except ValueError:
+            port = 23
+        command = "cat -- " + shlex.quote(path)
+        session = await telnet_session(
+            target=self._target, port=port, username=self._username, password=self._password,
+            command=command, login_timeout=self._login_timeout, read_timeout=self._read_timeout,
+            max_seconds=self._max_seconds, max_bytes=self._max_bytes,
+        )
+        if not session.connected or not session.authenticated:
+            return BoundedReadResult(
+                connected=False, output="", error=session.error or "telnet session failed",
+                method="telnet_cat",
+            )
+        output = session.command_output
+        return BoundedReadResult(
+            connected=True, output=output, error=session.error if not output else None,
+            return_code=None, bytes_received=len(output.encode("utf-8", errors="replace")),
+            truncated=False, method="telnet_cat",
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -68,6 +68,11 @@ class CapabilityEvidenceType(str, Enum):
     #: reference available (i.e. the orchestration layer can actually
     #: reconnect this turn).
     SSH_AUTHENTICATED_COMMAND = "ssh_authenticated_command"
+    #: A successful, authenticated Telnet operation — a shell was reached
+    #: (with or without a password) and a harmless command confirmed, with a
+    #: runtime session reference available. The telnet analogue of
+    #: ``SSH_AUTHENTICATED_COMMAND``.
+    TELNET_AUTHENTICATED_COMMAND = "telnet_authenticated_command"
     #: Path-dependent HTTP response content validated via an accepted
     #: direct-file-read validation method, with a fixed primitive
     #: available.
@@ -96,6 +101,7 @@ class CapabilityEvidenceType(str, Enum):
 #: (e.g. SSH evidence claiming ``capability_family="local_shell"``).
 _EVIDENCE_TYPE_TO_FAMILY: dict[CapabilityEvidenceType, AccessCapabilityType] = {
     CapabilityEvidenceType.SSH_AUTHENTICATED_COMMAND: AccessCapabilityType.ssh_command,
+    CapabilityEvidenceType.TELNET_AUTHENTICATED_COMMAND: AccessCapabilityType.telnet_command,
     CapabilityEvidenceType.LOCAL_COMMAND_VALIDATED: AccessCapabilityType.local_shell,
     CapabilityEvidenceType.REMOTE_COMMAND_VALIDATED: AccessCapabilityType.remote_command,
     CapabilityEvidenceType.WEB_COMMAND_VALIDATED: AccessCapabilityType.web_command,

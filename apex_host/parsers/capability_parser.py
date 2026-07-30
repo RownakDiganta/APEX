@@ -55,6 +55,10 @@ from apex_host.types import AccessCapabilityType
 #: absolute, mirroring AccessParser's own access_state confidence (0.85).
 _SSH_CAPABILITY_CONFIDENCE = 0.85
 
+#: Confidence assigned to a freshly-derived Telnet capability — same basis
+#: as SSH (a real, executor-validated authenticated shell).
+_TELNET_CAPABILITY_CONFIDENCE = 0.85
+
 #: The only capability types `derive_direct_file_read_capability` may ever
 #: produce — "arbitrary file read" and "API file read" are behaviorally
 #: identical at runtime (same adapter) but recorded as distinct metadata
@@ -210,6 +214,60 @@ class CapabilityParser:
         )
 
         acc_id = access_state_id(target, username, protocol="ssh")
+        edges = [
+            Edge(
+                id=has_capability_edge_id(h_id, cap_id),
+                from_id=h_id, to_id=cap_id, type="has_capability", props={},
+                confidence=confidence, source="capability_parser",
+                first_seen=timestamp, last_seen=timestamp,
+            ),
+            Edge(
+                id=enables_edge_id(acc_id, cap_id),
+                from_id=acc_id, to_id=cap_id, type="enables", props={},
+                confidence=confidence, source="capability_parser",
+                first_seen=timestamp, last_seen=timestamp,
+            ),
+        ]
+        return ParsedObservation(node_deltas=[cap_node], edge_deltas=edges)
+
+    def derive_telnet_capability(
+        self, *, target: str, username: str, source_task_id: str,
+        confidence: float = _TELNET_CAPABILITY_CONFIDENCE, metadata: dict[str, Any] | None = None,
+    ) -> ParsedObservation:
+        """Build the ``access_capability`` node + edges for a validated
+        Telnet login — the exact telnet analogue of ``derive_ssh_capability``,
+        differing only in ``capability_type`` (``telnet_command``) and the
+        ``protocol="telnet"`` used to locate the enabling ``access_state``.
+
+        ``runtime_available`` starts ``False`` — the orchestration layer flips
+        it to ``True`` once it registers a real ``TelnetCapabilityAdapter``.
+        """
+        if not username:
+            return ParsedObservation()
+
+        timestamp = now()
+        cap_id = access_capability_id(target, AccessCapabilityType.telnet_command.value, username)
+        h_id = host_id(target)
+        cap_node = Node(
+            id=cap_id,
+            type="access_capability",
+            props={
+                "capability_type": AccessCapabilityType.telnet_command.value,
+                "host_id": h_id,
+                "validated": True,
+                "principal": username,
+                "confidence": confidence,
+                "source_task_id": source_task_id,
+                "metadata": dict(metadata or {}),
+                "runtime_available": False,
+            },
+            confidence=confidence,
+            source="capability_parser",
+            first_seen=timestamp,
+            last_seen=timestamp,
+        )
+
+        acc_id = access_state_id(target, username, protocol="telnet")
         edges = [
             Edge(
                 id=has_capability_edge_id(h_id, cap_id),

@@ -414,6 +414,11 @@ class CapabilityDiscoveryEngine:
                 target=target, username=decision.principal, source_task_id=decision.source_task_id,
                 confidence=decision.confidence,
             )
+        elif capability_type is AccessCapabilityType.telnet_command:
+            parsed = self._parser.derive_telnet_capability(
+                target=target, username=decision.principal, source_task_id=decision.source_task_id,
+                confidence=decision.confidence,
+            )
         elif capability_type in (AccessCapabilityType.arbitrary_file_read, AccessCapabilityType.api_file_read):
             parsed = self._parser.derive_direct_file_read_capability(
                 target=target, capability_type=capability_type, principal=decision.principal,

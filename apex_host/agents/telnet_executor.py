@@ -7,44 +7,44 @@ Safety invariants:
   immediately with no network activity whatsoever.
 - Stateless across calls: no connection handle is held on self.
 - One attempt only: no credential looping, no brute force.
-- Uses asyncio.open_connection, never subprocess or shell=True.
+- Uses asyncio (via apex_host.agents.telnet_transport), never subprocess or
+  shell=True.
 - Credentials must come from explicit operator config (task.params), never
   guessed by this executor.
 - Live session stdout is NEVER stored in episode.data — only a
-  [session_redacted] placeholder is kept (P8-S03).  Use
-  apex_host.security.redaction for any further scrubbing needs.
+  [session_redacted] placeholder is kept (P8-S03), plus a short, redacted,
+  secret-free proof snippet (the harmless ``id`` output) as
+  ``response_summary`` — mirroring SSHExecutor's own structured result.
+
+Structured-result upgrade: this executor now emits the SAME structured
+episode-data shape as SSHExecutor/FTPExecutor (``protocol``/``success``/
+``authenticated``/``error_category``/``response_summary``/...), so a
+telnet login flows through ``_credential_result_to_tr`` and
+``AccessParser.parse_structured`` exactly like SSH/FTP. This fixes the
+prior behavior where a live telnet success could never create an
+``access_state`` (the raw session was redacted to ``[session_redacted]``
+and the downstream text heuristic then found no shell prompt), and it
+handles passwordless-root shells (see ``telnet_transport``).
 """
 from __future__ import annotations
 
-import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from memfabric.types import Episode, EvidenceBundle, ExecutorResult, Outcome, TaskSpec
-from apex_host.security.redaction import SESSION_REDACTED_PLACEHOLDER
+from apex_host.agents.telnet_transport import TelnetSessionResult, telnet_session
+from apex_host.security.redaction import SESSION_REDACTED_PLACEHOLDER, redact_session_text
+from apex_host.types import CredentialErrorCategory
 
 if TYPE_CHECKING:
     from apex_host.config import ApexConfig
 
 logger = logging.getLogger(__name__)
 
-_READ_BYTES: int = 4096
-
-
-def _login_succeeded(stdout: str) -> bool:
-    """Return True when stdout looks like a shell prompt after successful login."""
-    lower = stdout.lower()
-    failure_indicators = (
-        "login incorrect",
-        "authentication failed",
-        "access denied",
-        "permission denied",
-        "invalid password",
-        "login failed",
-    )
-    if any(indicator in lower for indicator in failure_indicators):
-        return False
-    return "$" in stdout or "#" in stdout
+#: Fixed, harmless validation command run once after a shell is reached, to
+#: confirm the access level. Never task/LLM-controlled.
+_VALIDATION_COMMAND = "id"
 
 
 class TelnetExecutor:
@@ -70,57 +70,53 @@ class TelnetExecutor:
         except ValueError:
             port = 23
 
-        try:
-            stdout = await asyncio.wait_for(
-                self._attempt_login(target, port, username, password),
-                timeout=float(self._config.max_command_seconds),
-            )
-        except asyncio.TimeoutError:
-            episode = Episode(
-                agent="apex.credential",
-                action=f"telnet {target}:{port_str}",
-                outcome=Outcome.fixable,
-                data={
-                    "error": "connection timed out",
-                    "target": target,
-                    "port": port_str,
-                    "dry_run": False,
-                },
-                task_id=task.id,
-                phase=task.phase,
-            )
-            return ExecutorResult(task_id=task.id, episode=episode)
-        except OSError as exc:
-            episode = Episode(
-                agent="apex.credential",
-                action=f"telnet {target}:{port_str}",
-                outcome=Outcome.fundamental,
-                data={
-                    "error": str(exc) or "connection error",
-                    "target": target,
-                    "port": port_str,
-                    "dry_run": False,
-                },
-                task_id=task.id,
-                phase=task.phase,
-            )
-            return ExecutorResult(task_id=task.id, episode=episode)
+        read_timeout = float(getattr(self._config, "telnet_read_timeout_seconds", 10.0))
+        max_seconds = float(self._config.max_command_seconds)
+        login_timeout = float(min(self._config.max_command_seconds, 15))
+        max_bytes = int(getattr(self._config, "user_flag_max_output_bytes", 4096) or 4096)
 
-        outcome = Outcome.success if _login_succeeded(stdout) else Outcome.fundamental
-        logger.info("telnet %s:%s user=%r outcome=%s", target, port_str, username, outcome.value)
-        # P8-S03: never store raw session transcript in the episodic log.
-        # Keep length + outcome flag for debugging without leaking credentials.
+        start = time.monotonic()
+        session = await telnet_session(
+            target=target, port=port, username=username, password=password,
+            command=_VALIDATION_COMMAND,
+            login_timeout=login_timeout, read_timeout=read_timeout,
+            max_seconds=max_seconds, max_bytes=max_bytes,
+        )
+        duration = time.monotonic() - start
+
+        success = session.authenticated
+        error_category, error_detail = self._classify(session)
+        response_summary = ""
+        if success:
+            response_summary = redact_session_text(
+                session.command_output[:200], passwords=[password] if password else []
+            )
+        outcome = Outcome.success if success else Outcome.fundamental
+        logger.info(
+            "telnet %s:%s user=%r outcome=%s category=%s",
+            target, port_str, username, outcome.value, error_category,
+        )
         episode = Episode(
             agent="apex.credential",
             action=f"telnet {target}:{port_str} user={username}",
             outcome=outcome,
             data={
-                "stdout": SESSION_REDACTED_PLACEHOLDER,
-                "stdout_length": len(stdout),
-                "shell_found": _login_succeeded(stdout),
+                "protocol": "telnet",
                 "target": target,
                 "port": port_str,
                 "username": username,
+                "success": success,
+                "authenticated": session.authenticated,
+                "operation": _VALIDATION_COMMAND,
+                "response_summary": response_summary,
+                "error_category": error_category,
+                "error_detail": error_detail,
+                "duration_seconds": duration,
+                "timed_out": False,
+                "executor": "telnet",
+                # P8-S03: never store the raw session transcript.
+                "stdout": SESSION_REDACTED_PLACEHOLDER,
+                "shell_found": session.authenticated,
                 "dry_run": False,
             },
             task_id=task.id,
@@ -128,89 +124,48 @@ class TelnetExecutor:
         )
         return ExecutorResult(task_id=task.id, episode=episode)
 
+    @staticmethod
+    def _classify(session: TelnetSessionResult) -> tuple[str, str]:
+        if session.authenticated:
+            return CredentialErrorCategory.success.value, ""
+        detail = session.error or "login failed"
+        if not session.connected:
+            return CredentialErrorCategory.connection_failed.value, detail
+        if "rejected" in detail.lower() or "incorrect" in detail.lower():
+            return CredentialErrorCategory.auth_rejected.value, detail
+        return CredentialErrorCategory.protocol_error.value, detail
+
     def _dry_run_result(
         self, task: TaskSpec, target: str, port: str, username: str
     ) -> ExecutorResult:
-        # Synthetic output includes a shell prompt so AccessParser._login_succeeded
-        # returns True and creates an access_state node in the EKG — this lets the
-        # dry-run engagement verify the full credential→priv_esc routing path.
-        stdout = (
-            f"telnet {target} {port}\r\n"
-            f"Connected to {target}.\r\n"
-            f"Escape character is '^]'.\r\n"
-            f"login: {username}\r\n"
-            f"Password: \r\n"
-            f"Welcome!\r\n"
-            f"[dry-run: no real connection — synthetic shell]\r\n"
-            f"# "
-        )
+        # Synthetic success so the dry-run engagement verifies the full
+        # credential -> objective routing path (mirrors SSHExecutor's dry-run).
         episode = Episode(
             agent="apex.credential",
             action=f"telnet {target}:{port} user={username} (dry-run)",
             outcome=Outcome.success,
             data={
-                "stdout": stdout,
-                "dry_run": True,
+                "protocol": "telnet",
                 "target": target,
                 "port": port,
                 "username": username,
+                "success": True,
+                "authenticated": True,
+                "operation": _VALIDATION_COMMAND,
+                "response_summary": "[dry-run: synthetic shell]",
+                "error_category": CredentialErrorCategory.success.value,
+                "error_detail": "",
+                "duration_seconds": 0.0,
+                "timed_out": False,
+                "executor": "telnet",
+                # Dry-run has no real session, so nothing to redact here — a
+                # descriptive synthetic stdout is safe and keeps the dry-run
+                # self-explanatory (the live path redacts stdout, above).
+                "stdout": f"[dry-run] would telnet {target}:{port} as {username} — no connection made",
+                "shell_found": True,
+                "dry_run": True,
             },
             task_id=task.id,
             phase=task.phase,
         )
         return ExecutorResult(task_id=task.id, episode=episode)
-
-    async def _attempt_login(
-        self, target: str, port: int, username: str, password: str
-    ) -> str:
-        reader, writer = await asyncio.open_connection(target, port)
-        try:
-            return await self._do_login(reader, writer, username, password)
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:
-                pass
-
-    async def _do_login(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        username: str,
-        password: str,
-    ) -> str:
-        buf: list[str] = []
-
-        # Read banner + login prompt
-        data = await reader.read(_READ_BYTES)
-        buf.append(data.decode("utf-8", errors="replace"))
-
-        # Send username
-        writer.write((username + "\r\n").encode())
-        await writer.drain()
-
-        # Read post-username response (password prompt or shell)
-        data = await reader.read(_READ_BYTES)
-        chunk = data.decode("utf-8", errors="replace")
-        buf.append(chunk)
-
-        if "password" in chunk.lower():
-            # Send password — empty string sends only "\r\n" (correct for no-auth services).
-            writer.write((password + "\r\n").encode())
-            await writer.drain()
-            data = await reader.read(_READ_BYTES)
-            buf.append(data.decode("utf-8", errors="replace"))
-
-        # If we have a shell, send a harmless command to confirm access level.
-        combined = "".join(buf)
-        if _login_succeeded(combined):
-            try:
-                writer.write(b"id\r\n")
-                await writer.drain()
-                data = await reader.read(_READ_BYTES)
-                buf.append(data.decode("utf-8", errors="replace"))
-            except Exception:
-                pass  # id probe failure is non-fatal; we already know login succeeded
-
-        return "".join(buf)

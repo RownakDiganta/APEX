@@ -49,6 +49,7 @@ from apex_host.parsers.capability_parser import (
     _MIN_COMMAND_CAPABILITY_CONFIDENCE,
     _MIN_DIRECT_FILE_READ_CONFIDENCE,
     _SSH_CAPABILITY_CONFIDENCE,
+    _TELNET_CAPABILITY_CONFIDENCE,
 )
 from apex_host.types import AccessCapabilityType
 
@@ -64,6 +65,7 @@ __all__ = [
     "evidence_from_local_command_validation",
     "evidence_from_remote_command_validation",
     "evidence_from_ssh_validation",
+    "evidence_from_telnet_validation",
     "evidence_from_web_command_validation",
 ]
 
@@ -93,6 +95,33 @@ def evidence_from_ssh_validation(
         principal=result.username,
         validation_method="deterministic_benign_command",
         confidence=_SSH_CAPABILITY_CONFIDENCE,
+        timestamp=now(),
+        is_dry_run=is_dry_run,
+    )
+
+
+def evidence_from_telnet_validation(
+    result: "CredentialValidationResult", *, task_id: str, target: str, is_dry_run: bool = False,
+) -> CapabilityEvidence | None:
+    """Build ``TELNET_AUTHENTICATED_COMMAND`` evidence from a typed
+    ``CredentialValidationResult`` (protocol ``"telnet"``) — the telnet
+    analogue of :func:`evidence_from_ssh_validation`, and the second family
+    with a real, live executor-backed producer.
+
+    Rejects: ``result.protocol != "telnet"``, a failed/unauthenticated
+    result, or a missing username.
+    """
+    if result.protocol != "telnet" or not result.success or not result.username:
+        return None
+    return CapabilityEvidence(
+        evidence_id=new_id(),
+        evidence_type=CapabilityEvidenceType.TELNET_AUTHENTICATED_COMMAND,
+        capability_family=AccessCapabilityType.telnet_command,
+        target_host_id=f"host:{target}",
+        source_task_id=task_id,
+        principal=result.username,
+        validation_method="deterministic_benign_command",
+        confidence=_TELNET_CAPABILITY_CONFIDENCE,
         timestamp=now(),
         is_dry_run=is_dry_run,
     )

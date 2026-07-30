@@ -265,30 +265,55 @@ class TestBound:
         result = asyncio.run(executor.run(_task(), _evidence()))
         assert result.episode.data.get("dry_run") is True
 
-    def test_bound_03_live_episode_stdout_is_session_redacted_constant(self) -> None:
-        """Live-mode episode must use SESSION_REDACTED_PLACEHOLDER, not raw session."""
+    def test_bound_03_live_episode_stdout_is_session_redacted_constant(self, monkeypatch) -> None:
+        """Live-mode episode must use SESSION_REDACTED_PLACEHOLDER, not raw session.
+
+        Updated for the structured telnet executor: the raw transcript now
+        lives entirely inside ``telnet_transport.telnet_session`` and is never
+        returned to the executor, so we stub that transport (no network) and
+        assert the episode still never stores anything but the placeholder.
+        """
+        from apex_host.agents import telnet_executor as _te
+        from apex_host.agents.telnet_transport import TelnetSessionResult
+
+        async def _fake(**_kwargs: object) -> TelnetSessionResult:
+            return TelnetSessionResult(
+                connected=True, authenticated=True, command_output="uid=0(root)", error=None
+            )
+
+        monkeypatch.setattr(_te, "telnet_session", _fake)
         config = ApexConfig(target="10.0.0.1", dry_run=False)
-        executor = TelnetExecutor(config)
-
-        async def _fake(t: str, p: int, u: str, pw: str) -> str:
-            return "login:\r\n# "
-
-        executor._attempt_login = _fake  # type: ignore[assignment]
+        executor = _te.TelnetExecutor(config)
         result = asyncio.run(executor.run(_task(), _evidence()))
         assert result.episode.data["stdout"] == SESSION_REDACTED_PLACEHOLDER
 
-    def test_bound_04_live_episode_preserves_stdout_length(self) -> None:
-        """stdout_length in live episode must equal the original session length."""
+    def test_bound_04_live_episode_stores_only_redacted_metadata(self, monkeypatch) -> None:
+        """Live episode stores structured, secret-free metadata (shell_found +
+        success flag) and the redacted placeholder — never the raw transcript.
+
+        (Replaces the former ``stdout_length`` assertion: the executor no
+        longer holds the raw transcript to measure — the redaction boundary
+        moved into ``telnet_transport`` — so it now stores structured result
+        fields instead, mirroring SSHExecutor. The P8 invariant preserved
+        here is unchanged: no raw session text is ever stored.)
+        """
+        from apex_host.agents import telnet_executor as _te
+        from apex_host.agents.telnet_transport import TelnetSessionResult
+
+        async def _fake(**_kwargs: object) -> TelnetSessionResult:
+            return TelnetSessionResult(
+                connected=True, authenticated=True,
+                command_output="uid=0(root) gid=0(root)", error=None,
+            )
+
+        monkeypatch.setattr(_te, "telnet_session", _fake)
         config = ApexConfig(target="10.0.0.1", dry_run=False)
-        executor = TelnetExecutor(config)
-        session_text = "login:\r\nPassword: \r\n$ "
-
-        async def _fake(t: str, p: int, u: str, pw: str) -> str:
-            return session_text
-
-        executor._attempt_login = _fake  # type: ignore[assignment]
+        executor = _te.TelnetExecutor(config)
         result = asyncio.run(executor.run(_task(), _evidence()))
-        assert result.episode.data.get("stdout_length") == len(session_text)
+        data = result.episode.data
+        assert data["stdout"] == SESSION_REDACTED_PLACEHOLDER
+        assert data.get("shell_found") is True
+        assert data.get("success") is True
 
     def test_bound_05_access_parser_empty_returns_empty_obs(self) -> None:
         parser = AccessParser()
