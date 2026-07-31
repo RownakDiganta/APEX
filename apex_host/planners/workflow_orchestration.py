@@ -62,6 +62,7 @@ from apex_host.graph_ids import (
     workflow_step_id,
 )
 from apex_host.planners.capabilities import capabilities_from_subgraph
+from apex_host.planners.phase_gates import web_evidence_status
 from apex_host.types import (
     OpportunityConfidence,
     Session,
@@ -135,6 +136,13 @@ def _has_web_opportunity(subgraph: "SubgraphView") -> bool:
     return any(n.type == "web_opportunity" for n in subgraph.nodes)
 
 
+def _page_acquired(subgraph: "SubgraphView") -> bool:
+    """True when a web page was successfully fetched (meaningful web content
+    exists) — the prerequisite for form/opportunity analysis. Reuses the same
+    evidence gate the phase router uses (apex_host.planners.phase_gates)."""
+    return web_evidence_status(subgraph).complete
+
+
 def _always_true(_subgraph: "SubgraphView") -> bool:
     return True
 
@@ -143,13 +151,30 @@ _CheckFn = Callable[["SubgraphView"], bool]
 
 
 class _StepDef:
-    __slots__ = ("name", "check_fn", "fail_fn", "description")
+    __slots__ = ("name", "check_fn", "fail_fn", "description", "prereq_fn", "prereq_key")
 
-    def __init__(self, name: str, check_fn: _CheckFn, fail_fn: _CheckFn | None, description: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        check_fn: _CheckFn,
+        fail_fn: _CheckFn | None,
+        description: str,
+        *,
+        prereq_fn: _CheckFn | None = None,
+        prereq_key: str | None = None,
+    ) -> None:
         self.name = name
         self.check_fn = check_fn
         self.fail_fn = fail_fn
         self.description = description
+        # A step whose true prerequisite is unavailable is BLOCKED (not
+        # pending) so it is not repeatedly scheduled. ``prereq_fn`` is a
+        # subgraph predicate (e.g. "a page was acquired" before form analysis);
+        # ``prereq_key`` names an external context bool (e.g.
+        # "credential_hypothesis" — an actionable credential hypothesis exists),
+        # supplied by the caller so the check stays pure over the subgraph.
+        self.prereq_fn = prereq_fn
+        self.prereq_key = prereq_key
 
 
 class _WorkflowDef:
@@ -173,8 +198,12 @@ WORKFLOW_TEMPLATES: tuple[_WorkflowDef, ...] = (
         steps=(
             _StepDef("discover_login", _has_login_mechanism, None,
                      "Identify a login mechanism (SSH/FTP/Telnet capability or a discovered web auth_flow)"),
+            # BLOCKED (not pending) when no bounded credential hypothesis
+            # exists — the presence of a login capability alone never makes
+            # validation actionable (missing_credential_hypothesis).
             _StepDef("validate_credentials", _has_validated_credential, _credential_attempt_failed,
-                     "Attempt bounded, operator-supplied credential validation"),
+                     "Attempt bounded, operator-supplied credential validation",
+                     prereq_key="credential_hypothesis"),
             _StepDef("enumerate_privilege", _has_priv_esc_data, None,
                      "Enumerate privilege-escalation opportunities over the validated session"),
             _StepDef("generate_recommendations", _always_true, None,
@@ -186,9 +215,15 @@ WORKFLOW_TEMPLATES: tuple[_WorkflowDef, ...] = (
         objective="Discover web functionality and identify potential opportunities",
         prerequisites=("host", "endpoint"),
         steps=(
-            _StepDef("discover_form", _has_form, None, "Discover forms (login/upload/search) on visited pages"),
-            _StepDef("inspect_technology", _has_tech, None, "Detect the technology stack in use"),
-            _StepDef("identify_opportunity", _has_web_opportunity, None, "Identify structured web opportunities"),
+            # Form/technology/opportunity analysis is BLOCKED until a page has
+            # actually been fetched — successful page acquisition must precede
+            # it (a discovered-but-unfetched link is not enough).
+            _StepDef("discover_form", _has_form, None, "Discover forms (login/upload/search) on visited pages",
+                     prereq_fn=_page_acquired),
+            _StepDef("inspect_technology", _has_tech, None, "Detect the technology stack in use",
+                     prereq_fn=_page_acquired),
+            _StepDef("identify_opportunity", _has_web_opportunity, None, "Identify structured web opportunities",
+                     prereq_fn=_page_acquired),
         ),
     ),
 )
@@ -204,13 +239,23 @@ _STATUS_PRIORITY: dict[str, int] = {
 }
 
 
-def _evaluate_steps(step_defs: tuple[_StepDef, ...], subgraph: "SubgraphView") -> list[WorkflowStep]:
+def _evaluate_steps(
+    step_defs: tuple[_StepDef, ...],
+    subgraph: "SubgraphView",
+    ctx: dict[str, bool] | None = None,
+) -> list[WorkflowStep]:
     """Evaluate a workflow's steps in order.
 
-    Once any step is not ``completed``, every subsequent step is
+    The FIRST non-completed step is classified precisely: ``completed`` if its
+    evidence exists; ``blocked`` if its own true prerequisite is unavailable
+    (its ``prereq_fn`` over the subgraph, or a ``prereq_key`` context bool from
+    *ctx* — e.g. no actionable credential hypothesis); ``failed`` if it was
+    attempted and failed; otherwise ``pending`` (actionable, awaiting its own
+    evidence). Once any step is not ``completed``, every SUBSEQUENT step is
     unconditionally ``blocked`` — see module docstring "Why later stages
     cannot begin until prerequisites exist".
     """
+    context = ctx or {}
     steps: list[WorkflowStep] = []
     prereqs_met = True
     for step_def in step_defs:
@@ -218,6 +263,10 @@ def _evaluate_steps(step_defs: tuple[_StepDef, ...], subgraph: "SubgraphView") -
             status = WorkflowStepStatus.blocked
         elif step_def.check_fn(subgraph):
             status = WorkflowStepStatus.completed
+        elif step_def.prereq_fn is not None and not step_def.prereq_fn(subgraph):
+            status = WorkflowStepStatus.blocked
+        elif step_def.prereq_key is not None and not context.get(step_def.prereq_key, True):
+            status = WorkflowStepStatus.blocked
         elif step_def.fail_fn is not None and step_def.fail_fn(subgraph):
             status = WorkflowStepStatus.failed
         else:
@@ -231,9 +280,18 @@ def _evaluate_steps(step_defs: tuple[_StepDef, ...], subgraph: "SubgraphView") -
 def _workflow_status(
     steps: list[WorkflowStep], *, engagement_completed: bool, engagement_outcome: str,
 ) -> WorkflowStatus:
-    if all(s.status is WorkflowStepStatus.completed for s in steps):
+    non_completed = [s for s in steps if s.status is not WorkflowStepStatus.completed]
+    if not non_completed:
         return WorkflowStatus.completed
-    if any(s.status is WorkflowStepStatus.failed for s in steps):
+    # The current actionable step is the FIRST non-completed one. If it is
+    # blocked (a true prerequisite is unavailable) or failed, the workflow is
+    # BLOCKED — a workflow whose validation step was never actionable (e.g.
+    # every attempt would be policy-blocked, or no credential hypothesis
+    # exists) must not be reported as a misleading "stalled" workflow. Only an
+    # actionable (pending) step that the engagement stopped making progress on
+    # is ``stalled``.
+    first = non_completed[0]
+    if first.status in (WorkflowStepStatus.blocked, WorkflowStepStatus.failed):
         return WorkflowStatus.blocked
     if engagement_outcome in ("duplicate_task_stall", "no_actionable_task", "policy_blocked"):
         return WorkflowStatus.stalled
@@ -248,6 +306,7 @@ def derive_workflows_from_subgraph(
     *,
     engagement_completed: bool = False,
     engagement_outcome: str = "",
+    credential_hypothesis_available: bool = True,
 ) -> list[Workflow]:
     """Derive the current set of applicable ``Workflow`` records.
 
@@ -256,14 +315,20 @@ def derive_workflows_from_subgraph(
     isn't "not started", it simply isn't applicable to this target yet
     (e.g. a pure-SSH target never produces a ``web_discovery_to_opportunity``
     workflow at all).
+
+    ``credential_hypothesis_available`` (default ``True`` for backward
+    compatibility) is the ``validate_credentials`` step's prerequisite: when
+    ``False``, that step is ``blocked`` (with the workflow reported as
+    ``blocked``, not ``stalled``) rather than repeatedly scheduled.
     """
     node_types_seen = {n.type for n in subgraph.nodes}
+    ctx = {"credential_hypothesis": credential_hypothesis_available}
     ts = now()
     out: list[Workflow] = []
     for wf_def in WORKFLOW_TEMPLATES:
         if not set(wf_def.prerequisites).issubset(node_types_seen):
             continue
-        steps = _evaluate_steps(wf_def.steps, subgraph)
+        steps = _evaluate_steps(wf_def.steps, subgraph, ctx)
         status = _workflow_status(
             steps, engagement_completed=engagement_completed, engagement_outcome=engagement_outcome,
         )
@@ -504,7 +569,9 @@ def workflow_recommendations_from_workflows(workflows: list[Workflow]) -> list[W
     return out
 
 
-def workflow_summary_fields(target: str, subgraph: "SubgraphView") -> dict[str, Any]:
+def workflow_summary_fields(
+    target: str, subgraph: "SubgraphView", *, credential_hypothesis_available: bool = True,
+) -> dict[str, Any]:
     """Build the ``ApexGraphState`` partial-update dict for the current turn.
 
     Pure derivation from the subgraph — mirrors
@@ -517,7 +584,9 @@ def workflow_summary_fields(target: str, subgraph: "SubgraphView") -> dict[str, 
     ``apex_host.eval.report.build_report``), so this one-turn-stale
     live snapshot never affects report correctness.
     """
-    workflows = rank_workflows(derive_workflows_from_subgraph(target, subgraph))
+    workflows = rank_workflows(derive_workflows_from_subgraph(
+        target, subgraph, credential_hypothesis_available=credential_hypothesis_available,
+    ))
     sessions = rank_sessions(derive_sessions_from_subgraph(target, subgraph))
     counts: dict[str, int] = {}
     for w in workflows:

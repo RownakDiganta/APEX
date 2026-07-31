@@ -301,6 +301,7 @@ class ApexRuntime:
             "enumeration_complete": False,
             "web_session_state": {},
             "workflow_summary": {},
+            "phase_selection": {},
             "learning_summary": {},
             "task_latency_log": [],
             "objective_status": "",

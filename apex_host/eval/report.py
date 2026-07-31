@@ -554,6 +554,16 @@ class RunReport:
     # explicitly.
     invariant_violations: list[str] = field(default_factory=list)
 
+    # phase_selection: the final turn's phase-gate reasoning
+    # (apex_host.orchestration.planning_node writes it into
+    # ApexGraphState.phase_selection). A secret-free record of WHY the phase
+    # was selected, which evidence prerequisite made it actionable (or why it
+    # was unavailable), and whether operator / discovered / another credential
+    # hypothesis was used — never a username or password value, only the
+    # SOURCE label. Shape: {phase, reason, has_credential_hypothesis,
+    # credential_source, credential_reason, web_evidence_complete, web_reason}.
+    phase_selection: dict[str, Any] = field(default_factory=dict)
+
 
 # ---------------------------------------------------------------------------
 # Canonical outcome resolution
@@ -1281,6 +1291,7 @@ def build_report(
         evaluation_machine_name=htb_machine_name or "",
         evaluation_difficulty=htb_difficulty or "",
         execution_diagnostics=execution_diagnostics,
+        phase_selection=dict(final_state.get("phase_selection", {}) or {}),
         observation_count=len(raw_findings),
         phases_attempted=phases_attempted,
         phases_entered=phases_entered,
@@ -1370,6 +1381,20 @@ def format_text(report: RunReport) -> str:
         f" Summary: {report.completion_summary}",
         _SEP,
     ]
+
+    if report.phase_selection:
+        ps = report.phase_selection
+        lines.append(
+            f" Phase selection: {ps.get('phase', '?')} — {ps.get('reason', '')}"
+        )
+        lines.append(
+            f"   credential hypothesis: "
+            f"{'yes' if ps.get('has_credential_hypothesis') else 'no'} "
+            f"(source={ps.get('credential_source', 'none')}); "
+            f"web evidence complete: {'yes' if ps.get('web_evidence_complete') else 'no'} "
+            f"({ps.get('web_reason', '')})"
+        )
+        lines.append(_SEP)
 
     if report.invariant_violations:
         lines.append("\n/!\\ REPORT INVARIANT VIOLATIONS — treat this report's contents with caution:")
@@ -1888,6 +1913,9 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
         "observation_count": report.observation_count,
         "completion_summary": report.completion_summary,
         "invariant_violations": report.invariant_violations,
+        # Why the (final) phase was selected / why unavailable, and which
+        # credential hypothesis source was used — never a secret value.
+        "phase_selection": dict(report.phase_selection),
         "ekg": {
             "total_nodes": report.total_nodes,
             "total_edges": report.total_edges,

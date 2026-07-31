@@ -176,6 +176,16 @@ class ApexGraphState(TypedDict):
     # possibly-stale live snapshot — same convention as `privilege_summary`
     # and `web_session_state` above.
     workflow_summary: dict[str, Any]
+    # Phase-gate reasoning for the CURRENT turn's phase selection, written by
+    # `apex_host.orchestration.planning_node.global_plan`. A secret-free,
+    # reportable record of WHY a phase was chosen and which evidence
+    # prerequisite made it actionable (or why it was unavailable). Shape:
+    # {phase, reason, credential_source, credential_reason, web_reason,
+    # has_credential_hypothesis, web_evidence_complete}. Never contains a
+    # username or password value — only the hypothesis SOURCE label
+    # (operator_supplied / discovered_evidence / ...). See
+    # `apex_host.planners.phase_gates`.
+    phase_selection: dict[str, Any]
     # Phase 16 — adaptive learning / experience-replay summary. UNLIKE
     # `web_session_state`/`workflow_summary` above, this is populated
     # EXACTLY ONCE, by `apex_host.runtime.ApexRuntime.run()` after the

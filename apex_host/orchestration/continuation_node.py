@@ -36,6 +36,7 @@ from apex_host.orchestration.outcome import (
 from apex_host.orchestration.terminal_episode import terminal_state_fields, write_terminal_episode
 from apex_host.planners.capabilities import capabilities_from_subgraph
 from apex_host.planners.objective import objective_reopening_eligible, objective_status_from_subgraph
+from apex_host.planners.phase_gates import credential_hypothesis, web_evidence_status
 from apex_host.planners.workflow_orchestration import (
     build_workflow_graph_deltas,
     derive_sessions_from_subgraph,
@@ -88,15 +89,36 @@ def make_continuation_node(deps: "OrchestrationDeps") -> Any:
         # and the final report re-derives independently from the complete
         # final EKG regardless of whether this per-turn sync ever ran (see
         # docs/workflow-orchestration.md).
+        # The credential hypothesis (apex_host.planners.phase_gates) — computed
+        # once here and reused for both the workflow accounting (the
+        # validate_credentials step is blocked, not stalled, when unavailable)
+        # and the next-phase peek below.
+        has_operator_credentials = bool(
+            deps.config.username_candidates and deps.config.password_candidates
+        )
+        credential_hyp_available = has_operator_credentials
+        if subgraph is not None:
+            credential_hyp_available = credential_hypothesis(
+                subgraph,
+                has_operator_credentials=has_operator_credentials,
+                allow_default_credentials=bool(getattr(deps.config, "allow_default_credentials", False)),
+            ).available
+
         workflow_fields: dict[str, Any] = {}
         if subgraph is not None:
             try:
-                workflows = derive_workflows_from_subgraph(state["target"], subgraph)
+                workflows = derive_workflows_from_subgraph(
+                    state["target"], subgraph,
+                    credential_hypothesis_available=credential_hyp_available,
+                )
                 sessions = derive_sessions_from_subgraph(state["target"], subgraph)
                 wf_nodes, wf_edges = build_workflow_graph_deltas(state["target"], workflows, sessions)
                 if wf_nodes:
                     await deps.api.apply_deltas(nodes=wf_nodes, edges=wf_edges)
-                workflow_fields = workflow_summary_fields(state["target"], subgraph)
+                workflow_fields = workflow_summary_fields(
+                    state["target"], subgraph,
+                    credential_hypothesis_available=credential_hyp_available,
+                )
             except Exception as exc:
                 logger.debug("reflect_or_continue: workflow sync failed: %s", exc)
 
@@ -139,6 +161,14 @@ def make_continuation_node(deps: "OrchestrationDeps") -> Any:
                     try:
                         peek_caps = capabilities_from_subgraph(subgraph) if subgraph else []
                         has_web_peek = any(c.name == "web_probe" for c in peek_caps)
+                        # Same evidence gates the global_plan node applies, so
+                        # the inter-turn peek and the next turn's own decision
+                        # agree (apex_host.planners.phase_gates). Credential
+                        # hypothesis was already computed above.
+                        web_complete_peek = (
+                            web_evidence_status(subgraph, has_web_capability=has_web_peek).complete
+                            if subgraph is not None else None
+                        )
                         # F08: pass current_phase so budget force-advance fires
                         # correctly during the inter-turn peek (without
                         # charging the budget counter).
@@ -150,6 +180,8 @@ def make_continuation_node(deps: "OrchestrationDeps") -> Any:
                             node_types_seen=node_types_seen,
                             turn_count=turn_count,
                             has_web_capability=has_web_peek,
+                            has_credential_hypothesis=credential_hyp_available,
+                            web_evidence_complete=web_complete_peek,
                             current_phase=state.get("phase"),
                             objective_status=objective_status,
                             objective_reopened=objective_reopened,

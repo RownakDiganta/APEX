@@ -279,6 +279,10 @@ def build_apex_graph(
             "browser_agent": "browser_agent", "execute_agent": "execute_agent",
             "objective_agent": "objective_agent",
             "priv_esc_agent": "priv_esc_agent", UNKNOWN_PHASE_NODE: UNKNOWN_PHASE_NODE,
+            # A ``done`` decision from GlobalPlanner routes to
+            # reflect_or_continue so the canonical termination path sets a
+            # truthful outcome/reason (see route_after_global_plan).
+            "reflect_or_continue": "reflect_or_continue",
             END: END,
         },
     )

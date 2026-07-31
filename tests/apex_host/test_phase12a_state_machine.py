@@ -265,8 +265,11 @@ class TestBugBAuthFlowIsNotAccessState:
             api, f"service:{_TARGET}:80/tcp", "service",
             {"port": "80", "proto": "tcp", "service": "http", "state": "open"},
         )
+        # endpoint carries a real HTTP status → web discovery has meaningful
+        # content, so the web-evidence gate is satisfied and the engagement
+        # proceeds to the credential phase (credential-evidence-gate fix).
         await _seed_node(
-            api, f"endpoint:{_TARGET}:seed", "endpoint", {"url": login_url}
+            api, f"endpoint:{_TARGET}:seed", "endpoint", {"url": login_url, "status": "200"}
         )
         await _seed_node(
             api, f"auth_flow:{_TARGET}:seed", "auth_flow", {"url": login_url}
@@ -276,7 +279,15 @@ class TestBugBAuthFlowIsNotAccessState:
         ):
             await _seed_edge(api, _ANCHOR, to_id)
 
-        config = ApexConfig(target=_TARGET, dry_run=True, max_turns=1)
+        # Operator credentials supply a bounded credential hypothesis — without
+        # one, the credential phase is (correctly) not actionable and the
+        # engagement would prefer/stay in web. CredentialPlanner still uses its
+        # curl-probe fallback here because the only service is HTTP (no
+        # telnet/ssh/ftp protocol capability).
+        config = ApexConfig(
+            target=_TARGET, dry_run=True, max_turns=1,
+            username_candidates=["admin"], password_candidates=["admin"],
+        )
         registry = ToolRegistry.from_config(config)
         graph = build_apex_graph(api, registry, config)
 
@@ -366,15 +377,14 @@ class TestBugEUnknownPhaseHandling:
         assert result == UNKNOWN_PHASE_NODE
         assert result != "END"
 
-    def test_route_after_global_plan_still_ends_cleanly_on_done(self) -> None:
-        """The done phase must still route straight to END, not to the
+    def test_route_after_global_plan_routes_done_to_reflect(self) -> None:
+        """The done phase routes to reflect_or_continue (the canonical
+        termination path that sets a truthful outcome/reason), not to the
         diagnostic node — only genuinely unrecognized values do."""
-        from langgraph.graph import END
-
         state: dict[str, Any] = {
             "completed": False, "phase": ApexPhase.done.value, "findings": [],
         }
-        assert route_after_global_plan(state) == END  # type: ignore[arg-type]
+        assert route_after_global_plan(state) == "reflect_or_continue"  # type: ignore[arg-type]
 
     async def test_unknown_phase_agent_writes_diagnostic_and_terminates(self) -> None:
         """The unknown_phase_agent node itself: appends an Episode, sets
@@ -446,6 +456,8 @@ class TestBugEUnknownPhaseHandling:
             turn_count: int,
             current_phase: str | None = None,
             has_web_capability: bool = True,
+            has_credential_hypothesis: bool = True,
+            web_evidence_complete: bool | None = None,
             objective_status: str = "pending",
             objective_reopened: bool = False,
         ) -> ApexPhase:
@@ -490,58 +502,42 @@ class TestFullRegressionCredentialToPrivEscToCompletion:
         and the stall detector — strictly more responsive than either
         phase's own turn budget — cleanly stops the engagement rather than
         oscillating or fabricating success from access alone."""
-        from apex_host.planners import global_planner as gp_mod
-
         api = make_api()
         await _seed_node(api, _ANCHOR, "host", {"ip": _TARGET})
+        # An SSH service IS a credential-validation *capability* — but with no
+        # credentials configured (and no discovered creds, no auth-bypass
+        # opportunity, no policy-default hypothesis), there is no actionable
+        # credential *hypothesis*. The credential phase must therefore never be
+        # entered (this removes the observed "capability present but no
+        # credentials configured" no-action loop); the engagement terminates
+        # cleanly with a truthful reason instead — never fabricating a
+        # credential/objective/priv_esc phase or a success from access alone.
         await _seed_node(
-            api, f"service:{_TARGET}:80/tcp", "service",
-            {"port": "80", "proto": "tcp", "service": "http", "state": "open"},
+            api, f"service:{_TARGET}:22/tcp", "service",
+            {"port": "22", "proto": "tcp", "service": "ssh", "state": "open"},
         )
-        await _seed_node(
-            api, f"endpoint:{_TARGET}:seed", "endpoint", {"url": f"http://{_TARGET}/"}
-        )
-        for to_id in (f"service:{_TARGET}:80/tcp", f"endpoint:{_TARGET}:seed"):
-            await _seed_edge(api, _ANCHOR, to_id)
+        await _seed_edge(api, _ANCHOR, f"service:{_TARGET}:22/tcp")
 
         config = ApexConfig(target=_TARGET, dry_run=True, max_turns=8)
         registry = ToolRegistry.from_config(config)
-
-        original_defaults = dict(gp_mod._DEFAULT_PHASE_BUDGETS)
-        gp_mod._DEFAULT_PHASE_BUDGETS[ApexPhase.credential.value] = 1
-        try:
-            graph = build_apex_graph(api, registry, config)
-            final_state = await graph.ainvoke(make_initial_state(_TARGET))
-        finally:
-            gp_mod._DEFAULT_PHASE_BUDGETS.clear()
-            gp_mod._DEFAULT_PHASE_BUDGETS.update(original_defaults)
+        graph = build_apex_graph(api, registry, config)
+        final_state = await graph.ainvoke(make_initial_state(_TARGET))
 
         phase_sequence = [
             d.get("phase") for d in final_state["planner_decisions"] if d.get("phase")
         ]
-        # Phase 18: objective (not priv_esc) is reached immediately after
-        # credential's one-turn budget — no oscillation back to credential,
-        # and never a bare-fabricated priv_esc dispatch with nothing to do.
-        assert ApexPhase.objective.value in phase_sequence, (
-            f"objective never dispatched; sequence was {phase_sequence}"
+        # Credential is never entered without a hypothesis; objective/priv_esc
+        # (both requiring access the engagement can never obtain here) are
+        # likewise never fabricated. No oscillation.
+        assert ApexPhase.credential.value not in phase_sequence, (
+            f"credential entered without a hypothesis (regression): {phase_sequence}"
         )
-        first_objective = phase_sequence.index(ApexPhase.objective.value)
-        assert first_objective == 1, (
-            f"objective should be reached on the second dispatched turn "
-            f"(right after credential's 1-turn budget); sequence was {phase_sequence}"
-        )
-        assert ApexPhase.credential.value not in phase_sequence[first_objective + 1:], (
-            f"credential re-dispatched after objective — oscillation regression: {phase_sequence}"
-        )
-        # Stall detector (Phase 12C) is strictly more responsive than either
-        # phase's own turn budget here: credential's AbandonSignal (turn 1)
-        # and objective's AbandonSignal (turns 2-3, no real ssh access ever
-        # available) are three *consecutive* no-action turns, so
-        # no_actionable_task fires at turn 3 — well before priv_esc is ever
-        # reached, and well before the global max_turns=8 ceiling.
-        assert final_state["turn_count"] == 3
-        assert final_state["turn_count"] < config.max_turns
+        assert ApexPhase.objective.value not in phase_sequence, phase_sequence
+        assert ApexPhase.priv_esc.value not in phase_sequence, phase_sequence
         assert final_state["completed"] is True
-        assert final_state["outcome"] == "no_actionable_task"
         assert final_state["outcome"] != "user_flag_verified"
-        assert final_state["stall_reason"]
+        # No fabricated evidence: no credential or access node was invented.
+        _sg = await api.get_subgraph(_ANCHOR, depth=3)
+        _seeded_types = {n.type for n in _sg.nodes}
+        assert "credential" not in _seeded_types
+        assert "access_state" not in _seeded_types

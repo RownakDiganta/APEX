@@ -98,13 +98,18 @@ _DEFAULT_PHASE_BUDGETS: dict[str, int] = {
 # turn-budget exhaustion is now handled directly in decide_phase() as an
 # explicit termination — see the "recon budget exhausted, no service
 # found" check below — never as fabricated evidence for a later,
-# capability-dependent phase. Web and credential retain their forced
-# advance: by the time either phase's OWN budget is checked, the
-# PREREQUISITE evidence for entering it (a real service, for web; being
-# in credential at all) already exists for real — forcing past THEM does
-# not fabricate evidence for a phase that has no prerequisite of its own.
+# capability-dependent phase.
+#
+# web is ALSO absent (credential-evidence-gate fix). Web-phase budget
+# exhaustion is no longer forced by injecting an "endpoint" node type
+# (which, under the new web-evidence gate, no longer signals web
+# completion) — it is handled explicitly in decide_phase() by forcing
+# ``web_evidence_complete=True`` (a terminal, classified inability to make
+# further web progress). credential retains its forced advance: by the time
+# its OWN budget is checked, the engagement is already legitimately in the
+# credential phase (an actionable hypothesis existed), so forcing past it on
+# exhaustion fabricates no prerequisite evidence.
 _PHASE_COMPLETION_NODE: dict[str, str] = {
-    ApexPhase.web.value: "endpoint",
     ApexPhase.credential.value: "access_state",
 }
 
@@ -166,6 +171,8 @@ class GlobalPlanner:
         turn_count: int,
         current_phase: str | None = None,
         has_web_capability: bool = True,
+        has_credential_hypothesis: bool = True,
+        web_evidence_complete: bool | None = None,
         objective_status: str = "pending",
         objective_reopened: bool = False,
     ) -> ApexPhase:
@@ -253,11 +260,22 @@ class GlobalPlanner:
             if self.budget_remaining(phase_value) == 0:
                 forced_node_types.add(completion_node)
 
+        # Web-phase budget exhaustion is a terminal, classified inability to
+        # make further web progress → treat web evidence as complete so the
+        # engagement doesn't loop in the web phase (it would otherwise stay in
+        # web whenever web_evidence_complete is False). An explicit caller
+        # value of False is overridden here ONLY on exhaustion.
+        effective_web_complete = web_evidence_complete
+        if self.budget_remaining(ApexPhase.web.value) == 0:
+            effective_web_complete = True
+
         objective_budget_exhausted = self.budget_remaining(ApexPhase.objective.value) == 0
 
         selected = self._select_phase(
             forced_node_types,
             has_web_capability=has_web_capability,
+            has_credential_hypothesis=has_credential_hypothesis,
+            web_evidence_complete=effective_web_complete,
             objective_status=objective_status,
             objective_budget_exhausted=objective_budget_exhausted,
             objective_reopened=objective_reopened,
@@ -271,6 +289,8 @@ class GlobalPlanner:
         node_types_seen: set[str],
         *,
         has_web_capability: bool = True,
+        has_credential_hypothesis: bool = True,
+        web_evidence_complete: bool | None = None,
         objective_status: str = "pending",
         objective_budget_exhausted: bool = False,
         objective_reopened: bool = False,
@@ -330,10 +350,51 @@ class GlobalPlanner:
             return ApexPhase.recon
         if "service" not in node_types_seen:
             return ApexPhase.recon
-        if "endpoint" not in node_types_seen and has_web_capability:
+
+        has_access = (
+            "access_state" in node_types_seen or "access_capability" in node_types_seen
+        )
+
+        # Web phase: stay in / return to web while an HTTP(S) surface exists
+        # and web discovery has not yet produced MEANINGFUL evidence (a
+        # fetched page, a form/tech/opportunity, or a terminal budget-
+        # exhaustion classified inability). ``web_evidence_complete`` is the
+        # authoritative signal (apex_host.planners.phase_gates.web_evidence_status);
+        # when a caller does not supply it (``None``), fall back to the
+        # pre-existing "endpoint node present" heuristic so every existing
+        # caller/test keeps its prior behavior. This preference — unfinished
+        # web discovery over credential validation — is exactly requirement
+        # "when port 80/443 is known but no successful web content exists,
+        # prefer web".
+        #
+        # Only when access has NOT yet been obtained: web discovery is a
+        # prerequisite for *gaining* access, so once an access_state or a
+        # validated access_capability already exists, the engagement proceeds
+        # to the objective rather than looping in web.
+        web_complete = (
+            web_evidence_complete if web_evidence_complete is not None
+            else ("endpoint" in node_types_seen)
+        )
+        if has_web_capability and not web_complete and not has_access:
             return ApexPhase.web
-        if "access_state" not in node_types_seen and "access_capability" not in node_types_seen:
-            return ApexPhase.credential
+
+        if not has_access:
+            # Credential validation is actionable ONLY when a bounded
+            # credential hypothesis exists (operator creds, discovered
+            # evidence, a policy-permitted default, or a structured
+            # auth-bypass opportunity — see phase_gates.credential_hypothesis).
+            # The mere presence of a credential-validation CAPABILITY never
+            # satisfies this: entering credential without a hypothesis
+            # produced the observed "capability present but no credentials
+            # configured" no-action loop. ``has_credential_hypothesis``
+            # defaults ``True`` so existing callers/tests are unchanged.
+            if has_credential_hypothesis:
+                return ApexPhase.credential
+            # No access, no actionable credential hypothesis, and web is
+            # complete (or absent): nothing further is actionable. Produce one
+            # truthful terminal decision rather than fabricating a phase.
+            return ApexPhase.done
+
         if objective_status == "verified":
             return ApexPhase.done
         if objective_reopened or (objective_status != "failed" and not objective_budget_exhausted):

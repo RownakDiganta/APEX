@@ -499,11 +499,12 @@ class TestRouting:
         """ROUTE-04: PHASE_NODE maps priv_esc to priv_esc_agent."""
         assert PHASE_NODE[ApexPhase.priv_esc.value] == "priv_esc_agent"
 
-    def test_route05_route_after_global_plan_completed_goes_to_end(self) -> None:
-        """ROUTE-05: completed=True sends route_after_global_plan to END."""
-        from langgraph.graph import END
+    def test_route05_route_after_global_plan_completed_goes_to_reflect(self) -> None:
+        """ROUTE-05: a GlobalPlanner ``done``/completed decision routes to
+        reflect_or_continue (the canonical termination path that sets a
+        truthful outcome + writes the terminal episode), not straight to END."""
         state = self._state(completed=True, phase="done")
-        assert route_after_global_plan(state) == END
+        assert route_after_global_plan(state) == "reflect_or_continue"
 
     def test_route06_route_after_global_plan_recon_phase(self) -> None:
         """ROUTE-06: recon phase with no prior findings → recon_agent."""

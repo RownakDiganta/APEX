@@ -48,8 +48,16 @@ def route_after_global_plan(state: "ApexGraphState") -> str:
     `done`) never falls through silently to END — it routes to
     UNKNOWN_PHASE_NODE, which records why before terminating (Bug E fix).
     """
-    if state["completed"]:
-        return END
+    # When GlobalPlanner decides ``done`` (e.g. on the very first turn, before
+    # any reflect_or_continue peek has run — the case that arises when no phase
+    # is actionable, e.g. a credential-validation capability with no credential
+    # hypothesis), route through reflect_or_continue rather than straight to
+    # END, so the ONE canonical termination path always sets a truthful
+    # ``outcome``/reason and writes the terminal episode (Phase 12C). On every
+    # later turn, reflect_or_continue's own peek has already caught the
+    # terminal condition, so this branch is normally reached only at turn 1.
+    if state["completed"] or state["phase"] == ApexPhase.done.value:
+        return "reflect_or_continue"
     phase = state["phase"]
     if phase == ApexPhase.web.value:
         has_web_finding = any(
@@ -59,8 +67,6 @@ def route_after_global_plan(state: "ApexGraphState") -> str:
     node = PHASE_NODE.get(phase)
     if node is not None:
         return node
-    if phase == ApexPhase.done.value:
-        return END
     return UNKNOWN_PHASE_NODE
 
 

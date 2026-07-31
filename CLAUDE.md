@@ -9319,3 +9319,129 @@ injection/extra-target stripping, UDP-unsupported), `plan_raw_socket_repair`
 keeps privileged; UDP unsupported never runs; diagnostics fields), and the
 deterministic `repair_agent` (one `-sT` re-execution, privileged never run
 verbatim, already-`-sT` terminal). Fake runner only — no real scans.
+
+---
+
+## 26. Phase evidence gates and credential prerequisites
+
+Fixes the planning failure where APEX entered the credential phase with no
+credentials supplied, none discovered, no login page fetched, and no
+authentication opportunity — ending in the repeated no-action message
+"a credential-validation capability is present but no credentials configured".
+That is an **unavailable prerequisite**, not a useful action.
+
+### 26.1 The single authoritative phase-transition path
+
+`apex_host.planners.global_planner.GlobalPlanner.decide_phase` /
+`_select_phase` is the ONE place a phase is chosen. It now consults two pure
+evidence gates from `apex_host.planners.phase_gates` (blackboard model — no
+I/O, no secrets), supplied by the callers (`apex_host.orchestration
+.planning_node.global_plan` and `continuation_node`'s peek):
+`has_credential_hypothesis: bool` and `web_evidence_complete: bool | None`.
+Both parameters **default** to the pre-fix behavior
+(`has_credential_hypothesis=True`, `web_evidence_complete=None` →
+"endpoint present"), so every existing caller/test is unchanged; only the two
+production callers pass the real signals.
+
+### 26.2 Credential prerequisites (capability availability ≠ actionable input)
+
+`phase_gates.credential_hypothesis(subgraph, *, has_operator_credentials,
+allow_default_credentials=False)` returns whether at least one **bounded
+credential hypothesis** exists, from exactly four evidence sources (checked in
+this fixed order for a deterministic `source` label):
+
+1. `operator_supplied` — `config.username_candidates` **and**
+   `password_candidates` are set;
+2. `discovered_evidence` — a `credential` EKG node marked discovered
+   (`props["discovered"] is True` or `props["source"]` in a discovered set) —
+   never a normal attempt-record credential node;
+3. `policy_default` — `getattr(config, "allow_default_credentials", False)` is
+   True (a config-gated hook, off by default — does NOT add any default-
+   credential attack behavior);
+4. `auth_bypass_opportunity` — a `web_opportunity` node whose `category` is a
+   structured bypass (`auth_bypass`/`authentication_bypass`/
+   `default_credentials`) — **not** an `authentication_portal` (a login form is
+   an auth *surface* that still requires credentials).
+
+**The mere presence of a credential-validation CAPABILITY** (an SSH/FTP/Telnet
+service, an `access_validate_*` capability, or a discovered `auth_flow` login
+form) **never satisfies this prerequisite.** When no hypothesis exists the
+typed reason is `phase_gates.MISSING_CREDENTIAL_HYPOTHESIS`
+(`"missing_credential_hypothesis"`).
+
+In `_select_phase`: with no `access_state`/`access_capability`, the credential
+phase is entered **only** when `has_credential_hypothesis` is True; otherwise
+(web complete/absent, no hypothesis) the router returns `done` — one truthful
+terminal decision, never a fabricated service/endpoint/credential/opportunity/
+phase-completion. `planning_node` sets a precise upstream
+`outcome=no_actionable_task` + `termination_reason` for that terminal, and
+`route_after_global_plan` routes a `done` decision to `reflect_or_continue`
+(the canonical termination path that writes the terminal episode), so a
+first-turn `done` still produces a proper outcome.
+
+### 26.3 Web completion conditions
+
+`phase_gates.web_evidence_status(subgraph, *, has_web_capability=True)` marks
+web discovery complete ONLY on **meaningful evidence**, never because web tasks
+were merely attempted:
+
+- a fetched page — an `endpoint` node actually browsed (`browsed=True`) or
+  carrying a real HTTP `status` (the curl/ffuf/gobuster/browser parsers set
+  these on a successful response);
+- a structured artifact that could only come from fetched content — a `form`,
+  `tech`, or `web_opportunity` node;
+- (in `GlobalPlanner`) a terminal, classified inability — the web phase's own
+  turn budget exhausted (`decide_phase` forces `web_evidence_complete=True`).
+
+A **policy-blocked or execution-failed** web request creates no such node and
+never counts. A bare discovered-but-unfetched link `endpoint` does not count.
+**When port 80/443 is known but no successful web content exists yet, the
+router prefers/stays in the web phase over credential validation.**
+
+The web gate fires **only before access is obtained**: `_select_phase` checks
+`access_state`/`access_capability` first, and once either exists the engagement
+proceeds to the objective (web discovery is a prerequisite for *gaining* access,
+not something to loop on after access is already validated).
+
+### 26.4 Workflow blocked-vs-stalled accounting
+
+`apex_host.planners.workflow_orchestration` steps gained an explicit
+prerequisite model (`_StepDef.prereq_fn` subgraph predicate / `prereq_key`
+context bool). The FIRST non-completed step is classified precisely:
+`completed` / `blocked` (its own true prerequisite unavailable) / `failed` /
+`pending` (actionable). `_workflow_status` returns **`blocked`** when that step
+is blocked or failed — so a workflow whose validation step was never actionable
+is never reported as a misleading **`stalled`** workflow; `stalled` is reserved
+for an actionable (`pending`) step the engagement stopped progressing on.
+
+- `credential_to_privesc`: `validate_credentials` has
+  `prereq_key="credential_hypothesis"` — missing credentials **block** it (with
+  the workflow `blocked`), not repeatedly schedule it.
+- `web_discovery_to_opportunity`: `discover_form`/`inspect_technology`/
+  `identify_opportunity` have `prereq_fn=_page_acquired` — successful page
+  acquisition must precede form/opportunity analysis.
+
+`derive_workflows_from_subgraph`/`workflow_summary_fields` take
+`credential_hypothesis_available` (default `True`); `continuation_node` computes
+it once (from the same gate) and passes it to both the workflow sync and the
+next-phase peek.
+
+### 26.5 Reporting
+
+`ApexGraphState.phase_selection` (written by `global_plan`) and
+`RunReport.phase_selection` (JSON + a text "Phase selection" line) record, with
+**no secret value** — only the hypothesis SOURCE label — why the phase was
+selected, which prerequisite made it actionable (or why it was unavailable via
+the typed reason), and whether operator/discovered/policy-default/auth-bypass
+was used.
+
+### 26.6 Tests
+
+`tests/apex_host/test_credential_phase_gate.py` (the four hypothesis sources +
+the `missing_credential_hypothesis` reason; capability/login-form are NOT a
+hypothesis; web evidence complete/incomplete incl. policy-blocked; `decide_phase`
+gate cases; a compiled-graph run proving an SSH-capability-no-creds target
+enters no credential/objective turn and fabricates no credential/access node;
+workflow blocked-not-stalled + completion percentage + web page-acquisition
+gate). `tests/apex_host/test_phase12a_state_machine.py` updated to assert the
+fixed behavior. Synthetic only — no real network or LLM calls.

@@ -62,7 +62,7 @@ async def seed_synthetic_machine(api: MemoryAPI, target: str = SYNTHETIC_TARGET)
 
     await api.upsert_node(Node(id=nid_host, type="host", props={"ip": target}, confidence=0.9, source="synthetic", first_seen=timestamp, last_seen=timestamp))
     await api.upsert_node(Node(id=nid_service, type="service", props={"port": "80", "service": "http"}, confidence=0.85, source="synthetic", first_seen=timestamp, last_seen=timestamp))
-    await api.upsert_node(Node(id=nid_endpoint, type="endpoint", props={"url": login_url}, confidence=0.7, source="synthetic", first_seen=timestamp, last_seen=timestamp))
+    await api.upsert_node(Node(id=nid_endpoint, type="endpoint", props={"url": login_url, "status": "200"}, confidence=0.7, source="synthetic", first_seen=timestamp, last_seen=timestamp))
     await api.upsert_node(Node(id=nid_auth, type="auth_flow", props={"url": login_url}, confidence=0.75, source="synthetic", first_seen=timestamp, last_seen=timestamp))
 
     for to_id in (nid_service, nid_endpoint, nid_auth):
@@ -87,7 +87,19 @@ async def run_synthetic_machine(*, max_turns: int = 5) -> EngagementMetrics:
     api = _make_api()
     await seed_synthetic_machine(api)
 
-    config = ApexConfig(target=SYNTHETIC_TARGET, dry_run=True, max_turns=max_turns)
+    # Operator-supplied credentials make credential validation an *actionable*
+    # hypothesis (apex_host.planners.phase_gates.credential_hypothesis) — the
+    # synthetic seed's auth_flow node alone is a discovered login page, never a
+    # hypothesis (Phase 26 gating). With web content already fetched (the
+    # endpoint's status="200" above) and a credential hypothesis present, the
+    # phase ladder legitimately advances recon -> web -> credential.
+    config = ApexConfig(
+        target=SYNTHETIC_TARGET,
+        dry_run=True,
+        max_turns=max_turns,
+        username_candidates=["synthetic"],
+        password_candidates=["synthetic"],
+    )
     registry = ToolRegistry.from_config(config)
     graph = build_apex_graph(api, registry, config)
 
@@ -124,6 +136,7 @@ async def run_synthetic_machine(*, max_turns: int = 5) -> EngagementMetrics:
         "enumeration_complete": False,
         "web_session_state": {},
         "workflow_summary": {},
+        "phase_selection": {},
         "learning_summary": {},
         "task_latency_log": [],
         "objective_status": "",
