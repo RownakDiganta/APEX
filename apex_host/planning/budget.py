@@ -168,6 +168,13 @@ class LLMBudgetTracker:
         self.calls_succeeded: int = 0
         self.calls_failed: int = 0
         self.fallbacks: int = 0
+        # Per-reason fallback accounting — WHY the deterministic fallback was
+        # used, so a report distinguishes "no actionable candidate" from
+        # "budget exhausted" from "provider error" instead of collapsing every
+        # fallback into one unexplained count (CLAUDE.md §28). Every fallback
+        # increment goes through _note_fallback(reason) so `fallbacks` always
+        # equals sum(fallback_reasons.values()).
+        self.fallback_reasons: dict[str, int] = {}
         self.retries: int = 0
         self.total_elapsed_seconds: float = 0.0
 
@@ -382,6 +389,15 @@ class LLMBudgetTracker:
             call_num, self.max_per_run, phase, model or "?", elapsed, task_count,
         )
 
+    def _note_fallback(self, reason: str) -> None:
+        """Increment the global fallback counter AND the per-reason breakdown.
+        The single place `fallbacks` is incremented, so it always equals
+        sum(fallback_reasons.values()). An empty/falsy reason is recorded as
+        ``"unspecified"`` rather than silently dropped."""
+        self.fallbacks += 1
+        key = reason or "unspecified"
+        self.fallback_reasons[key] = self.fallback_reasons.get(key, 0) + 1
+
     def record_failure(
         self,
         phase: str,
@@ -390,9 +406,10 @@ class LLMBudgetTracker:
         http_status: int | None,
         model: str = "",
     ) -> None:
-        """Record a failed LLM call."""
+        """Record a failed LLM call (a real provider call was made and failed —
+        the fallback reason is the error category)."""
         self.calls_failed += 1
-        self.fallbacks += 1
+        self._note_fallback(error_category or "provider_failure")
         self.total_elapsed_seconds += elapsed
         call_num = self.calls_attempted
         self.call_metrics.append({
@@ -435,9 +452,14 @@ class LLMBudgetTracker:
         """
         self._last_context[phase] = context_hash
 
-    def record_fallback_only(self) -> None:
-        """Record that the deterministic path was used without any LLM attempt."""
-        self.fallbacks += 1
+    def record_fallback_only(self, reason: str = "") -> None:
+        """Record that the deterministic path was used WITHOUT any LLM attempt
+        (no real provider call, no budget slot consumed). *reason* explains
+        why — e.g. ``no_actionable_candidate`` (the deterministic planner
+        abandoned — a prerequisite is absent or no candidate exists),
+        ``no_llm_configured``, ``budget_exhausted``, ``repeated_context``,
+        ``permanent_provider_error``, ``prompt_blocked``. See CLAUDE.md §28."""
+        self._note_fallback(reason)
 
     def record_permanent_provider_error(self, category: str) -> None:
         """Record a CONFIRMED permanent provider-configuration failure
@@ -489,6 +511,7 @@ class LLMBudgetTracker:
             "calls_succeeded": self.calls_succeeded,
             "calls_failed": self.calls_failed,
             "fallbacks": self.fallbacks,
+            "fallback_reasons": dict(self.fallback_reasons),
             "retries": self.retries,
             "total_elapsed_seconds": round(self.total_elapsed_seconds, 3),
             "budget_remaining": self.budget_remaining,
@@ -516,6 +539,7 @@ class LLMBudgetTracker:
         tracker.calls_succeeded = int(d.get("calls_succeeded", 0))
         tracker.calls_failed = int(d.get("calls_failed", 0))
         tracker.fallbacks = int(d.get("fallbacks", 0))
+        tracker.fallback_reasons = dict(d.get("fallback_reasons", {}))
         tracker.retries = int(d.get("retries", 0))
         tracker.total_elapsed_seconds = float(d.get("total_elapsed_seconds", 0.0))
         tracker.stop_reason = str(d.get("stop_reason", ""))

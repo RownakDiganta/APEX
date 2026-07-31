@@ -1247,6 +1247,7 @@ docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
   --tool-service-timeout 120 \
   --use-llm --llm-provider openai --llm-model gpt-5.5 \
   --max-turns 20 \
+  --max-llm-calls 20 --max-llm-calls-per-phase 4 \
   --export-json /app/run_reports/live.json \
   --export-graph /app/run_reports/live_graph.json \
   --no-dry-run --confirm-live \
@@ -1255,6 +1256,21 @@ docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
 
 Reports land in `./run_reports/` on the host. `user_flag_verified` is the only
 benchmark-success outcome.
+
+**LLM planner-call budget (important).** `--max-llm-calls` defaults to a
+deliberately conservative **5** — too low for a real multi-phase engagement,
+which is why the live command above raises it to a practical, still-bounded
+**20** (with `--max-llm-calls-per-phase 4`). This is a hard cost cap, not a
+target: deterministic operations (policy scope, backend capability selection,
+the known Nmap `-sT` repair, duplicate suppression, prerequisite checks, and
+any turn where the deterministic planner has no actionable candidate) consume
+**no** LLM calls at all (CLAUDE.md §28), so a bounded 20 comfortably covers a
+recon→web→credential→objective progression. The report's **LLM Usage** section
+breaks fallbacks down **by reason** (`no_actionable_candidate`,
+`budget_exhausted`, `repeated_context`, `permanent_provider_error`,
+validation/transient/permanent, …) so an exhausted budget is explainable rather
+than a single opaque count. Values are range-validated at preflight (zero,
+negative, or excessively large budgets are rejected).
 
 **10. Clean shutdown:**
 

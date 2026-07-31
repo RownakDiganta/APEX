@@ -335,9 +335,16 @@ class PlanningEngine:
         llm_error_category: str = "",
         llm_http_status: int | None = None,
         llm_retry_count: int = 0,
+        precomputed_fallback: "list[TaskSpec] | AbandonSignal | None" = None,
     ) -> "list[TaskSpec] | AbandonSignal":
         """Call the deterministic fallback planner, record the decision
         with the REAL resulting task count, and return its result.
+
+        When *precomputed_fallback* is supplied, that single already-computed
+        deterministic result is REUSED instead of invoking the fallback planner
+        again — so one deterministic decision is produced per turn and reused on
+        every fallback path (CLAUDE.md §28, requirement "reuse one planner
+        decision within the same turn").
 
         Phase 3 (post-live-test debugging): before this phase,
         ``selected_task_count`` was unconditionally recorded as ``0`` for
@@ -352,7 +359,11 @@ class PlanningEngine:
         every fallback decision, unchanged, since that field's own
         meaning ("what the LLM selected") is still correctly zero.
         """
-        fallback_result = await self._fallback.plan(goal, subgraph, evidence)
+        fallback_result = (
+            precomputed_fallback
+            if precomputed_fallback is not None
+            else await self._fallback.plan(goal, subgraph, evidence)
+        )
         fallback_task_count = 0 if isinstance(fallback_result, AbandonSignal) else len(fallback_result)
         self._last_decision = PlanDecision(
             planner_model="deterministic",
@@ -419,8 +430,14 @@ class PlanningEngine:
         phase: ApexPhase,
         subgraph: SubgraphView,
         evidence: EvidenceBundle,
+        *,
+        cached_fallback: "list[TaskSpec] | AbandonSignal | None" = None,
     ) -> "list[TaskSpec] | AbandonSignal":
         """Route all LLM invocations through the injected ``LLMGateway``.
+
+        *cached_fallback* is the single deterministic result already computed
+        for this turn by ``plan()``'s deterministic-first gate; it is reused on
+        every fallback path so the fallback planner is not re-invoked.
 
         This path is taken when ``self._gateway is not None``.  The gateway
         handles atomic budget reservation, prompt sanitization, pre/post guard
@@ -447,23 +464,25 @@ class PlanningEngine:
         # .record_permanent_provider_error's own docstring.
         if self._budget is not None and self._budget.permanent_provider_error_category:
             known_category = self._budget.permanent_provider_error_category
-            self._budget.record_fallback_only()
+            self._budget.record_fallback_only("permanent_provider_error")
             return await self._record_fallback(
                 phase, goal, subgraph, evidence,
                 llm_error_category=known_category,
                 repeated_plan_action="skipped_known_provider_error",
+                precomputed_fallback=cached_fallback,
             )
 
         # Repeated-context detection — same logic as direct path.
         ctx_hash = _context_hash(subgraph, evidence)
         if self._budget is not None and self._budget.is_context_repeated(phase.value, ctx_hash):
             repeated_count = self._budget.record_repeated_skip(phase.value)
-            self._budget.record_fallback_only()
+            self._budget.record_fallback_only("repeated_context")
             return await self._record_fallback(
                 phase, goal, subgraph, evidence,
                 repeated_plan_detected=True,
                 repeated_plan_count=repeated_count,
                 repeated_plan_action="skipped_llm",
+                precomputed_fallback=cached_fallback,
             )
 
         # Build prompt messages.
@@ -500,7 +519,7 @@ class PlanningEngine:
                     result.status.value, _category, phase.value,
                 )
                 if self._budget is not None:
-                    self._budget.record_fallback_only()
+                    self._budget.record_fallback_only(_category)
                     if result.error_category in PERMANENT_LLM_ERROR_CATEGORIES:
                         self._budget.record_permanent_provider_error(result.error_category)
                 return await self._record_fallback(
@@ -510,6 +529,7 @@ class PlanningEngine:
                     policy_block_reason=result.blocked_reason,
                     llm_error_category=_category,
                     llm_retry_count=_retry_count,
+                    precomputed_fallback=cached_fallback,
                 )
 
             raw = result.raw_text
@@ -533,6 +553,7 @@ class PlanningEngine:
                     redaction_count=_redaction_count,
                     llm_error_category="validation",
                     llm_retry_count=_retry_count,
+                    precomputed_fallback=cached_fallback,
                 )
 
             # Low confidence — epistemic signal, not transient; fallback immediately.
@@ -548,7 +569,10 @@ class PlanningEngine:
                     redaction_count=_redaction_count,
                     llm_retry_count=_retry_count,
                 )
-                return await self._fallback.plan(goal, subgraph, evidence)
+                return (
+                cached_fallback if cached_fallback is not None
+                else await self._fallback.plan(goal, subgraph, evidence)
+            )
 
             # Stop signal from LLM.
             if output.stop_reason:
@@ -580,6 +604,7 @@ class PlanningEngine:
                     redaction_count=_redaction_count,
                     llm_error_category="validation",
                     llm_retry_count=_retry_count,
+                    precomputed_fallback=cached_fallback,
                 )
 
             # Success — convert to TaskSpecs.
@@ -599,7 +624,8 @@ class PlanningEngine:
 
         # Exhausted retries.
         return await self._record_fallback(
-            phase, goal, subgraph, evidence, llm_retry_count=_retry_count
+            phase, goal, subgraph, evidence, llm_retry_count=_retry_count,
+            precomputed_fallback=cached_fallback,
         )
 
     async def plan(
@@ -628,16 +654,52 @@ class PlanningEngine:
         - Low confidence (< ``confidence_threshold``): fallback immediately
           without retrying — low confidence is a signal, not a transient error.
         """
+        # ------------------------------------------------------------------ #
+        # Deterministic-first gate (CLAUDE.md §28) — budgeted engagements only
+        # ------------------------------------------------------------------ #
+        # When a budget tracker is present (a real, cost-bounded engagement),
+        # consult the deterministic planner ONCE per turn. When it abandons —
+        # no actionable task candidate exists (a prerequisite-absent phase is
+        # already prevented upstream by the §26 phase gates, so an abandon here
+        # means the rules, in an appropriately-routed phase, found nothing to
+        # do) — return that decision WITHOUT reserving a budget slot or invoking
+        # the LLM. This is the primary fix for the demonstrated budget
+        # exhaustion, where dead-end turns each still spent one of five LLM
+        # calls before falling back. When the deterministic planner DOES
+        # produce candidates, the LLM is still consulted (it may improve on
+        # them) and this SAME result is reused as the fallback on any later LLM
+        # failure — one deterministic decision per turn, never re-asked.
+        #
+        # With NO budget (unit tests / unlimited mode) the gate does not fire
+        # and cached_fallback stays None: the LLM is always attempted and the
+        # pre-existing LLM-primary behavior is preserved exactly.
+        cached_fallback: "list[TaskSpec] | AbandonSignal | None" = None
+        if self._budget is not None:
+            cached_fallback = await self._fallback.plan(goal, subgraph, evidence)
+            if isinstance(cached_fallback, AbandonSignal):
+                self._budget.record_fallback_only("no_actionable_candidate")
+                self._last_decision = PlanDecision(
+                    planner_model="deterministic", confidence=1.0,
+                    selected_task_count=0, rejected_task_count=0,
+                    reasoning_summary="no actionable candidate — LLM not consulted",
+                    fallback_used=True, timestamp=now(), phase=phase.value,
+                    repeated_plan_action="skipped_llm_no_candidate",
+                    fallback_task_count=0,
+                )
+                return cached_fallback
+
         if self._gateway is not None:
-            return await self._plan_via_gateway(goal, phase, subgraph, evidence)
+            return await self._plan_via_gateway(
+                goal, phase, subgraph, evidence, cached_fallback=cached_fallback
+            )
 
         llm = self._router.planner_llm()
         if llm is None:
             logger.debug("planning_engine: no LLM configured — using fallback planner")
             if self._budget is not None:
-                self._budget.record_fallback_only()
+                self._budget.record_fallback_only("no_llm_configured")
             return await self._record_fallback(
-                phase, goal, subgraph, evidence
+                phase, goal, subgraph, evidence, precomputed_fallback=cached_fallback
             )
 
         # ------------------------------------------------------------------ #
@@ -650,9 +712,10 @@ class PlanningEngine:
                     "planning_engine: budget blocked LLM call (%s) — using fallback",
                     budget_reason,
                 )
-                self._budget.record_fallback_only()
+                self._budget.record_fallback_only("budget_exhausted")
                 return await self._record_fallback(
-                    phase, goal, subgraph, evidence, llm_error_category="budget_exhausted"
+                    phase, goal, subgraph, evidence, llm_error_category="budget_exhausted",
+                    precomputed_fallback=cached_fallback,
                 )
 
         # ------------------------------------------------------------------ #
@@ -661,12 +724,13 @@ class PlanningEngine:
         ctx_hash = _context_hash(subgraph, evidence)
         if self._budget is not None and self._budget.is_context_repeated(phase.value, ctx_hash):
             repeated_count = self._budget.record_repeated_skip(phase.value)
-            self._budget.record_fallback_only()
+            self._budget.record_fallback_only("repeated_context")
             return await self._record_fallback(
                 phase, goal, subgraph, evidence,
                 repeated_plan_detected=True,
                 repeated_plan_count=repeated_count,
                 repeated_plan_action="skipped_llm",
+                precomputed_fallback=cached_fallback,
             )
 
         # ------------------------------------------------------------------ #
@@ -694,12 +758,13 @@ class PlanningEngine:
                     prompt_reason,
                 )
                 if self._budget is not None:
-                    self._budget.record_fallback_only()
+                    self._budget.record_fallback_only("prompt_blocked")
                 return await self._record_fallback(
                     phase, goal, subgraph, evidence,
                     policy_checkpoint_status="blocked",
                     redaction_count=_redaction_count,
                     policy_block_reason=prompt_reason,
+                    precomputed_fallback=cached_fallback,
                 )
 
         # ------------------------------------------------------------------ #
@@ -750,6 +815,7 @@ class PlanningEngine:
                         llm_error_category="permanent",
                         llm_http_status=http_status,
                         llm_retry_count=_retry_count,
+                        precomputed_fallback=cached_fallback,
                     )
 
                 # Transient error — retry if attempts remain.
@@ -776,6 +842,7 @@ class PlanningEngine:
                     llm_error_category="transient",
                     llm_http_status=http_status,
                     llm_retry_count=_retry_count,
+                    precomputed_fallback=cached_fallback,
                 )
 
             # ---------------------------------------------------------------- #
@@ -808,6 +875,7 @@ class PlanningEngine:
                         policy_block_reason=out_reason,
                         llm_error_category="validation",
                         llm_retry_count=_retry_count,
+                        precomputed_fallback=cached_fallback,
                     )
 
             output: PlannerOutput | None = self._validator.validate(
@@ -836,6 +904,7 @@ class PlanningEngine:
                     redaction_count=_redaction_count,
                     llm_error_category="validation",
                     llm_retry_count=_retry_count,
+                    precomputed_fallback=cached_fallback,
                 )
 
             last_output = output
@@ -862,7 +931,10 @@ class PlanningEngine:
                     redaction_count=_redaction_count,
                     llm_retry_count=_retry_count,
                 )
-                return await self._fallback.plan(goal, subgraph, evidence)
+                return (
+                cached_fallback if cached_fallback is not None
+                else await self._fallback.plan(goal, subgraph, evidence)
+            )
 
             if output.stop_reason:
                 elapsed = time.monotonic() - t0
@@ -905,6 +977,7 @@ class PlanningEngine:
                     redaction_count=_redaction_count,
                     llm_error_category="validation",
                     llm_retry_count=_retry_count,
+                    precomputed_fallback=cached_fallback,
                 )
 
             # ---------------------------------------------------------------- #
@@ -957,7 +1030,10 @@ class PlanningEngine:
             # call is used here rather than _record_fallback (which would
             # overwrite that already-correct decision with a generic
             # deterministic one).
-            return await self._fallback.plan(goal, subgraph, evidence)
+            return (
+                cached_fallback if cached_fallback is not None
+                else await self._fallback.plan(goal, subgraph, evidence)
+            )
 
         if self._budget is not None:
             self._budget.record_failure(
@@ -968,4 +1044,5 @@ class PlanningEngine:
             policy_checkpoint_status=_checkpoint_status,
             redaction_count=_redaction_count,
             llm_retry_count=_retry_count,
+            precomputed_fallback=cached_fallback,
         )

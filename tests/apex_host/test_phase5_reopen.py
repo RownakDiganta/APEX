@@ -721,21 +721,30 @@ class TestPlanViaGateway:
 
     @pytest.mark.asyncio
     async def test_r07_gateway_budget_record_context_on_success(self) -> None:
-        """After successful gateway plan, record_context is called so next call detects repeat."""
+        """After successful gateway plan, record_context is called so the next
+        identical call detects the repeat and skips the LLM (CLAUDE.md §28).
+
+        The fallback returns a candidate task (not an abandon) so the
+        deterministic-first budget gate passes through to the gateway; the
+        second identical-context call then takes the repeated-context skip."""
         budget = LLMBudgetTracker(max_per_run=5, stop_on_repeated_plan=True)
         llm = _StubLLM()
         router = _FakeRouter(llm=llm)
         gateway = LLMGateway(model_router=router, budget=budget)
 
-        class _FakeFallback:
+        class _TaskFallback:
             async def plan(
                 self, goal: Goal, subgraph: SubgraphView, evidence: EvidenceBundle
             ) -> list[TaskSpec] | AbandonSignal:
-                return AbandonSignal(reason="fallback")
+                return [TaskSpec(
+                    id="fb", goal_id=goal.id, executor_domain="recon",
+                    params={"tool": "nmap", "args": ["-sV"], "target": _TARGET, "parser": "nmap"},
+                    subgraph_anchor=goal.anchor_node, phase=goal.phase,
+                )]
 
         engine = PlanningEngine(
             model_router=router,
-            fallback_planner=_FakeFallback(),
+            fallback_planner=_TaskFallback(),
             allowed_tools=["nmap"],
             target=_TARGET,
             gateway=gateway,
@@ -746,9 +755,11 @@ class TestPlanViaGateway:
         ev = _empty_evidence()
         result1 = await engine.plan(goal, ApexPhase.recon, sg, ev)
         assert isinstance(result1, list)
-        # Second call with same context → context is repeated → fallback
+        # Second call with same context → context is repeated → the LLM is
+        # skipped and the (reused) deterministic result is returned.
         result2 = await engine.plan(goal, ApexPhase.recon, sg, ev)
-        assert isinstance(result2, AbandonSignal)
+        assert isinstance(result2, list)
+        assert budget.fallback_reasons.get("repeated_context") == 1
 
     @pytest.mark.asyncio
     async def test_r07_gateway_validator_rejection_retries(self) -> None:

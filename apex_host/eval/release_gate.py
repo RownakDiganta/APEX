@@ -648,6 +648,187 @@ async def scenario_restart_replay() -> ScenarioResult:
     )
 
 
+class _ReconWebFakeBackend:
+    """A synthetic ``ToolBackend`` for the recon->web regression scenario.
+
+    Returns realistic-but-fake nmap (ports 22 + 80 open) and curl (HTTP 200
+    homepage / robots.txt) output — never a real subprocess or network call.
+    Records every (tool, args) call so the scenario can assert the demonstrated
+    regressions are absent (privileged nmap, repeated failing scans, credential
+    tasks without credentials)."""
+
+    name = "fake-recon-web"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[str]]] = []
+
+    async def execute(
+        self, tool: str, arguments: list[str], *,
+        timeout_seconds: float | None = None, stdin: str | None = None,
+    ) -> Any:
+        from apex_host.types import ToolCommand, ToolResult
+
+        self.calls.append((tool, list(arguments)))
+        cmd = ToolCommand(tool=tool, args=list(arguments), timeout_seconds=int(timeout_seconds or 30))
+        stdout = ""
+        if tool == "nmap":
+            stdout = (
+                f"Nmap scan report for {_TARGET}\n"
+                "Host is up (0.015s latency).\n"
+                "PORT   STATE SERVICE VERSION\n"
+                "22/tcp open  ssh     OpenSSH 8.2p1 Ubuntu\n"
+                "80/tcp open  http    Apache httpd 2.4.41\n"
+            )
+        elif tool == "curl":
+            joined = " ".join(arguments)
+            if "-I" in arguments:
+                stdout = "HTTP/1.1 200 OK\r\nServer: Apache/2.4.41 (Ubuntu)\r\nContent-Type: text/html\r\n"
+            elif "robots.txt" in joined:
+                stdout = "User-agent: *\nDisallow: /admin\n"
+            else:
+                stdout = (
+                    "<!doctype html><html><head><title>Home</title></head>"
+                    "<body><a href=\"/robots.txt\">robots</a></body></html>"
+                )
+        return ToolResult(
+            command=cmd, stdout=stdout, stderr="", returncode=0,
+            duration_seconds=0.001, dry_run=True, backend="fake-recon-web", error=None,
+        )
+
+
+async def scenario_recon_web_engagement_regression() -> ScenarioResult:
+    """13. End-to-end recon->web regression (the demonstrated failed run).
+
+    One authorized host; ports 22 + 80 discovered; an UNPRIVILEGED remote
+    backend; HTTP homepage + robots.txt probed via URL targets; no credentials
+    configured. Drives the REAL compiled graph with fake tools + a
+    FakeModelRouter (deterministic) + a bounded LLM budget. Fails the gate if
+    ANY demonstrated regression reappears:
+
+    - a privileged nmap scan (``-sS`` / no ``-sT``) on the unprivileged backend;
+    - a repeated unchanged fundamental nmap failure;
+    - an authorized same-host HTTP URL rejected by policy;
+    - a credential task scheduled without a credential hypothesis;
+    - a fabricated success / forced phase completion;
+    - inconsistent planner-call accounting;
+    - a report schema regression;
+    - a non-idempotent runtime shutdown.
+    """
+    from apex_host.config import ApexConfig
+    from apex_host.eval.report import build_report, to_json_dict
+    from apex_host.graph_state import ApexGraphState
+    from apex_host.llm.router import FakeModelRouter
+    from apex_host.orchestration.builder import build_apex_graph
+    from apex_host.planning.budget import LLMBudgetTracker
+    from apex_host.tools.registry import ToolRegistry
+
+    api = _make_api()
+    config = ApexConfig(
+        target=_TARGET, dry_run=True, max_turns=8, tool_backend="remote",
+        allowed_tools=["nmap", "curl", "nc"], use_llm=False,
+        max_llm_calls_per_run=20, max_llm_calls_per_phase=4,
+    )
+    backend = _ReconWebFakeBackend()
+    budget = LLMBudgetTracker(max_per_run=20, max_per_phase=4)
+    registry = ToolRegistry.from_config(config)
+    graph = build_apex_graph(
+        api, registry, config,
+        model_router=FakeModelRouter(), budget_tracker=budget, tool_backend=backend,
+    )
+
+    initial: ApexGraphState = {
+        "run_id": "release-gate-recon-web", "target": _TARGET, "phase": "recon",
+        "goal": f"Begin engagement against {_TARGET}", "current_task": None,
+        "evidence_summary": "", "findings": [], "error_episodes": [],
+        "last_tool_result": None, "last_error": None, "completed": False,
+        "turn_count": 0, "planner_decisions": [], "tool_results": None,
+        "repair_count": 0, "policy_decisions": [], "duplicate_actions": [],
+        "completed_fingerprints": [], "execution_backend_log": [],
+        "diagnostic_events": [], "credential_validation_log": [], "repair_log": [],
+        "outcome": "", "termination_reason": "", "termination_phase": "",
+        "stall_reason": "", "privilege_state": "", "privilege_summary": {},
+        "opportunity_ids": [], "attempted_opportunities": [],
+        "enumeration_complete": False, "web_session_state": {},
+        "workflow_summary": {}, "phase_selection": {}, "learning_summary": {},
+        "task_latency_log": [], "objective_status": "", "objective_summary": {},
+        "direct_file_read_log": [], "bounded_command_log": [],
+        "capability_discovery_log": [], "execution_diagnostics": [],
+    }
+    final_state: ApexGraphState = await graph.ainvoke(initial)
+
+    problems: list[str] = []
+
+    # --- nmap: never privileged on an unprivileged backend, never repeated raw-socket failure ---
+    nmap_calls = [args for (tool, args) in backend.calls if tool == "nmap"]
+    for args in nmap_calls:
+        if "-sS" in args or "-sT" not in args:
+            problems.append(f"privileged/non-connect nmap on unprivileged backend: {args}")
+    if len(nmap_calls) > 2:
+        problems.append(f"nmap re-executed {len(nmap_calls)} times (repeated unchanged scan)")
+    if any(str(d.get("disposition")) == "raw_socket_terminal" for d in final_state.get("duplicate_actions") or []):
+        problems.append("a raw-socket terminal failure occurred against the fake backend")
+
+    # --- policy: authorized same-host HTTP URLs must not be rejected ---
+    for pd in final_state.get("policy_decisions") or []:
+        tgt = str(pd.get("target", ""))
+        if str(pd.get("status")) == "blocked" and tgt.startswith("http") and _TARGET in tgt:
+            problems.append(f"authorized same-host HTTP URL rejected by policy: {tgt}")
+
+    # --- credential phase must not run without a credential hypothesis (no creds) ---
+    cred_tools = {"telnet_access", "ssh_access", "ftp_access"}
+    if any(tool in cred_tools for (tool, _a) in backend.calls):
+        problems.append("a credential-validation task ran with no credentials configured")
+    if final_state.get("credential_validation_log"):
+        problems.append("credential validation attempted without a credential hypothesis")
+
+    # --- progress beyond initial web acquisition: web evidence was created ---
+    subgraph = await api.get_subgraph(_ANCHOR, depth=5)
+    node_types = {n.type for n in subgraph.nodes}
+    if "service" not in node_types:
+        problems.append("recon produced no service node (ports 22/80 not discovered)")
+    if "endpoint" not in node_types:
+        problems.append("web acquisition produced no endpoint node (no web evidence)")
+
+    # --- no fabricated success / forced phase completion ---
+    report = build_report(final_state, subgraph, config, llm_budget=budget.to_dict())
+    if report.success or report.outcome == "user_flag_verified":
+        problems.append("engagement fabricated success without a verified user flag")
+    if not final_state.get("completed"):
+        problems.append("engagement did not terminate with a truthful decision")
+
+    # --- planner-call accounting is internally consistent ---
+    u = budget.to_dict()
+    if u["fallbacks"] != sum(u["fallback_reasons"].values()):
+        problems.append("inconsistent fallback accounting (fallbacks != sum of reasons)")
+    if u["calls_attempted"] > u["max_calls_per_run"]:
+        problems.append("LLM calls exceeded the configured per-run budget")
+
+    # --- report schema is intact ---
+    js = to_json_dict(report)
+    if not report.report_schema_version:
+        problems.append("report schema_version missing")
+    for key in ("engagement_outcome", "bounded_repair", "llm_usage"):
+        if key not in js:
+            problems.append(f"report JSON missing '{key}' block")
+    if "fallback_reasons" not in js.get("llm_usage", {}):
+        problems.append("report llm_usage missing fallback_reasons breakdown")
+
+    # --- runtime shutdown is idempotent (no missing/duplicate shutdown) ---
+    from apex_host.runtime import ApexRuntime
+    rt = ApexRuntime(api=api, config=config, memfabric_config=Config(), registry=registry)
+    await rt.aclose()
+    await rt.aclose()  # second call must not raise
+
+    if problems:
+        return ScenarioResult("recon_web_engagement_regression", False, "; ".join(problems))
+    return ScenarioResult(
+        "recon_web_engagement_regression", True,
+        f"recon->web progressed cleanly: {len(nmap_calls)} -sT nmap scan(s), "
+        f"web evidence created, no premature credential, no fabricated success, "
+        f"budget {u['calls_attempted']}/{u['max_calls_per_run']} consistent",
+    )
+
+
 SCENARIOS: list[Any] = [
     scenario_ssh_success,
     scenario_dfr_success,
@@ -661,6 +842,7 @@ SCENARIOS: list[Any] = [
     scenario_repair_path_capability_activation,
     scenario_duplicate_evidence,
     scenario_restart_replay,
+    scenario_recon_web_engagement_regression,
 ]
 
 

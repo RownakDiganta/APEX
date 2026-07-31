@@ -9570,3 +9570,126 @@ and `tests/apex_host/test_phase6_dispatcher.py` each had one test updated from
 the superseded "reorder differs" rule to the new "independent-flag reorder is
 one identity" contract (the opposite-value-pair distinctness test is unchanged).
 All fake planners/runners — no real subprocess, network, or LLM.
+
+---
+
+## 28. LLM planner-call budget efficiency and fallback accounting
+
+Fixes the demonstrated run that exhausted the global LLM budget
+(`global LLM budget exhausted (5/5 calls used)`) during minimal recon and
+failed web attempts. This does NOT make the budget unlimited — it removes
+unnecessary calls, accounts fallbacks by reason, and provides a practical,
+range-validated configurable budget.
+
+### 28.1 Retry/fallback authority (unchanged, restated)
+
+`apex_host.planning.engine.PlanningEngine` is the SOLE component that calls
+`ModelRouter.planner_llm()`. Deterministic fallback remains mandatory: any
+provider failure, invalid/low-confidence output, or exhausted budget falls back
+to the deterministic planner (or terminates when `--llm-required`, §17.1).
+
+### 28.2 Deterministic decisions never consume an LLM call
+
+These are all deterministic and, by architecture, make NO LLM call: policy
+scope normalization (`apex_host.policy.scope`), backend capability selection
+(`apex_host.tools.backend.backend_raw_socket_capability`), the known Nmap
+`raw_socket_permission_denied` → `-sT` repair (§27,
+`apex_host.orchestration.repair_node` deterministic branch — before and
+independent of the LLM `RepairEngine`), duplicate suppression
+(`TaskDispatcher` + `TaskRegistry`), credential/web prerequisite checks (§26
+`apex_host.planners.phase_gates`), and obvious phase unavailability (the §26
+gates route `GlobalPlanner` to `done` so the domain planner — and thus the LLM
+— is never invoked).
+
+### 28.3 Deterministic-first abandon gate (the primary fix)
+
+`PlanningEngine.plan()` consults the deterministic planner ONCE per turn
+**when a budget tracker is present** (a real, cost-bounded engagement). When it
+abandons — no actionable task candidate exists — the engine returns that
+decision WITHOUT reserving a budget slot or invoking the LLM
+(`fallback_reasons["no_actionable_candidate"]`). When the deterministic planner
+DOES produce candidates the LLM is still consulted (it may improve on them), and
+that SAME single deterministic result is reused as the fallback on every later
+LLM-failure path (`precomputed_fallback`) — one deterministic decision per
+turn, never re-asked. With NO budget tracker (unit tests / unlimited mode) the
+gate does not fire and the pre-existing LLM-primary behavior is preserved
+exactly. Combined with the already-present repeated-context skip (identical
+subgraph+evidence → LLM skipped) and the permanent-provider-error run-wide
+short-circuit, the budget is not burned on dead-end turns.
+
+The engine does not itself know which candidate tasks are duplicates or
+policy-blocked (it has no registry/advisor) — those LLM-produced tasks are
+suppressed at DISPATCH (§27) and, because they create no new EKG nodes, the
+next turn's identical context triggers the repeated-context skip rather than a
+fresh LLM call.
+
+### 28.4 Configurable budget with validated ranges
+
+`ApexConfig.max_llm_calls_per_run` (default **5** — conservative) and
+`max_llm_calls_per_phase` (default **2**), CLI flags `--max-llm-calls` /
+`--max-llm-calls-per-phase` (both entry points, via
+`ApexConfig.from_cli_args`). `apex_host.eval.check_config.validate_combinations`
+(the repository's config-validation convention, §Phase 25) rejects a per-run or
+per-phase budget below 1, a per-run budget above `_MAX_LLM_CALLS_CEILING`
+(500 — a sanity ceiling, not a recommendation), and a per-phase budget
+exceeding the per-run budget. The documented HTB live-test command
+(`README.md`) uses a practical bounded **20** / per-phase **4**, not the
+default 5.
+
+### 28.5 Fallback reason accounting
+
+`LLMBudgetTracker.fallbacks` is incremented ONLY via `_note_fallback(reason)`,
+so it always equals `sum(fallback_reasons.values())`. `record_fallback_only(reason)`
+(no LLM attempt: `no_actionable_candidate`/`no_llm_configured`/`budget_exhausted`/
+`repeated_context`/`permanent_provider_error`/`prompt_blocked`) and
+`record_failure(error_category)` (a real call that failed: validation/transient/
+permanent/low_confidence/provider category) both route through it.
+`to_dict()`/`from_dict()` round-trip `fallback_reasons`; the report's **LLM
+Usage** section and the `llm_usage` JSON block surface the per-reason breakdown
+so fallbacks are explainable, not one opaque count. No API key, credential,
+raw prompt, or full provider response is ever logged or serialized.
+
+### 28.6 Web-evidence gate correction
+
+`apex_host.planners.phase_gates._has_web_content` no longer treats a BARE
+`tech` node as web content: nmap version detection (`-sV`) produces
+`service`+`tech` with no endpoint, and counting that as "web discovery
+complete" skipped the web phase entirely on any versioned HTTP service (a
+control-flow regression the recon→web release-gate scenario now guards). A
+`tech` node counts as web content only when an `endpoint` node is also present
+(web fingerprinting produces endpoint+tech together); `form`/`web_opportunity`
+and a fetched-endpoint (browsed / real HTTP status) remain unambiguous web
+evidence.
+
+### 28.7 Release gate
+
+`apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,
+`scenario_recon_web_engagement_regression` — a synthetic end-to-end recon→web
+engagement (one authorized host; ports 22+80; unprivileged remote backend;
+homepage+robots.txt via URL targets; no credentials; fake tools + a
+FakeModelRouter + a bounded budget, driven through the REAL compiled graph). It
+FAILS the gate if any demonstrated regression reappears: a privileged Nmap scan
+on the unprivileged backend, a repeated unchanged fundamental failure, an
+authorized same-host HTTP URL rejected by policy, a credential task without a
+credential hypothesis, a fabricated success / forced phase completion,
+inconsistent planner-call accounting, a report schema regression, or a
+non-idempotent runtime shutdown. Run it with:
+
+```bash
+uv run python -m apex_host.eval.release_gate
+```
+
+Its exit code is a test-suite result, not an engagement-success signal. This
+work repairs the demonstrated control-flow and execution regressions; it does
+not, and does not claim to, guarantee compromise of arbitrary HTB machines.
+
+### 28.8 Tests
+
+`tests/apex_host/test_llm_budget_efficiency.py` (15 tests): the budgeted
+abandon-gate skips the LLM and the budget slot; the unbudgeted path still
+attempts the LLM (LLM-primary preserved); one deterministic decision reused per
+turn; `fallbacks == sum(fallback_reasons)` and serialization round-trip; budget
+range validation (zero/negative/excessive/per-phase>per-run rejected, practical
+20/4 valid); and both the recon→web scenario and the full 13-scenario gate
+pass. `tests/apex_host/test_credential_phase_gate.py` gains the bare-`tech`
+vs `tech`+endpoint web-content cases. All fakes — no real provider/network.

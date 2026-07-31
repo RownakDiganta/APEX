@@ -1911,6 +1911,12 @@ def format_text(report: RunReport) -> str:
         lines.append(f"  Calls succeeded   : {u.get('calls_succeeded', 0)}")
         lines.append(f"  Calls failed      : {u.get('calls_failed', 0)}")
         lines.append(f"  Fallbacks (total) : {u.get('fallbacks', 0)}")
+        # Per-reason fallback breakdown (CLAUDE.md §28) — WHY the deterministic
+        # planner was used, so fallbacks are no longer one unexplained count.
+        fb_reasons = u.get("fallback_reasons") or {}
+        if fb_reasons:
+            reason_str = ", ".join(f"{k}={v}" for k, v in sorted(fb_reasons.items()))
+            lines.append(f"  Fallback reasons  : {reason_str}")
         lines.append(f"  Retries           : {u.get('retries', 0)}")
         lines.append(f"  Total elapsed s   : {u.get('total_elapsed_seconds', 0.0):.2f}")
         if u.get("stop_reason"):

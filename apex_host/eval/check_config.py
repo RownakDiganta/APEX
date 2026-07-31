@@ -49,6 +49,11 @@ from apex_host.config_env import (
 
 _CONNECTIVITY_TIMEOUT_SECONDS = 5.0
 
+# Generous sanity ceiling for the per-run LLM planner-call budget — not a
+# recommended value, just an upper bound that rejects an accidentally
+# unbounded/huge budget (which would defeat the cost cap the setting enforces).
+_MAX_LLM_CALLS_CEILING = 500
+
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -175,6 +180,30 @@ def validate_combinations(config: ApexConfig) -> list[str]:
 
     if config.max_turns < 1:
         problems.append(f"max_turns={config.max_turns} must be at least 1")
+
+    # LLM planner-call budget ranges (CLAUDE.md §28). Reject zero, negative,
+    # and excessively large values — an unbounded/huge budget defeats the
+    # cost cap the setting exists to enforce. _MAX_LLM_CALLS_CEILING is a
+    # deliberately generous sanity ceiling, not a recommended value.
+    if config.max_llm_calls_per_run < 1:
+        problems.append(
+            f"max_llm_calls_per_run={config.max_llm_calls_per_run} must be at least 1 "
+            "(use --use-llm=false / llm_provider=fake for a no-LLM run instead of a zero budget)"
+        )
+    elif config.max_llm_calls_per_run > _MAX_LLM_CALLS_CEILING:
+        problems.append(
+            f"max_llm_calls_per_run={config.max_llm_calls_per_run} exceeds the sanity ceiling "
+            f"{_MAX_LLM_CALLS_CEILING} — an unbounded budget defeats the cost cap"
+        )
+    if config.max_llm_calls_per_phase < 1:
+        problems.append(
+            f"max_llm_calls_per_phase={config.max_llm_calls_per_phase} must be at least 1"
+        )
+    elif config.max_llm_calls_per_phase > config.max_llm_calls_per_run:
+        problems.append(
+            f"max_llm_calls_per_phase={config.max_llm_calls_per_phase} must not exceed "
+            f"max_llm_calls_per_run={config.max_llm_calls_per_run}"
+        )
 
     if config.tool_service_timeout_seconds < 0:
         problems.append(

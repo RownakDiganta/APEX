@@ -110,9 +110,25 @@ class TestWebEvidence:
         sg = _subgraph(_node("endpoint", {"url": f"http://{_HOST}/", "browsed": True}))
         assert web_evidence_status(sg).complete is True
 
-    def test_form_tech_opportunity_are_complete(self) -> None:
-        for t in ("form", "tech", "web_opportunity"):
+    def test_form_and_opportunity_are_complete(self) -> None:
+        for t in ("form", "web_opportunity"):
             assert web_evidence_status(_subgraph(_node(t, {}))).complete is True
+
+    def test_bare_tech_node_is_not_web_content(self) -> None:
+        # A bare `tech` node with no endpoint is produced by nmap version
+        # detection (service+tech), not web fetching — it must NOT mark web
+        # discovery complete (else the web phase is skipped on any versioned
+        # HTTP service). CLAUDE.md §26.3/§28.
+        assert web_evidence_status(_subgraph(_node("tech", {}))).complete is False
+
+    def test_tech_with_endpoint_is_web_content(self) -> None:
+        # Web fingerprinting (curl/browser) produces an endpoint AND a tech
+        # node together — that tech node legitimately counts.
+        sg = _subgraph(
+            _node("endpoint", {"url": f"http://{_HOST}/"}),
+            _node("tech", {"name": "Apache"}),
+        )
+        assert web_evidence_status(sg).complete is True
 
     def test_no_web_capability_is_trivially_complete(self) -> None:
         assert web_evidence_status(_subgraph(), has_web_capability=False).complete is True
