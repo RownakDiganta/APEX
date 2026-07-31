@@ -295,8 +295,14 @@ services:
     # corpus, no secrets directory, and no `.ovpn` file is mounted
     # anywhere in this file.
     #
-    # No `user:` override: the image's own `USER apex` (UID/GID 1000)
-    # already applies. No Docker socket, no host networking, no
+    # No `user:` override: the image's own entrypoint
+    # (docker/apex/entrypoint.py) starts as root ONLY to prepare (chown) the
+    # root-owned apex-knowledge-cache volume below, then permanently drops to
+    # the non-root apex user (UID/GID 1000) before running anything — so the
+    # engagement itself always runs non-root. Do NOT add `user: apex` here:
+    # that would start the entrypoint as apex and it could no longer repair a
+    # root-owned volume, reintroducing the /app/knowledge_cache/.init.lock
+    # permission failure. No Docker socket, no host networking, no
     # `privileged:`, no added capabilities.
     #
     # Safe default command (Infra Phase 9): the container's own ENTRYPOINT

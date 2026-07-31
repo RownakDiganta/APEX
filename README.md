@@ -2397,6 +2397,67 @@ engagement- or target-specific state. Reset with `docker volume rm
 apex-knowledge-cache` (stack stopped) or `docker compose down -v`, or
 in-process via `--reset-knowledge-cache [FAMILY]`.
 
+### Knowledge-cache volume ownership (non-root, no `chmod 777`)
+
+The APEX application always runs as a **non-root** user (`apex`, UID/GID
+1000). A brand-new Docker *named* volume mounted at `/app/knowledge_cache`
+is created **root-owned**, which would stop that non-root user from writing
+the cache lock (`/app/knowledge_cache/.init.lock`) and block the engagement.
+
+APEX handles this automatically — **you never need `chmod 777` or a manual
+`chown`.** The image's entrypoint (`docker/apex/entrypoint.py`) starts as
+root **only** to prepare that one mounted directory: it creates
+`/app/knowledge_cache` if missing, repairs its ownership to the `apex` user
+**only when it is actually wrong** (never an unconditional recursive
+`chown`), applies a restrictive `0770` mode (never world-writable), verifies
+the runtime user can write, and then **permanently drops privileges**
+(`os.setgroups`/`setgid`/`setuid`) before `os.execv`-ing the real
+entrypoint. The engagement, LLM calls, report generation, and tool
+orchestration therefore all run as the non-root `apex` user — only the brief
+directory preparation ever holds root. Existing cache contents are never
+deleted. If the directory still cannot be made writable, the container fails
+fast with a clear diagnostic (path, runtime UID/GID, current ownership, and
+mode — never any secret).
+
+**Diagnosing cache ownership** — verify container identity and cache
+writability through the real entrypoint (which performs the fix and drops to
+`apex`):
+
+```bash
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
+  run --rm apex exec -- sh -c \
+  'id; ls -ld /app/knowledge_cache; touch /app/knowledge_cache/.permtest && rm /app/knowledge_cache/.permtest && echo "knowledge cache is writable"'
+```
+
+Expect `uid=1000(apex)`, `/app/knowledge_cache` owned by `apex`, and
+`knowledge cache is writable`. (Do **not** use `--entrypoint sh`: that
+bypasses the privilege-drop entrypoint and runs as root, so it would not
+reflect the real non-root runtime.)
+
+**Recreating only the cache volume** (for a legacy volume whose ownership
+is unrecoverable, or to force a full knowledge rebuild) — the Compose
+project prefix varies per checkout/directory and must be **discovered, not
+assumed** (`newapex_...` is only this checkout's prefix):
+
+```bash
+# Discover the exact Compose-managed volume name:
+docker volume ls --filter name=apex-knowledge-cache
+# Recreate it (stack stopped) — one of:
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb down --remove-orphans
+docker volume rm "<discovered-volume-name>"        # then start the stack again
+# or, to remove all this project's named volumes at once:
+docker compose -f compose.yaml -f compose.htb.yaml --profile htb down -v
+```
+
+**The `payload repo path does not exist: payloads` warning is expected and
+non-blocking.** The canonical Docker workflow seeds compiled knowledge via
+`--knowledge-root /app/knowledge` (baked into the image) and does not pass
+`--payload-repo`, so `run_htb_local`'s default relative `./payloads` — an
+optional, host-supplied raw payload repository that the image intentionally
+does not ship — is simply absent. It is logged as a warning and the
+engagement continues; it is unrelated to the knowledge cache and was **not**
+the cause of the permission crash.
+
 ## Privilege Escalation Planning Framework
 
 The `priv_esc` phase is a **planning framework, not privilege escalation.**

@@ -5767,6 +5767,98 @@ entirely out of scope for this phase and untouched.
 
 ---
 
+### Infra Phase 12 — Knowledge-cache named-volume ownership fix ✓ COMPLETE
+
+**Files:** `docker/apex/entrypoint.py` (new), `docker/apex/Dockerfile`
+(updated), `compose.yaml` (comment updated),
+`tests/docker/test_apex_entrypoint.py` (new, 40 tests),
+`tests/docker/test_apex_dockerfile.py` (two tests updated), `README.md`.
+
+**Root cause (blocked authorized HTB live runs):** the `apex` service mounts
+the Docker *named* volume `apex-knowledge-cache` at `/app/knowledge_cache`
+(`compose.yaml`). `/app/knowledge_cache` was never created in the apex image,
+so a brand-new named volume mounted onto that non-existent path was created
+**root-owned**. The application runs as the non-root `apex` user (UID/GID
+1000), so its first durable-cache operation — `apex_host/knowledge/init_lock.py`
+creating `/app/knowledge_cache/.init.lock` via `os.open(..., O_CREAT|O_EXCL)`
+— failed with `PermissionError: [Errno 13] Permission denied`, crashing the
+engagement (`ERROR:__main__:engagement failed to run`). The
+`payload repo path does not exist: payloads` line is an expected,
+non-blocking warning (the canonical workflow seeds via `--knowledge-root`,
+not `--payload-repo`), **not** the cause — left unchanged, documented as
+non-blocking in `README.md`.
+
+**Architectural decision — root-init entrypoint + permanent privilege drop
+(stdlib, no `gosu`/`su-exec` package).** Fixing an *already-existing*
+root-owned volume (requirement) needs runtime root, which a non-root
+process cannot do. So the apex image no longer sets a final `USER apex`;
+instead `ENTRYPOINT ["python", "/app/entrypoint.py"]` runs
+`docker/apex/entrypoint.py` as root, which:
+1. `os.makedirs("/app/knowledge_cache")` (idempotent);
+2. repairs ownership to the `apex` UID/GID **only when it is actually wrong**
+   (a fresh/legacy root-owned volume) — a conditional recursive `chown`,
+   never an unconditional one on the warm path (the cache is small
+   bookkeeping); `/app/run_reports` is a bind mount already writable and is
+   deliberately NOT touched (chowning a bind mount rewrites host ownership);
+3. applies mode `0o770` (restrictive, never world-writable — no `chmod 777`);
+4. permanently drops privileges via `os.setgroups`/`os.setgid`/`os.setuid`;
+5. verifies the now-non-root process can write, failing fast with a clear,
+   secret-free diagnostic (path, runtime UID/GID, ownership, mode) if not —
+   never silently falling back to another directory, never suppressing the
+   `PermissionError` in Python;
+6. `os.execv(sys.executable, [..., "-m", "apex_host.container_entrypoint", *argv])`
+   — process replacement, so the real (unchanged) entrypoint inherits PID 1,
+   signals, and the exit code, and all CLI args (including the `exec -- ...`
+   form) are forwarded verbatim.
+
+The engagement, LLM calls, report generation, and tool orchestration all run
+as the non-root `apex` user — only the brief directory preparation ever holds
+root. The Dockerfile also now `mkdir -p /app/knowledge_cache && chown` at
+build so a *fresh* volume inherits `apex` ownership on first mount (belt and
+suspenders; the entrypoint still handles pre-existing root-owned volumes).
+`apex_host`/`memfabric` and the live-run interlock/dry-run defaults are
+completely unchanged — this is container-plumbing only.
+
+**Binding invariants (Infra Phase 12):**
+- The apex container's *runtime* is always non-root (`apex`, UID/GID 1000);
+  root is held only transiently by the entrypoint's directory preparation and
+  is permanently dropped before `os.execv`. Do NOT re-add `USER apex` to the
+  Dockerfile and do NOT add `user: apex` to the `apex` Compose service —
+  either would start the entrypoint as `apex` and it could no longer repair a
+  root-owned volume, reintroducing the crash.
+- Never `chmod 777` the cache; the mode is `0o770`.
+- Never suppress the cache `PermissionError` in Python and never silently fall
+  back to a different cache directory — the entrypoint fixes ownership or
+  fails loudly.
+- Never chown `/app/run_reports` from the entrypoint (bind mount).
+- The Compose project prefix (`newapex_`) is per-checkout and must be
+  discovered (`docker volume ls --filter name=apex-knowledge-cache`), never
+  hard-coded in code or docs.
+
+**Tests:** `tests/docker/test_apex_entrypoint.py` (imports the standalone
+script via `importlib`, like `test_vpn_scripts.py`): source invariants
+(no `chmod 777`, `0o770` mode, only prepares knowledge_cache, execs the real
+entrypoint); `prepare_dir` idempotency, conditional-vs-recursive chown,
+existing-file preservation, restrictive mode; `verify_writable` true/false;
+`report_unwritable` diagnostic content + no-secret-leak + non-zero exit;
+`main` root-start (prepare→drop→execv), non-root-start (skip prepare/drop),
+`exec -- ...` argv forwarding, and fail-fast-when-unwritable (never execs the
+app). Plus an optional Docker end-to-end regression (skipped unless `docker`
++ a built apex image are present) that mounts a deliberately root-owned fresh
+volume and proves the runtime user CAN create `.init.lock` through the
+entrypoint (as UID 1000) and CANNOT when the entrypoint is bypassed
+(reproducing the original `Permission denied`).
+
+**Operational notes:** operators never run `chmod 777`/`chown`. Diagnose with
+`docker compose ... run --rm apex exec -- sh -c 'id; ls -ld /app/knowledge_cache; touch /app/knowledge_cache/.permtest && rm ...'`
+(through the entrypoint — `--entrypoint sh` bypasses the drop and misleads).
+Recreate a legacy volume with `docker compose ... down -v` or
+`docker volume rm <discovered-name>` (discover via
+`docker volume ls --filter name=apex-knowledge-cache`). Full operator guide:
+`README.md` "Knowledge-cache volume ownership (non-root, no chmod 777)".
+
+---
+
 ## 23. Application Repair Roadmap — Phase 12
 
 Separate from the Infrastructure Migration Roadmap (§22) and the Reviewer

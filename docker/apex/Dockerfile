@@ -151,6 +151,16 @@ COPY --chown=apex:apex Knowledge/policy_db/compiled /app/knowledge/policy_db/com
 # opt-in; nothing in apex_host writes here unless explicitly told to).
 RUN mkdir -p /app/run_reports && chown apex:apex /app/run_reports
 
+# Mount point for the persistent knowledge-initialization cache named volume
+# (apex-knowledge-cache -> /app/knowledge_cache, see compose.yaml). Creating
+# and chowning it here means a BRAND-NEW named volume inherits apex ownership
+# on first mount (Docker copies the image directory's ownership into an empty
+# volume). It is NOT sufficient on its own, though: a pre-existing or
+# externally-created root-owned volume is never re-initialized from the image,
+# so the entrypoint below performs an idempotent runtime ownership repair too.
+# See docker/apex/entrypoint.py and CLAUDE.md "Knowledge-cache volume ownership".
+RUN mkdir -p /app/knowledge_cache && chown apex:apex /app/knowledge_cache
+
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
@@ -164,7 +174,17 @@ ENV PATH="/app/.venv/bin:${PATH}" \
 # — see CLAUDE.md Infra Phase roadmap for when one will be introduced) and
 # no placeholder/fake credential value is defined for any of them.
 
-USER apex
+# Root-init privilege-drop entrypoint (knowledge-cache volume ownership fix).
+# The image deliberately does NOT set a final `USER apex`: the container must
+# start as root so this entrypoint can prepare (chown) the root-owned
+# apex-knowledge-cache named volume, and it then PERMANENTLY drops to the
+# non-root apex user (os.setgroups/setgid/setuid) before os.execv-ing the real
+# entrypoint. The engagement, LLM calls, report generation, and tool
+# orchestration all run as the non-root apex user — only the brief directory
+# preparation ever holds root. No `gosu`/`su-exec` package is added; the drop
+# uses the Python standard library already present in the image. See
+# docker/apex/entrypoint.py's own module docstring for the full rationale.
+COPY --chown=apex:apex docker/apex/entrypoint.py /app/entrypoint.py
 
 # No HEALTHCHECK: APEX is a one-shot CLI application, not a long-running
 # server (apex_tool_service, the actual HTTP server in this repository, is
@@ -175,14 +195,18 @@ USER apex
 # docs/apex-container.md "Health check decision".
 
 # ---------------------------------------------------------------------------
-# Entrypoint (Infra Phase 9): apex_host.container_entrypoint — parses
-# configuration, prints a redacted summary, runs local preflight (report
-# directory, compiled knowledge, policy) and, for `smoke`/`run`, connectivity
-# checks — before dispatching to any operational command. Exec-form JSON
-# array (no shell), so `docker run`/Compose deliver signals directly to the
-# Python interpreter, and CMD's arguments are appended to ENTRYPOINT's argv
-# rather than being shell-interpreted. See docs/container-entrypoint.md for
-# the full mode reference (check/smoke/dry-run/run/exec).
+# Entrypoint: docker/apex/entrypoint.py (root-init privilege-drop wrapper,
+# above) which, after preparing the mounted knowledge-cache volume and
+# dropping to the non-root apex user, os.execv's the real, unchanged
+# apex_host.container_entrypoint (Infra Phase 9) — which parses configuration,
+# prints a redacted summary, runs local preflight (report directory, compiled
+# knowledge, policy) and, for `smoke`/`run`, connectivity checks, before
+# dispatching to any operational command. Exec-form JSON array (no shell), so
+# `docker run`/Compose deliver signals directly to the wrapper (and, after
+# os.execv, to the real entrypoint), and CMD's arguments are appended to
+# ENTRYPOINT's argv and forwarded verbatim rather than being shell-interpreted.
+# See docs/container-entrypoint.md for the full mode reference
+# (check/smoke/dry-run/run/exec).
 #
 # Safe default mode: `check` — local-only configuration/report-directory/
 # knowledge/policy validation. Requires no target, contacts no network, and
@@ -195,7 +219,7 @@ USER apex
 # `check` actually validates the real artifact this image ships, not a
 # skipped/optional check — knowledge validation is otherwise a soft-pass
 # when no root is configured (apex_host/eval/preflight.py::check_compiled_knowledge).
-ENTRYPOINT ["python", "-m", "apex_host.container_entrypoint"]
+ENTRYPOINT ["python", "/app/entrypoint.py"]
 CMD ["check", "--knowledge-root", "/app/knowledge"]
 
 # Equivalents for prior bare-module invocations, now that ENTRYPOINT is set

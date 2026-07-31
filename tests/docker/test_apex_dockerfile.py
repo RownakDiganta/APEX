@@ -147,11 +147,41 @@ def test_uv_lock_copied_before_first_party_source() -> None:
 # Non-root execution
 # ---------------------------------------------------------------------------
 
-def test_user_directive_present_and_not_root() -> None:
+def test_runtime_drops_to_non_root_user_via_entrypoint() -> None:
+    """The knowledge-cache volume fix requires the container to start as root
+    (so the entrypoint can chown the root-owned named volume), then
+    PERMANENTLY drop to the non-root apex user before running anything. So the
+    image intentionally has no final `USER apex` directive; instead
+    docker/apex/entrypoint.py performs the privilege drop
+    (os.setgroups/os.setgid/os.setuid) and the ENTRYPOINT points at it. The
+    engagement itself therefore never runs as root."""
+    # No final USER directive that would keep the whole container as root.
     user_lines = [ln for ln in _non_comment_lines() if re.match(r"^USER\s", ln)]
-    assert user_lines, "expected a USER directive"
-    last_user = user_lines[-1].split(maxsplit=1)[1].strip()
-    assert last_user not in ("root", "0"), f"final USER must not be root: {last_user!r}"
+    for ln in user_lines:
+        val = ln.split(maxsplit=1)[1].strip()
+        assert val not in ("root", "0"), f"USER must never be root: {ln!r}"
+
+    entrypoint_script = _REPO_ROOT / "docker" / "apex" / "entrypoint.py"
+    assert entrypoint_script.is_file(), "expected docker/apex/entrypoint.py to exist"
+    src = entrypoint_script.read_text(encoding="utf-8")
+    # It must permanently drop privileges to the non-root runtime user.
+    assert "setuid" in src and "setgid" in src, "entrypoint must drop UID and GID"
+    assert "_RUNTIME_USER" in src and '"apex"' in src, "entrypoint must target the non-root apex user"
+    # It must never widen permissions to world-writable. (A `& 0o777`
+    # permission-bit mask in the diagnostic is fine; a chmod target is not.)
+    assert "chmod 777" not in src and "0777" not in src, "entrypoint must not use chmod 777"
+    for ln in src.splitlines():
+        if "0o777" in ln:
+            assert "& 0o777" in ln, f"0o777 may only be used as a permission mask: {ln!r}"
+    # It must hand off to the real, unchanged container entrypoint.
+    assert "apex_host.container_entrypoint" in src, "entrypoint must exec the real container entrypoint"
+
+
+def test_no_sudo_or_gosu_password_binary_install() -> None:
+    """The privilege drop uses the Python standard library — no sudo, and no
+    setuid helper package needs installing."""
+    for ln in _non_comment_lines():
+        assert "sudo" not in ln.lower(), f"unexpected sudo reference: {ln!r}"
 
 
 def test_no_sudo_or_password_setup() -> None:
@@ -232,12 +262,21 @@ def test_cmd_present_and_safe() -> None:
     assert re.search(r'"check"', cmd), f"expected the safe default CMD to use 'check' mode: {cmd!r}"
 
 
-def test_entrypoint_present_and_uses_container_entrypoint_module() -> None:
+def test_entrypoint_present_and_uses_privilege_drop_wrapper() -> None:
+    """ENTRYPOINT is the root-init privilege-drop wrapper
+    (docker/apex/entrypoint.py, copied to /app/entrypoint.py), which os.execv's
+    the real apex_host.container_entrypoint after dropping privileges. Exec-form
+    JSON array, so CMD args are forwarded and signals delivered directly."""
     entrypoint_lines = [ln for ln in _non_comment_lines() if re.match(r"^ENTRYPOINT\b", ln)]
-    assert entrypoint_lines, "expected an ENTRYPOINT directive (Infra Phase 9)"
+    assert entrypoint_lines, "expected an ENTRYPOINT directive"
     entrypoint = entrypoint_lines[-1]
-    assert "apex_host.container_entrypoint" in entrypoint
+    assert "/app/entrypoint.py" in entrypoint, "ENTRYPOINT must be the privilege-drop wrapper script"
     assert entrypoint.strip().startswith("ENTRYPOINT ["), "must be exec-form JSON array, not shell form"
+    # The wrapper is copied into the image and forwards to the real entrypoint.
+    copy_lines = [ln for ln in _non_comment_lines() if re.match(r"^COPY\b", ln)]
+    assert any("docker/apex/entrypoint.py" in ln and "/app/entrypoint.py" in ln for ln in copy_lines), (
+        "expected a COPY of docker/apex/entrypoint.py to /app/entrypoint.py"
+    )
 
 
 def test_entrypoint_and_cmd_use_no_shell_json_array_form() -> None:
