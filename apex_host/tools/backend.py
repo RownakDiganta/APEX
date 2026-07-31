@@ -52,9 +52,13 @@ __all__ = [
     "RemoteToolBackend",
     "VALID_TOOL_BACKENDS",
     "backend_supports_raw_sockets",
+    "backend_raw_socket_capability",
     "backend_capability_mode",
     "CAPABILITY_MODE_RAW_SOCKET",
     "CAPABILITY_MODE_TCP_CONNECT",
+    "RAW_SOCKET_CAPABILITY_RAW",
+    "RAW_SOCKET_CAPABILITY_UNPRIVILEGED",
+    "RAW_SOCKET_CAPABILITY_UNKNOWN",
     "select_tool_backend",
     "select_runtime_backend",
     "to_run_command_fn",
@@ -395,6 +399,46 @@ def backend_supports_raw_sockets(config: "ApexConfig") -> bool:
 #: unbounded set of ad-hoc labels.
 CAPABILITY_MODE_RAW_SOCKET = "raw_socket"
 CAPABILITY_MODE_TCP_CONNECT = "tcp_connect"
+
+
+#: Three-state raw-socket capability (requirement: distinguish raw-capable /
+#: unprivileged / unknown). Mirrors the constants in
+#: ``apex_host.tools.nmap_command`` so the two never drift.
+RAW_SOCKET_CAPABILITY_RAW = "raw_socket"
+RAW_SOCKET_CAPABILITY_UNPRIVILEGED = "unprivileged"
+RAW_SOCKET_CAPABILITY_UNKNOWN = "unknown"
+
+
+def backend_raw_socket_capability(config: "ApexConfig") -> str:
+    """Return the three-state raw-socket capability of *config*'s backend:
+    ``RAW_SOCKET_CAPABILITY_RAW`` / ``_UNPRIVILEGED`` / ``_UNKNOWN``.
+
+    This is the reporting- and scan-selection-facing counterpart to the
+    boolean :func:`backend_supports_raw_sockets`. Precedence:
+
+    - explicit ``config.tool_backend_raw_socket_capable`` override →
+      ``raw_socket`` (``True``) / ``unprivileged`` (``False``) — the only
+      "explicit trusted capability response" that confirms raw-socket support;
+    - otherwise ``remote`` → ``unprivileged`` (the Kali tool-service container
+      is documented non-root with zero added capabilities);
+    - otherwise ``local``/``dry-run`` → ``raw_socket`` (historical default,
+      typically root-capable);
+    - any other/unrecognized name (or a derivation error) → ``unknown`` —
+      which every scan-selection caller defaults **safely** to the
+      unprivileged ``-sT`` behavior (``apex_host.tools.nmap_command``).
+    """
+    override = getattr(config, "tool_backend_raw_socket_capable", None)
+    if override is not None:
+        return RAW_SOCKET_CAPABILITY_RAW if override else RAW_SOCKET_CAPABILITY_UNPRIVILEGED
+    try:
+        name = _normalize_backend_name(config.tool_backend)
+    except ValueError:
+        return RAW_SOCKET_CAPABILITY_UNKNOWN
+    if name == "remote":
+        return RAW_SOCKET_CAPABILITY_UNPRIVILEGED
+    if name in ("local", "dry-run"):
+        return RAW_SOCKET_CAPABILITY_RAW
+    return RAW_SOCKET_CAPABILITY_UNKNOWN
 
 
 def backend_capability_mode(config: "ApexConfig") -> str:

@@ -129,4 +129,13 @@ def build_execution_diagnostic(
         "policy_decision_ref": str(tr.get("policy_rule", "")) or None,
         "retry_index": retry_index,
         "final_disposition": str(tr.get("final_disposition", "")),
+        # Nmap scan-selection diagnostics (present only for nmap executions):
+        # the selected transport (tcp_connect/tcp_syn/udp/ping), the backend's
+        # three-state raw-socket capability, and whether a deterministic
+        # raw-socket repair rewrote the command. Empty strings/False for
+        # non-nmap results.
+        "nmap_transport": str(tr.get("nmap_transport", "")),
+        "backend_raw_socket_capability": str(tr.get("backend_raw_socket_capability", "")),
+        "repaired": bool(tr.get("repaired", False)),
+        "repair_kind": str(tr.get("repair_kind", "")),
     }

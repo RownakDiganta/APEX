@@ -9227,3 +9227,95 @@ add a construction branch to `apex_host.eval.preflight._provider_readiness`;
 add tests to `tests/apex_host/test_llm_providers.py`. Never touch
 `apex_host/planning/engine.py`, `apex_host/llm/gateway.py`, or any planner
 — the provider seam is entirely below `ModelRouter`.
+
+---
+
+## 25. Nmap scan-mode selection and unprivileged-backend safety
+
+Fixes the demonstrated live failure `Couldn't open a raw socket. Error: (1)
+Operation not permitted`: the restricted Kali tool-service backend runs
+non-root with zero added Linux capabilities (docs/kali-container.md §5/§14),
+so any nmap scan mode that needs raw sockets (`-sS`, the privileged `-sV`
+default, UDP) hard-fails there. APEX now selects an unprivileged TCP-connect
+scan whenever the backend lacks raw-socket privilege — **without** granting
+the container `--privileged`, `NET_RAW`/`NET_ADMIN`, or running the service
+as root (that prohibition is non-negotiable — see §22 Infra Phase 6/7).
+
+### 25.1 Backend capability selection (three-state)
+
+`apex_host.tools.backend.backend_raw_socket_capability(config) -> str` returns
+one of `"raw_socket"` / `"unprivileged"` / `"unknown"`. Precedence: an explicit
+`config.tool_backend_raw_socket_capable` override (the only "explicit trusted
+capability response" that confirms raw-socket support) → otherwise `remote` is
+`unprivileged`, `local`/`dry-run` are `raw_socket`, any other/unrecognized name
+is `unknown`. The boolean `backend_supports_raw_sockets` is retained for
+existing callers. **Default to unprivileged unless raw-socket support is
+explicitly confirmed**; `unknown` defaults **safely** to the unprivileged
+`-sT` behavior.
+
+### 25.2 The single authoritative nmap command path
+
+`apex_host/tools/nmap_command.py::normalize_nmap_command(args, target, *,
+capability)` is the ONE place a scan mode is chosen. It is applied at the
+execution chokepoint — `apex_host.execution.dispatcher._run_command` — to
+**every** nmap task (deterministic-planner, LLM-planned, or repaired), so no
+privileged scan can reach an unprivileged backend:
+
+- **Unprivileged / unknown → exactly one `-sT`** (TCP connect). Equivalent to
+  `nmap -sT -sV -Pn -T4 <authorized-target>`. Never emits `-sS`, never relies
+  on nmap's privileged default.
+- **`raw_socket` may keep the existing privileged strategy** — an explicit
+  `-sS`, or nmap's SYN default (no scan flag) — but only that; an arbitrary
+  exotic raw scan is still downgraded to `-sT`.
+- **The LLM cannot inject arbitrary nmap arguments.** Only a fixed allowlist
+  survives (`-sV`, `-Pn`, `-n`, `--open`, `-v`/`-vv`, `-6`, `-T0..-T5`, and the
+  bounded value flags `-p <ports>` / `--top-ports <n>`); scripts (`--script`),
+  output files (`-oN`/`-oX`/`-oG`/`-oA`/`-oS`), input lists (`-iL`/`-iR`), and
+  any extra positional target are dropped. Shell operators are already blocked
+  by `apex_host.tools.safety`. The single positional is always exactly the
+  authorized target. Existing safe flags (bounded ports, `-T` timing, `-Pn`,
+  and the runner.py subprocess timeout) are preserved.
+- **UDP is never silently converted to TCP.** `-sU` on a non-raw-socket
+  backend returns `unsupported=True` and the dispatcher yields a clear
+  `error_category="unsupported_capability"` result (disposition
+  `INVALID_TASK`) — the scan is never executed and never rewritten to TCP.
+
+### 25.3 Bounded one-time deterministic raw-socket repair
+
+If an nmap command still returns the classified error
+`raw_socket_permission_denied` (e.g. a raw-capable backend that unexpectedly
+lacks privilege), `apex_host.orchestration.repair_node.repair_agent` runs a
+**deterministic** repair (before the LLM `RepairEngine`) via
+`nmap_command.plan_raw_socket_repair`:
+
+- retries **at most once**, rewriting to the equivalent `-sT` scan
+  (`repair_kind="raw_socket_to_tcp_connect"`); the original privileged
+  fingerprint is marked `SUPERSEDED` so it is never re-executed;
+- **if the failed command already used `-sT`** (or was a UDP scan), the
+  failure is **terminal** — the fingerprint is marked `FAILED_TERMINAL` and a
+  `raw_socket_terminal` entry is recorded; no re-dispatch, no loop.
+
+The bounded-retry taxonomy (§ Action Fingerprinting) still applies on top —
+`ApexConfig.max_repair_attempts` and `max_fingerprint_retries` cap everything.
+
+### 25.4 Diagnostics
+
+`_run_command` records `nmap_transport` (`tcp_connect`/`tcp_syn`/`udp`/`ping`),
+`backend_raw_socket_capability`, and `nmap_normalized` on the tool result; the
+repaired result carries `repaired`/`repair_kind`. All are surfaced by
+`apex_host.execution.diagnostics.build_execution_diagnostic` (alongside the
+existing `tool_error_category`) so a report can distinguish the selected
+transport, the backend capability, whether a deterministic repair was applied,
+the original failure category, and the repaired execution result — never
+exposing secrets or excessive raw command content.
+
+### 25.5 Tests
+
+`tests/apex_host/test_nmap_scan_mode.py`: `normalize_nmap_command` (unprivileged
+`-sT`, raw-capable privileged, unknown-defaults-safely, exactly-one-scan-mode,
+injection/extra-target stripping, UDP-unsupported), `plan_raw_socket_repair`
+(rewrite / already-`-sT`-terminal / UDP-terminal), `backend_raw_socket_capability`
+(three-state), dispatcher integration (remote runs `-sT`, never `-sS`; local
+keeps privileged; UDP unsupported never runs; diagnostics fields), and the
+deterministic `repair_agent` (one `-sT` re-execution, privileged never run
+verbatim, already-`-sT` terminal). Fake runner only — no real scans.

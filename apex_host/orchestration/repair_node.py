@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from memfabric.ids import new_id
 from memfabric.types import Episode, TaskSpec
 
 from apex_host.execution.context import ExecutionContext
@@ -81,19 +82,59 @@ def make_repair_node(deps: "OrchestrationDeps") -> Any:
         anchor = deps.anchor_id
         subgraph = await deps.api.get_subgraph(anchor, depth=2)
         evidence = await deps.api.query(text=state["goal"], subgraph_anchor=anchor)
-
-        repair_result = await deps.repair_engine.repair(
-            failed_task=failed_task, error=error, phase=state["phase"],
-            evidence=evidence, subgraph=subgraph,
-            repair_attempt=int(state.get("repair_count") or 0),
-        )
         new_repair_count = int(state.get("repair_count") or 0) + 1
+        capability_mode = backend_capability_mode(deps.config)
 
-        if repair_result is None:
-            logger.debug("repair_agent: no repair available for phase=%s", state["phase"])
-            return {"repair_count": new_repair_count}
+        # ── Deterministic, bounded raw-socket repair (runs BEFORE the LLM
+        # repair path). A classified nmap ``raw_socket_permission_denied``
+        # failure is rewritten ONCE to the equivalent unprivileged ``-sT``
+        # scan; a failure that ALREADY used ``-sT`` (or was a UDP scan) is
+        # terminal rather than looping. See
+        # apex_host.tools.nmap_command.plan_raw_socket_repair.
+        failed_tool = str(failed_task_params.get("tool", ""))
+        error_category = str(tool_result.get("error_category") or "")
+        repaired_task: TaskSpec
+        repair_kind = "llm"
+        if failed_tool == "nmap" and error_category == "raw_socket_permission_denied":
+            from apex_host.tools.nmap_command import plan_raw_socket_repair
 
-        repaired_task: TaskSpec = repair_result.repaired_task
+            failed_args = [str(a) for a in failed_task_params.get("args", [])]
+            rs_target = str(failed_task_params.get("target", deps.config.target))
+            plan = plan_raw_socket_repair(failed_args, rs_target)
+            if plan.terminal:
+                terminal_fp = _action_fingerprint(failed_task, state["phase"], capability_mode)
+                await deps.dispatcher.task_registry.update_status(
+                    terminal_fp, TaskStatus.FAILED_TERMINAL,
+                )
+                logger.info("repair_agent: nmap raw-socket failure is terminal — %s", plan.reason)
+                return {
+                    "repair_count": new_repair_count,
+                    "duplicate_actions": [{
+                        "fingerprint": terminal_fp, "tool": "nmap", "target": rs_target,
+                        "phase": state["phase"], "disposition": "raw_socket_terminal",
+                        "reason": plan.reason,
+                        "meaningful_state_change": False,
+                        "repair_changed_action": False,
+                    }],
+                }
+            repaired_task = TaskSpec(
+                id=new_id(), goal_id=state["run_id"],
+                executor_domain=failed_task.executor_domain,
+                params={**dict(failed_task_params), "args": list(plan.repaired_args or [])},
+                subgraph_anchor=deps.anchor_id, phase=state["phase"],
+            )
+            repair_kind = "raw_socket_to_tcp_connect"
+        else:
+            repair_result = await deps.repair_engine.repair(
+                failed_task=failed_task, error=error, phase=state["phase"],
+                evidence=evidence, subgraph=subgraph,
+                repair_attempt=int(state.get("repair_count") or 0),
+            )
+            if repair_result is None:
+                logger.debug("repair_agent: no repair available for phase=%s", state["phase"])
+                return {"repair_count": new_repair_count}
+            repaired_task = repair_result.repaired_task
+
         r_tool = str(repaired_task.params.get("tool", ""))
         r_target = str(repaired_task.params.get("target", deps.config.target))
 
@@ -107,7 +148,6 @@ def make_repair_node(deps: "OrchestrationDeps") -> Any:
         # the identical failing command. Recorded in duplicate_actions
         # (never as an execution episode) so the report shows exactly why
         # no new action was taken.
-        capability_mode = backend_capability_mode(deps.config)
         original_fp = _action_fingerprint(failed_task, state["phase"], capability_mode)
         repaired_fp = _action_fingerprint(repaired_task, state["phase"], capability_mode)
 
@@ -160,6 +200,7 @@ def make_repair_node(deps: "OrchestrationDeps") -> Any:
 
         repaired_tr: dict[str, Any] = dict(repair_dr.tool_result_dict)
         repaired_tr["repaired"] = True
+        repaired_tr["repair_kind"] = repair_kind
         r_error = repaired_tr.get("error")
 
         # Phase 24: shared with parse_observation's own per-result body

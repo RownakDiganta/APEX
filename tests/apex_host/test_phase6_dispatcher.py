@@ -1366,7 +1366,10 @@ class TestToolBackendSeam:
         result = await disp.dispatch(task, ctx)
 
         assert result.disposition is ExecutionDisposition.EXECUTED_SUCCESS
-        assert calls == [("nmap", ["-T4"])]
+        # Nmap normalization (apex_host.tools.nmap_command) always ensures the
+        # authorized target is the single positional. The _FakeConfig backend
+        # is "local" (raw-socket-capable), so no -sT is forced here.
+        assert calls == [("nmap", ["-T4", "10.10.10.10"])]
 
     @pytest.mark.asyncio
     async def test_build_apex_graph_default_omits_tool_backend_and_completes(self) -> None:

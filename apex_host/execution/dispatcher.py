@@ -590,14 +590,53 @@ class TaskDispatcher:
         from apex_host.types import ToolCommand
 
         tool = str(task.params.get("tool", ""))
-        cmd = ToolCommand(tool=tool, args=args, timeout_seconds=self._config.max_command_seconds)
+
+        # ── Nmap scan-mode normalization (the single authoritative nmap
+        # command path). On a backend without raw-socket privilege, force an
+        # unprivileged -sT TCP-connect scan; strip LLM-injected flags/extra
+        # targets; never silently convert UDP to TCP. See
+        # apex_host.tools.nmap_command. Applies to EVERY nmap task —
+        # deterministic, LLM-planned, or repaired — so no privileged scan can
+        # reach an unprivileged backend and hard-fail with "Couldn't open a
+        # raw socket".
+        exec_args = args
+        nmap_transport = ""
+        nmap_capability = ""
+        nmap_normalized = False
+        if tool == "nmap":
+            from apex_host.tools.backend import backend_raw_socket_capability
+            from apex_host.tools.nmap_command import normalize_nmap_command
+
+            nmap_capability = backend_raw_socket_capability(self._config)
+            norm = normalize_nmap_command(args, target, capability=nmap_capability)
+            nmap_transport = norm.transport
+            nmap_normalized = norm.changed
+            if norm.unsupported:
+                # e.g. a UDP scan on a non-raw-socket backend: return a clear
+                # unsupported-capability result instead of executing or
+                # silently rewriting to TCP. `error` is set so this is a
+                # terminal (non-repairable) outcome.
+                return {
+                    "task_id": task.id, "tool": tool, "args": args,
+                    "target": target, "parser": parser, "stdout": "",
+                    "stderr": "", "returncode": 1, "dry_run": self._config.dry_run,
+                    "error": f"unsupported_capability: {norm.reason}", "phase": phase,
+                    "timed_out": False, "backend": "",
+                    "error_category": "unsupported_capability",
+                    "nmap_transport": nmap_transport,
+                    "backend_raw_socket_capability": nmap_capability,
+                    "nmap_normalized": nmap_normalized,
+                }, ExecutionDisposition.INVALID_TASK
+            exec_args = norm.args
+
+        cmd = ToolCommand(tool=tool, args=exec_args, timeout_seconds=self._config.max_command_seconds)
         try:
             result = await self._run_command_fn(cmd, self._config)
         except ValueError as exc:
             # Safety gate in runner.py (or a ToolBackend's own check_command
             # call) rejected the command before any backend was reached.
             tr: dict[str, Any] = {
-                "task_id": task.id, "tool": tool, "args": args,
+                "task_id": task.id, "tool": tool, "args": exec_args,
                 "target": target, "parser": parser, "stdout": "",
                 "stderr": "", "returncode": 1, "dry_run": self._config.dry_run,
                 "error": str(exc), "phase": phase,
@@ -612,7 +651,7 @@ class TaskDispatcher:
             else ExecutionDisposition.EXECUTED_FAILURE
         )
         tr = {
-            "task_id": task.id, "tool": tool, "args": args,
+            "task_id": task.id, "tool": tool, "args": exec_args,
             "target": target, "parser": parser,
             "stdout": result.stdout, "stderr": result.stderr,
             "returncode": result.returncode, "dry_run": result.dry_run,
@@ -630,6 +669,13 @@ class TaskDispatcher:
             "duration_seconds": result.duration_seconds,
         }
         if tool == "nmap":
+            # Diagnostics: the selected transport, the backend's three-state
+            # raw-socket capability, and whether normalization altered the
+            # planned command — so the report can distinguish the scan mode
+            # that actually ran from what was planned.
+            tr["nmap_transport"] = nmap_transport
+            tr["backend_raw_socket_capability"] = nmap_capability
+            tr["nmap_normalized"] = nmap_normalized
             # Live-test debugging fix (Phase 1 of 4): classify WHY nmap
             # failed (e.g. a raw-socket permission failure on a non-root
             # backend) into a bounded diagnostic vocabulary, distinct from
