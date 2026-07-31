@@ -116,15 +116,16 @@ def _target_in_scope(config: "ApexConfig") -> tuple[bool, str]:
     permissive."""
     try:
         from apex_host.policy.policy_loader import load_policy
+        from apex_host.policy.scope import target_in_scope
 
         policy = load_policy(config)
     except Exception as exc:  # noqa: BLE001 - a policy load failure must fail closed
         return False, f"could not load policy for scope check: {type(exc).__name__}"
-    if config.target not in policy.allowed_targets:
-        return False, (
-            f"target {config.target!r} is not in the resolved policy scope "
-            f"{sorted(policy.allowed_targets)}"
-        )
+    # Same normalized host/port scope check every per-task policy rule uses,
+    # so a URL-form target (or a bare host/IP) is authorized consistently.
+    match = target_in_scope(config.target, policy.allowed_targets, allowed_ports=policy.allowed_ports)
+    if not match.allowed:
+        return False, match.reason
     return True, f"target in scope (allowed_targets={sorted(policy.allowed_targets)})"
 
 

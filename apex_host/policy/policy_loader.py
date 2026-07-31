@@ -118,6 +118,13 @@ def load_policy(config: "ApexConfig") -> ScopePolicy:
                 policy_path, exc,
             )
 
+    # Optional port restriction: read from config if the host application
+    # supplied one (``config.allowed_ports``), else ``None`` — the current,
+    # unchanged behaviour of no port restriction. Kept via getattr so this
+    # is backward-compatible with configs that do not define the field.
+    raw_ports = getattr(config, "allowed_ports", None)
+    allowed_ports = frozenset(raw_ports) if raw_ports else None
+
     return ScopePolicy(
         allowed_targets=frozenset({config.target}),
         blocked_tools=_ALWAYS_BLOCKED_TOOLS,
@@ -126,6 +133,7 @@ def load_policy(config: "ApexConfig") -> ScopePolicy:
         require_review_for=list(config.require_policy_approval_for),
         policy_loaded=policy_loaded,
         policy_source=policy_source,
+        allowed_ports=allowed_ports,
     )
 
 

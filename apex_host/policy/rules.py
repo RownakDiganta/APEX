@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 
 from apex_host.planners.priv_esc_opportunities import ENUM_COMMANDS as _ENUM_COMMANDS
 from apex_host.policy.models import PolicyDecision, PolicyStatus
+from apex_host.policy.scope import canonical_allowed_hosts, normalize_target, target_in_scope
 from apex_host.verification.user_flag import is_bounded_candidate_path
 
 if TYPE_CHECKING:
@@ -136,6 +137,21 @@ _FORBIDDEN_COMMAND_PARAM_KEYS: frozenset[str] = frozenset({
 
 
 # ---------------------------------------------------------------------------
+# Shared scope predicate — the ONE authorization path (no per-rule/per-tool
+# duplication). A target's HOST (and, when the policy restricts ports, its
+# port) is compared against the authorized scope via
+# apex_host.policy.scope.target_in_scope — never a prefix or substring match.
+# ---------------------------------------------------------------------------
+
+def _in_scope(raw_target: str, policy: "ScopePolicy") -> bool:
+    """True iff *raw_target* (a bare host/IP or an http(s) URL) normalizes to
+    an authorized host and a permitted port."""
+    return target_in_scope(
+        raw_target, policy.allowed_targets, allowed_ports=policy.allowed_ports,
+    ).allowed
+
+
+# ---------------------------------------------------------------------------
 # Public rule functions
 # ---------------------------------------------------------------------------
 
@@ -162,19 +178,26 @@ def check_target_in_scope(
     policy: "ScopePolicy",
     config: "ApexConfig",
 ) -> PolicyDecision | None:
-    """Block tasks whose explicit target field is not in the allowed targets."""
+    """Block tasks whose explicit target field is not in scope.
+
+    The target may be a bare IP/hostname OR an equivalent http(s) URL for the
+    same authorized host (e.g. ``http://10.129.75.42/robots.txt`` for host
+    ``10.129.75.42``). Authorization is decided by
+    ``apex_host.policy.scope.target_in_scope`` — normalized host equality (and
+    permitted port, when the policy restricts ports), never a prefix/substring
+    match. Malformed, credential-bearing, unsupported-scheme, host-less, and
+    host-confusion targets are all out of scope.
+    """
     raw_target = str(task.params.get("target", "")).strip()
     if not raw_target:
         return None  # no explicit target field; checked by infrastructure rule
 
-    if raw_target not in policy.allowed_targets:
+    match = target_in_scope(raw_target, policy.allowed_targets, allowed_ports=policy.allowed_ports)
+    if not match.allowed:
         return PolicyDecision(
             status=PolicyStatus.blocked,
             rule_name="target_in_scope",
-            reason=(
-                f"target {raw_target!r} is not in the allowed scope "
-                f"{sorted(policy.allowed_targets)}"
-            ),
+            reason=match.reason,
             task_tool=str(task.params.get("tool", "")),
             task_target=raw_target,
         )
@@ -194,17 +217,23 @@ def check_no_attacking_infrastructure(
     """
     args: list[str] = list(task.params.get("args", []))
     tool = str(task.params.get("tool", ""))
+    # Compare against the NORMALIZED authorized hosts so an IP that appears in
+    # args (including inside an in-scope URL like http://<host>/...) is matched
+    # by host, not by raw string — consistent with check_target_in_scope.
+    allowed_hosts = canonical_allowed_hosts(policy.allowed_targets)
 
     for token in args:
         for match in _IPV4_RE.finditer(token):
             ip = match.group(1)
-            if ip not in policy.allowed_targets:
+            normalized = normalize_target(ip)
+            ip_host = normalized.host if normalized is not None else ip
+            if ip_host not in allowed_hosts:
                 return PolicyDecision(
                     status=PolicyStatus.blocked,
                     rule_name="no_attacking_infrastructure",
                     reason=(
                         f"arg {token!r} contains IP {ip!r} which is outside "
-                        f"the allowed scope {sorted(policy.allowed_targets)}"
+                        f"the allowed scope {sorted(allowed_hosts)}"
                     ),
                     task_tool=tool,
                     task_target=ip,
@@ -309,7 +338,7 @@ def check_safe_recon_allowed(
     tool = str(task.params.get("tool", "")).strip().lower()
     raw_target = str(task.params.get("target", "")).strip()
 
-    if tool in _SAFE_RECON_TOOLS and raw_target in policy.allowed_targets:
+    if tool in _SAFE_RECON_TOOLS and raw_target and _in_scope(raw_target, policy):
         return PolicyDecision(
             status=PolicyStatus.approved,
             rule_name="safe_recon_allowed",
@@ -422,7 +451,7 @@ def check_bounded_priv_esc_enumeration(
         return None
 
     raw_target = str(task.params.get("target", "")).strip()
-    if raw_target not in policy.allowed_targets:
+    if not _in_scope(raw_target, policy):
         return None  # fall through; check_target_in_scope already blocked this
 
     if tool == "priv_esc_enum":
@@ -507,7 +536,7 @@ def check_bounded_user_flag_verification(
         return None
 
     raw_target = str(task.params.get("target", "")).strip()
-    if raw_target not in policy.allowed_targets:
+    if not _in_scope(raw_target, policy):
         return None  # fall through; check_target_in_scope already blocked this
 
     forbidden_keys_present = _FORBIDDEN_COMMAND_PARAM_KEYS.intersection(task.params.keys())

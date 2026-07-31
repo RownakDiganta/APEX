@@ -2984,13 +2984,53 @@ The first rule that returns a non-None `PolicyDecision` wins.
 | # | Rule function | When it fires |
 |---|---|---|
 | 1 | `check_no_destructive_command` | `task.params["tool"]` in `policy.blocked_tools` |
-| 2 | `check_target_in_scope` | `task.params["target"]` not in `policy.allowed_targets` |
+| 2 | `check_target_in_scope` | `task.params["target"]` normalizes outside `policy.allowed_targets` (see §19.12) |
 | 3 | `check_no_attacking_infrastructure` | An arg token contains an IP outside the allowed scope |
 | 4 | `check_no_password_list` | An arg token is a wordlist flag (`-w`, `--wordlist`, …) |
 | 5 | `check_no_sensitive_data` | An arg token contains a known sensitive path fragment |
 | 6 | `check_require_review` | Tool is in `policy.require_review_for` |
 | 7 | `check_safe_recon_allowed` | Safe recon tool against assigned target → explicit `approved` |
 | — | Default allow | All rules returned None → `approved` |
+
+### 19.12 Target normalization and URL scope matching (non-negotiable)
+
+**Where it lives.** `apex_host/policy/scope.py` is the **single, authoritative**
+target-normalization and scope-matching helper. Every scope decision — the
+per-task `check_target_in_scope` gate, the positive-approval rules
+(`check_safe_recon_allowed`, `check_bounded_priv_esc_enumeration`,
+`check_bounded_user_flag_verification`, via the shared `rules._in_scope`
+predicate), `check_no_attacking_infrastructure`'s allowed-host comparison, and
+the live-run interlock's `_target_in_scope` — routes through
+`scope.target_in_scope()`. There is **no** duplicate URL-authorization logic in
+`curl`, browser, or workflow code, and no per-tool scope check.
+
+**The rule.** A task's `target` may be a bare IP/hostname **or** an equivalent
+`http`/`https` URL for the same host (e.g. `http://10.129.75.42/robots.txt` for
+authorized host `10.129.75.42`). Scope is authorized by **normalized host
+equality** — the URL's `urllib.parse.urlsplit` hostname (userinfo and port
+stripped by the parser), IP-canonicalized or lowercased, compared for exact
+equality against the canonicalized authorized-host set. **Never a prefix or
+substring match.** When `ScopePolicy.allowed_ports` is set (default `None` = no
+port restriction), a URL whose normalized port (explicit, or the scheme default
+80/443) is not permitted is out of scope even if its host is authorized —
+paths/query strings never change host authorization.
+
+**Rejected as out of scope** (all blocked by `check_target_in_scope`):
+different host; host-confusion suffix (`10.129.75.42.evil.example`); the IP only
+in a path/query (`http://evil.example/?target=10.129.75.42`); unsupported
+scheme (`ftp://`, `file://`); credential-bearing URL (`http://user@host/`,
+`user:pass@host`); host-less/malformed URL; invalid port.
+
+**Redirects.** A redirect is **never** auto-authorized. Any redirect
+destination that becomes a task target is independently checked by the same
+policy gate (an out-of-scope redirect host is blocked exactly like any other
+off-scope target). Do not add redirect-following that bypasses the gate.
+
+**Tests.** `tests/apex_host/test_policy_scope_url.py` — `normalize_target`/
+`target_in_scope` units, positive URL cases, the full blocked-security matrix,
+port restriction, `load_policy` end-to-end, and a dispatcher integration test
+(authorized URL reaches the fake runner; off-scope URL never does, no real
+network call). Uses RFC 5737 documentation IPs, never a live HTB address.
 
 ### 19.5 New `ApexConfig` fields
 

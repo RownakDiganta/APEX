@@ -63,6 +63,14 @@ class ScopePolicy:
 
     ``policy_loaded`` is True when the policy YAML file was found and parsed
     successfully.  False means the conservative default is in effect.
+
+    ``allowed_ports`` optionally restricts which ports an in-scope HTTP(S)
+    URL target may address.  ``None`` (the default) means no port restriction
+    — any port on an authorized host is permitted (the current, unchanged
+    behaviour).  When set, a URL whose normalized port is not in the set is
+    out of scope even if its host is authorized (enforced by
+    ``apex_host.policy.scope.target_in_scope``).  Host authorization is by
+    normalized host equality — never a prefix/substring match.
     """
     allowed_targets: frozenset[str]
     blocked_tools: frozenset[str]
@@ -71,3 +79,4 @@ class ScopePolicy:
     require_review_for: list[str]
     policy_loaded: bool
     policy_source: str
+    allowed_ports: frozenset[int] | None = None
