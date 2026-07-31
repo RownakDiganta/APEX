@@ -290,6 +290,7 @@ class ApexRuntime:
             "execution_backend_log": [],
             "diagnostic_events": [],
             "credential_validation_log": [],
+            "repair_log": [],
             "outcome": "",
             "termination_reason": "",
             "termination_phase": "",

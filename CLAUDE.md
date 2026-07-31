@@ -9445,3 +9445,128 @@ enters no credential/objective turn and fabricates no credential/access node;
 workflow blocked-not-stalled + completion percentage + web page-acquisition
 gate). `tests/apex_host/test_phase12a_state_machine.py` updated to assert the
 fixed behavior. Synthetic only — no real network or LLM calls.
+
+---
+
+## 27. Bounded repair, canonical task identity, and terminal-failure suppression
+
+Fixes the behavior where APEX recognized a fundamental Nmap failure (a
+raw-socket permission error on an unprivileged backend) yet later executed the
+same failing strategy again, while duplicate avoidance stayed zero — and
+ensures policy blocks and missing prerequisites do not consume repeated
+no-action turns without a useful repair or a truthful terminal decision. Most
+of this machinery predates this section (the post-live-test debugging tracks);
+this section is the authoritative statement of the invariants and records the
+canonical-identity + reporting completion.
+
+### 27.1 Retry authority (single decision point)
+
+`apex_host.execution.dispositions.classify_retry(disposition, error)` is the
+ONE retry/repair decision point. No planner, executor, graph node, or repair
+component makes an independent retry decision.
+
+- **A terminal classifier is never overridden by a generic shape.** The
+  coarse `ExecutionDisposition.EXECUTED_FAILURE` /
+  `ExecutionDisposition.is_retryable` "shape" must NOT drive suppression on
+  its own — `TaskDispatcher.dispatch` computes `classify_retry()` FIRST on the
+  ACTUAL error text and that specific decision drives `TaskRegistry` status
+  assignment. A raw-socket "Operation not permitted" failure classifies
+  `may_retry=False` (repair-eligible, not retry-eligible) and is recorded
+  `TaskStatus.FAILED_TERMINAL`, so the identical action is suppressed on every
+  later turn rather than re-executed. This is exactly the class of bug the
+  earlier live test hit (six identical Nmap failures, zero duplicate skips).
+- **Bounded retries.** Even a genuinely transient failure (a timeout —
+  `may_retry=True`) is permitted only `ApexConfig.max_fingerprint_retries`
+  resubmissions under the same fingerprint before it, too, is forced to
+  `FAILED_TERMINAL`.
+
+### 27.2 Canonical task identity (`apex_host.planning.fingerprint.task_fingerprint`)
+
+The fingerprint is the SEMANTIC action identity — `(phase, tool, canonical
+args, canonical target, parser, executor_domain, capability_mode)` — never a
+task-object identity (ephemeral `task.id`/timestamps/run-ids are never hashed).
+Canonicalization is TOOL-AWARE (`_canonical_args` / `_canonical_target`):
+
+- **nmap args** go through
+  `apex_host.tools.nmap_command.canonical_fingerprint_args` — an
+  order-INDEPENDENT canonical form. Harmless reordering of independent flags
+  (`-sV -T4` vs `-T4 -sV`) is ONE identity (so a stateless planner re-emitting
+  the same scan with a different flag order IS recognized as a duplicate),
+  while flag/value pairs stay BOUND and are sorted by `(flag, value)` so
+  semantically-OPPOSITE commands (`-p 80` vs `-p 443`) never collide. The
+  scan-mode intent is preserved as a single representative token, so an
+  explicit `-sT` connect scan is DISTINCT from a no-scan default (a repaired
+  `-sT` is therefore a different action than the original privileged strategy).
+  This deliberately supersedes the earlier Phase-2 "never sort args" rule,
+  which over-corrected by making ALL reordering distinct.
+- **every other tool** preserves argument ORDER (a generic tool's positionals
+  can be order-sensitive) and normalizes only incidental whitespace, plus
+  canonicalizes any URL-shaped token.
+- **targets and URL arg tokens** are normalized via
+  `apex_host.graph_ids.normalize_url` + trailing-slash collapse, so equivalent
+  URL FORMS (`http://h`, `http://h/`, `http://h:80/`) share ONE action
+  identity; distinct paths stay distinct.
+
+### 27.3 Terminal-failure suppression + deterministic bounded repair
+
+- `TaskRegistry` fingerprint status `FAILED_TERMINAL` / `SUPERSEDED` /
+  `COMPLETED` / `PENDING` / `EXECUTING` all suppress a new submission of the
+  same canonical action (`TaskStatus.suppresses_new_submission`). A terminal
+  strategy is thus recorded and the planner's re-proposal is skipped at the
+  dispatch duplicate gate — the blackboard-level record subsequent planners
+  rely on.
+- **Deterministic repair runs BEFORE the LLM and consumes no LLM budget.**
+  `apex_host.orchestration.repair_node` handles a classified nmap
+  `raw_socket_permission_denied` via
+  `apex_host.tools.nmap_command.plan_raw_socket_repair` — rewriting ONCE to
+  the equivalent unprivileged `-sT` scan (a distinct fingerprint → the
+  original is marked `SUPERSEDED`), or, when the failed command already used
+  `-sT` (or was UDP), marking the original `FAILED_TERMINAL` with NO
+  resubmission. `deps.repair_engine` (the LLM path) is never consulted on this
+  branch. A repair that reproduces the same normalized action is rejected
+  before dispatch (`repair_no_change`).
+
+### 27.4 Stall reason semantics
+
+`apex_host.orchestration.stall.StallTracker` distinguishes the dominant cause
+across consecutive no-progress turns: `duplicate_task_stall` (a duplicate
+streak, or a stagnant EKG/planner fingerprint), `policy_blocked` (a
+policy-block streak), and `no_actionable_task` (a no-candidate streak). A
+genuine new (non-duplicate, non-policy-blocked) action resets every streak, so
+a turn whose deterministic repair produced a new action is progress, not a
+stall. Missing prerequisites are handled UPSTREAM by the §26 phase gates (a
+missing credential hypothesis yields a truthful `done` with
+`no_actionable_task`, not repeated credential-phase no-action turns), never by
+fabricating a service/endpoint/credential/opportunity or forcing a phase
+completion.
+
+### 27.5 Reporting (`apex_host.eval.report`)
+
+`RunReport` gains a backward-compatible "Bounded Repair & Suppression" summary
+(text section + `bounded_repair` JSON block), all derived from existing
+accumulated audit state (`state["duplicate_actions"]` dispositions +
+`state["repair_log"]` + `state["policy_decisions"]`), never a fabricated
+finding: `duplicate_action_count` (candidates detected), `executions_suppressed`,
+`terminal_strategies_recorded`, `repairs_attempted`/`_succeeded`/`_failed`/
+`_terminal`/`_no_change`, `no_action_reason_counts` (the cause breakdown), and
+the dominant `stall_reason`. `repair_log` is a new append-only
+`ApexGraphState` field (one entry per `repair_agent` invocation:
+`{kind, tool, target, phase, outcome, changed_action, reason}` — never a
+secret), mirroring the `credential_validation_log` convention.
+
+### 27.6 Tests
+
+`tests/apex_host/test_bounded_repair_dedup.py` (21 tests): semantic nmap
+flag-reorder dedup + opposite-pair distinctness + equivalent-URL-form identity
++ generic-order preservation; a fundamental failure recorded terminal and not
+retried unchanged (dispatcher); `classify_retry` non-retryable for raw-socket
+and the shape-not-overriding-classifier guard; a bounded transient-timeout
+retry; policy-blocked neither retried nor repaired (no loop); deterministic
+`-sT` repair runs once, distinct fingerprint, zero LLM calls; the terminal
+already-`-sT` repair; missing-credential-hypothesis never enters the credential
+phase; and the report duplicate/repair/terminal/no-action-reason/stall-reason
+metrics with no fabricated findings. `tests/apex_host/test_duplicate_actions.py`
+and `tests/apex_host/test_phase6_dispatcher.py` each had one test updated from
+the superseded "reorder differs" rule to the new "independent-flag reorder is
+one identity" contract (the opposite-value-pair distinctness test is unchanged).
+All fake planners/runners — no real subprocess, network, or LLM.

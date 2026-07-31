@@ -235,6 +235,30 @@ class RunReport:
     duplicate_action_count: int = 0
     duplicate_action_entries: list[dict[str, Any]] = field(default_factory=list)
 
+    # Bounded-repair & suppression summary (CLAUDE.md §27) — all derived from
+    # state["duplicate_actions"] (dispositions) + state["repair_log"], never
+    # a fabricated finding. Backward-compatible additive fields.
+    #   executions_suppressed: duplicate-gate skips (an action NOT executed
+    #     because its canonical fingerprint was already attempted/terminal).
+    #   terminal_strategies_recorded: actions recorded FAILED_TERMINAL /
+    #     raw_socket_terminal (a strategy marked permanently unavailable).
+    #   repairs_attempted / _succeeded / _failed: repair_agent invocations by
+    #     outcome (succeeded=executed cleanly; failed=executed-but-failed or
+    #     blocked; terminal/no_change/no_repair are counted separately below).
+    #   repairs_terminal / repairs_no_change: deterministic-repair outcomes
+    #     that produced NO new execution (a raw-socket failure with no valid
+    #     downgrade / a repair that reproduced the same normalized action).
+    #   no_action_reason_counts: no-action turns broken down by cause.
+    executions_suppressed: int = 0
+    terminal_strategies_recorded: int = 0
+    repairs_attempted: int = 0
+    repairs_succeeded: int = 0
+    repairs_failed: int = 0
+    repairs_terminal: int = 0
+    repairs_no_change: int = 0
+    repair_log_entries: list[dict[str, Any]] = field(default_factory=list)
+    no_action_reason_counts: dict[str, int] = field(default_factory=dict)
+
     # Infra Phase 4 — tool-execution backend summary, populated from
     # state["execution_backend_log"]. backend_usage counts executions per
     # backend identifier ("dry-run" | "local" | "remote"); timed_out_count
@@ -870,6 +894,36 @@ def build_report(
     # Duplicate action summary
     raw_dup = list(final_state.get("duplicate_actions") or [])
 
+    # Bounded-repair & suppression summary (CLAUDE.md §27). Every value is
+    # derived from existing accumulated audit state — never a fabricated
+    # finding, never a forced phase completion.
+    #   A "terminal" duplicate_actions disposition marks a strategy recorded
+    #   permanently unavailable (raw_socket_terminal); every OTHER disposition
+    #   (skipped_duplicate at the gate, repair_no_change) is a suppressed
+    #   execution. repair_no_change is counted separately below via repair_log,
+    #   so executions_suppressed here counts only the true duplicate-gate skips.
+    _TERMINAL_DISPOSITIONS = {"raw_socket_terminal"}
+    terminal_strategies_recorded = sum(
+        1 for d in raw_dup if str(d.get("disposition", "")) in _TERMINAL_DISPOSITIONS
+    )
+    executions_suppressed = sum(
+        1 for d in raw_dup
+        if str(d.get("disposition", "")) not in _TERMINAL_DISPOSITIONS
+        and str(d.get("disposition", "")) != "repair_no_change"
+    )
+
+    raw_repair_log = list(final_state.get("repair_log") or [])
+    repairs_succeeded = sum(1 for r in raw_repair_log if r.get("outcome") == "succeeded")
+    repairs_failed = sum(1 for r in raw_repair_log if r.get("outcome") == "failed")
+    repairs_terminal = sum(1 for r in raw_repair_log if r.get("outcome") == "terminal")
+    repairs_no_change = sum(1 for r in raw_repair_log if r.get("outcome") == "no_change")
+    # "attempted" = every repair_agent invocation that actually produced a
+    # repair decision (excludes the "no_repair" declines, which never
+    # attempted a corrected action).
+    repairs_attempted = sum(
+        1 for r in raw_repair_log if r.get("outcome") != "no_repair"
+    )
+
     # Infra Phase 4: tool-execution backend summary
     raw_backend_log = list(final_state.get("execution_backend_log") or [])
     backend_usage: dict[str, int] = {}
@@ -900,6 +954,24 @@ def build_report(
     no_action_count = sum(
         1 for d in planner_decisions if int(d.get("selected_task_count", 0) or 0) == 0
     )
+
+    # Bounded-repair/dedup (CLAUDE.md §27): no-action reason counts — WHY
+    # turns produced no useful new action, so a report distinguishes "the
+    # candidate was a duplicate" from "the candidate was policy-blocked" from
+    # "the planner had no candidate" from "a strategy was recorded terminal".
+    # Derived from the accumulated audit state; never fabricated.
+    no_action_reason_counts: dict[str, int] = {}
+    for d in raw_dup:
+        reason = str(d.get("disposition", "") or "unknown")
+        no_action_reason_counts[reason] = no_action_reason_counts.get(reason, 0) + 1
+    policy_blocked_turns = sum(
+        1 for pd in (final_state.get("policy_decisions") or [])
+        if str(pd.get("status", "")) == "blocked"
+    )
+    if policy_blocked_turns:
+        no_action_reason_counts["policy_blocked"] = policy_blocked_turns
+    if no_action_count:
+        no_action_reason_counts["planner_no_candidate"] = no_action_count
 
     # Phase 12C: access summary — never a password. The successful
     # credential_validation_log entry (if any) supplies protocol/username;
@@ -1197,6 +1269,15 @@ def build_report(
         llm_required_terminated=llm_required_terminated,
         duplicate_action_count=len(raw_dup),
         duplicate_action_entries=raw_dup,
+        executions_suppressed=executions_suppressed,
+        terminal_strategies_recorded=terminal_strategies_recorded,
+        repairs_attempted=repairs_attempted,
+        repairs_succeeded=repairs_succeeded,
+        repairs_failed=repairs_failed,
+        repairs_terminal=repairs_terminal,
+        repairs_no_change=repairs_no_change,
+        repair_log_entries=raw_repair_log,
+        no_action_reason_counts=no_action_reason_counts,
         backend_usage=backend_usage,
         timed_out_count=timed_out_count,
         credential_attempts_by_protocol=credential_attempts_by_protocol,
@@ -1884,6 +1965,31 @@ def format_text(report: RunReport) -> str:
                 detail += f" repair_changed_action={e.get('repair_changed_action')}"
             lines.append(detail)
 
+    # Bounded-repair & suppression summary (CLAUDE.md §27). Shown only when
+    # there was something to report — a repair attempt, a suppression, or a
+    # terminal strategy.
+    if (
+        report.repairs_attempted or report.executions_suppressed
+        or report.terminal_strategies_recorded or report.repairs_terminal
+        or report.repairs_no_change or report.no_action_reason_counts
+    ):
+        lines.append("\nBounded Repair & Suppression")
+        lines.append(f"  Duplicate candidates detected : {report.duplicate_action_count}")
+        lines.append(f"  Executions suppressed         : {report.executions_suppressed}")
+        lines.append(f"  Terminal strategies recorded  : {report.terminal_strategies_recorded}")
+        lines.append(
+            f"  Repairs attempted             : {report.repairs_attempted} "
+            f"(succeeded={report.repairs_succeeded} failed={report.repairs_failed} "
+            f"terminal={report.repairs_terminal} no_change={report.repairs_no_change})"
+        )
+        if report.no_action_reason_counts:
+            reasons = ", ".join(
+                f"{k}={v}" for k, v in sorted(report.no_action_reason_counts.items())
+            )
+            lines.append(f"  No-action reasons             : {reasons}")
+        if report.stall_reason:
+            lines.append(f"  Dominant stall reason         : {report.stall_reason}")
+
     lines += ["", _SEP, ""]
     return "\n".join(lines)
 
@@ -1963,6 +2069,19 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
         "duplicate_actions": {
             "total_skipped": report.duplicate_action_count,
             "entries": report.duplicate_action_entries,
+        },
+        "bounded_repair": {
+            "duplicate_candidates_detected": report.duplicate_action_count,
+            "executions_suppressed": report.executions_suppressed,
+            "terminal_strategies_recorded": report.terminal_strategies_recorded,
+            "repairs_attempted": report.repairs_attempted,
+            "repairs_succeeded": report.repairs_succeeded,
+            "repairs_failed": report.repairs_failed,
+            "repairs_terminal": report.repairs_terminal,
+            "repairs_no_change": report.repairs_no_change,
+            "no_action_reason_counts": report.no_action_reason_counts,
+            "dominant_stall_reason": report.stall_reason,
+            "entries": report.repair_log_entries,
         },
         "execution_backend": {
             "usage": report.backend_usage,

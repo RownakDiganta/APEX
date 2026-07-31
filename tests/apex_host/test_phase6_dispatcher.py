@@ -1056,13 +1056,14 @@ class TestFingerprintUpgrade:
         assert task_fingerprint("recon", "nmap", [], "1.2.3.4") != \
                task_fingerprint("web", "nmap", [], "1.2.3.4")
 
-    def test_arg_order_matters(self) -> None:
-        # Phase 2 correction: order is no longer normalized away — see
-        # apex_host/planning/fingerprint.py module docstring and
+    def test_independent_nmap_flag_reorder_is_one_identity(self) -> None:
+        # Bounded-repair/dedup fix: nmap args are canonicalized
+        # order-independently, so harmless flag reordering is ONE action
+        # identity (a re-emitted scan is a duplicate). Opposite value-pair
+        # distinctness is still preserved — see
         # tests/apex_host/test_duplicate_actions.py
-        # ::test_reordered_flag_value_pairs_are_not_conflated for the
-        # concrete over-normalization bug this prevents.
-        assert task_fingerprint("recon", "nmap", ["-sV", "-T4"], "x") != \
+        # ::test_reordered_flag_value_pairs_are_not_conflated.
+        assert task_fingerprint("recon", "nmap", ["-sV", "-T4"], "x") == \
                task_fingerprint("recon", "nmap", ["-T4", "-sV"], "x")
 
     def test_dispatcher_uses_16_char_fingerprint(self) -> None:

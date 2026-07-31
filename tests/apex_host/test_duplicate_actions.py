@@ -37,20 +37,22 @@ class TestTaskFingerprint:
         fp2 = task_fingerprint("recon", "nmap", ["-sV", "10.10.10.10"], "10.10.10.10")
         assert fp1 == fp2
 
-    def test_argument_order_matters_for_flag_value_pairs(self) -> None:
-        """Phase 2 correction: argument order is no longer normalized away.
+    def test_independent_nmap_flag_reorder_is_one_identity(self) -> None:
+        """Bounded-repair/dedup fix: harmless reordering of INDEPENDENT nmap
+        flags is the same action and must share ONE fingerprint.
 
-        The pre-Phase-2 implementation sorted args, so
-        ["-sV", "-T4"] and ["-T4", "-sV"] produced the same fingerprint —
-        harmless for a fixed flag set with no positional values, but a
-        real over-normalization bug for flag/value pairs (see
-        test_reordered_flag_value_pairs_are_not_conflated below). Order
-        is now preserved; a genuine reordering produces a DIFFERENT
-        fingerprint.
+        ``nmap`` args are canonicalized order-independently
+        (apex_host.tools.nmap_command.canonical_fingerprint_args), so a
+        planner that re-emits the same scan with flags in a different order
+        is now correctly recognized as a duplicate. This deliberately
+        supersedes the earlier Phase-2 "never sort args" rule (which
+        over-corrected by making ALL reordering distinct). The companion
+        test_reordered_flag_value_pairs_are_not_conflated below proves the
+        opposite-value-pair distinctness is still preserved.
         """
         fp1 = task_fingerprint("recon", "nmap", ["-sV", "-T4"], "10.10.10.10")
         fp2 = task_fingerprint("recon", "nmap", ["-T4", "-sV"], "10.10.10.10")
-        assert fp1 != fp2
+        assert fp1 == fp2
 
     def test_reordered_flag_value_pairs_are_not_conflated(self) -> None:
         """The concrete over-normalization bug the order-preserving fix

@@ -1,5 +1,5 @@
 # nmap_command.py
-# The single authoritative Nmap command normalizer: selects an unprivileged TCP-connect (-sT) scan when the execution backend lacks raw sockets, enforces exactly one scan mode, drops LLM-injected dangerous flags/extra targets, never silently converts UDP to TCP, and plans a deterministic one-time raw-socket repair.
+# The single authoritative Nmap command normalizer: selects an unprivileged TCP-connect (-sT) scan when the execution backend lacks raw sockets, enforces exactly one scan mode, drops LLM-injected dangerous flags/extra targets, never silently converts UDP to TCP, plans a deterministic one-time raw-socket repair, and produces the order-independent canonical fingerprint token list for semantic duplicate suppression.
 """Nmap command construction/normalization for the execution chokepoint.
 
 Every nmap invocation — whether its args came from the deterministic
@@ -241,6 +241,69 @@ def normalize_nmap_command(
         args=normalized, transport=transport, capability=cap,
         changed=normalized != original, dropped=dropped,
     )
+
+
+#: Canonical representative flag for each coarse scan intent — used ONLY for
+#: fingerprint identity, never for execution. ``tcp`` (a generic raw TCP scan)
+#: shares ``-sT``'s representative because both collapse to an unprivileged
+#: ``-sT`` at execution on a non-raw-socket backend.
+_INTENT_FINGERPRINT_TOKEN: dict[str, str] = {
+    "tcp_connect": "-sT",
+    "tcp_syn": "-sS",
+    "udp": "-sU",
+    "ping": "-sn",
+    "tcp": "-sT",
+}
+
+
+def canonical_fingerprint_args(args: list[str], target: str) -> list[str]:
+    """Return an ORDER-INDEPENDENT canonical token list for fingerprinting an
+    nmap command (a semantic action identity, never an executable command).
+
+    Two nmap invocations that differ ONLY in the order of independent flags —
+    ``["-sV", "-T4"]`` vs ``["-T4", "-sV"]`` — are the SAME action and must
+    share one fingerprint. This canonicalizer makes flag order irrelevant by
+    sorting (and de-duplicating) the independent boolean/timing flags, while
+    keeping flag/value pairs (``-p <ports>`` / ``--top-ports <n>``) BOUND and
+    sorting them by ``(flag, value)`` so a semantically-OPPOSITE command
+    (``-p 80`` vs ``-p 443``) never collides — the exact distinctness guarantee
+    the previous order-preserving fingerprint protected, now achieved WITHOUT
+    treating harmless flag reordering as a distinct action.
+
+    The scan-mode intent is preserved as a single canonical representative
+    token, so an explicit ``-sT`` connect scan and a no-scan default remain
+    DISTINCT actions. Unknown/injected flags (``--script``, ``-oN``, an extra
+    positional) and the target positional are dropped — they are ALSO dropped
+    at execution by :func:`normalize_nmap_command`, so two commands differing
+    only in a dropped token execute identically and correctly share one
+    identity. Pure; never raises.
+    """
+    original = [str(a).strip() for a in args]
+    intent = _classify_scan_intent(original)
+    intent_token = _INTENT_FINGERPRINT_TOKEN.get(intent or "", "")
+
+    kept, _dropped = _keep_safe_flags(original, target)
+    bools: list[str] = []
+    pairs: list[tuple[str, str]] = []
+    i = 0
+    n = len(kept)
+    while i < n:
+        tok = kept[i]
+        if tok in ("-p", "--top-ports") and i + 1 < n:
+            pairs.append((tok, kept[i + 1]))
+            i += 2
+        else:
+            bools.append(tok)
+            i += 1
+
+    tokens: list[str] = []
+    if intent_token:
+        tokens.append(intent_token)
+    tokens.extend(sorted(set(bools)))
+    for flag, value in sorted(pairs):
+        tokens.append(flag)
+        tokens.append(value)
+    return tokens
 
 
 def plan_raw_socket_repair(args: list[str], target: str) -> NmapRepairPlan:

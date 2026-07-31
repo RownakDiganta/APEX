@@ -112,6 +112,15 @@ class ApexGraphState(TypedDict):
     # counts per protocol across the whole run without re-querying the
     # episodic store. See docs/credential-validation.md "Reporting".
     credential_validation_log: Annotated[list[dict[str, Any]], operator.add]
+    # Bounded-repair audit log — one entry per repair_agent invocation, with
+    # fields {kind, tool, target, phase, outcome, changed_action, reason}
+    # where kind is "raw_socket_to_tcp_connect" | "llm" and outcome is
+    # "succeeded" | "failed" | "terminal" | "no_change" | "no_repair". Never a
+    # secret. Lets apex_host/eval/report.py report repairs attempted /
+    # succeeded / failed / terminal / no-change without re-querying the
+    # episodic store. Accumulated (operator.add), mirroring
+    # credential_validation_log's convention. See CLAUDE.md §27.
+    repair_log: Annotated[list[dict[str, Any]], operator.add]
     # Phase 12C — canonical engagement outcome (apex_host.orchestration.outcome
     # .EngagementOutcome value; "" until the terminating turn). Overwrite,
     # not accumulated: set exactly once, on the single turn that terminates

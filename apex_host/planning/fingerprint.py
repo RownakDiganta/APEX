@@ -12,17 +12,30 @@ produce the IDENTICAL fingerprint when their semantic action fields match
 fingerprint answers "is this the SAME action as one already attempted?",
 never "is this the same TASK OBJECT?".
 
-Phase 2 (post-live-test debugging) correction — argument ORDER is no
-longer normalized away by sorting. The pre-Phase-2 implementation sorted
-``args`` before hashing so that e.g. ``["-sV", "-T4"]`` and
-``["-T4", "-sV"]`` produced the same fingerprint. This is safe for a
-FIXED flag set with no positional values, but it is a genuine
-over-normalization bug for flag/value pairs: ``["-p", "80", "--exclude",
-"443"]`` (scan port 80, exclude port 443) and ``["-p", "443", "--exclude",
-"80"]`` (the semantically OPPOSITE command) sort to the IDENTICAL token
-multiset and would collide onto the same fingerprint. Argument order is
-now preserved; only incidental whitespace is normalized. See
-docs/action-fingerprint.md for the full rationale.
+Argument canonicalization is TOOL-AWARE (see ``_canonical_args``):
+
+  - ``nmap`` args go through
+    ``apex_host.tools.nmap_command.canonical_fingerprint_args`` — an
+    order-INDEPENDENT canonical form. Harmless flag reordering
+    (``["-sV", "-T4"]`` vs ``["-T4", "-sV"]``) shares ONE identity, while
+    flag/value pairs stay bound and are sorted by ``(flag, value)`` so
+    semantically-OPPOSITE commands do NOT collide: ``["-p", "80",
+    "--exclude", "443"]`` and ``["-p", "443", "--exclude", "80"]`` remain
+    distinct fingerprints (the exact over-normalization bug a naive blind
+    sort would introduce). This deliberately supersedes the earlier
+    Phase-2 "never sort args" rule, which fixed the collision by making
+    ALL reordering distinct — over-corrected in the other direction, so a
+    planner that re-emitted the same scan with flags in a different order
+    was never recognized as a duplicate.
+  - every OTHER tool preserves argument ORDER (a generic tool's positional
+    arguments can be order-sensitive) and normalizes only incidental
+    whitespace, plus canonicalizes any URL-shaped token so equivalent URL
+    FORMS (``http://h``, ``http://h/``, ``http://h:80/``) share one action
+    identity.
+
+Targets are canonicalized by ``_canonical_target``: a URL is normalized to
+one form (default port and trailing slash removed); a bare host stays
+case-insensitive. See docs/action-fingerprint.md for the full rationale.
 
 ``DuplicateActionTracker`` maintains a bounded sliding-window history and flags
 any fingerprint that has been executed >= max_repeats times as a duplicate.  The
@@ -39,6 +52,59 @@ from __future__ import annotations
 
 import hashlib
 from collections import deque
+
+
+def _canonical_target(target: str) -> str:
+    """Canonicalize a target field for fingerprint identity.
+
+    A URL-shaped target is normalized to one canonical form
+    (``apex_host.graph_ids.normalize_url`` — lower-cased scheme+host, default
+    port stripped, redundant/trailing slashes collapsed) and then any lone
+    trailing slash is removed so ``http://h``, ``http://h/``, and
+    ``http://h:80/`` all share ONE identity. A bare host/IP keeps the existing
+    case-insensitive behavior (a hostname is case-insensitive by DNS
+    convention). Never raises."""
+    value = target.strip()
+    if "://" in value:
+        from apex_host.graph_ids import normalize_url
+
+        # normalize_url lower-cases scheme+host and strips the default port;
+        # rstrip('/') then collapses the root-path-vs-no-path distinction
+        # (``http://h/`` == ``http://h``). It only removes a genuine trailing
+        # path slash — the scheme separator ``//`` is preceded by ``:`` and is
+        # never trailing, so it is untouched.
+        return normalize_url(value).rstrip("/")
+    return value.lower()
+
+
+def _canonical_url_token(token: str) -> str:
+    """URL-normalize a single arg token when it is URL-shaped; otherwise
+    return it whitespace-stripped and unchanged. URL normalization is
+    semantics-preserving, so applying it to an argument (e.g. curl's target
+    URL) makes equivalent URL FORMS share one action identity without
+    reordering or dropping any non-URL token."""
+    stripped = str(token).strip()
+    if "://" in stripped:
+        return _canonical_target(stripped)
+    return stripped
+
+
+def _canonical_args(tool: str, args: list[str], target: str) -> list[str]:
+    """Return the canonical fingerprint token list for *args*.
+
+    - ``nmap``: an ORDER-INDEPENDENT canonical form
+      (``apex_host.tools.nmap_command.canonical_fingerprint_args``) so that
+      harmless flag reordering (``-sV -T4`` vs ``-T4 -sV``) shares one
+      identity while opposite flag/value pairs (``-p 80`` vs ``-p 443``) stay
+      distinct.
+    - every other tool: each token whitespace-stripped and URL-normalized when
+      URL-shaped, with ORDER PRESERVED — a generic tool's positional argument
+      order can be semantically meaningful, so it is never reordered."""
+    if tool.strip().lower() == "nmap":
+        from apex_host.tools.nmap_command import canonical_fingerprint_args
+
+        return canonical_fingerprint_args([str(a) for a in args], target)
+    return [_canonical_url_token(a) for a in args]
 
 
 def task_fingerprint(
@@ -77,12 +143,12 @@ def task_fingerprint(
     trace/run ID. A caller must never pass these in — the function
     signature has no parameter for any of them.
     """
-    norm_args = [str(a).strip() for a in args]
+    canon_args = _canonical_args(tool, args, target)
     key = "|".join([
         phase.strip().lower(),
         tool.strip().lower(),
-        ",".join(norm_args),
-        target.strip().lower(),
+        ",".join(canon_args),
+        _canonical_target(target),
         parser.strip().lower(),
         executor_domain.strip().lower(),
         capability_mode.strip().lower(),
