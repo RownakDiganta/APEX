@@ -53,9 +53,15 @@ binding order (highest precedence first) — see ``evaluate_termination()``:
    upstream outcome exists.
 3. Stall-derived outcomes (``duplicate_task_stall``, ``no_actionable_task``,
    ``policy_blocked``) — from ``apex_host.orchestration.stall.StallTracker``.
-4. ``phase_budget_exhausted`` / ``goal_completed`` — the phase router
-   (``GlobalPlanner``) returned ``ApexPhase.done`` for a reason other than
-   the hard turn ceiling.
+4. ``phase_budget_exhausted`` (recon/priv_esc) / ``no_actionable_task``
+   (web / credential / objective) — the phase router (``GlobalPlanner``)
+   returned ``ApexPhase.done`` for a reason other than the hard turn ceiling.
+   A phase reaching ``done`` before ``max_turns`` without the objective
+   verified is an unproductive stop (nothing actionable), NEVER an "organic
+   goal completion": ``evaluate_termination()`` no longer produces
+   ``goal_completed`` for it — success is only ever ``user_flag_verified``
+   (precedence 1), so labelling an unproductive stop a "completion" would
+   overstate what happened.
 5. ``max_turns_exhausted`` — the hard turn ceiling.
 
 ``validated_access`` is never produced by ``evaluate_termination()`` — a
@@ -97,9 +103,12 @@ class EngagementOutcome(str, Enum):
     # report fallback (see module docstring and apex_host.eval.report
     # ._derive_outcome_from_state).
     validated_access = "validated_access"
-    # Organic, non-success completion of the phase ladder (see module
-    # docstring — not reachable via the current GlobalPlanner logic, kept
-    # for completeness and forward-compatibility; never marked success).
+    # Organic, non-success completion of the phase ladder. NEVER produced by
+    # evaluate_termination() — a phase reaching "done" without the objective
+    # verified is reported as no_actionable_task (an unproductive stop), not
+    # a "completion". Retained only for the backward-compatible report
+    # fallback (_derive_outcome_from_state) and forward-compatibility; never
+    # marked success.
     goal_completed = "goal_completed"
     # Resource-exhaustion terminations.
     max_turns_exhausted = "max_turns_exhausted"
@@ -248,6 +257,7 @@ def evaluate_termination(
     next_phase: str,
     current_phase: str,
     stall: "StallDecision",
+    web_evidence_complete: bool | None = None,
 ) -> TerminationDecision:
     """Pure termination evaluator — precedence levels 1 and 3-5 (see module
     docstring; level 2, upstream-preset outcomes, is handled by the caller
@@ -306,10 +316,29 @@ def evaluate_termination(
                 terminate=True, outcome=EngagementOutcome.phase_budget_exhausted, success=False,
                 reason=reason, phase=current_phase, turn=turn_count,
             )
+        # Any OTHER phase (web / credential / objective) reaching "done" before
+        # max_turns, with the objective NOT verified, means nothing further is
+        # ACTIONABLE — never an "organic goal completion". Success is exactly
+        # `user_flag_verified` (checked at precedence 1); labelling an
+        # unproductive stop `goal_completed` overstates what happened (the
+        # demonstrated live bug: a web phase that discovered 0 forms / 0
+        # opportunities, with turns and LLM budget remaining, reported
+        # `goal_completed`). Emit an honest `no_actionable_task` with a
+        # phase-aware, secret-free reason. `goal_completed` is therefore never
+        # produced by this evaluator (its enum member is retained only for the
+        # backward-compatible report fallback / forward compatibility).
+        if current_phase == "web" and web_evidence_complete is False:
+            reason = (
+                "web discovery reached no actionable next step (no forms, technologies, "
+                "or opportunities discovered) and the configured objective was not verified"
+            )
+        else:
+            reason = (
+                "no actionable next step remained and the configured objective was not verified"
+            )
         return TerminationDecision(
-            terminate=True, outcome=EngagementOutcome.goal_completed, success=False,
-            reason="engagement reached its organic completion state without validated access",
-            phase=current_phase, turn=turn_count,
+            terminate=True, outcome=EngagementOutcome.no_actionable_task, success=False,
+            reason=reason, phase=current_phase, turn=turn_count,
         )
 
     if stall.stalled:

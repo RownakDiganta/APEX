@@ -1123,6 +1123,91 @@ async def scenario_vhost_redirect_web_discovery() -> ScenarioResult:
     )
 
 
+async def scenario_web_incomplete_not_goal_completed() -> ScenarioResult:
+    """17. A web phase that discovered nothing must NOT report goal_completed.
+
+    Reproduces the demonstrated bug: the web phase ran, found 0 forms / 0
+    opportunities, no credentials were configured, turns/LLM budget remained —
+    and the engagement declared outcome="goal_completed" ("organic completion").
+    Drives the REAL compiled graph (dry-run, FakeModelRouter — no LLM calls) with
+    a web service + a fetched-but-empty endpoint seeded. Fails the gate if the
+    engagement reports goal_completed, reports success, or exits 0 without a
+    verified user flag.
+    """
+    from apex_host.config import ApexConfig
+    from apex_host.graph_state import ApexGraphState
+    from apex_host.llm.router import FakeModelRouter
+    from apex_host.orchestration.builder import build_apex_graph
+    from apex_host.orchestration.outcome import EngagementOutcome, exit_code_for
+    from apex_host.planning.budget import LLMBudgetTracker
+    from apex_host.tools.registry import ToolRegistry
+
+    api = _make_api()
+
+    async def _seed(node_id: str, node_type: str, props: dict[str, Any]) -> None:
+        await _seed_node(api, node_id, node_type, props)
+
+    await _seed(_ANCHOR, "host", {"ip": _TARGET})
+    await _seed(f"service:{_TARGET}:80/tcp", "service",
+                {"port": "80", "proto": "tcp", "state": "open", "service": "http"})
+    await _seed(f"endpoint:http://{_TARGET}", "endpoint",
+                {"url": f"http://{_TARGET}", "status": "301", "fetched": True})
+    await _seed_edge(api, _ANCHOR, f"service:{_TARGET}:80/tcp", "exposes")
+    await _seed_edge(api, _ANCHOR, f"endpoint:http://{_TARGET}", "exposes")
+
+    config = ApexConfig(
+        target=_TARGET, dry_run=True, max_turns=6, tool_backend="dry-run",
+        allowed_tools=["nmap", "curl", "nc"], use_llm=False,
+        max_llm_calls_per_run=10, max_llm_calls_per_phase=3,
+    )
+    budget = LLMBudgetTracker(max_per_run=10, max_per_phase=3)
+    registry = ToolRegistry.from_config(config)
+    graph = build_apex_graph(
+        api, registry, config, model_router=FakeModelRouter(), budget_tracker=budget,
+    )
+    initial: ApexGraphState = {
+        "run_id": "release-gate-web-incomplete", "target": _TARGET, "phase": "web",
+        "goal": f"Web discovery against {_TARGET}", "current_task": None,
+        "evidence_summary": "", "findings": [], "error_episodes": [],
+        "last_tool_result": None, "last_error": None, "completed": False,
+        "turn_count": 0, "planner_decisions": [], "tool_results": None,
+        "repair_count": 0, "policy_decisions": [], "duplicate_actions": [],
+        "completed_fingerprints": [], "execution_backend_log": [],
+        "diagnostic_events": [], "credential_validation_log": [], "repair_log": [],
+        "outcome": "", "termination_reason": "", "termination_phase": "",
+        "stall_reason": "", "privilege_state": "", "privilege_summary": {},
+        "opportunity_ids": [], "attempted_opportunities": [],
+        "enumeration_complete": False, "web_session_state": {},
+        "workflow_summary": {}, "phase_selection": {}, "learning_summary": {},
+        "task_latency_log": [], "objective_status": "", "objective_summary": {},
+        "direct_file_read_log": [], "bounded_command_log": [],
+        "capability_discovery_log": [], "execution_diagnostics": [],
+    }
+    final_state: ApexGraphState = await graph.ainvoke(initial)
+
+    problems: list[str] = []
+    outcome = str(final_state.get("outcome") or "")
+    if outcome == EngagementOutcome.goal_completed.value:
+        problems.append("web phase with no evidence reported goal_completed")
+    if outcome == EngagementOutcome.user_flag_verified.value:
+        problems.append("fabricated success without a verified user flag")
+    if not final_state.get("completed"):
+        problems.append("engagement did not terminate")
+    if outcome:
+        if exit_code_for(EngagementOutcome(outcome)) == 0:
+            problems.append(f"non-success outcome {outcome!r} mapped to exit code 0")
+    else:
+        problems.append("no terminal outcome recorded")
+
+    if problems:
+        return ScenarioResult("web_incomplete_not_goal_completed", False, "; ".join(problems))
+    return ScenarioResult(
+        "web_incomplete_not_goal_completed", True,
+        f"web phase with no evidence terminated honestly as {outcome!r} "
+        "(never goal_completed, never success)",
+    )
+
+
 SCENARIOS: list[Any] = [
     scenario_ssh_success,
     scenario_dfr_success,
@@ -1140,6 +1225,7 @@ SCENARIOS: list[Any] = [
     scenario_unprivileged_backend_completes_connect_scan,
     scenario_curl_only_web_discovery,
     scenario_vhost_redirect_web_discovery,
+    scenario_web_incomplete_not_goal_completed,
 ]
 
 

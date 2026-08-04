@@ -84,8 +84,27 @@ def _redirect_vhost(location: str, target_host: str) -> str | None:
 
 
 def _host_from_target(target: str) -> str:
-    """Strip scheme and path from target to get the bare host."""
-    return target.split("//")[-1].split("/")[0]
+    """Return the bare host of *target* — scheme, port, and path all stripped.
+
+    A service/host node is keyed on the bare host (``10.129.40.164``), never a
+    URL or ``host:port`` string: ``_service_id(host, port)`` and ``_host_id(host)``
+    must receive a clean host so the id is canonical
+    (``service:10.129.40.164:80/tcp``) and dedups against the nmap-discovered
+    service. Handles ``http://h``, ``http://h:8080/p``, bare ``h``, ``h:8080``,
+    and bracketed IPv6 (``http://[::1]:80/``)."""
+    t = target.strip()
+    if "://" in t:
+        host = urlsplit(t).hostname
+        if host:
+            return host
+    # Bare host (possibly host:port or host/path, no scheme).
+    t = t.split("//")[-1].split("/")[0]
+    if t.startswith("["):  # bracketed IPv6 literal, optionally with :port
+        return t[1:].split("]")[0]
+    head, sep, tail = t.rpartition(":")
+    if sep and tail.isdigit():  # strip a trailing numeric :port
+        return head
+    return t
 
 
 def _normalize_url(target: str) -> str:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urlsplit
 
 from memfabric.ids import now
 from memfabric.types import Edge, KnowledgeEntry, Node, ParsedObservation
@@ -30,6 +31,39 @@ _FTP_GENERIC_RE = re.compile(r"^220[\s-]", re.MULTILINE)
 _SMTP_RE = re.compile(r"^220\s+\S+\s+ESMTP", re.MULTILINE)
 _HTTP_RE = re.compile(r"^HTTP/[\d.]+\s+\d{3}", re.MULTILINE)
 _TELNET_RE = re.compile(r"(login:\s*$|Escape character is|telnet>)", re.IGNORECASE | re.MULTILINE)
+
+
+def _bare_host(target: str) -> str:
+    """Return the bare host of *target* — scheme, port, and path stripped.
+
+    A service/host node must be keyed on the bare host (``10.129.40.164``),
+    never a URL or ``host:port`` string. This guards against a mis-routed
+    HTTP-shaped result reaching the banner parser with a URL ``target``
+    (which previously produced a junk ``service:http://.../tcp`` node)."""
+    t = target.strip()
+    if "://" in t:
+        host = urlsplit(t).hostname
+        if host:
+            return host
+    t = t.split("//")[-1].split("/")[0]
+    if t.startswith("["):  # bracketed IPv6, optionally with :port
+        return t[1:].split("]")[0]
+    head, sep, tail = t.rpartition(":")
+    if sep and tail.isdigit():
+        return head
+    return t
+
+
+def _numeric_port(port: str) -> str:
+    """Return *port* only when it is a plain numeric port (1..65535); else "".
+
+    A non-numeric ``port`` (e.g. a URL leaked from a mis-routed task's args)
+    must NEVER land in a service node's ``port`` field — it is dropped so the
+    per-service default (80/21/22/...) is used and the node id stays canonical."""
+    p = port.strip()
+    if p.isdigit() and 1 <= int(p) <= 65535:
+        return p
+    return ""
 
 
 def _service_id(host: str, port: str, service_name: str) -> str:
@@ -59,6 +93,13 @@ class BannerParser:
         stripped = text.strip()
         if not stripped:
             return ParsedObservation()
+
+        # Normalize BEFORE any node is built: the service/host id must be keyed
+        # on a bare host and a numeric port, never a URL. A URL target/port
+        # (e.g. from a mis-routed HTTP-shaped result) previously produced a
+        # junk service:http://.../tcp node with port=<full-url>.
+        target = _bare_host(target)
+        port = _numeric_port(port)
 
         m_ssh = _SSH_RE.search(stripped)
         if m_ssh:

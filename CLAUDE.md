@@ -9717,7 +9717,10 @@ stall. Missing prerequisites are handled UPSTREAM by the §26 phase gates (a
 missing credential hypothesis yields a truthful `done` with
 `no_actionable_task`, not repeated credential-phase no-action turns), never by
 fabricating a service/endpoint/credential/opportunity or forcing a phase
-completion.
+completion. Likewise, a web/credential/objective phase reaching `done` with
+nothing actionable terminates as the honest `no_actionable_task`, **never**
+`goal_completed` — `evaluate_termination` no longer emits that label (§28.9);
+success remains user-flag-only.
 
 ### 27.5 Reporting (`apex_host.eval.report`)
 
@@ -9870,6 +9873,14 @@ root causes, both in `apex_host` (memfabric untouched; all writes are
    returned HTML body) — never fabricated; a non-HTML/failed response falls
    back to a `KnowledgeEntry` and records no service. With the service node
    present, recon no longer dies "no services discovered" and advances to web.
+   The service id is always canonical `service:<bare-ip>:<numeric-port>/tcp`:
+   the host is the bare IP/hostname (scheme and any `:port` stripped by
+   `_host_from_target`) and the port is the URL's explicit port or scheme
+   default — **never** a URL string in the host/port field, so a curl http:80
+   service dedups (upsert-merges) with the nmap-discovered `service:<ip>:80/tcp`
+   rather than creating a second node. The same normalization guards
+   `BannerParser` (`_bare_host`/`_numeric_port`): a mis-routed HTTP-shaped
+   result can never produce a junk `service:http://…/tcp` node with a URL port.
 
 Tests (fakes only): `tests/apex_host/test_web_planner.py` /
 `test_recon_parser.py` (a successful curl 301 yields both a `fetched` endpoint
@@ -9938,6 +9949,55 @@ no-pin / off-scope-pin / port-excluded blocked). Release-gate scenario
 `vhost_redirect_web_discovery` drives recon-:80 → IP-301 → vhost node →
 WebPlanner `--resolve` task → PolicyAdvisor approval → vhost body fetch →
 discovered content, end to end.
+
+### 28.9 Honest terminal outcome for an unproductive phase (no fabricated `goal_completed`)
+
+Fixes the demonstrated bug where a web phase that discovered nothing (0 forms,
+0 opportunities, both workflows abandoned, turns AND 16/20 LLM calls remaining)
+terminated with `outcome="goal_completed"` — "engagement reached its organic
+completion state". That overstates what happened: **success is only ever
+`user_flag_verified`** (precedence 1, `is_success_outcome` unchanged), so any
+other phase reaching `done` is an unproductive stop, not a "completion".
+
+- **`evaluate_termination` no longer emits `goal_completed`.** In the
+  `next_phase == "done"` branch, `recon`/`priv_esc` still map to
+  `phase_budget_exhausted` (unchanged), but every OTHER phase
+  (`web`/`credential`/`objective`) reaching `done` before `max_turns` without
+  the objective verified now maps to the honest **`no_actionable_task`** with a
+  phase-aware, secret-free reason (for `web` + `web_evidence_complete is False`:
+  "web discovery reached no actionable next step (no forms, technologies, or
+  opportunities discovered) and the configured objective was not verified").
+  `no_actionable_task` is a non-success outcome (exit code 1, legacy
+  `"abandoned"`), so `is_success_outcome` is preserved. `EngagementOutcome
+  .goal_completed` is retained as an enum member **only** for the
+  backward-compatible report fallback (`_derive_outcome_from_state`) and
+  forward-compatibility — the evaluator never produces it.
+- **`continuation_node` passes `web_evidence_complete` into
+  `evaluate_termination`** (the peek value; `None` when the peek did not run) so
+  the web-specific honest reason fires only on an explicit `False`.
+- **"Stuck with budget remaining" continues, not terminates.** When the web
+  phase has a web surface AND web evidence is incomplete, `GlobalPlanner
+  ._select_phase` already returns `web` (not `done`), so the engagement stays in
+  web and (with §28.8) re-fetches with the vhost-aware `--resolve` action rather
+  than terminating. The label fix only governs the case where the router
+  genuinely returns `done`. No LLM call is added to decide termination; §27
+  stall semantics and the §28.3 deterministic-first gate are unchanged.
+- **The deterministic web fallback yields a usable next step.** When the web
+  LLM output fails the `Validator` (a `validation` fallback — JSON/schema/tool/
+  domain/shell-metachar rejection; see `apex_host.planning.validator`), the
+  `PlanningEngine` falls back to the deterministic web planner, which (with a
+  discovered vhost, §28.8) proposes the bounded Host-aware `--resolve` fetch — a
+  NEW action, not an empty candidate — so the phase progresses instead of
+  dedup-stalling on the same IP curl.
+
+Tests: `tests/apex_host/test_phase12c_outcomes.py` (`evaluate_termination` never
+emits `goal_completed`; web/credential done → `no_actionable_task`; web-incomplete
+reason; a full compiled-graph web-no-evidence run terminates honestly, never
+`goal_completed`/success, never exit 0), `test_planners_with_engine.py` (LLM
+validation failure → deterministic vhost-aware fallback action). Release-gate
+scenario `web_incomplete_not_goal_completed` drives the real compiled graph and
+fails if the outcome is `goal_completed`, is a success, or exits 0 without a
+verified user flag.
 
 ### 28.7 Release gate
 

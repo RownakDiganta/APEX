@@ -678,8 +678,9 @@ class TestReleaseGateScenarios:
         # 12 Phase-25 scenarios + the Phase-28 recon->web regression scenario
         # + the nmap unprivileged-connect-scan (--unprivileged) scenario
         # + the curl-only web-discovery (fetched-endpoint→service) scenario
-        # + the vhost-redirect web-discovery (--resolve Host-aware) scenario.
-        assert len(SCENARIOS) == 16
+        # + the vhost-redirect web-discovery (--resolve Host-aware) scenario
+        # + the web-incomplete-must-not-report-goal_completed scenario.
+        assert len(SCENARIOS) == 17
 
     @pytest.mark.asyncio
     async def test_full_release_gate_passes(self) -> None:

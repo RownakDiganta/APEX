@@ -157,6 +157,7 @@ def make_continuation_node(deps: "OrchestrationDeps") -> Any:
                 # own turn_count>=max_turns fallback still fires correctly
                 # in that case (it does not depend on next_phase_value).
                 next_phase_value = current_phase
+                web_complete_peek: bool | None = None
                 if turn_count < deps.config.max_turns:
                     try:
                         peek_caps = capabilities_from_subgraph(subgraph) if subgraph else []
@@ -204,6 +205,11 @@ def make_continuation_node(deps: "OrchestrationDeps") -> Any:
                     max_turns=deps.config.max_turns, turn_count=turn_count,
                     objective_verified=False, next_phase=next_phase_value,
                     current_phase=current_phase, stall=stall,
+                    # web_complete_peek is None when the peek did not run; the
+                    # honest web-incomplete reason only fires on an explicit
+                    # False (web has a surface but produced no meaningful
+                    # evidence). See evaluate_termination's done-fallback.
+                    web_evidence_complete=web_complete_peek,
                 )
                 if not decision.terminate:
                     return {

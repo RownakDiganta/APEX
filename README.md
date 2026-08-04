@@ -2216,8 +2216,8 @@ return a deterministic process exit code derived from the outcome:
 
 | Code | Meaning |
 |---|---|
-| `0` | Success (`validated_access`, `goal_completed`) |
-| `1` | Exhausted / stalled (`max_turns_exhausted`, `phase_budget_exhausted`, `no_actionable_task`, `duplicate_task_stall`) |
+| `0` | Success — **`user_flag_verified` only** (a verified user flag; Phase 18). A validated `access_state`/`access_capability` alone is an intermediate milestone, never exit 0. |
+| `1` | Exhausted / stalled (`max_turns_exhausted`, `phase_budget_exhausted`, `no_actionable_task`, `duplicate_task_stall`, `validated_access`). A web/credential/objective phase that reaches `done` with nothing actionable terminates as the honest `no_actionable_task`, **never** a fabricated `goal_completed` "organic completion". |
 | `2` | Configuration error |
 | `3` | Policy blocked |
 | `4` | Operational failure (planner/parser/tool/memory/unknown-phase/internal) |

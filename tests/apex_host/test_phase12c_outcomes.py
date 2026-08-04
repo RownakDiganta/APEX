@@ -267,13 +267,33 @@ class TestEvaluateTerminationPrecedence:
         assert decision.outcome is EngagementOutcome.phase_budget_exhausted
         assert decision.success is False
 
-    def test_done_from_non_priv_esc_before_max_turns_is_goal_completed(self) -> None:
+    def test_done_from_web_before_max_turns_is_no_actionable_task(self) -> None:
+        # A web/credential/objective phase reaching "done" before max_turns
+        # without the objective verified is an unproductive stop — an honest
+        # no_actionable_task, NEVER goal_completed (§28.9).
         decision = evaluate_termination(
             max_turns=20, turn_count=8, objective_verified=False,
             next_phase="done", current_phase="web", stall=_no_stall(),
         )
-        assert decision.outcome is EngagementOutcome.goal_completed
+        assert decision.outcome is EngagementOutcome.no_actionable_task
         assert decision.success is False
+
+    def test_evaluator_never_emits_goal_completed(self) -> None:
+        for phase in ("web", "credential", "objective"):
+            decision = evaluate_termination(
+                max_turns=20, turn_count=8, objective_verified=False,
+                next_phase="done", current_phase=phase, stall=_no_stall(),
+            )
+            assert decision.outcome is not EngagementOutcome.goal_completed
+
+    def test_web_incomplete_done_has_web_specific_reason(self) -> None:
+        decision = evaluate_termination(
+            max_turns=20, turn_count=8, objective_verified=False,
+            next_phase="done", current_phase="web", stall=_no_stall(),
+            web_evidence_complete=False,
+        )
+        assert decision.outcome is EngagementOutcome.no_actionable_task
+        assert "web discovery" in decision.reason
 
     def test_stall_decision_propagates_when_not_done(self) -> None:
         stall = StallDecision(True, EngagementOutcome.no_actionable_task, "3 no-op turns")
@@ -302,15 +322,17 @@ class TestEvaluateTerminationPrecedence:
         assert decision.success is False
 
     def test_done_takes_priority_over_stall(self) -> None:
-        # If GlobalPlanner already says "done", that outcome wins over a
-        # stall signal from the same turn (level 4/5 precedes stall only
-        # when done fires — done is checked before stall in the evaluator).
+        # If GlobalPlanner already says "done", that path wins over a stall
+        # signal from the same turn (done is checked before stall in the
+        # evaluator). The done-branch now emits the honest no_actionable_task
+        # with its own reason — NOT the stall's outcome/reason.
         stall = StallDecision(True, EngagementOutcome.policy_blocked, "policy stall")
         decision = evaluate_termination(
             max_turns=20, turn_count=5, objective_verified=False,
             next_phase="done", current_phase="web", stall=stall,
         )
-        assert decision.outcome is EngagementOutcome.goal_completed
+        assert decision.outcome is EngagementOutcome.no_actionable_task
+        assert decision.reason != "policy stall"  # the done-branch reason, not the stall's
 
     def test_reason_and_phase_and_turn_populated(self) -> None:
         decision = evaluate_termination(
@@ -906,6 +928,45 @@ class TestContinuationNodeIntegration:
         all_episodes = await api._episodic.all()
         terminal_entries = [e for e in all_episodes if e.action == "engagement_terminated"]
         assert len(terminal_entries) == 1
+
+    async def test_web_phase_no_evidence_never_reports_goal_completed(self) -> None:
+        """§28.9 — a web phase that discovered nothing useful (a fetched but
+        empty endpoint, 0 forms/opportunities), with no credentials and turns
+        remaining, must NOT report goal_completed. It terminates with the honest
+        no_actionable_task (or continues) — never a fabricated 'organic
+        completion'. Success remains user-flag-only."""
+        from apex_host.graph import build_apex_graph
+
+        api = _make_api()
+        target = "10.10.10.211"
+        host_id = f"host:{target}"
+        await _seed_node(api, host_id, "host", {"ip": target})
+        # A live HTTP service + a fetched-but-empty endpoint: web_evidence is
+        # "complete" (a fetched endpoint counts), yet nothing actionable was
+        # found and no credential hypothesis exists.
+        await _seed_node(api, f"service:{target}:80/tcp", "service",
+                         {"port": "80", "proto": "tcp", "state": "open", "service": "http"})
+        await _seed_node(api, f"endpoint:http://{target}", "endpoint",
+                         {"url": f"http://{target}", "status": "301", "fetched": True})
+        await _seed_edge(api, host_id, f"service:{target}:80/tcp")
+        await _seed_edge(api, host_id, f"endpoint:http://{target}")
+
+        config = _make_config(target=target, max_turns=20)  # no username/password
+        registry = ToolRegistry.from_config(config)
+        graph = build_apex_graph(api, registry, config)
+        final_state = await graph.ainvoke(_make_initial_state(target=target, phase="web"))
+
+        assert final_state["completed"] is True
+        # The core assertion: NEVER goal_completed, NEVER a success.
+        assert final_state["outcome"] != EngagementOutcome.goal_completed.value
+        assert final_state["outcome"] != EngagementOutcome.user_flag_verified.value
+        assert exit_code_for(EngagementOutcome(final_state["outcome"])) != 0
+        # Terminated (or stalled) with an honest, non-success label.
+        assert final_state["outcome"] in (
+            EngagementOutcome.no_actionable_task.value,
+            EngagementOutcome.duplicate_task_stall.value,
+            EngagementOutcome.max_turns_exhausted.value,
+        )
 
     async def test_access_state_alone_does_not_terminate_as_success(self) -> None:
         """Phase 18 — a validated access_state (seeded directly, matching

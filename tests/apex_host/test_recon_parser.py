@@ -410,6 +410,64 @@ class TestCommandParserCurl:
         assert svc.props["port"] == "443"
         assert svc.props["service"] == "https"
 
+    def test_curl_service_port_always_numeric_never_url(self) -> None:
+        # Data-quality guard: a curl http-service node must have a numeric port
+        # and a canonical service:<ip>:<port>/tcp id — never a URL in the port
+        # field, never a URL-keyed id (the demonstrated junk node).
+        for tgt in ("http://10.10.10.14", "http://10.10.10.14/", "http://10.10.10.14:8080/x"):
+            parsed = CommandParser().parse(self._raw(_CURL_APACHE, target=tgt))
+            svc = next(n for n in parsed.node_deltas if n.type == "service")
+            assert svc.props["port"].isdigit(), f"{tgt}: port {svc.props['port']!r} not numeric"
+            assert "://" not in svc.id and svc.id.count(":") == 2, f"non-canonical id {svc.id!r}"
+
+    def test_curl_explicit_port_no_double_port_id(self) -> None:
+        parsed = CommandParser().parse(self._raw(_CURL_APACHE, target="http://10.10.10.14:8080"))
+        svc = next(n for n in parsed.node_deltas if n.type == "service")
+        assert svc.id == "service:10.10.10.14:8080/tcp"
+        assert svc.props["port"] == "8080"
+
+    def test_curl_service_dedups_with_nmap_service_id(self) -> None:
+        # The curl http:80 service id must equal the nmap-discovered service id
+        # for the same host+port, so an upsert merges rather than duplicating.
+        from apex_host.graph_ids import service_id
+        parsed = CommandParser().parse(self._raw(_CURL_APACHE, target="http://10.10.10.14"))
+        svc = next(n for n in parsed.node_deltas if n.type == "service")
+        assert svc.id == service_id("10.10.10.14", "80", "tcp")
+
+    async def test_curl_service_merges_with_existing_nmap_service_via_memoryapi(self) -> None:
+        # End-to-end through MemoryAPI deltas (Invariant 1): an nmap service on
+        # :80 then a curl http fetch on the same host produces exactly ONE
+        # service node — merged, not a second URL-keyed duplicate.
+        from memfabric.api import MemoryAPI
+        from memfabric.config import Config
+        from memfabric.stores.episodic_jsonl import JSONLEpisodicStore
+        from memfabric.stores.graph_networkx import NetworkXGraphStore
+        from memfabric.stores.kv_memory import InMemoryKVStore
+        from memfabric.stores.lexical_bm25 import BM25LexicalIndex
+        from memfabric.stores.vector_faiss import FaissVectorIndex
+
+        cfg = Config()
+        api = MemoryAPI(
+            graph=NetworkXGraphStore(), episodic=JSONLEpisodicStore(path=None),
+            lexical=BM25LexicalIndex(), vector=FaissVectorIndex(dim=cfg.vector_dim),
+            kv=InMemoryKVStore(), config=cfg,
+        )
+        ip = "10.10.10.14"
+        nmap = NmapParser().parse_text(
+            f"Nmap scan report for {ip}\n80/tcp open http nginx 1.18.0\n", target=ip
+        )
+        await api.apply_deltas(nodes=nmap.node_deltas, edges=nmap.edge_deltas)
+        curl = CommandParser().parse(self._raw(_CURL_APACHE, target=f"http://{ip}"))
+        await api.apply_deltas(nodes=curl.node_deltas, edges=curl.edge_deltas)
+
+        sub = await api.get_subgraph(f"host:{ip}", depth=3)
+        services = [n for n in sub.nodes if n.type == "service"]
+        assert len(services) == 1, f"expected 1 merged service, got {[n.id for n in services]}"
+        assert services[0].id == f"service:{ip}:80/tcp"
+        # No SERVICE node is URL-keyed (endpoint nodes legitimately embed a URL
+        # in their id — that is by design; only service ids must be canonical).
+        assert not any("://" in n.id for n in services), "no URL-keyed service node"
+
     def test_curl_nginx_produces_nginx_tech(self) -> None:
         parsed = CommandParser().parse(self._raw(_CURL_NGINX))
         tech_nodes = [n for n in parsed.node_deltas if n.type == "tech"]
@@ -472,6 +530,38 @@ class TestCommandParserCurl:
 # ---------------------------------------------------------------------------
 
 class TestBannerParser:
+    def test_url_target_and_port_never_produce_url_keyed_service(self) -> None:
+        # A mis-routed HTTP-shaped result reaching the banner parser with a URL
+        # target AND a URL port must NOT create the junk
+        # service:http://.../tcp node — the id must be canonical and the port
+        # numeric (the demonstrated data-quality bug).
+        parsed = BannerParser().parse_text(
+            "HTTP/1.1 200 OK", target="http://10.129.40.164",
+            port="http://10.129.40.164", source="curl",
+        )
+        services = [n for n in parsed.node_deltas if n.type == "service"]
+        assert len(services) == 1
+        svc = services[0]
+        assert svc.id == "service:10.129.40.164:80/tcp"
+        assert svc.props["port"] == "80"
+        assert "://" not in svc.id
+
+    def test_explicit_port_url_target_uses_bare_host(self) -> None:
+        parsed = BannerParser().parse_text(
+            _SSH_BANNER, target="http://10.10.10.14:22/", port="22",
+        )
+        svc = next(n for n in parsed.node_deltas if n.type == "service")
+        assert svc.id == "service:10.10.10.14:22/tcp"
+
+    def test_non_numeric_port_is_dropped(self) -> None:
+        # A non-numeric port never lands in the service node; the HTTP branch
+        # falls back to its default (80).
+        parsed = BannerParser().parse_text(
+            "HTTP/1.1 200 OK", target="10.10.10.14", port="not-a-port",
+        )
+        svc = next(n for n in parsed.node_deltas if n.type == "service")
+        assert svc.props["port"] == "80"
+
     def test_ssh_banner_creates_service_node(self) -> None:
         parsed = BannerParser().parse_text(_SSH_BANNER, target="10.10.10.14", port="22")
         services = [n for n in parsed.node_deltas if n.type == "service"]

@@ -381,6 +381,31 @@ class TestWebPlannerWithEngine:
         # Deterministic fallback produces curl tasks
         assert result[0].params["tool"] == "curl"
 
+    async def test_llm_validation_failure_falls_back_to_vhost_aware_action(self) -> None:
+        # §28.9 — when the web LLM output fails validation, the deterministic
+        # fallback must still yield a USABLE next web action. With a vhost
+        # discovered, that is the bounded, Host-aware --resolve fetch (a NEW
+        # action, not an empty candidate).
+        from memfabric.ids import now
+        from memfabric.types import Node
+
+        reg = _registry("curl")
+        vhost = Node(
+            id=f"vhost:{_TARGET}:app.example.htb", type="vhost",
+            props={"hostname": "app.example.htb", "ip": _TARGET, "discovered_from": "http_redirect"},
+            confidence=0.8, source="curl", first_seen=now(), last_seen=now(),
+        )
+        subgraph = SubgraphView(anchor=f"host:{_TARGET}", nodes=[vhost], edges=[], depth=2)
+        # Invalid JSON → validator returns None → deterministic fallback.
+        llm = _StubLLM("NOT VALID JSON {{{{")
+        planner = WebPlanner(_TARGET, reg, model_router=_StubRouter(llm), max_retries=0)
+        result = await planner.plan(_goal("web"), subgraph, _empty_evidence())
+        assert isinstance(result, list) and result, "fallback must not be empty"
+        head = next(t for t in result if t.params.get("parser") == "command")
+        assert "--resolve" in head.params["args"]
+        assert "app.example.htb" in " ".join(head.params["args"])
+        assert head.params["target"] == "http://app.example.htb"
+
     async def test_engine_created_only_with_router(self) -> None:
         reg = _registry("curl")
         planner_no_router = WebPlanner(_TARGET, reg)
