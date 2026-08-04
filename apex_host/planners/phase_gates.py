@@ -138,6 +138,9 @@ WEB_EVIDENCE_NONE = "no_web_content_evidence"
 WEB_EVIDENCE_CONTENT = "page_content_fetched"
 WEB_EVIDENCE_STRUCTURED = "structured_web_evidence"
 WEB_EVIDENCE_NO_CAPABILITY = "no_web_capability"
+# §28.13 — discovered (enumerated) endpoints remain unfetched: a productive
+# fetch action is still available, so the web phase is NOT complete yet.
+WEB_EVIDENCE_PENDING_ENDPOINTS = "unfetched_discovered_endpoints"
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,8 +228,17 @@ def web_evidence_status(
     complete — there is nothing to fetch. A terminal, budget-exhausted
     inability to make further web progress is handled by ``GlobalPlanner``
     (not here), since it depends on the turn budget, not the EKG."""
+    from apex_host.planners.web_opportunities import pending_enumerated_endpoints
+
     if not has_web_capability:
         return WebEvidence(True, WEB_EVIDENCE_NO_CAPABILITY)
+    # §28.13 — while enumeration discovered endpoints that have NOT been fetched,
+    # the web phase is NOT complete: fetching them is a productive next action,
+    # so the loop must not end (never mark complete with high-signal endpoints
+    # outstanding). GlobalPlanner's web-budget exhaustion still force-advances if
+    # the budget runs out, so this can never loop forever.
+    if pending_enumerated_endpoints(subgraph):
+        return WebEvidence(False, WEB_EVIDENCE_PENDING_ENDPOINTS)
     if _has_web_content(subgraph):
         return WebEvidence(True, WEB_EVIDENCE_CONTENT)
     return WebEvidence(False, WEB_EVIDENCE_NONE)

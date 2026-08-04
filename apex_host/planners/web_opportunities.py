@@ -185,6 +185,50 @@ def select_unvisited_endpoints(subgraph: "SubgraphView", target_host: str) -> li
     )
 
 
+def _url_path(url: str) -> str:
+    try:
+        return (urllib.parse.urlsplit(url).path or "/").rstrip("/") or "/"
+    except ValueError:
+        return "/"
+
+
+def pending_enumerated_endpoints(subgraph: "SubgraphView") -> list["Node"]:
+    """Discovered-but-unfetched enumeration endpoints, ranked highest-signal
+    first (§28.13).
+
+    A candidate is an ``endpoint`` node discovered by content enumeration
+    (``source`` in ffuf/gobuster) whose URL path has NOT yet been fetched —
+    i.e. no ``endpoint`` node marked ``fetched``/``browsed`` shares that path.
+    A ``404`` status is low-signal and excluded (the GOAL: non-404, /api-like
+    first). Ranking reuses the deterministic interest/depth/url ordering — a
+    stateless, blackboard-only view (reads the subgraph). This is what tells the
+    web planner to FETCH the paths enumeration found, and keeps the web phase
+    incomplete while a productive fetch remains."""
+    fetched_paths = {
+        _url_path(str(n.props.get("url", "")))
+        for n in subgraph.nodes
+        if n.type == "endpoint"
+        and (n.props.get("fetched") is True or n.props.get("browsed") is True)
+        and str(n.props.get("url", ""))
+    }
+    candidates = [
+        n for n in subgraph.nodes
+        if n.type == "endpoint"
+        and n.source in ("ffuf", "gobuster")
+        and str(n.props.get("url", ""))
+        and str(n.props.get("status", "")).strip() != "404"
+        and _url_path(str(n.props.get("url", ""))) not in fetched_paths
+    ]
+    return sorted(
+        candidates,
+        key=lambda n: (
+            _path_interest_rank(str(n.props.get("url", ""))),
+            _path_depth(str(n.props.get("url", ""))),
+            str(n.props.get("url", "")),
+        ),
+    )
+
+
 def technologies_from_subgraph(subgraph: "SubgraphView") -> list[dict[str, Any]]:
     """Reconstruct detected technologies (``tech`` nodes) for reporting.
 

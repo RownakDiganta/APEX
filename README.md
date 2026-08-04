@@ -2390,6 +2390,17 @@ capped on both axes — `--web-enum-threads` (concurrency, default 20) and
 policy-approved while nginx serves the real app). Hits become actionable
 `endpoint` nodes linked to the authorized host. See CLAUDE.md §28.12.
 
+**Closing the loop — fetch discovered endpoints (§28.13).** Enumeration records
+`/api`-style paths as `endpoint` nodes; the web planner then **fetches** them
+(instead of re-fetching only the homepage and stalling). It emits a bounded
+`--resolve -L` HEAD + body fetch of the highest-signal unfetched discovered
+endpoints (non-404, `/api`-like first), reusing the same Host-aware `--resolve`
+pin as the homepage — never a bare-IP fetch — at most 3 per turn, each fetched
+once. The web phase stays incomplete while a high-signal discovered endpoint is
+unfetched, and completes (or honestly terminates via the turn budget) once they
+are exhausted. Discovery only — fetch and record; no form submission or request
+forging. See CLAUDE.md §28.13.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,

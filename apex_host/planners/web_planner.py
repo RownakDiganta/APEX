@@ -44,6 +44,7 @@ Safety rules
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from memfabric.ids import new_id, now
 from memfabric.types import (
@@ -57,9 +58,15 @@ from memfabric.types import (
 )
 
 from apex_host.planners.capabilities import capabilities_from_subgraph
+from apex_host.planners.web_opportunities import pending_enumerated_endpoints
 from apex_host.planning.models import PlanDecision
 from apex_host.tools.registry import ToolRegistry
 from apex_host.types import ApexPhase
+
+#: Max discovered endpoints fetched per web turn (§28.13) — bounds the
+#: loop-closing fetch step; each endpoint is fetched once (distinct URL →
+#: distinct fingerprint), so the total is bounded by the enumeration result.
+_MAX_ENDPOINT_FETCHES = 3
 
 if TYPE_CHECKING:
     from apex_host.llm.gateway import LLMGateway
@@ -263,6 +270,41 @@ class _WebDeterministic:
                         },
                         subgraph_anchor=goal.anchor_node,
                         phase=goal.phase,
+                        claim_dependencies=web_claim_deps,
+                    )
+                )
+
+        # Fetch discovered-but-unfetched enumeration endpoints (§28.13) — close
+        # the loop: homepage → enumerate → FETCH what enumeration found. Each is
+        # fetched via the same Host-aware --resolve -L path as the homepage
+        # (highest-signal first), HEAD + body, once per endpoint (distinct URL →
+        # distinct fingerprint), bounded to _MAX_ENDPOINT_FETCHES per turn.
+        # DISCOVERY ONLY — fetch and record; no form submission or request forging.
+        if self._registry.get("curl") is not None:
+            for ep in pending_enumerated_endpoints(subgraph)[:_MAX_ENDPOINT_FETCHES]:
+                path = urlsplit(str(ep.props.get("url", ""))).path or "/"
+                fetch_url = f"{base_url.rstrip('/')}{path}"
+                tasks.append(
+                    TaskSpec(
+                        id=new_id(), goal_id=goal.id, executor_domain="web",
+                        params={
+                            "tool": "curl",
+                            "args": ["-s", "-I", *follow_args, *resolve_args, fetch_url],
+                            "target": fetch_url, "parser": "command",
+                        },
+                        subgraph_anchor=goal.anchor_node, phase=goal.phase,
+                        claim_dependencies=web_claim_deps,
+                    )
+                )
+                tasks.append(
+                    TaskSpec(
+                        id=new_id(), goal_id=goal.id, executor_domain="web",
+                        params={
+                            "tool": "curl",
+                            "args": ["-s", *follow_args, *resolve_args, fetch_url],
+                            "target": fetch_url, "parser": "curl_body",
+                        },
+                        subgraph_anchor=goal.anchor_node, phase=goal.phase,
                         claim_dependencies=web_claim_deps,
                     )
                 )

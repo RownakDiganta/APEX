@@ -241,3 +241,120 @@ class TestEnumConfigValidation:
         assert c1.web_enum_threads == 12
         assert c1.web_enum_max_seconds == 25
         assert c1.allow_password_lists is True
+
+
+# ---------------------------------------------------------------------------
+# §28.13 — close the loop: the web planner FETCHES discovered (enumerated)
+# endpoints instead of stalling; the phase gate defers completion while any
+# high-signal discovered endpoint is unfetched.
+# ---------------------------------------------------------------------------
+def _fetched(nid: str, url: str, source: str = "curl") -> Node:
+    return _node(nid, "endpoint", {"url": url, "status": "200", "fetched": True}, source=source)
+
+
+def _discovered(path: str, status: str = "200", source: str = "ffuf") -> Node:
+    url = f"http://{_IP}/{path}"
+    return _node(f"endpoint:{url}", "endpoint", {"url": url, "path": path, "status": status}, source=source)
+
+
+def _nodes_with_vhost_home_and(discovered: list[Node]) -> list[Node]:
+    return _base_nodes(with_vhost=True) + [
+        _fetched("endpoint:http://2million.htb", "http://2million.htb"),
+    ] + discovered
+
+
+class TestEndpointFetchLoop:
+    def _planner(self) -> _WebDeterministic:
+        return _WebDeterministic(_IP, ToolRegistry(["curl", "ffuf"]), web_wordlist_path="/wl.txt")
+
+    def test_fetches_discovered_endpoint_via_resolve(self) -> None:
+        nodes = _nodes_with_vhost_home_and([_discovered("api")])
+        tasks = _plan(self._planner(), nodes)
+        fetches = [t for t in tasks if t.params["target"] == "http://2million.htb/api"]
+        assert fetches, "planner ignored the discovered /api endpoint"
+        # Host-aware --resolve -L fetch, never a bare-IP fetch of /api.
+        for t in fetches:
+            assert "--resolve" in t.params["args"]
+            assert f"2million.htb:80:{_IP}" in t.params["args"]
+            assert "-L" in t.params["args"]
+        assert not any(t.params["target"] == f"http://{_IP}/api" for t in tasks)
+
+    def test_low_signal_404_not_fetched(self) -> None:
+        nodes = _nodes_with_vhost_home_and([_discovered("gone", status="404")])
+        tasks = _plan(self._planner(), nodes)
+        assert not any("gone" in t.params["target"] for t in tasks)
+
+    def test_each_endpoint_fingerprint_distinct(self) -> None:
+        from apex_host.planning.fingerprint import task_fingerprint
+        nodes = _nodes_with_vhost_home_and([_discovered("api"), _discovered("admin")])
+        tasks = _plan(self._planner(), nodes)
+        head = [t for t in tasks if t.params.get("parser") == "command"
+                and t.params["target"].startswith("http://2million.htb/")]
+        fps = {task_fingerprint("web", "curl", t.params["args"], t.params["target"],
+                                "command", "web", "") for t in head}
+        assert len(fps) == len(head) and len(head) >= 2  # one distinct action per endpoint
+
+    def test_fetch_bounded_per_turn(self) -> None:
+        many = [_discovered(f"p{i}") for i in range(10)]
+        tasks = _plan(self._planner(), _nodes_with_vhost_home_and(many))
+        head = [t for t in tasks if t.params.get("parser") == "command"
+                and t.params["target"].startswith("http://2million.htb/")
+                and t.params["target"] != "http://2million.htb"]
+        assert len(head) <= 3  # _MAX_ENDPOINT_FETCHES
+
+    def test_already_fetched_endpoint_not_refetched(self) -> None:
+        # A discovered /api whose path already has a fetched counterpart is done.
+        nodes = _nodes_with_vhost_home_and([
+            _discovered("api"),
+            _fetched("endpoint:http://2million.htb/api", "http://2million.htb/api"),
+        ])
+        tasks = _plan(self._planner(), nodes)
+        assert not any(t.params["target"] == "http://2million.htb/api"
+                       and t.params.get("parser") == "command" for t in tasks)
+
+
+class TestWebGateDefersForPendingEndpoints:
+    def test_gate_incomplete_while_pending(self) -> None:
+        from apex_host.planners.phase_gates import (
+            WEB_EVIDENCE_PENDING_ENDPOINTS,
+            web_evidence_status,
+        )
+        nodes = _nodes_with_vhost_home_and([_discovered("api")])
+        ws = web_evidence_status(_subgraph(nodes))
+        assert ws.complete is False and ws.reason == WEB_EVIDENCE_PENDING_ENDPOINTS
+
+    def test_gate_complete_when_endpoints_exhausted(self) -> None:
+        from apex_host.planners.phase_gates import web_evidence_status
+        nodes = _nodes_with_vhost_home_and([
+            _discovered("api"),
+            _fetched("endpoint:http://2million.htb/api", "http://2million.htb/api"),
+        ])
+        assert web_evidence_status(_subgraph(nodes)).complete is True
+
+    def test_gate_complete_when_only_404_discovered(self) -> None:
+        from apex_host.planners.phase_gates import web_evidence_status
+        # A 404-only enumeration is not high-signal — the phase can complete.
+        nodes = _nodes_with_vhost_home_and([_discovered("gone", status="404")])
+        assert web_evidence_status(_subgraph(nodes)).complete is True
+
+
+class TestFetchRoutedThroughRealParser:
+    def test_head_fetch_marks_path_fetched(self) -> None:
+        # The HEAD fetch result, routed through parse_single_result, records a
+        # fetched endpoint whose path clears the pending set (loop terminates).
+        from apex_host.planners.web_opportunities import pending_enumerated_endpoints
+        header = ("HTTP/1.1 200 OK\r\nServer: nginx\r\n"
+                  "Content-Type: application/json\r\n")
+        obs, _src = parse_single_result(
+            {"tool": "curl", "parser": "command",
+             "args": ["-s", "-I", "-L", "--resolve", f"2million.htb:80:{_IP}",
+                      "http://2million.htb/api"],
+             "target": "http://2million.htb/api", "stdout": header},
+            {"target": _IP},
+        )
+        eps = [n for n in obs.node_deltas if n.type == "endpoint"]
+        assert eps and eps[0].props.get("fetched") is True
+        assert eps[0].props.get("content_type") == "application/json"
+        # Simulate the graph now holding the fetched endpoint + the discovered one.
+        combined = _subgraph([_discovered("api"), *obs.node_deltas])
+        assert not pending_enumerated_endpoints(combined)  # /api no longer pending

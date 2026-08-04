@@ -10302,6 +10302,63 @@ vhost known → one bounded ffuf → policy-approved → safety-passed → a `/a
 routed through `parse_single_result` becomes an EKG endpoint node under the
 authorized host → enumeration is once-per-phase.
 
+### 28.13 Fetch discovered endpoints — closing the web loop
+
+> **Numbering note:** highest unique §28 heading is §28.12 (the trailing
+> `### 28.7`/`### 28.8` are the known collision). This section is **§28.13**;
+> nothing was renumbered.
+
+§28.12 enumeration records `/api`-style paths as `endpoint` nodes, but the web
+planner then re-fetched only the homepage and stalled — the discovered endpoints
+were never fetched. This closes the loop: **homepage → enumerate → fetch the
+discovered endpoints → parse**. Still discovery only — fetch and record; no form
+submission, request forging, or auth.
+
+**Pending set (`apex_host.planners.web_opportunities.pending_enumerated_endpoints`).**
+A stateless, blackboard-only view: `endpoint` nodes discovered by enumeration
+(`source in {ffuf, gobuster}`) whose URL **path** has no fetched counterpart (no
+`endpoint` marked `fetched`/`browsed` sharing that path). A `404` is low-signal
+and excluded. Ranked highest-signal first via the existing
+interest(`/api`…)/depth/url ordering. Used by BOTH the planner and the phase
+gate so they never disagree.
+
+**Planner (`_WebDeterministic.plan`).** After the homepage fetch and the
+once-per-phase enumeration, it emits a bounded `--resolve -L` HEAD + body fetch
+of the top-`_MAX_ENDPOINT_FETCHES` (3) pending endpoints, reusing the **same
+§28.8 Host-aware `--resolve` path** as the homepage (fetch URL =
+`{vhost_base}{path}`, target = that vhost URL, authorized by the `--resolve`
+pin — never a bare-IP fetch of the path). Each endpoint is a distinct URL →
+distinct fingerprint → fetched once; the total is bounded by the enumeration
+result, and the HEAD fetch (`parser="command"` → `_parse_curl_headers`) records
+a `fetched` endpoint with `status`/`content_type`/tech — which clears that path
+from the pending set, so the loop terminates. No parser change was needed (a
+JSON API's response shape is captured by the HEAD endpoint's `content_type`; the
+non-HTML `parse_curl_body` → KnowledgeEntry behavior is unchanged).
+
+**Phase gate (`web_evidence_status`).** New `WEB_EVIDENCE_PENDING_ENDPOINTS`
+reason: while `pending_enumerated_endpoints(subgraph)` is non-empty the web phase
+is **not** complete (a productive fetch remains) — it never marks complete with a
+high-signal discovered endpoint outstanding. `GlobalPlanner`'s web-budget
+exhaustion still force-advances if the budget runs out, so it can never loop
+forever; a 404-only enumeration (no pending) completes normally.
+
+**Safety.** Every fetch runs through `runner.py` → `safety.py`, is
+`--resolve`-pinned to the authorized IP, and passes `PolicyAdvisor` scope
+(authorized via the pin, §28.8). Bounded count per turn; dry-run default
+unchanged.
+
+**Tests (through the real path).** `tests/apex_host/test_web_enum.py`:
+`TestEndpointFetchLoop` (fetches the discovered endpoint via `--resolve`, never
+bare-IP; 404 skipped; distinct fingerprints; bounded to 3/turn; already-fetched
+not re-fetched), `TestWebGateDefersForPendingEndpoints` (incomplete while
+pending, complete when exhausted, 404-only completes),
+`TestFetchRoutedThroughRealParser` (the HEAD result through
+`parse_single_result` marks the path fetched → pending cleared). Release-gate
+scenario `web_endpoint_fetch_loop` (§28.13): vhost + enumerated `/api` → the
+planner emits the `--resolve -L` fetch → routed through the real parser → `/api`
+becomes fetched → pending cleared → web completes. It **fails** if the planner
+ignores discovered endpoints (verified).
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

@@ -74,11 +74,14 @@ def _make_api() -> MemoryAPI:
     )
 
 
-async def _seed_node(api: MemoryAPI, node_id: str, node_type: str, props: dict[str, Any] | None = None) -> None:
+async def _seed_node(
+    api: MemoryAPI, node_id: str, node_type: str, props: dict[str, Any] | None = None,
+    *, source: str = "release_gate",
+) -> None:
     ts = now()
     await api.upsert_node(Node(
         id=node_id, type=node_type, props=props or {}, confidence=0.9,
-        source="release_gate", first_seen=ts, last_seen=ts,
+        source=source, first_seen=ts, last_seen=ts,
     ))
 
 
@@ -1502,6 +1505,124 @@ async def scenario_web_content_enumeration() -> ScenarioResult:
     )
 
 
+async def scenario_web_endpoint_fetch_loop() -> ScenarioResult:
+    """20. Discovered (enumerated) endpoints get FETCHED, closing the web loop.
+
+    Reproduces the demonstrated stall: enumeration records /api endpoint nodes,
+    but the web planner re-fetched only the homepage and stalled. Drives the REAL
+    WebPlanner + PolicyAdvisor + safety + parse_single_result (router) + MemoryAPI
+    (Invariant 1). Fails the gate if the planner IGNORES the discovered endpoint
+    (no --resolve fetch), if the phase completes with a high-signal endpoint
+    unfetched, or if the fetched result does not clear the pending set.
+    DISCOVERY ONLY — fetch and record.
+    """
+    from typing import cast
+
+    from apex_host.config import ApexConfig
+    from apex_host.graph_state import ApexGraphState
+    from apex_host.orchestration.parsing_node import parse_single_result
+    from apex_host.planners.phase_gates import web_evidence_status
+    from apex_host.planners.web_opportunities import pending_enumerated_endpoints
+    from apex_host.planners.web_planner import _WebDeterministic
+    from apex_host.policy import PolicyAdvisor
+    from apex_host.policy.policy_loader import load_policy
+    from apex_host.tools.registry import ToolRegistry
+    from apex_host.tools.safety import check_command
+    from apex_host.types import ToolCommand
+    from memfabric.types import EvidenceBundle, Goal
+
+    _VHOST = "app.example.htb"
+    problems: list[str] = []
+    api = _make_api()
+    await _seed_node(api, _ANCHOR, "host", {"ip": _TARGET})
+    await _seed_node(api, f"service:{_TARGET}:80/tcp", "service",
+                     {"port": "80", "proto": "tcp", "state": "open", "service": "http"})
+    await _seed_edge(api, _ANCHOR, f"service:{_TARGET}:80/tcp", "exposes")
+    await _seed_node(api, f"vhost:{_TARGET}:{_VHOST}", "vhost",
+                     {"hostname": _VHOST, "ip": _TARGET})
+    await _seed_edge(api, _ANCHOR, f"vhost:{_TARGET}:{_VHOST}", "exposes")
+    # The vhost homepage was already fetched.
+    home_url = f"http://{_VHOST}"
+    await _seed_node(api, f"endpoint:{home_url}", "endpoint",
+                     {"url": home_url, "status": "200", "fetched": True})
+    await _seed_edge(api, _ANCHOR, f"endpoint:{home_url}", "exposes")
+    # Enumeration discovered /api (source=ffuf, IP-scoped, not yet fetched) and a
+    # low-signal 404.
+    api_url = f"http://{_TARGET}/api"
+    await _seed_node(api, f"endpoint:{api_url}", "endpoint",
+                     {"url": api_url, "path": "api", "status": "200"}, source="ffuf")
+    await _seed_edge(api, _ANCHOR, f"endpoint:{api_url}", "exposes")
+    gone_url = f"http://{_TARGET}/gone"
+    await _seed_node(api, f"endpoint:{gone_url}", "endpoint",
+                     {"url": gone_url, "path": "gone", "status": "404"}, source="ffuf")
+    await _seed_edge(api, _ANCHOR, f"endpoint:{gone_url}", "exposes")
+
+    config = ApexConfig(target=_TARGET, dry_run=True, allowed_tools=["curl"])
+    subgraph = await api.get_subgraph(_ANCHOR, depth=5)
+    goal = Goal(id="rg-fetch", description="web", phase="web", anchor_node=_ANCHOR)
+    empty = EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[])
+
+    # The gate must NOT be complete — /api is a discovered, unfetched, high-signal
+    # endpoint (a productive fetch remains).
+    if web_evidence_status(subgraph).complete:
+        problems.append("web marked complete while /api was still unfetched")
+
+    planner = _WebDeterministic(_TARGET, ToolRegistry.from_config(config))
+    tasks = await planner.plan(goal, subgraph, empty)
+    if not isinstance(tasks, list):
+        return ScenarioResult("web_endpoint_fetch_loop", False, "planner abandoned")
+    api_fetches = [t for t in tasks if t.params.get("target") == f"http://{_VHOST}/api"]
+    if not api_fetches:
+        problems.append("planner IGNORED the discovered /api endpoint (no fetch emitted)")
+        return ScenarioResult("web_endpoint_fetch_loop", False, "; ".join(problems))
+    head = next((t for t in api_fetches if t.params.get("parser") == "command"), None)
+    if head is None:
+        problems.append("no HEAD fetch of the discovered endpoint")
+        return ScenarioResult("web_endpoint_fetch_loop", False, "; ".join(problems))
+    args = head.params["args"]
+    if "--resolve" not in args or f"{_VHOST}:80:{_TARGET}" not in args:
+        problems.append(f"discovered-endpoint fetch is not --resolve-pinned: {args}")
+    if "-L" not in args:
+        problems.append("discovered-endpoint fetch does not follow redirects (-L)")
+    if any(t.params.get("target") == f"http://{_TARGET}/api" for t in tasks):
+        problems.append("planner emitted a bare-IP fetch of /api instead of the vhost")
+    if any(t.params.get("target", "").endswith("/gone") for t in tasks):
+        problems.append("planner fetched a low-signal 404 endpoint")
+
+    # Policy + safety on the emitted fetch.
+    advisor = PolicyAdvisor(load_policy(config), config)
+    if not advisor.review_task(head, "web", empty, config).is_approved:
+        problems.append("policy blocked the --resolve-pinned discovered-endpoint fetch")
+    try:
+        check_command(ToolCommand(tool="curl", args=args), config)
+    except ValueError as exc:  # pragma: no cover - defensive
+        problems.append(f"safety.py rejected the fetch: {exc}")
+
+    # Route the HEAD /api result through the real router → apply deltas → /api is
+    # now fetched → pending cleared → gate completes.
+    header = "HTTP/1.1 200 OK\r\nServer: nginx\r\nContent-Type: application/json\r\n"
+    obs, _src = parse_single_result(
+        {"tool": "curl", "parser": "command", "args": args,
+         "target": head.params["target"], "stdout": header},
+        cast("ApexGraphState", {"target": _TARGET}),
+    )
+    await api.apply_deltas(nodes=obs.node_deltas, edges=obs.edge_deltas)
+    subgraph2 = await api.get_subgraph(_ANCHOR, depth=6)
+    if pending_enumerated_endpoints(subgraph2):
+        problems.append("/api still pending after it was fetched (loop would not terminate)")
+    if not web_evidence_status(subgraph2).complete:
+        problems.append("web did not complete after discovered endpoints were fetched")
+
+    if problems:
+        return ScenarioResult("web_endpoint_fetch_loop", False, "; ".join(problems))
+    return ScenarioResult(
+        "web_endpoint_fetch_loop", True,
+        f"discovered /api fetched via --resolve -L http://{_VHOST}/api (not bare-IP, "
+        "not homepage); 404 skipped; policy-approved; safety-passed; the fetched "
+        "result cleared the pending set and the web phase then completed",
+    )
+
+
 SCENARIOS: list[Any] = [
     scenario_ssh_success,
     scenario_dfr_success,
@@ -1522,6 +1643,7 @@ SCENARIOS: list[Any] = [
     scenario_web_incomplete_not_goal_completed,
     scenario_incomplete_scan_escalates_not_stall,
     scenario_web_content_enumeration,
+    scenario_web_endpoint_fetch_loop,
 ]
 
 
