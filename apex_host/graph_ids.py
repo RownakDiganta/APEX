@@ -109,6 +109,32 @@ def _normalize_endpoint_url(url: str) -> str:
 # Node ID builders
 # ---------------------------------------------------------------------------
 
+def bare_host(target: str) -> str:
+    """Return the bare host of *target* — scheme, port, and path all stripped.
+
+    A host node is keyed on the bare host (``10.10.10.14``), never a URL or
+    ``host:port`` string, so ``host_id(bare_host(t))`` is canonical
+    (``host:10.10.10.14``) and matches the host node other parsers create.
+    Handles ``http://h``, ``http://h:8080/p``, bare ``h``, ``h:8080``, and
+    bracketed IPv6 (``http://[::1]:80/``).
+
+    >>> bare_host("http://10.10.10.14:8080/dir")
+    '10.10.10.14'
+    """
+    t = target.strip()
+    if "://" in t:
+        host = urllib.parse.urlsplit(t).hostname
+        if host:
+            return host
+    t = t.split("//")[-1].split("/")[0]
+    if t.startswith("["):  # bracketed IPv6 literal, optionally with :port
+        return t[1:].split("]")[0]
+    head, sep, tail = t.rpartition(":")
+    if sep and tail.isdigit():  # strip a trailing numeric :port
+        return head
+    return t
+
+
 def host_id(ip: str) -> str:
     """Canonical ID for a host node.
 

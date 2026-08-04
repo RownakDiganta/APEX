@@ -2377,6 +2377,19 @@ pinned via `--resolve` to an already-authorized IP (a raw off-scope host, or a
 pin to an unauthorized IP, stays blocked); the safety allowlist accepts the
 `--resolve`/`-L` values unchanged (no shell metacharacters). See CLAUDE.md §28.8.
 
+**Bounded content enumeration (§28.12).** Once a vhost is discovered, the web
+planner can run a single, bounded ffuf/gobuster scan against it to find
+undocumented paths — **discovery only** (no exploitation, no auth-flow
+automation). It is **opt-in and doubly gated**: the operator must set
+`--web-wordlist <path>` (pointing at the mounted SecLists/Knowledge corpus,
+never bundled in source) **and** `allow_password_lists=True` (the §19 wordlist
+policy gate). The scan is emitted **once per phase**, one tool (ffuf preferred),
+capped on both axes — `--web-enum-threads` (concurrency, default 20) and
+`--web-enum-max-seconds` (ffuf `--maxtime`, default 60) — and fuzzes the
+**authorized IP** URL with a `-H Host: <vhost>` header (so the target stays
+policy-approved while nginx serves the real app). Hits become actionable
+`endpoint` nodes linked to the authorized host. See CLAUDE.md §28.12.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,

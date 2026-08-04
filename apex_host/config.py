@@ -92,6 +92,16 @@ class ApexConfig:
     # Without a wordlist, WebPlanner emits only bounded curl probes (HEAD + body).
     web_wordlist_path: str | None = None
     max_web_paths: int = 50
+    # Bounded web content-enumeration (§28.12). ffuf/gobuster discovery against a
+    # discovered vhost is capped on BOTH axes so it can never run unbounded:
+    # web_enum_threads caps concurrency (ffuf -t / gobuster -t) and
+    # web_enum_max_seconds is ffuf's hard --maxtime wall-clock ceiling (gobuster
+    # dir has no total-time flag, so it is additionally bounded by the runner's
+    # own subprocess timeout). The wordlist itself is operator-configured
+    # (web_wordlist_path → the mounted SecLists/Knowledge corpus), never bundled.
+    # Validated ranges live in apex_host.eval.check_config.validate_combinations.
+    web_enum_threads: int = 20
+    web_enum_max_seconds: int = 60
     # Bounded access validation — explicit credentials only, no looping.
     # Empty by default: no login attempts are made unless the operator
     # supplies credentials via --username / --password CLI flags.
@@ -665,6 +675,8 @@ class ApexConfig:
             "dry_run": bool(_g("dry_run", True)),
             "web_wordlist_path": _g("web_wordlist", None),
             "max_web_paths": _g("max_web_paths", 50),
+            "web_enum_threads": _g("web_enum_threads", 20),
+            "web_enum_max_seconds": _g("web_enum_max_seconds", 60),
             "username_candidates": list(getattr(args, "username", None) or []),
             "password_candidates": list(getattr(args, "password", None) or []),
             "max_access_attempts": _g("max_access_attempts", 1),
@@ -687,6 +699,9 @@ class ApexConfig:
             "llm_openrouter_base_url": _g("llm_openrouter_base_url", None),
             "knowledge_root": _g("knowledge_root", None),
             "policy_file": _g("policy_file", None),
+            # §19 wordlist-fuzzing gate — opt-in, default False. Required (with a
+            # wordlist) for §28.12 content enumeration to pass the policy gate.
+            "allow_password_lists": bool(_g("allow_password_lists", False)),
             "llm_stop_on_repeated_plan": bool(_g("llm_stop_on_repeated_plan", True)),
             "llm_required": bool(_g("llm_required", False)),
             # Infra Phase 4 — tool-execution backend selection. Note there is

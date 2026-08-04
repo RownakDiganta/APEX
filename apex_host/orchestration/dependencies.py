@@ -127,6 +127,8 @@ def build_planners(
             registry,
             web_wordlist_path=config.web_wordlist_path,
             max_web_paths=config.max_web_paths,
+            web_enum_threads=config.web_enum_threads,
+            web_enum_max_seconds=config.web_enum_max_seconds,
             **_kwargs(),
         ),
         ApexPhase.credential.value: CredentialPlanner(

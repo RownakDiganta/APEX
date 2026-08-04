@@ -7,7 +7,12 @@ import re
 
 from memfabric.ids import now
 from memfabric.types import Edge, Node, ParsedObservation
-from apex_host.graph_ids import host_id as _host_id_fn, endpoint_id as _endpoint_id, exposes_edge_id
+from apex_host.graph_ids import (
+    bare_host as _bare_host,
+    endpoint_id as _endpoint_id,
+    exposes_edge_id,
+    host_id as _host_id_fn,
+)
 
 _LINE_RE = re.compile(r"^(?P<path>\S+)\s+\[Status:\s*(?P<status>\d+)")
 
@@ -15,11 +20,20 @@ _LINE_RE = re.compile(r"^(?P<path>\S+)\s+\[Status:\s*(?P<status>\d+)")
 class FfufParser:
     """Stateless parser: ffuf stdout text -> ParsedObservation."""
 
-    def parse_text(self, output: str, *, target: str, source: str = "ffuf") -> ParsedObservation:
+    def parse_text(
+        self, output: str, *, target: str, source: str = "ffuf", host_ip: str = ""
+    ) -> ParsedObservation:
         nodes: list[Node] = []
         edges: list[Edge] = []
         timestamp = now()
-        h_id = _host_id_fn(target)
+        # The exposes edge attaches to the AUTHORIZED host node — the bare host
+        # of host_ip when supplied (as parsing_node does, = state["target"]),
+        # else the bare host of target. target may be a URL (http://ip/), so it
+        # MUST be normalized to a bare host: host_id("http://ip") would be
+        # "host:http://ip" — a non-existent node whose exposes edge fails
+        # put_edge's endpoint check (P8-I05) and rolls back the whole batch.
+        host = _bare_host(host_ip) if host_ip.strip() else _bare_host(target)
+        h_id = _host_id_fn(host)
 
         for line in output.splitlines():
             match = _LINE_RE.match(line.strip())

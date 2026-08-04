@@ -234,7 +234,18 @@ class TestFfufParser:
     def test_exposes_edge_from_host(self) -> None:
         parsed = FfufParser().parse_text(_FFUF_SAMPLE, target=self._TARGET)
         for edge in parsed.edge_deltas:
-            assert edge.from_id == f"host:{self._TARGET}"
+            # §28.12 — the exposes edge attaches to the BARE host node
+            # (host:target.local), never host:http://target.local, which would
+            # dangle and roll back the batch (P8-I05).
+            assert edge.from_id == "host:target.local"
+
+    def test_exposes_edge_uses_host_ip_when_supplied(self) -> None:
+        # When parsing_node supplies host_ip (= the authorized host), the edge
+        # attaches to it even though target is a vhost URL (§28.12).
+        parsed = FfufParser().parse_text(
+            _FFUF_SAMPLE, target="http://2million.htb", host_ip="10.129.40.164"
+        )
+        assert all(e.from_id == "host:10.129.40.164" for e in parsed.edge_deltas)
 
     def test_url_constructed_from_target_and_path(self) -> None:
         output = "/api [Status: 200, Size: 10, Words: 1, Lines: 1, Duration: 5ms]"
@@ -301,7 +312,8 @@ class TestGobusterParser:
     def test_exposes_edge_from_host(self) -> None:
         parsed = GobusterParser().parse_text(_GOBUSTER_SAMPLE, target=self._TARGET)
         for edge in parsed.edge_deltas:
-            assert edge.from_id == f"host:{self._TARGET}"
+            # §28.12 — bare host node, never host:http://target.local (dangling).
+            assert edge.from_id == "host:target.local"
 
     def test_url_constructed_from_target_and_path(self) -> None:
         output = "/admin (Status: 200) [Size: 512]"

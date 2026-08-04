@@ -243,6 +243,17 @@ def validate_combinations(config: ApexConfig) -> list[str]:
             "(nmap would be SIGTERM'd before its own --host-timeout fires)"
         )
 
+    # Bounded web content-enumeration caps (§28.12) — both must be positive and
+    # bounded so a fuzzing scan can never run unbounded.
+    if config.web_enum_threads < 1 or config.web_enum_threads > 200:
+        problems.append(
+            f"web_enum_threads={config.web_enum_threads} must be in the range 1..200"
+        )
+    if config.web_enum_max_seconds < 1 or config.web_enum_max_seconds > 3600:
+        problems.append(
+            f"web_enum_max_seconds={config.web_enum_max_seconds} must be in the range 1..3600"
+        )
+
     return problems
 
 

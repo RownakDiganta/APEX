@@ -170,6 +170,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Maximum web paths to discover per turn (default: 50)",
     )
     parser.add_argument(
+        "--web-enum-threads", dest="web_enum_threads", type=int, default=None, metavar="N",
+        help="Capped concurrency for ffuf/gobuster content enumeration (default: 20).",
+    )
+    parser.add_argument(
+        "--web-enum-max-seconds", dest="web_enum_max_seconds", type=int, default=None, metavar="SECS",
+        help="Hard wall-clock cap for a content-enumeration scan (ffuf --maxtime; default: 60).",
+    )
+    parser.add_argument(
+        "--allow-password-lists", dest="allow_password_lists", action="store_true", default=None,
+        help="Permit wordlist fuzzing (ffuf/gobuster -w) past the §19 policy gate. "
+             "Required, with --web-wordlist, for content enumeration. Off by default.",
+    )
+    parser.add_argument(
         "--export-graph", metavar="PATH",
         help="After the run, write EKG nodes+edges JSON to this file (default: $APEX_GRAPH_PATH)",
     )

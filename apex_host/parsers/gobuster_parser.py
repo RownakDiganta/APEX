@@ -7,7 +7,12 @@ import re
 
 from memfabric.ids import now
 from memfabric.types import Edge, Node, ParsedObservation
-from apex_host.graph_ids import host_id as _host_id_fn, endpoint_id as _endpoint_id, exposes_edge_id
+from apex_host.graph_ids import (
+    bare_host as _bare_host,
+    endpoint_id as _endpoint_id,
+    exposes_edge_id,
+    host_id as _host_id_fn,
+)
 
 _LINE_RE = re.compile(r"^(?P<path>/\S*)\s+\(Status:\s*(?P<status>\d+)\)")
 
@@ -15,11 +20,17 @@ _LINE_RE = re.compile(r"^(?P<path>/\S*)\s+\(Status:\s*(?P<status>\d+)\)")
 class GobusterParser:
     """Stateless parser: gobuster stdout text -> ParsedObservation."""
 
-    def parse_text(self, output: str, *, target: str, source: str = "gobuster") -> ParsedObservation:
+    def parse_text(
+        self, output: str, *, target: str, source: str = "gobuster", host_ip: str = ""
+    ) -> ParsedObservation:
         nodes: list[Node] = []
         edges: list[Edge] = []
         timestamp = now()
-        h_id = _host_id_fn(target)
+        # Attach the exposes edge to the AUTHORIZED host node; normalize a URL
+        # target to its bare host (host_id of a "http://ip" would dangle and
+        # roll back the batch — P8-I05). See FfufParser for the full rationale.
+        host = _bare_host(host_ip) if host_ip.strip() else _bare_host(target)
+        h_id = _host_id_fn(host)
 
         for line in output.splitlines():
             match = _LINE_RE.match(line.strip())

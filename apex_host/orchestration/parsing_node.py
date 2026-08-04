@@ -114,9 +114,12 @@ def parse_single_result(
     if parser_name == "nmap" or tool_name == "nmap":
         return _NMAP.parse_text(stdout, target=target), tool_name
     if parser_name == "ffuf":
-        return _FFUF.parse_text(stdout, target=target), tool_name
+        # host_ip = the authorized host so ffuf hits (fuzzed against the IP URL
+        # with a -H Host: <vhost> header, §28.12) link to the existing host node
+        # rather than a non-existent host:<url> that would roll back the batch.
+        return _FFUF.parse_text(stdout, target=target, host_ip=state["target"]), tool_name
     if parser_name == "gobuster":
-        return _GOBUSTER.parse_text(stdout, target=target), tool_name
+        return _GOBUSTER.parse_text(stdout, target=target, host_ip=state["target"]), tool_name
     if tool_name in ("nc", "netcat") or parser_name == "banner":
         port = _port_from_nc_args(tool_result.get("args", []))
         return _BANNER.parse_text(stdout, target=target, source=tool_name, port=port), tool_name

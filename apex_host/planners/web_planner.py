@@ -93,11 +93,15 @@ class _WebDeterministic:
         *,
         web_wordlist_path: str | None = None,
         max_web_paths: int = 50,
+        web_enum_threads: int = 20,
+        web_enum_max_seconds: int = 60,
     ) -> None:
         self._target = target
         self._registry = registry
         self._wordlist = web_wordlist_path
         self._max_paths = max_web_paths
+        self._enum_threads = web_enum_threads
+        self._enum_max_seconds = web_enum_max_seconds
 
     async def plan(
         self, goal: Goal, subgraph: SubgraphView, evidence: EvidenceBundle
@@ -195,17 +199,24 @@ class _WebDeterministic:
                 )
             )
 
-        # Wordlist-based directory discovery — opt-in only.
-        # Neither ffuf nor gobuster are emitted without an explicit wordlist.
-        # ffuf/gobuster fuzz the AUTHORIZED IP URL (which resolves in the
-        # container) and, when a vhost is known, carry a `-H Host: <vhost>`
-        # header so nginx serves the real app under that vhost.
-        if self._wordlist:
+        # Bounded content-enumeration (§28.12) — opt-in and once per phase.
+        # Emitted only when a wordlist is configured AND no prior enumeration hit
+        # already exists in the EKG (so a single bounded scan runs per phase, not
+        # every turn). ONE tool is emitted — prefer ffuf (it has a hard --maxtime
+        # ceiling), else gobuster. Both fuzz the AUTHORIZED IP URL (which resolves
+        # in the container, so the target stays policy-approved) and, when a vhost
+        # is known, carry `-H Host: <vhost>` so nginx serves the real app under
+        # that vhost. Every scan is capped: concurrency (-t) and, for ffuf, a hard
+        # wall-clock --maxtime; gobuster is additionally bounded by the runner's
+        # subprocess timeout. DISCOVERY ONLY — hits are recorded as endpoint nodes.
+        if self._wordlist and not self._enumeration_done(subgraph):
             host_header_args = (
                 ["-H", f"Host: {vhost_node.props.get('hostname', '')}"]
                 if vhost_node is not None
                 else []
             )
+            threads = str(max(1, self._enum_threads))
+            maxtime = str(max(1, self._enum_max_seconds))
             if self._registry.get("ffuf") is not None:
                 tasks.append(
                     TaskSpec(
@@ -219,7 +230,8 @@ class _WebDeterministic:
                                 "-w", self._wordlist,
                                 *host_header_args,
                                 "-mc", "200,301,302,403",
-                                "-maxtime", "60",
+                                "-t", threads,
+                                "-maxtime", maxtime,
                             ],
                             "target": ip_base_url,
                             "parser": "ffuf",
@@ -229,7 +241,7 @@ class _WebDeterministic:
                         claim_dependencies=web_claim_deps,
                     )
                 )
-            if self._registry.get("gobuster") is not None:
+            elif self._registry.get("gobuster") is not None:
                 tasks.append(
                     TaskSpec(
                         id=new_id(),
@@ -242,6 +254,7 @@ class _WebDeterministic:
                                 "-u", ip_base_url,
                                 "-w", self._wordlist,
                                 *host_header_args,
+                                "-t", threads,
                                 "-q",
                                 "--no-progress",
                             ],
@@ -263,6 +276,17 @@ class _WebDeterministic:
                 )
             )
         return tasks
+
+    @staticmethod
+    def _enumeration_done(subgraph: SubgraphView) -> bool:
+        """True once a content-enumeration scan has already produced endpoints
+        (an ``endpoint`` node whose provenance is ffuf/gobuster). Gates the scan
+        to ONCE per phase — a stateless, blackboard-only check (reads the
+        subgraph), never a stored flag."""
+        return any(
+            n.type == "endpoint" and n.source in ("ffuf", "gobuster")
+            for n in subgraph.nodes
+        )
 
     @staticmethod
     def _select_vhost(subgraph: SubgraphView) -> Node | None:
@@ -292,6 +316,8 @@ class WebPlanner:
         *,
         web_wordlist_path: str | None = None,
         max_web_paths: int = 50,
+        web_enum_threads: int = 20,
+        web_enum_max_seconds: int = 60,
         model_router: "ModelRouter | None" = None,
         allowed_tools: list[str] | None = None,
         confidence_threshold: float = 0.4,
@@ -304,6 +330,8 @@ class WebPlanner:
             target, registry,
             web_wordlist_path=web_wordlist_path,
             max_web_paths=max_web_paths,
+            web_enum_threads=web_enum_threads,
+            web_enum_max_seconds=web_enum_max_seconds,
         )
         self._engine: PlanningEngine | None = None
         self._last_decision: PlanDecision | None = None

@@ -10231,6 +10231,77 @@ mislabeled `banner`/`curl_body` still yields a vhost; a correct `command` label
 still works; a curl HTML body is **not** swept into the header path; an
 `nc` banner is unaffected).
 
+### 28.12 Bounded web content-enumeration against a discovered vhost
+
+> **Numbering note:** §28.11 is the highest unique heading (the trailing
+> `### 28.7`/`### 28.8` are the known pre-existing collision). This section
+> takes the next free number, **§28.12**. Nothing was renumbered.
+
+The web phase could fetch the real vhost (§28.8) but could not **discover**
+endpoints it wasn't handed — it loaded the homepage and stalled with no `/api`
+paths. This adds bounded content enumeration (ffuf/gobuster) against the
+discovered vhost, turning hits into actionable `endpoint` nodes. **Discovery
+only** — no exploitation, auth-flow automation, or request forging.
+
+**What already existed:** `FfufParser`/`GobusterParser`, a generic
+safety-gated tool path (`TaskDispatcher._run_command` → `tools/runner.py` →
+`tools/safety.py` — the single subprocess site, §13.6; `ExecuteExecutor` is the
+`Executor`-Protocol embodiment of the same), and `WebPlanner` ffuf/gobuster
+emission. So this is wiring + bounding + a real bug fix, not a new subsystem —
+no duplicate executor was added.
+
+**Latent bug fixed (would have rolled back every enumeration batch).** The
+parsers did `host_id(target)` where the web planner's task `target` is the IP
+**URL** (`http://10.129.40.164`). `host_id("http://10.129.40.164")` is
+`"host:http://10.129.40.164"` — a non-existent node whose `exposes` edge fails
+`put_edge`'s endpoint check (P8-I05) and rolls back the whole `apply_deltas`
+batch, so ffuf/gobuster hits never persisted. Fix: a new
+`apex_host.graph_ids.bare_host()` (strip scheme/port/path) + both parsers now
+take an optional `host_ip` and attach the `exposes` edge to
+`host_id(bare_host(host_ip or target))`. `parse_single_result` passes
+`host_ip=state["target"]` (the authorized host), so hits — fuzzed against the IP
+URL with a `-H Host: <vhost>` header — link to the existing host node without
+dangling. Two pre-existing tests that asserted the buggy `host:http://…` id were
+corrected.
+
+**Planner (`_WebDeterministic`): one bounded scan, once per phase.** Emitted
+only when a wordlist is configured **and** `_enumeration_done(subgraph)` is
+False (no prior `endpoint` node with `source in {ffuf, gobuster}` — a stateless
+blackboard check). **One** tool per phase: prefer ffuf (it has a hard
+`--maxtime`), else gobuster. Every scan is capped on both axes —
+`-t <web_enum_threads>` (concurrency) and, for ffuf, `-maxtime
+<web_enum_max_seconds>` (hard wall-clock; gobuster is additionally bounded by
+the runner subprocess timeout). When a vhost is known it carries `-H Host:
+<vhost>`; the task `target` stays the **authorized IP URL** (policy-approved),
+never a raw off-scope vhost host.
+
+**Config (validated, `check_config`):** `web_enum_threads` (default 20, range
+1..200) and `web_enum_max_seconds` (default 60, range 1..3600), CLI
+`--web-enum-threads` / `--web-enum-max-seconds` on both entry points. The
+wordlist stays operator-configured (`web_wordlist_path` → the mounted
+SecLists/Knowledge corpus), never bundled in source.
+
+**Safety layers (all enforced, all tested):** the command runs through
+`runner.py` → `safety.py` (ffuf/gobuster must be in `allowed_tools`, no shell
+metacharacters — a `Host: evil; rm -rf /` injection raises); the `target` must
+pass `PolicyAdvisor` scope (an off-scope target is blocked by the scope rule);
+and — an additional layer surfaced by this work — wordlist fuzzing is gated by
+the §19 `no_password_list` rule, so enumeration also requires
+`allow_password_lists=True`. dry-run default unchanged; a dry-run scan returns a
+synthetic result.
+
+**Tests (through the real path, not hand-fed).**
+`tests/apex_host/test_web_enum.py`: a ffuf/gobuster hit becomes a host-linked
+endpoint via `parse_single_result` (the router); the planner emits one bounded
+scan with the caps + vhost Host header + IP target; once-per-phase; ffuf
+preferred, gobuster fallback; `safety.check_command` passes the emitted command
+and blocks a metacharacter-injected one; policy approves the authorized IP,
+blocks off-scope, and blocks wordlist fuzzing without `allow_password_lists`;
+config caps validated. Release-gate scenario `web_content_enumeration` (§28.12):
+vhost known → one bounded ffuf → policy-approved → safety-passed → a `/api` hit
+routed through `parse_single_result` becomes an EKG endpoint node under the
+authorized host → enumeration is once-per-phase.
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

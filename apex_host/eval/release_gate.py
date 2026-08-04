@@ -1380,6 +1380,128 @@ async def scenario_incomplete_scan_escalates_not_stall() -> ScenarioResult:
     )
 
 
+async def scenario_web_content_enumeration() -> ScenarioResult:
+    """19. A discovered vhost enables bounded content enumeration whose hits
+    become actionable endpoint nodes.
+
+    Reproduces the demonstrated gap: the web phase can fetch the real vhost but
+    cannot DISCOVER paths it wasn't handed (loaded the homepage, stalled with no
+    /api). Drives the REAL WebPlanner + PolicyAdvisor + safety.check_command +
+    parse_single_result (the router) + MemoryAPI (Invariant 1). Fails the gate if
+    the enumeration is unbounded, off-scope, unsafe, or if a ffuf hit does not
+    become an EKG endpoint node under the authorized host. DISCOVERY ONLY.
+    """
+    from typing import cast
+
+    from apex_host.config import ApexConfig
+    from apex_host.graph_state import ApexGraphState
+    from apex_host.orchestration.parsing_node import parse_single_result
+    from apex_host.planners.web_planner import _WebDeterministic
+    from apex_host.policy import PolicyAdvisor
+    from apex_host.policy.policy_loader import load_policy
+    from apex_host.tools.registry import ToolRegistry
+    from apex_host.tools.safety import check_command
+    from apex_host.types import ToolCommand
+    from memfabric.types import EvidenceBundle, Goal
+
+    _VHOST = "app.example.htb"
+    problems: list[str] = []
+    api = _make_api()
+    await _seed_node(api, _ANCHOR, "host", {"ip": _TARGET})
+    await _seed_node(api, f"service:{_TARGET}:80/tcp", "service",
+                     {"port": "80", "proto": "tcp", "state": "open", "service": "http"})
+    await _seed_edge(api, _ANCHOR, f"service:{_TARGET}:80/tcp", "exposes")
+    await _seed_node(api, f"vhost:{_TARGET}:{_VHOST}", "vhost",
+                     {"hostname": _VHOST, "ip": _TARGET})
+    # host --exposes--> vhost so the vhost is reachable in the host-anchored
+    # subgraph traversal (as CommandParser records it, §28.8).
+    await _seed_edge(api, _ANCHOR, f"vhost:{_TARGET}:{_VHOST}", "exposes")
+
+    # Wordlist fuzzing requires explicit operator approval (§19) on top of scope.
+    config = ApexConfig(
+        target=_TARGET, dry_run=True, allowed_tools=["curl", "ffuf"],
+        web_wordlist_path="/seclists/common.txt", allow_password_lists=True,
+        web_enum_threads=15, web_enum_max_seconds=30,
+    )
+    subgraph = await api.get_subgraph(_ANCHOR, depth=4)
+    goal = Goal(id="rg-enum", description="web", phase="web", anchor_node=_ANCHOR)
+    empty = EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[])
+
+    planner = _WebDeterministic(
+        _TARGET, ToolRegistry.from_config(config),
+        web_wordlist_path=config.web_wordlist_path,
+        web_enum_threads=config.web_enum_threads,
+        web_enum_max_seconds=config.web_enum_max_seconds,
+    )
+    tasks = await planner.plan(goal, subgraph, empty)
+    enum = [t for t in tasks if isinstance(tasks, list)
+            and t.params["tool"] in ("ffuf", "gobuster")] if isinstance(tasks, list) else []
+    if len(enum) != 1:
+        problems.append(f"expected exactly one bounded enumeration task, got {len(enum)}")
+        return ScenarioResult("web_content_enumeration", False, "; ".join(problems))
+    task = enum[0]
+    args = task.params["args"]
+    # Bounded on BOTH axes + wordlist + vhost Host header + authorized IP target.
+    if "-t" not in args or "15" not in args:
+        problems.append(f"enumeration missing concurrency cap: {args}")
+    if "-maxtime" not in args or "30" not in args:
+        problems.append(f"enumeration missing hard time cap: {args}")
+    if "/seclists/common.txt" not in args:
+        problems.append("enumeration wordlist not present in command")
+    if "-H" not in args or f"Host: {_VHOST}" not in args:
+        problems.append("enumeration does not carry the vhost Host header")
+    if task.params["target"] != f"http://{_TARGET}":
+        problems.append(f"enumeration target is not the authorized IP: {task.params['target']}")
+
+    # PolicyAdvisor approves the authorized-IP enumeration (wordlists allowed).
+    advisor = PolicyAdvisor(load_policy(config), config)
+    decision = advisor.review_task(task, "web", empty, config)
+    if not decision.is_approved:
+        problems.append(f"policy blocked the bounded enumeration: {decision.rule_name}")
+
+    # safety.py passes the emitted command (no shell metacharacters).
+    try:
+        check_command(ToolCommand(tool="ffuf", args=args), config)
+    except ValueError as exc:  # pragma: no cover - defensive
+        problems.append(f"safety.py rejected the enumeration command: {exc}")
+
+    # A ffuf hit routed through parse_single_result becomes an /api endpoint
+    # node under the authorized host (no dangling edge → no rollback).
+    ffuf_out = ("api                     [Status: 200, Size: 12]\n"
+                "admin                   [Status: 403, Size: 0]")
+    obs, _src = parse_single_result(
+        {"tool": "ffuf", "parser": "ffuf", "args": args,
+         "target": task.params["target"], "stdout": ffuf_out},
+        cast("ApexGraphState", {"target": _TARGET}),
+    )
+    await api.apply_deltas(nodes=obs.node_deltas, edges=obs.edge_deltas)
+    subgraph2 = await api.get_subgraph(_ANCHOR, depth=5)
+    api_eps = [
+        n for n in subgraph2.nodes
+        if n.type == "endpoint" and n.props.get("path") == "api"
+    ]
+    if not api_eps:
+        problems.append("discovered /api endpoint did not become an EKG node")
+    elif api_eps[0].source != "ffuf":
+        problems.append(f"endpoint provenance wrong: {api_eps[0].source!r}")
+
+    # Once per phase: with a ffuf endpoint present, no new enumeration is emitted.
+    tasks2 = await planner.plan(goal, subgraph2, empty)
+    if isinstance(tasks2, list) and any(
+        t.params["tool"] in ("ffuf", "gobuster") for t in tasks2
+    ):
+        problems.append("enumeration re-ran after a prior hit (not once-per-phase)")
+
+    if problems:
+        return ScenarioResult("web_content_enumeration", False, "; ".join(problems))
+    return ScenarioResult(
+        "web_content_enumeration", True,
+        f"vhost {_VHOST} → one bounded ffuf (-t 15, --maxtime 30, -H Host, IP target); "
+        "policy-approved; safety-passed; /api hit became an EKG endpoint node; "
+        "enumeration is once-per-phase",
+    )
+
+
 SCENARIOS: list[Any] = [
     scenario_ssh_success,
     scenario_dfr_success,
@@ -1399,6 +1521,7 @@ SCENARIOS: list[Any] = [
     scenario_vhost_redirect_web_discovery,
     scenario_web_incomplete_not_goal_completed,
     scenario_incomplete_scan_escalates_not_stall,
+    scenario_web_content_enumeration,
 ]
 
 
