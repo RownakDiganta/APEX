@@ -643,6 +643,31 @@ class TestNmapErrorClassification:
     def test_generic_nonzero_failure_gets_generic_category(self) -> None:
         assert classify_nmap_error(1, "", "some other unrelated failure") == NMAP_ERROR_CATEGORY_EXECUTION_FAILED
 
+    def test_host_timeout_zero_ports_is_incomplete_not_success(self) -> None:
+        # §25.7 — nmap exits 0 on a per-host timeout; with 0 open ports that is
+        # INCOMPLETE (repair-eligible), never a plain success.
+        from apex_host.parsers.nmap_parser import NMAP_ERROR_CATEGORY_INCOMPLETE_HOST_TIMEOUT
+        stdout = (
+            "Nmap scan report for 10.129.40.164\n"
+            "Skipping host 10.129.40.164 due to host timeout\n"
+            "giving up on port because retransmission cap hit (2)\n"
+        )
+        assert classify_nmap_error(0, stdout, "") == NMAP_ERROR_CATEGORY_INCOMPLETE_HOST_TIMEOUT
+
+    def test_host_timeout_but_ports_found_is_success(self) -> None:
+        # A timeout that still produced open ports is a partial SUCCESS — the
+        # ports are real evidence; never reclassify it as incomplete.
+        stdout = (
+            "Nmap scan report for 10.129.40.164\n"
+            "Skipping host due to host timeout\n"
+            "22/tcp open ssh OpenSSH 8.2p1\n"
+        )
+        assert classify_nmap_error(0, stdout, "") == NMAP_ERROR_CATEGORY_SUCCESS
+
+    def test_normal_scan_with_ports_is_success(self) -> None:
+        stdout = "Nmap scan report for 10.129.40.164\n80/tcp open http nginx\n"
+        assert classify_nmap_error(0, stdout, "") == NMAP_ERROR_CATEGORY_SUCCESS
+
     def test_dispatcher_run_command_sets_error_category_for_nmap(self) -> None:
         import asyncio
         from apex_host.execution.dispatcher import ExecutionContext, TaskDispatcher

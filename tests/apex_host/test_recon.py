@@ -82,7 +82,11 @@ class TestReconPlannerNmapPhase:
         result = await planner.plan(_make_goal(), _empty_subgraph(), _empty_evidence())
         assert not isinstance(result, AbandonSignal)
         tasks = list(result)
-        assert len(tasks) == 1
+        # §25.8 — pass 1 emits BOTH a top-N discovery scan and a targeted
+        # -p <common> -sV scan (two distinct nmap actions), so a slow/empty
+        # broad scan never leaves recon with nothing productive to run.
+        assert len(tasks) == 2
+        assert all(t.params["tool"] == "nmap" for t in tasks)
         assert tasks[0].params["tool"] == "nmap"
 
     async def test_nmap_task_has_correct_args_including_target(self) -> None:

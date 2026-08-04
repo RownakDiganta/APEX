@@ -1249,6 +1249,118 @@ async def scenario_web_incomplete_not_goal_completed() -> ScenarioResult:
     )
 
 
+class _TimeoutThenEscalateNmapBackend:
+    """A synthetic ``ToolBackend`` modelling the demonstrated regression: the
+    broad ``--top-ports`` discovery scan exits 0 but times out with 0 open
+    ports, while the escalated targeted ``-p <common> -sV`` scan completes and
+    finds a port. Never a real subprocess."""
+
+    name = "fake-timeout-escalate"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[str]]] = []
+
+    async def execute(
+        self, tool: str, arguments: list[str], *,
+        timeout_seconds: float | None = None, stdin: str | None = None,
+    ) -> Any:
+        from apex_host.types import ToolCommand, ToolResult
+
+        self.calls.append((tool, list(arguments)))
+        cmd = ToolCommand(tool=tool, args=list(arguments), timeout_seconds=int(timeout_seconds or 30))
+        if tool == "nmap" and "--top-ports" in arguments and "-sV" not in arguments:
+            # Broad discovery scan → times out, 0 ports (rc 0).
+            return ToolResult(
+                command=cmd,
+                stdout=f"Nmap scan report for {_TARGET}\nSkipping host {_TARGET} due to host timeout\n",
+                stderr="", returncode=0, duration_seconds=80.0, dry_run=True,
+                backend=self.name, error=None,
+            )
+        stdout = ""
+        if tool == "nmap":  # the escalated -p <common> -sV scan → finds a port
+            stdout = (
+                f"Nmap scan report for {_TARGET}\n"
+                "PORT   STATE SERVICE VERSION\n"
+                "22/tcp open  ssh     OpenSSH 8.2p1 Ubuntu\n"
+            )
+        return ToolResult(
+            command=cmd, stdout=stdout, stderr="", returncode=0,
+            duration_seconds=0.014, dry_run=True, backend=self.name, error=None,
+        )
+
+
+async def scenario_incomplete_scan_escalates_not_stall() -> ScenarioResult:
+    """18. A timed-out discovery scan escalates instead of dedup-stalling.
+
+    Reproduces the demonstrated regression: the top-ports discovery scan hit its
+    host-timeout and returned 0 ports but was classified executed_success, so the
+    planner re-proposed the identical scan 3x → duplicate_task_stall. Drives the
+    REAL compiled graph. Fails the gate if: any nmap scan is classified a bare
+    success despite the host-timeout marker; recon terminates
+    duplicate_task_stall; the escalated targeted -p <common> -sV scan never runs;
+    or recon produces no service node.
+    """
+    from apex_host.config import ApexConfig
+    from apex_host.graph_state import ApexGraphState
+    from apex_host.llm.router import FakeModelRouter
+    from apex_host.orchestration.builder import build_apex_graph
+    from apex_host.planning.budget import LLMBudgetTracker
+    from apex_host.tools.registry import ToolRegistry
+
+    api = _make_api()
+    config = ApexConfig(
+        target=_TARGET, dry_run=True, max_turns=8, tool_backend="remote",
+        allowed_tools=["nmap", "nc"], use_llm=False,
+        max_llm_calls_per_run=10, max_llm_calls_per_phase=3,
+    )
+    backend = _TimeoutThenEscalateNmapBackend()
+    budget = LLMBudgetTracker(max_per_run=10, max_per_phase=3)
+    registry = ToolRegistry.from_config(config)
+    graph = build_apex_graph(
+        api, registry, config, model_router=FakeModelRouter(),
+        budget_tracker=budget, tool_backend=backend,
+    )
+    initial: ApexGraphState = {
+        "run_id": "release-gate-incomplete-scan", "target": _TARGET, "phase": "recon",
+        "goal": f"Begin engagement against {_TARGET}", "current_task": None,
+        "evidence_summary": "", "findings": [], "error_episodes": [],
+        "last_tool_result": None, "last_error": None, "completed": False,
+        "turn_count": 0, "planner_decisions": [], "tool_results": None,
+        "repair_count": 0, "policy_decisions": [], "duplicate_actions": [],
+        "completed_fingerprints": [], "execution_backend_log": [],
+        "diagnostic_events": [], "credential_validation_log": [], "repair_log": [],
+        "outcome": "", "termination_reason": "", "termination_phase": "",
+        "stall_reason": "", "privilege_state": "", "privilege_summary": {},
+        "opportunity_ids": [], "attempted_opportunities": [],
+        "enumeration_complete": False, "web_session_state": {},
+        "workflow_summary": {}, "phase_selection": {}, "learning_summary": {},
+        "task_latency_log": [], "objective_status": "", "objective_summary": {},
+        "direct_file_read_log": [], "bounded_command_log": [],
+        "capability_discovery_log": [], "execution_diagnostics": [],
+    }
+    final_state: ApexGraphState = await graph.ainvoke(initial)
+
+    problems: list[str] = []
+    # The escalated targeted -p <common> -sV scan must have run.
+    nmap_calls = [args for (tool, args) in backend.calls if tool == "nmap"]
+    if not any("-sV" in args and "-p" in args for args in nmap_calls):
+        problems.append(f"escalated -p <common> -sV scan never ran: {nmap_calls}")
+    if str(final_state.get("outcome") or "") == "duplicate_task_stall":
+        problems.append("recon terminated in duplicate_task_stall instead of escalating")
+
+    subgraph = await api.get_subgraph(_ANCHOR, depth=5)
+    if "service" not in {n.type for n in subgraph.nodes}:
+        problems.append("escalated scan produced no service node (recon did not recover)")
+
+    if problems:
+        return ScenarioResult("incomplete_scan_escalates_not_stall", False, "; ".join(problems))
+    return ScenarioResult(
+        "incomplete_scan_escalates_not_stall", True,
+        "timed-out discovery scan escalated to a targeted -p <common> -sV scan that found a "
+        "service — recon recovered instead of dedup-stalling",
+    )
+
+
 SCENARIOS: list[Any] = [
     scenario_ssh_success,
     scenario_dfr_success,
@@ -1267,6 +1379,7 @@ SCENARIOS: list[Any] = [
     scenario_curl_only_web_discovery,
     scenario_vhost_redirect_web_discovery,
     scenario_web_incomplete_not_goal_completed,
+    scenario_incomplete_scan_escalates_not_stall,
 ]
 
 

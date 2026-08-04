@@ -229,6 +229,20 @@ def validate_combinations(config: ApexConfig) -> list[str]:
             f"nmap_top_ports={config.nmap_top_ports} must be in the range 1..65535"
         )
 
+    # nmap first-pass --host-timeout budget (§25.8). Must be positive, bounded,
+    # and <= the per-execution nmap timeout so nmap self-terminates gracefully
+    # before the outer subprocess SIGTERM rather than being killed mid-scan.
+    if config.nmap_host_timeout_seconds <= 0 or config.nmap_host_timeout_seconds > 3600:
+        problems.append(
+            f"nmap_host_timeout_seconds={config.nmap_host_timeout_seconds} must be in the range 1..3600"
+        )
+    elif config.nmap_host_timeout_seconds > config.nmap_execution_timeout_seconds:
+        problems.append(
+            f"nmap_host_timeout_seconds={config.nmap_host_timeout_seconds} must not exceed "
+            f"nmap_execution_timeout_seconds={config.nmap_execution_timeout_seconds} "
+            "(nmap would be SIGTERM'd before its own --host-timeout fires)"
+        )
+
     return problems
 
 

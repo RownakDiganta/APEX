@@ -986,6 +986,25 @@ downgraded to a plain TCP scan. Kali stays unprivileged: **no `NET_RAW` or
 `--unprivileged -Pn` once (a distinct, non-suppressed action) and is terminal
 only once those flags were already present and it still failed.
 
+**Timed-out discovery scans escalate, they don't stall.** nmap **exits 0** even
+when a per-host timeout makes it give up, so a broad `--top-ports` scan that
+returns **0 ports** over VPN latency used to be mislabelled a success and
+re-proposed identically until recon dedup-stalled. Such a scan (a host-timeout
+marker + 0 open ports) is now classified `nmap_incomplete_host_timeout` — a
+repairable failure that deterministically escalates (no LLM) to a smaller,
+targeted `-p <common-ports> -sV` scan (a distinct action, so it is not
+dedup-suppressed; the known-good ~14s scan). If that also times out with
+nothing it terminates honestly, never as a bare duplicate stall and never a
+fabricated port. A partial result (timeout but some ports found) stays a real
+success. The first-pass `--nmap-top-ports` default is **100** (a top-1000 scan
+does not complete within the per-host timeout over VPN); the escalation covers
+depth. `--nmap-host-timeout` (default 80s, validated `<= --nmap-timeout`) is the
+first-pass `--host-timeout` budget. To make recon robust regardless of the broad
+scan's outcome, pass 1 emits **both** the top-N discovery scan **and** a targeted
+`-p <common-ports> -sV` scan (the reliable ~14s finder) in the same turn, as two
+distinct actions — so a slow/empty broad scan never leaves recon with nothing to
+do. See CLAUDE.md §25.7–§25.8.
+
 **Docker Compose integration (Infra Phase 7):** `compose.yaml` wires the
 APEX application and Kali tool-service images together on a dedicated,
 non-host-published internal network (`apex-internal`) — `apex` reaches

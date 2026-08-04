@@ -45,6 +45,22 @@ _RAW_SOCKET_PERMISSION_MARKERS: tuple[str, ...] = (
     "requires root privileges",
 )
 
+#: Markers nmap prints when a scan did NOT finish scanning a host — it exits
+#: 0 anyway (nmap treats a per-host timeout as a completed run), so returncode
+#: alone cannot distinguish "scanned, found nothing" from "gave up before
+#: finishing". Verified live text: "Skipping host 10.129.40.164 due to host
+#: timeout" / "giving up on port because retransmission cap hit".
+_HOST_TIMEOUT_MARKERS: tuple[str, ...] = (
+    "host timeout",
+    "skipping host",
+    "due to host timeout",
+)
+
+#: One nmap "open port" report line (``22/tcp open ssh``). Presence means the
+#: scan produced at least one usable result even if it later timed out — that
+#: is a partial SUCCESS (the ports are real), never "incomplete".
+_OPEN_PORT_LINE_RE = re.compile(r"^\d+/(?:tcp|udp)\s+open\b", re.MULTILINE)
+
 #: Fixed, small diagnostic-error vocabulary for nmap task results — used
 #: only for structured diagnostics (never for parsing/EKG-write decisions,
 #: which remain driven entirely by whether stdout actually matches
@@ -54,28 +70,38 @@ _RAW_SOCKET_PERMISSION_MARKERS: tuple[str, ...] = (
 NMAP_ERROR_CATEGORY_SUCCESS = ""
 NMAP_ERROR_CATEGORY_RAW_SOCKET_PERMISSION_DENIED = "raw_socket_permission_denied"
 NMAP_ERROR_CATEGORY_EXECUTION_FAILED = "nmap_execution_failed"
+#: A scan that exited 0 but reported a per-host timeout AND found no open
+#: ports — it did NOT actually finish. Repair-eligible (escalate to a smaller,
+#: targeted scan), never a plain success and never terminal on the first hit.
+NMAP_ERROR_CATEGORY_INCOMPLETE_HOST_TIMEOUT = "nmap_incomplete_host_timeout"
 
 
 def classify_nmap_error(returncode: int, stdout: str, stderr: str) -> str:
-    """Classify why an nmap invocation failed, for structured diagnostics
-    only — never affects EKG parsing, which is driven purely by whether
-    ``output`` matches the expected nmap text format (see
-    :meth:`NmapParser.parse_text`).
+    """Classify an nmap invocation result, for structured diagnostics only —
+    never affects EKG parsing, which is driven purely by whether ``output``
+    matches the expected nmap text format (see :meth:`NmapParser.parse_text`).
 
-    Returns :data:`NMAP_ERROR_CATEGORY_SUCCESS` (``""``) when *returncode*
-    is ``0`` — there is nothing to classify. Otherwise returns
-    :data:`NMAP_ERROR_CATEGORY_RAW_SOCKET_PERMISSION_DENIED` when *stderr*
-    (or, defensively, *stdout* — some environments interleave nmap's
-    diagnostic output onto stdout) contains one of the known raw-socket
-    permission-failure markers, or the generic
-    :data:`NMAP_ERROR_CATEGORY_EXECUTION_FAILED` for any other nonzero-exit
-    failure (host down, invalid target, unreachable network, ...).
+    - :data:`NMAP_ERROR_CATEGORY_RAW_SOCKET_PERMISSION_DENIED` when a
+      raw-socket permission marker is present (in *stderr* or, defensively,
+      *stdout*).
+    - :data:`NMAP_ERROR_CATEGORY_INCOMPLETE_HOST_TIMEOUT` when nmap exited
+      **0** but reported a per-host timeout AND found **no open ports** — nmap
+      exits 0 even when it gives up on a host, so returncode alone would
+      mislabel this as success and let the planner re-propose the identical
+      scan forever (the demonstrated ``duplicate_task_stall``). If any open
+      port WAS found, the timeout is ignored — those ports are a real,
+      partial success.
+    - :data:`NMAP_ERROR_CATEGORY_SUCCESS` (``""``) for any other rc-0 result.
+    - :data:`NMAP_ERROR_CATEGORY_EXECUTION_FAILED` for any other nonzero exit.
     """
-    if returncode == 0:
-        return NMAP_ERROR_CATEGORY_SUCCESS
     combined = f"{stderr}\n{stdout}".lower()
     if any(marker in combined for marker in _RAW_SOCKET_PERMISSION_MARKERS):
         return NMAP_ERROR_CATEGORY_RAW_SOCKET_PERMISSION_DENIED
+    if returncode == 0:
+        timed_out = any(marker in combined for marker in _HOST_TIMEOUT_MARKERS)
+        if timed_out and not _OPEN_PORT_LINE_RE.search(stdout):
+            return NMAP_ERROR_CATEGORY_INCOMPLETE_HOST_TIMEOUT
+        return NMAP_ERROR_CATEGORY_SUCCESS
     return NMAP_ERROR_CATEGORY_EXECUTION_FAILED
 
 

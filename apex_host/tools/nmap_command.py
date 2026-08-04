@@ -84,6 +84,26 @@ _PN_FLAG = "-Pn"
 #: never silently dropped so a plain TCP scan is presented as if it ran them.
 _RAW_ONLY_FEATURE_FLAGS: tuple[str, ...] = ("-O", "--traceroute")
 
+#: The fixed, small set of the most common service ports — the escalation
+#: target when a broad ``--top-ports`` discovery scan times out with 0 open
+#: ports. A ``-p <this> -sV`` scan is a handful of ports, so it completes fast
+#: over VPN latency (the known-good ~14s scan) where the top-1000 does not.
+#: A fixed, well-known port list, NOT a machine-specific value (§13.8).
+_COMMON_PORTS = (
+    "21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1723,3306,3389,5900,8080"
+)
+
+
+def common_ports() -> str:
+    """The fixed, well-known common-port list (§13.8 — never machine-specific).
+
+    The single source of truth for both the incomplete-scan escalation
+    (:func:`plan_incomplete_scan_escalation`) and the recon planner's targeted
+    ``-p <common> -sV`` pass, so the two always agree on which ports the fast
+    complete scan covers.
+    """
+    return _COMMON_PORTS
+
 # Every nmap scan-mode selector token, mapped to a coarse intent. Anything
 # not listed here is not a scan-mode token.
 _SCAN_MODE_INTENT: dict[str, str] = {
@@ -428,4 +448,62 @@ def plan_raw_socket_repair(args: list[str], target: str) -> NmapRepairPlan:
     return NmapRepairPlan(
         terminal=False, repaired_args=rewritten.args, transport=rewritten.transport,
         reason="rewrote to an unprivileged -sT scan with --unprivileged -Pn",
+    )
+
+
+def _host_timeout_of(args: list[str]) -> str:
+    """Return the ``--host-timeout`` value present in *args*, else ``""``."""
+    for i, tok in enumerate(args):
+        if tok == "--host-timeout" and i + 1 < len(args):
+            return str(args[i + 1])
+    return ""
+
+
+def plan_incomplete_scan_escalation(args: list[str], target: str) -> NmapRepairPlan:
+    """Deterministic, bounded escalation for a classified
+    ``nmap_incomplete_host_timeout`` scan (exited 0, timed out, 0 open ports).
+
+    A broad ``--top-ports`` discovery scan that times out over VPN latency is
+    escalated to a SMALLER, targeted ``-p <common-ports> -sV`` scan — the
+    known-good fast scan that completes in ~14s where the top-1000 does not.
+    This is a DISTINCT action from the discovery scan (it carries ``-p`` and
+    ``-sV`` and drops ``--top-ports``), so it is not dedup-suppressed against
+    the timed-out scan.
+
+    - If the failed scan was **already** the targeted ``-p … -sV`` escalation
+      and STILL timed out with nothing, there is no smaller bounded scan to try
+      — it is **terminal** (surfaced as an honest outcome, never a bare
+      duplicate stall, and never a fabricated port/service).
+    - Otherwise, return the targeted escalation, preserving the connect-scan
+      intent, the ``--host-timeout`` budget, and going through
+      :func:`normalize_nmap_command` so the unprivileged flags are injected and
+      the id stays canonical.
+
+    *args* should be the command that ACTUALLY executed (the normalized args on
+    the tool result).
+    """
+    original = [str(a) for a in args]
+    kept, _dropped = _keep_safe_flags(original, target)
+    already_targeted = "-p" in kept and "-sV" in kept
+    if already_targeted:
+        return NmapRepairPlan(
+            terminal=True, repaired_args=None, transport=TRANSPORT_TCP_CONNECT,
+            reason=(
+                "targeted -p <common-ports> -sV scan also timed out with no open "
+                "ports; no smaller bounded scan to escalate to"
+            ),
+        )
+
+    host_timeout = _host_timeout_of(original)
+    escalated = [
+        _TCP_CONNECT_FLAG, "-Pn", "-T4",
+        "-p", _COMMON_PORTS, "-sV", "--max-retries", "2",
+    ]
+    if host_timeout:
+        escalated += ["--host-timeout", host_timeout]
+    escalated.append(target)
+    rewritten = normalize_nmap_command(escalated, target, capability=UNPRIVILEGED)
+    return NmapRepairPlan(
+        terminal=False, repaired_args=rewritten.args, transport=rewritten.transport,
+        reason="escalated a timed-out top-ports discovery scan to a targeted -p <common> -sV scan",
     )

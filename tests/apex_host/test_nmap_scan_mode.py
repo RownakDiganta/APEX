@@ -236,6 +236,39 @@ class TestRepairPlan:
         assert plan.terminal is True
 
 
+class TestIncompleteScanEscalation:
+    _DISCOVERY = ["-sT", "--unprivileged", "-Pn", "-T4", "--top-ports", "100",
+                  "--max-retries", "2", "--host-timeout", "80s", _HOST]
+
+    def test_discovery_timeout_escalates_to_targeted_pV_scan(self) -> None:
+        plan = nc.plan_incomplete_scan_escalation(self._DISCOVERY, _HOST)
+        assert plan.terminal is False
+        assert plan.repaired_args is not None
+        assert "-sV" in plan.repaired_args
+        assert "-p" in plan.repaired_args
+        # A fixed common-port list, not the top-ports breadth.
+        assert "--top-ports" not in plan.repaired_args
+        assert "80" in " ".join(plan.repaired_args)  # a common port (80) present
+
+    def test_escalated_scan_has_distinct_fingerprint(self) -> None:
+        plan = nc.plan_incomplete_scan_escalation(self._DISCOVERY, _HOST)
+        assert plan.repaired_args is not None
+        assert nc.canonical_fingerprint_args(plan.repaired_args, _HOST) != \
+            nc.canonical_fingerprint_args(self._DISCOVERY, _HOST)
+
+    def test_already_targeted_scan_is_terminal(self) -> None:
+        targeted = ["-sT", "--unprivileged", "-Pn", "-T4", "-p", "22,80", "-sV",
+                    "--host-timeout", "80s", _HOST]
+        plan = nc.plan_incomplete_scan_escalation(targeted, _HOST)
+        assert plan.terminal is True and plan.repaired_args is None
+
+    def test_escalation_preserves_host_timeout(self) -> None:
+        plan = nc.plan_incomplete_scan_escalation(self._DISCOVERY, _HOST)
+        assert plan.repaired_args is not None
+        assert "--host-timeout" in plan.repaired_args
+        assert "80s" in plan.repaired_args
+
+
 # ---------------------------------------------------------------------------
 # backend_raw_socket_capability — three-state
 # ---------------------------------------------------------------------------
@@ -315,6 +348,46 @@ def _dispatcher(tool_backend: str, calls: list[tuple[str, list[str]]]) -> TaskDi
         advisor=PolicyAdvisor(load_policy(config), config),
         task_registry=TaskRegistry(), config=config, run_command_fn=_fake_run,
     )
+
+
+def _timeout_dispatcher(calls: list[tuple[str, list[str]]]) -> TaskDispatcher:
+    """A dispatcher whose fake nmap returns rc0 + a host-timeout stdout with
+    0 open ports — the demonstrated 'executed_success but scanned nothing' case."""
+    config = ApexConfig(target=_HOST, dry_run=False, tool_backend="remote",
+                        allowed_tools=["nmap"])
+
+    async def _fake_run(cmd: Any, cfg: Any) -> ToolResult:
+        calls.append((cmd.tool, list(cmd.args)))
+        return ToolResult(
+            command=cmd,
+            stdout=f"Nmap scan report for {_HOST}\nSkipping host {_HOST} due to host timeout\n",
+            stderr="", returncode=0, duration_seconds=80.0, dry_run=False, backend="remote",
+        )
+
+    return TaskDispatcher(
+        advisor=PolicyAdvisor(load_policy(config), config),
+        task_registry=TaskRegistry(), config=config, run_command_fn=_fake_run,
+    )
+
+
+class TestDispatcherIncompleteScan:
+    @pytest.mark.asyncio
+    async def test_timed_out_zero_ports_is_repairable_failure_not_success(self) -> None:
+        calls: list[tuple[str, list[str]]] = []
+        disp = _timeout_dispatcher(calls)
+        result = await disp.dispatch(
+            _nmap_task(["-sT", "--unprivileged", "-Pn", "-T4", "--top-ports", "100", _HOST]),
+            _context(),
+        )
+        tr = result.tool_result_dict
+        # Classified incomplete, NOT plain success.
+        assert tr["error_category"] == "nmap_incomplete_host_timeout"
+        assert result.disposition == ExecutionDisposition.EXECUTED_FAILURE
+        # Error contains "timed out" so outcome_for() → fixable (repair-eligible).
+        assert "timed out" in (tr.get("error") or "")
+        from apex_host.orchestration.completion import outcome_for
+        from memfabric.types import Outcome
+        assert outcome_for(0, tr["error"]) is Outcome.fixable
 
 
 class TestDispatcherIntegration:
@@ -481,6 +554,24 @@ def _raw_socket_state(args: list[str]) -> dict[str, Any]:
     }
 
 
+def _incomplete_state(args: list[str]) -> dict[str, Any]:
+    return {
+        "run_id": "r1", "target": _HOST, "phase": "recon", "goal": "scan",
+        "turn_count": 1, "repair_count": 0,
+        "current_task": {
+            "params": {"tool": "nmap", "args": args, "target": _HOST, "parser": "nmap"},
+            "executor_domain": "recon",
+        },
+        "last_tool_result": {
+            "task_id": "failed-1", "tool": "nmap", "args": args, "target": _HOST,
+            "parser": "nmap", "returncode": 0,
+            "error": "nmap discovery incomplete: host timed out before finishing with 0 open ports found",
+            "stdout": f"Skipping host {_HOST} due to host timeout\n",
+            "error_category": "nmap_incomplete_host_timeout", "phase": "recon",
+        },
+    }
+
+
 class TestDeterministicRepair:
     @pytest.mark.asyncio
     async def test_privileged_failure_repaired_to_sT_once(self) -> None:
@@ -536,3 +627,36 @@ class TestDeterministicRepair:
         assert calls == []
         entries = result.get("duplicate_actions") or []
         assert entries and entries[0]["disposition"] == "raw_socket_terminal"
+
+    @pytest.mark.asyncio
+    async def test_incomplete_scan_escalates_to_targeted_pV(self) -> None:
+        # A timed-out top-ports discovery scan escalates to a DIFFERENT bounded
+        # -p <common> -sV scan (executed once), so the planner does not
+        # re-propose the identical scan and dedup-stall.
+        calls: list[tuple[str, list[str]]] = []
+        deps = _make_deps(calls)
+        repair_agent = make_repair_node(deps)
+        result = await repair_agent(_incomplete_state(
+            ["-sT", "--unprivileged", "-Pn", "-T4", "--top-ports", "100",
+             "--max-retries", "2", "--host-timeout", "80s", _HOST]
+        ))  # type: ignore[arg-type]
+        assert len(calls) == 1
+        _tool, args = calls[0]
+        assert "-sV" in args and "-p" in args and "--top-ports" not in args
+        assert result["last_tool_result"]["repaired"] is True
+        assert result["last_tool_result"]["repair_kind"] == "nmap_incomplete_escalation"
+
+    @pytest.mark.asyncio
+    async def test_targeted_scan_incomplete_is_terminal(self) -> None:
+        # The targeted -p <common> -sV scan also timed out with nothing → no
+        # smaller bounded scan → terminal (honest), never a bare stall.
+        calls: list[tuple[str, list[str]]] = []
+        deps = _make_deps(calls)
+        repair_agent = make_repair_node(deps)
+        result = await repair_agent(_incomplete_state(
+            ["-sT", "--unprivileged", "-Pn", "-T4", "-p", "22,80", "-sV",
+             "--host-timeout", "80s", _HOST]
+        ))  # type: ignore[arg-type]
+        assert calls == []  # no re-execution
+        entries = result.get("duplicate_actions") or []
+        assert entries and entries[0]["disposition"] == "nmap_incomplete_terminal"

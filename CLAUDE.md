@@ -9492,6 +9492,98 @@ top-ports out of range), the bounded first pass omitting `-sV` and carrying the
 bounds, the version follow-up on only the open ports, and a fake slow (45s) scan
 that times out at a 20s budget but completes under the 90s nmap timeout.
 
+### 25.7 Incomplete-scan (host-timeout, 0 ports) classification + escalation
+
+Fixes the demonstrated `duplicate_task_stall`: a broad `--top-ports` discovery
+scan hit its `--host-timeout` and returned **0 ports**, but nmap **exits 0** on a
+per-host timeout, so it was classified `executed_success`. The planner then
+re-proposed the identical scan (same fingerprint) every turn → dedup-suppressed
+3× → stall. (An earlier run recovered only because the >0-ports case produced
+service nodes and the two-pass version scan ran; a 0-ports timeout has no such
+next step.)
+
+- **Classification.** `parsers.nmap_parser.classify_nmap_error` now checks
+  stdout even on rc 0: a per-host-timeout marker (`"host timeout"` /
+  `"skipping host"`) **AND** no open-port line (`_OPEN_PORT_LINE_RE`) →
+  `NMAP_ERROR_CATEGORY_INCOMPLETE_HOST_TIMEOUT`. If the timeout still produced
+  open ports, those are a real **partial success** — never reclassified.
+  Raw-socket detection runs first (unchanged).
+- **Repairable, not success.** `TaskDispatcher._run_command` maps the incomplete
+  category to `EXECUTED_FAILURE` and sets an error containing `"timed out"`, so
+  `completion.outcome_for` → `Outcome.fixable` (repair-eligible) and
+  `route_after_write` sends it to `repair_agent`. Never fabricates a port/service.
+- **Deterministic escalation (no LLM).** `repair_node`'s deterministic branch
+  (before the LLM, like the §27 raw-socket repair) calls
+  `nmap_command.plan_incomplete_scan_escalation`: escalate to a smaller,
+  targeted `-sT --unprivileged -Pn -T4 -p <common-ports> -sV --max-retries 2
+  --host-timeout <bound>` scan — the known-good ~14s scan. It carries `-p` +
+  `-sV` and drops `--top-ports`, so it is a **DISTINCT fingerprint** and is not
+  dedup-suppressed against the timed-out scan. `_COMMON_PORTS` is a fixed,
+  well-known port list (§13.8 — never a machine-specific value). If the targeted
+  scan **also** times out with nothing, it is **terminal** — an honest outcome
+  (`nmap_incomplete_terminal`), never a bare duplicate stall.
+- **Sane pass-1 default.** `ApexConfig.nmap_top_ports` default is reduced
+  1000 → **100** (nmap's standard "top 100"): a top-1000 scan does not complete
+  within the per-host timeout over HTB VPN latency, so a smaller breadth is the
+  sane default; the escalation covers depth, so reducing breadth never loses the
+  common services. Still validated 1..65535 (§28.4 convention).
+
+Tests: `tests/apex_host/test_phase1_live_debug.py` (host-timeout + 0 ports →
+incomplete; timeout + ports → success; normal → success),
+`test_nmap_scan_mode.py` (`plan_incomplete_scan_escalation` shape + distinct
+fingerprint + already-targeted-terminal; dispatcher classifies the timed-out
+scan as a repairable failure; `repair_agent` escalates once to the targeted
+scan and is terminal when the targeted scan also times out). Release-gate
+scenario `incomplete_scan_escalates_not_stall` drives the real compiled graph:
+discovery times out with 0 ports → the escalated `-p <common> -sV` scan finds a
+service → recon recovers (no `duplicate_task_stall`).
+
+### 25.8 Retuned pass-1 discovery + guaranteed targeted pass-2 (VPN latency)
+
+The demonstrated stall persisted because the §25.7 fix (a smaller field default)
+was **not reaching the CLI path**: `ApexConfig.from_cli_args` still defaulted
+`nmap_top_ports` to **1000**, silently overriding the field default of 100 on
+every `main.py` / `run_htb_local.py`-constructed config (§9 P9-I01), so a live
+run still emitted `--top-ports 1000` — which cannot finish within an 80s
+`--host-timeout` over HTB VPN latency (~0.27s RTT), timing out with 0 ports.
+
+- **Root fix.** `from_cli_args`'s `nmap_top_ports` fallback is corrected 1000 →
+  **100** to match the field default. (The field default was already 100; the
+  CLI fallback is the value that actually applied in production.)
+- **`--host-timeout` is now an explicit, validated config field.**
+  `ApexConfig.nmap_host_timeout_seconds` (default **80.0**, CLI
+  `--nmap-host-timeout`, range **1..3600**, and validated `<=
+  nmap_execution_timeout_seconds` so nmap self-terminates before the outer
+  SIGTERM). It was previously derived inline in `_ReconDeterministic`; making it
+  a field (per §28.4) lets an operator widen the budget without changing the
+  execution timeout. Both knobs — top-ports **and** host-timeout — are now
+  ApexConfig fields with CLI flags and validated ranges.
+- **Pass-1 emits BOTH scans, so a slow/empty broad scan never strands recon.**
+  `_ReconDeterministic._discovery_scan` (the "no service nodes yet" branch) now
+  returns **two** distinct-fingerprint tasks: the bounded `--top-ports N`
+  discovery scan (breadth, no `-sV`) **and** a targeted `-p <common-ports> -sV`
+  scan — the reliable ~14s finder. The targeted scan runs in the **same turn**,
+  so even if the broad scan is slow or returns 0 ports, recon still has a
+  productive action that finds+versions the common services (22/80/…). The
+  common-port list is the single shared source of truth
+  (`nmap_command.common_ports()`), reused by the §25.7 escalation so the two
+  always agree. This is the stateless answer to "pass-2 must run even when
+  pass-1 finds few/zero ports": there is no "did pass-1 run?" question — both
+  run in turn 1.
+- **Bounded & finite.** small pass-1 breadth → targeted `-sV` (same turn) → the
+  §25.7 escalation is a secondary net (bounded by the repair budget, terminal on
+  an already-targeted scan) → honest termination if truly nothing is open. Never
+  an unbounded scan loop; never a fabricated port/service (0 open ports → no
+  service node → recon terminates honestly, never `duplicate_task_stall` masking
+  a mislabeled success).
+
+Tests: `tests/apex_host/test_nmap_two_pass_timeout.py` (corrected `from_cli_args`
+default 100; `nmap_host_timeout_seconds` field default/CLI/range/`<=`-exec
+validation; pass-1 emits discovery + targeted with **distinct** fingerprints;
+the targeted `-p` list equals `common_ports()`; a fresh default config passes
+nmap validation) and `test_recon.py` (pass-1 emits two nmap actions). The §25.7
+release-gate scenario now recovers via the pass-1 targeted scan.
+
 ---
 
 ## 26. Phase evidence gates and credential prerequisites
@@ -9704,6 +9796,16 @@ Canonicalization is TOOL-AWARE (`_canonical_args` / `_canonical_target`):
   same normalized action is rejected before dispatch (`repair_no_change`).
   (Correction: a bare `-sT` failure is no longer treated as terminal — `-sT`
   alone does not resolve the EPERM; see §25.2's correction note.)
+- **Deterministic escalation for a timed-out discovery scan (§25.7).** The same
+  `repair_node` deterministic branch also handles a classified
+  `nmap_incomplete_host_timeout` (a scan that exited 0 but timed out with 0 open
+  ports) via `nmap_command.plan_incomplete_scan_escalation` — escalating ONCE to
+  a smaller targeted `-p <common-ports> -sV` scan (a distinct fingerprint, so it
+  is not dedup-suppressed; the timed-out scan's fingerprint is `SUPERSEDED`), or
+  marking `FAILED_TERMINAL` (`nmap_incomplete_terminal`) when the targeted scan
+  itself already timed out. No LLM call; never fabricates a port/service. This
+  is the fix for the demonstrated recon `duplicate_task_stall` where a 0-ports
+  host-timeout scan was mislabelled `executed_success` and re-proposed forever.
 
 ### 27.4 Stall reason semantics
 

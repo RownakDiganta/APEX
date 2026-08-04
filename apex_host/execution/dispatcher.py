@@ -692,11 +692,28 @@ class TaskDispatcher:
             # into episode.data via the existing tr-dict spread in
             # apex_host/orchestration/memory_node.py, no further plumbing
             # needed. Never affects parsing/EKG-write decisions.
-            from apex_host.parsers.nmap_parser import classify_nmap_error
+            from apex_host.parsers.nmap_parser import (
+                NMAP_ERROR_CATEGORY_INCOMPLETE_HOST_TIMEOUT,
+                classify_nmap_error,
+            )
 
-            tr["error_category"] = classify_nmap_error(
+            category = classify_nmap_error(
                 result.returncode, result.stdout, result.stderr
             )
+            tr["error_category"] = category
+            # A scan that exited 0 but timed out with 0 open ports did NOT
+            # finish — treat it as a REPAIRABLE failure so the deterministic
+            # escalation runs (a smaller targeted scan), instead of a plain
+            # success the planner re-proposes identically until it dedup-stalls.
+            # The error text contains "timed out" so outcome_for() maps it to
+            # Outcome.fixable (repair-eligible), and the disposition becomes
+            # EXECUTED_FAILURE. Never fabricates a port/service.
+            if category == NMAP_ERROR_CATEGORY_INCOMPLETE_HOST_TIMEOUT and not tr["error"]:
+                tr["error"] = (
+                    "nmap discovery incomplete: host timed out before finishing "
+                    "with 0 open ports found"
+                )
+                disposition = ExecutionDisposition.EXECUTED_FAILURE
         return tr, disposition
 
     async def _run_telnet(

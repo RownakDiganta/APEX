@@ -138,6 +138,50 @@ def make_repair_node(deps: "OrchestrationDeps") -> Any:
                 subgraph_anchor=deps.anchor_id, phase=state["phase"],
             )
             repair_kind = "raw_socket_to_tcp_connect"
+        elif failed_tool == "nmap" and error_category == "nmap_incomplete_host_timeout":
+            # A broad discovery scan exited 0 but timed out with 0 open ports —
+            # escalate DETERMINISTICALLY (before the LLM) to a smaller targeted
+            # -p <common> -sV scan (a DISTINCT fingerprint, so it is not
+            # dedup-suppressed against the timed-out scan). If the targeted scan
+            # also timed out with nothing, it is terminal — an honest outcome,
+            # never a bare duplicate stall, never a fabricated port. §25.7.
+            from apex_host.tools.nmap_command import plan_incomplete_scan_escalation
+
+            executed_args = tool_result.get("args")
+            failed_args = [
+                str(a) for a in (executed_args if executed_args else failed_task_params.get("args", []))
+            ]
+            esc_target = str(failed_task_params.get("target", deps.config.target))
+            plan = plan_incomplete_scan_escalation(failed_args, esc_target)
+            if plan.terminal:
+                terminal_fp = _action_fingerprint(failed_task, state["phase"], capability_mode)
+                await deps.dispatcher.task_registry.update_status(
+                    terminal_fp, TaskStatus.FAILED_TERMINAL,
+                )
+                logger.info("repair_agent: nmap incomplete-scan escalation exhausted — %s", plan.reason)
+                return {
+                    "repair_count": new_repair_count,
+                    "duplicate_actions": [{
+                        "fingerprint": terminal_fp, "tool": "nmap", "target": esc_target,
+                        "phase": state["phase"], "disposition": "nmap_incomplete_terminal",
+                        "reason": plan.reason,
+                        "meaningful_state_change": False,
+                        "repair_changed_action": False,
+                    }],
+                    "repair_log": [{
+                        "kind": "nmap_incomplete_escalation", "tool": "nmap",
+                        "target": esc_target, "phase": state["phase"],
+                        "outcome": "terminal", "changed_action": False,
+                        "reason": plan.reason,
+                    }],
+                }
+            repaired_task = TaskSpec(
+                id=new_id(), goal_id=state["run_id"],
+                executor_domain=failed_task.executor_domain,
+                params={**dict(failed_task_params), "args": list(plan.repaired_args or [])},
+                subgraph_anchor=deps.anchor_id, phase=state["phase"],
+            )
+            repair_kind = "nmap_incomplete_escalation"
         else:
             repair_result = await deps.repair_engine.repair(
                 failed_task=failed_task, error=error, phase=state["phase"],

@@ -38,7 +38,10 @@ class TestNmapTimeoutConfig:
     def test_defaults(self) -> None:
         cfg = ApexConfig(target=_HOST)
         assert cfg.nmap_execution_timeout_seconds == 90.0
-        assert cfg.nmap_top_ports == 1000
+        # §25.7 — reduced from 1000 to 100 (a top-1000 scan times out over VPN
+        # latency and returns 0 ports; 100 completes and the escalation covers
+        # depth).
+        assert cfg.nmap_top_ports == 100
         # Independent of the tool-service HTTP budget.
         assert cfg.tool_service_timeout_seconds == 120.0
 
@@ -52,7 +55,36 @@ class TestNmapTimeoutConfig:
         args = argparse.Namespace(target=_HOST)  # neither flag supplied
         cfg = ApexConfig.from_cli_args(args)
         assert cfg.nmap_execution_timeout_seconds == 90.0
-        assert cfg.nmap_top_ports == 1000
+        # §25.8 — the from_cli_args fallback must match the field default (100);
+        # the prior 1000 here silently overrode the field default on every
+        # CLI-constructed config (the live run got top-1000 despite the field
+        # default of 100).
+        assert cfg.nmap_top_ports == 100
+        assert cfg.nmap_host_timeout_seconds == 80.0
+
+    def test_host_timeout_field_default_and_cli(self) -> None:
+        assert ApexConfig(target=_HOST).nmap_host_timeout_seconds == 80.0
+        cfg = ApexConfig.from_cli_args(
+            argparse.Namespace(target=_HOST, nmap_host_timeout=45.0)
+        )
+        assert cfg.nmap_host_timeout_seconds == 45.0
+
+    def test_host_timeout_range_validated(self) -> None:
+        # Non-positive and out-of-range rejected.
+        assert any("nmap_host_timeout_seconds" in p for p in
+                   validate_combinations(ApexConfig(target=_HOST, nmap_host_timeout_seconds=0.0)))
+        assert any("nmap_host_timeout_seconds" in p for p in
+                   validate_combinations(ApexConfig(target=_HOST, nmap_host_timeout_seconds=4000.0)))
+        # Must not exceed the per-execution nmap timeout (else nmap is SIGTERM'd
+        # before its own --host-timeout fires).
+        problems = [p for p in validate_combinations(
+            ApexConfig(target=_HOST, nmap_host_timeout_seconds=100.0,
+                       nmap_execution_timeout_seconds=90.0)) if "nmap_host_timeout" in p]
+        assert problems and "must not exceed" in problems[0]
+        # A sane value within budget passes.
+        assert [p for p in validate_combinations(
+            ApexConfig(target=_HOST, nmap_host_timeout_seconds=80.0,
+                       nmap_execution_timeout_seconds=90.0)) if "nmap_host_timeout" in p] == []
 
     def test_valid_when_below_tool_service_timeout(self) -> None:
         cfg = ApexConfig(target=_HOST, nmap_execution_timeout_seconds=90.0,
@@ -157,16 +189,56 @@ def _service(port: str, version: str = "") -> _Node:
 
 class TestTwoPassRecon:
     @pytest.mark.asyncio
-    async def test_first_pass_is_discovery_without_sV(self) -> None:
+    async def test_first_pass_emits_discovery_and_targeted(self) -> None:
+        # §25.8: pass 1 emits BOTH a top-N discovery scan (no -sV) AND a
+        # targeted -p <common> -sV scan, so a slow/empty broad scan never
+        # leaves recon with nothing productive to run.
         core = _core()
         tasks = await core.plan(_goal(), _sg([]), EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[]))
-        assert isinstance(tasks, list) and len(tasks) == 1
-        args = tasks[0].params["args"]
-        assert "-sV" not in args, f"first discovery pass must omit -sV, got {args}"
-        assert "--top-ports" in args and "1000" in args
-        assert "--max-retries" in args and "2" in args
-        assert "--host-timeout" in args and args[args.index("--host-timeout") + 1] == "80s"
-        assert _scan_flags(args) == ["-sT"]
+        assert isinstance(tasks, list) and len(tasks) == 2
+        discovery = [t for t in tasks if "--top-ports" in t.params["args"]]
+        targeted = [t for t in tasks if "-p" in t.params["args"] and "-sV" in t.params["args"]]
+        assert len(discovery) == 1 and len(targeted) == 1
+        d_args = discovery[0].params["args"]
+        assert "-sV" not in d_args, f"discovery pass must omit -sV, got {d_args}"
+        assert "1000" in d_args or "100" in d_args
+        assert "--max-retries" in d_args and "2" in d_args
+        assert "--host-timeout" in d_args and d_args[d_args.index("--host-timeout") + 1] == "80s"
+        assert _scan_flags(d_args) == ["-sT"]
+        # The targeted scan is the reliable ~14s finder — no --top-ports.
+        t_args = targeted[0].params["args"]
+        assert "--top-ports" not in t_args
+        assert "--host-timeout" in t_args
+        assert _scan_flags(t_args) == ["-sT"]
+
+    @pytest.mark.asyncio
+    async def test_first_pass_two_scans_have_distinct_fingerprints(self) -> None:
+        from apex_host.planning.fingerprint import task_fingerprint
+        core = _core()
+        tasks = await core.plan(_goal(), _sg([]), EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[]))
+        fps = {
+            task_fingerprint("recon", "nmap", t.params["args"], _HOST, "nmap", "recon", "unprivileged")
+            for t in tasks
+        }
+        assert len(fps) == 2, "discovery and targeted scans must be distinct actions (not dedup-suppressed)"
+
+    @pytest.mark.asyncio
+    async def test_targeted_pass_uses_shared_common_ports(self) -> None:
+        # The targeted pass-2 -p list is the single shared source of truth
+        # (nmap_command.common_ports), so it agrees with the incomplete-scan
+        # escalation about which ports the fast complete scan covers.
+        from apex_host.tools.nmap_command import common_ports
+        core = _core()
+        tasks = await core.plan(_goal(), _sg([]), EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[]))
+        assert isinstance(tasks, list)
+        targeted = next(t for t in tasks if "-sV" in t.params["args"])
+        args = targeted.params["args"]
+        assert args[args.index("-p") + 1] == common_ports()
+
+    def test_default_config_passes_nmap_validation(self) -> None:
+        # The retuned pass-1 defaults (top-100, host-timeout 80 <= exec 90) are
+        # all within their validated ranges — a fresh default config is scannable.
+        assert [p for p in validate_combinations(ApexConfig(target=_HOST)) if "nmap" in p] == []
 
     @pytest.mark.asyncio
     async def test_second_pass_version_on_open_ports_only(self) -> None:

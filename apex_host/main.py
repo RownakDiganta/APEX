@@ -212,7 +212,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--nmap-top-ports", dest="nmap_top_ports", type=int, default=None, metavar="N",
-        help="Breadth of the fast first-pass nmap port-discovery scan (--top-ports N, default: 1000).",
+        help="Breadth of the fast first-pass nmap port-discovery scan (--top-ports N, default: 100).",
+    )
+    parser.add_argument(
+        "--nmap-host-timeout", dest="nmap_host_timeout", type=float, default=None, metavar="SECS",
+        help="--host-timeout budget for the first-pass nmap discovery scan "
+             "(default: 80; must be <= --nmap-timeout).",
     )
     raw_socket_group = parser.add_mutually_exclusive_group()
     raw_socket_group.add_argument(

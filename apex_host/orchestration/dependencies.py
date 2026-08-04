@@ -119,6 +119,7 @@ def build_planners(
             raw_socket_capable=backend_supports_raw_sockets(config),
             top_ports=config.nmap_top_ports,
             execution_timeout_seconds=config.nmap_execution_timeout_seconds,
+            host_timeout_seconds=config.nmap_host_timeout_seconds,
             **_kwargs(),
         ),
         ApexPhase.web.value: WebPlanner(

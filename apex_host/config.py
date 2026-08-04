@@ -43,8 +43,26 @@ class ApexConfig:
     # nmap_top_ports: breadth of the fast first-pass port-DISCOVERY scan
     # (`--top-ports N`, WITHOUT -sV) so it completes under the bound; service/
     # version detection is a separate, smaller follow-up scan on only the open
-    # ports found. Range 1..65535. CLI: --nmap-top-ports.
-    nmap_top_ports: int = 1000
+    # ports found. Range 1..65535. CLI: --nmap-top-ports. Default 100 (nmap's
+    # standard "top 100"): a top-1000 scan does NOT complete within the
+    # per-host timeout over HTB VPN latency and returns 0 ports (§25.7), so a
+    # smaller breadth is the sane default. If a top-N scan still times out with
+    # 0 open ports it is escalated to a targeted -p <common-ports> -sV scan
+    # (apex_host.tools.nmap_command.plan_incomplete_scan_escalation), so
+    # reducing breadth never loses the common services.
+    nmap_top_ports: int = 100
+    # nmap_host_timeout_seconds: the `--host-timeout` budget for the first-pass
+    # discovery scan — nmap self-terminates the per-host scan gracefully at this
+    # bound (printing any partial results) BEFORE the outer subprocess SIGTERM
+    # (nmap_execution_timeout_seconds) fires. It MUST be <=
+    # nmap_execution_timeout_seconds (validated in
+    # apex_host.eval.check_config.validate_combinations), so nmap finishes on its
+    # own terms rather than being killed mid-scan. Range 1..3600. CLI:
+    # --nmap-host-timeout. Default 80s: comfortably completes a top-100 discovery
+    # scan over HTB VPN latency (~0.27s RTT); the retuned top-100 default (down
+    # from top-1000, which could NOT finish within this budget — §25.7/§25.8) is
+    # what makes pass-1 both fast AND complete.
+    nmap_host_timeout_seconds: float = 80.0
     allowed_tools: list[str] = field(
         default_factory=lambda: ["nmap", "curl", "python3", "nc"]
     )
@@ -681,7 +699,12 @@ class ApexConfig:
             # (`ps`) while environment variables set via `export` are not.
             "tool_backend": _g("tool_backend", "local"),
             "nmap_execution_timeout_seconds": _g("nmap_timeout", 90.0),
-            "nmap_top_ports": _g("nmap_top_ports", 1000),
+            # Default MUST match the field default (100); the prior 1000 here
+            # silently overrode the field default on every CLI-constructed
+            # config (main.py / run_htb_local.py — §9 P9-I01), so a live run
+            # still got top-1000 despite the field default (§25.8).
+            "nmap_top_ports": _g("nmap_top_ports", 100),
+            "nmap_host_timeout_seconds": _g("nmap_host_timeout", 80.0),
             "tool_service_url": _g("tool_service_url", None),
             # None (unset) means "derive automatically from tool_backend" —
             # see apex_host.tools.backend.backend_supports_raw_sockets().

@@ -49,6 +49,7 @@ from memfabric.types import (
 
 from apex_host.planners.capabilities import capabilities_from_subgraph
 from apex_host.planning.models import PlanDecision
+from apex_host.tools.nmap_command import common_ports
 from apex_host.tools.registry import ToolRegistry
 from apex_host.types import ApexPhase
 
@@ -80,19 +81,24 @@ class _ReconDeterministic:
         registry: ToolRegistry,
         *,
         raw_socket_capable: bool = True,
-        top_ports: int = 1000,
+        top_ports: int = 100,
         execution_timeout_seconds: float = 90.0,
+        host_timeout_seconds: float = 80.0,
     ) -> None:
         self._target = target
         self._registry = registry
-        # Two-pass scan bounding (§25.6): the first pass is a fast port
-        # DISCOVERY scan over the top-N ports (no -sV); version detection is a
-        # separate, smaller follow-up scan on only the ports found open. Both
-        # carry a --host-timeout derived from the per-execution nmap timeout
-        # (a margin below it) so nmap self-terminates gracefully before the
-        # outer SIGTERM, and --max-retries 2 to bound VPN-latency retransmits.
+        # Two-pass scan bounding (§25.6/§25.8): pass 1 emits BOTH a fast port
+        # DISCOVERY scan over the top-N ports (no -sV) AND a targeted
+        # -p <common-ports> -sV scan, as two DISTINCT fingerprinted actions.
+        # The targeted scan is the reliable finder (the known-good ~14s scan);
+        # emitting it in the same turn guarantees recon has a productive action
+        # even when the broad top-N scan is slow or returns 0 ports over VPN
+        # latency (the demonstrated duplicate_task_stall). --host-timeout is an
+        # explicit config budget (a margin below the per-execution nmap timeout,
+        # validated in check_config) so nmap self-terminates gracefully before
+        # the outer SIGTERM; --max-retries 2 bounds VPN-latency retransmits.
         self._top_ports = top_ports
-        self._host_timeout = f"{max(10, int(execution_timeout_seconds) - 10)}s"
+        self._host_timeout = f"{max(1, int(host_timeout_seconds))}s"
         # Capability seam (apex_host.tools.backend.backend_supports_raw_sockets):
         # when the execution backend lacks CAP_NET_RAW/root (the Kali
         # tool-service container's own documented non-root, zero-capability
@@ -171,15 +177,27 @@ class _ReconDeterministic:
         )
 
     def _discovery_scan(self, goal: Goal) -> list[TaskSpec] | AbandonSignal:
-        """Pass 1: fast, bounded port discovery over the top-N ports — no -sV,
-        so it completes within the timeout instead of timing out."""
+        """Pass 1: emit BOTH a fast top-N port DISCOVERY scan (breadth, no -sV)
+        AND a targeted -p <common-ports> -sV scan (the reliable ~14s finder), as
+        two DISTINCT fingerprinted actions. Emitting the targeted scan in the
+        same turn guarantees a productive recon action even when the broad top-N
+        scan is slow or returns 0 ports over VPN latency — so a slow/empty pass 1
+        never leaves recon with nothing to do (§25.8). If both find nothing,
+        recon terminates honestly (no service nodes → no fabricated service)."""
         if self._registry.get("nmap") is None:
             return AbandonSignal(reason="nmap not available in allowed_tools")
-        args = [
+        discovery_args = [
             *self._scan_prefix(), "-Pn", "-T4",
             "--top-ports", str(self._top_ports), *self._bounds(), self._target,
         ]
-        return [self._nmap_taskspec(goal, args)]
+        targeted_args = [
+            *self._scan_prefix(), "-Pn", "-T4",
+            "-p", common_ports(), "-sV", *self._bounds(), self._target,
+        ]
+        return [
+            self._nmap_taskspec(goal, discovery_args),
+            self._nmap_taskspec(goal, targeted_args),
+        ]
 
     def _version_scan(
         self, goal: Goal, service_nodes: list[Any]
@@ -294,12 +312,14 @@ class ReconPlanner:
         guard: "LLMPolicyGuard | None" = None,
         gateway: "LLMGateway | None" = None,
         raw_socket_capable: bool = True,
-        top_ports: int = 1000,
+        top_ports: int = 100,
         execution_timeout_seconds: float = 90.0,
+        host_timeout_seconds: float = 80.0,
     ) -> None:
         self._core = _ReconDeterministic(
             target, registry, raw_socket_capable=raw_socket_capable,
             top_ports=top_ports, execution_timeout_seconds=execution_timeout_seconds,
+            host_timeout_seconds=host_timeout_seconds,
         )
         self._engine: PlanningEngine | None = None
         self._last_decision: PlanDecision | None = None
