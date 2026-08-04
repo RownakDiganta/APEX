@@ -949,9 +949,20 @@ async def check_vpn_readiness(
             ),
         )
     else:
+        # Prefer the readiness server's own layered `reason` (which names the
+        # exact failing layer — VPN process not running / tunnel interface
+        # missing or down / no HTB route installed / route egresses via eth0
+        # not the tunnel) over the coarse status string. Never a secret — the
+        # reason contains only interface/device names and the configured CIDR
+        # (see docker/vpn/tunnel_status.py::TunnelStatus.reason).
+        reason = data.get("reason")
+        detail = (
+            f"VPN not ready: {reason}"
+            if isinstance(reason, str) and reason
+            else f"VPN service reports status={data.get('status')!r} — tunnel not yet ready"
+        )
         tunnel_check = PreflightCheck(
-            name="VPN tunnel/route ready", passed=False,
-            detail=f"VPN service reports status={data.get('status')!r} — tunnel not yet ready",
+            name="VPN tunnel/route ready", passed=False, detail=detail,
         )
     return [service_check, tunnel_check]
 

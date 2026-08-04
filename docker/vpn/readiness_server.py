@@ -7,7 +7,13 @@ the foreground OpenVPN process. Exposes exactly three read-only, GET-only
 endpoints:
 
     GET /health
-        {"status": "ok"|"degraded", "tunnel": bool, "route_cidr": "..."}
+        {"status": "ok"|"degraded", "service": ..., "tunnel": bool (the
+         layered overall readiness), "route_cidr": "...", plus the per-layer
+         booleans "openvpn_running"/"tunnel_interface"/"tunnel_interface_up"/
+         "route_present"/"route_via_tunnel"/"route_device" and a human-
+         readable "reason" naming the first failing layer. Always HTTP 200
+         (the HTTP service is reachable); genuine tunnel readiness is the
+         body's `tunnel` field — see docker/vpn/tunnel_status.py.}
 
     GET /route-check?target=<ip>
         {"target": ..., "ok": ..., "would_use_route": ..., "device": ...,
@@ -99,9 +105,23 @@ class ReadinessHandler(BaseHTTPRequestHandler):
         route_cidr = os.environ.get(ENV_ROUTE_CIDR, DEFAULT_ROUTE_CIDR)
         status = check_tunnel_status(route_cidr)
         logger.info(
-            "health tunnel_interface=%s route_present=%s ready=%s",
-            status.tunnel_interface_name, status.route_present, status.ready,
+            "health openvpn_running=%s tunnel_interface=%s tunnel_up=%s "
+            "route_present=%s route_via_tunnel=%s ready=%s reason=%s",
+            status.openvpn_running, status.tunnel_interface_name,
+            status.tunnel_interface_up, status.route_present,
+            status.route_via_tunnel, status.ready, status.reason,
         )
+        # HTTP status is ALWAYS 200 (the readiness HTTP service itself is
+        # reachable — apex_host.eval.preflight distinguishes "service
+        # reachable" from "tunnel ready" via the body's `tunnel` field, and
+        # would misread a non-200 as "service unreachable"). Genuine tunnel
+        # readiness is carried in the body: `tunnel` (== the layered
+        # `ready`) is what the Docker healthcheck and preflight gate on, so
+        # "container healthy" now means "HTB traffic is actually routed
+        # through the tunnel", never merely "the HTTP sidecar answered".
+        # The per-layer booleans + `reason` let a diagnostic name the exact
+        # failing layer. No secret is ever included — only interface/device
+        # names and the configured CIDR (see TunnelStatus.reason).
         _json_response(
             self, 200,
             {
@@ -109,6 +129,14 @@ class ReadinessHandler(BaseHTTPRequestHandler):
                 "service": SERVICE_NAME,
                 "tunnel": status.ready,
                 "route_cidr": status.route_cidr,
+                "openvpn_running": status.openvpn_running,
+                "tunnel_interface": status.tunnel_interface_name,
+                "tunnel_interface_present": status.tunnel_interface_present,
+                "tunnel_interface_up": status.tunnel_interface_up,
+                "route_present": status.route_present,
+                "route_via_tunnel": status.route_via_tunnel,
+                "route_device": status.route_device,
+                "reason": status.reason,
             },
         )
 

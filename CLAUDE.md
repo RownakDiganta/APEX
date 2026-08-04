@@ -5635,6 +5635,80 @@ machine-specific routing decision was added anywhere in this phase). No
 git branch was created; no commit or push was made as part of this
 phase's work.
 
+#### Infra Phase 10 — CORRECTION: layered tunnel readiness (readiness-only healthcheck fixed)
+
+**Root cause of the demonstrated bug** (VPN container reported *healthy* yet
+`ip route get <HTB_TARGET>` still resolved through Docker `eth0`, not `tun0`):
+the Docker `HEALTHCHECK` in `docker/vpn/Dockerfile` gated on `GET /health`
+returning **HTTP 200**, but `docker/vpn/readiness_server.py::_handle_health`
+returns HTTP **200 unconditionally** (tunnel state lives in the JSON *body*
+`"status": "ok"|"degraded"`, never in the status code). So the container flipped
+to `healthy` the instant the readiness HTTP sidecar started listening — before
+OpenVPN had connected or installed any HTB route. `kali`/`apex`
+(`depends_on: vpn: service_healthy`) then started prematurely and the operator's
+`vpn_route_check` correctly reported `device: eth0`. Compounding it,
+`check_tunnel_status` never verified the OpenVPN process was alive nor that the
+matching HTB route egressed via the tunnel device.
+
+**Fix (binding — do NOT reintroduce a readiness-only healthcheck):**
+
+- `docker/vpn/tunnel_status.py::TunnelStatus` is now **layered**. `ready` is the
+  conjunction of: `openvpn_running` (a `/proc/<pid>/comm` scan — stdlib, no
+  subprocess, reads only the command NAME so it can never leak a profile path
+  or credential), `tunnel_interface_present` **and** `tunnel_interface_up`
+  (missing vs down distinguished via `find_any_tunnel_interface`), `route_present`
+  (an HTB-CIDR route exists — exact or a covered subnet, via `find_htb_route`),
+  **and** `route_via_tunnel` (that route's `dev` egress is `tun*`/`tap*`/`ppp*`,
+  NOT `eth0`). A new `reason` property names the FIRST failing layer (secret-free
+  — interface/device names + the configured CIDR only).
+- `/health` still returns **HTTP 200 always** (the HTTP service IS reachable;
+  `apex_host.eval.preflight.check_vpn_readiness` distinguishes "service
+  reachable" from "tunnel ready" via the body and would misread a non-200 as
+  "service unreachable"). The body now carries the per-layer booleans +
+  `reason`; the overall `tunnel` field == the layered `ready`.
+- The **Docker `HEALTHCHECK` now parses the body and exits 0 only when
+  `tunnel is True`** (`b.get('tunnel')`), never `.status == 200`. This is the
+  two-level design the requirements asked for: the healthcheck confirms
+  process+tun+route-installed-via-tunnel; `apex_host.eval.vpn_route_check
+  --target` confirms the *specific* target uses the tunnel before a live run.
+  `start-period` was raised to 45s / retries to 12 (OpenVPN connect + route push
+  takes seconds).
+- `preflight`'s "VPN tunnel/route ready" failure detail now surfaces the body's
+  `reason`.
+- **Not changed** (deliberately): `apex_host.eval.vpn_route_check`'s
+  `would_use_route` still means "egress device is tunnel-shaped" — `eth0` is
+  never accepted (requirement: do not weaken the route check). No per-target
+  `/32` route is ever fabricated; the default route is never blindly replaced;
+  `entrypoint.py`'s profile/`/dev/net/tun` fail-fast, signal forwarding, and
+  OpenVPN-exit-code propagation are unchanged; the `vpn` capabilities
+  (`NET_ADMIN` + `/dev/net/tun`, never `privileged`) and the
+  `kali` `network_mode: service:vpn` topology are unchanged. `target_in_scope`,
+  the live-run interlock, and authorization checks are untouched.
+
+**Why it works for current AND future HTB targets:** health now means the HTB
+CIDR route is installed *via the tunnel*, so once OpenVPN pushes it, `ip route
+get <any 10.129.x.x>` resolves through `tun0`. If the profile does not push the
+route (`route-nopull` / a pull-filter / wrong region), the container stays
+*unhealthy* with an honest `reason` (never silently "healthy"). No target IP is
+hard-coded anywhere (a static scan in the tests asserts this).
+
+**Tests:** `tests/docker/test_vpn_route_readiness.py` (new) — readiness-server-
+alone-is-not-healthy; missing-process/missing-tun/tun-down/no-route/route-via-
+eth0 each unhealthy; `would_use_route` eth0=False & tun0=True; `find_htb_route`
+device extraction + `ip route show table all` policy-routing tolerance;
+`openvpn_process_running` against a fake `/proc`; the Docker healthcheck gating
+on the body (and a test proving the OLD `.status==200` check would have falsely
+passed the degraded container); no-secret-in-diagnostics; no-hard-coded-target;
+Dockerfile healthcheck contract. `tests/docker/test_vpn_scripts.py` and
+`tests/apex_host/test_vpn_preflight.py` updated to the layered contract. All
+196 VPN tests pass; ruff + mypy clean.
+
+**Operational note (macOS Docker Desktop):** OpenVPN runs inside the Linux VM;
+`NET_ADMIN` + `/dev/net/tun` on the `vpn` service alone are sufficient — no
+`--privileged`. Live validation against a real, authorized HTB `.ovpn` profile
+still requires an operator (none is committed; the normal test suite never needs
+one).
+
 ---
 
 ### Infra Phase 11 — GitHub Actions CI and GHCR image publishing ✓ CODE COMPLETE — GITHUB RUN VALIDATION REQUIRED

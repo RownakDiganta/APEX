@@ -98,13 +98,25 @@ ENV PYTHONUNBUFFERED=1 \
 # (never published to the host — see compose.yaml/compose.htb.yaml).
 EXPOSE 8090
 
-# Meaningful readiness probe: the readiness server's own /health endpoint,
-# which reports tunnel+route status (docker/vpn/tunnel_status.py) — not
-# mere OpenVPN process existence. No bearer token required (see
-# docker/vpn/readiness_server.py's own docstring for why this endpoint is
-# intentionally unauthenticated), no packet sent, no secret exposed.
-HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=5 \
-    CMD python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2).status == 200 else 1)"
+# Meaningful readiness probe: the readiness server's own /health endpoint.
+#
+# CRITICAL — this gates on the RESPONSE BODY's layered readiness, NOT on the
+# HTTP status code. /health ALWAYS returns HTTP 200 (the HTTP service itself
+# is reachable — see docker/vpn/readiness_server.py for why a non-200 would
+# make apex_host.eval.preflight misreport "service unreachable"). The earlier
+# healthcheck checked only `.status == 200`, so the container reported HEALTHY
+# the instant the readiness HTTP sidecar started listening — before OpenVPN
+# had connected or installed any HTB route. That is the exact bug this fix
+# resolves: "container healthy" while `ip route get <target>` still resolved
+# through Docker eth0. The container is now healthy ONLY when the parsed body
+# reports `tunnel: true`, which requires (docker/vpn/tunnel_status.py, layered):
+# the OpenVPN process running, a tunnel device up, the HTB route installed,
+# AND that route egressing via the tunnel — i.e. HTB traffic genuinely uses
+# the tunnel. No bearer token required (endpoint is intentionally
+# unauthenticated), no packet sent, no secret exposed. `start-period` is
+# generous because OpenVPN's connect + route push can take many seconds.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=45s --retries=12 \
+    CMD python3 -c "import urllib.request,json,sys; b=json.load(urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2)); sys.exit(0 if b.get('tunnel') is True else 1)"
 
 # Exec-form JSON array — no shell, no shell string evaluation. Every
 # subprocess this entrypoint spawns (openvpn; the readiness server's own

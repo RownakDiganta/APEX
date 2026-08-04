@@ -526,6 +526,7 @@ class TestCheckTunnelStatus:
             return subprocess.CompletedProcess(argv, 0, stdout="10.129.0.0/16 dev tun0", stderr="")
 
         monkeypatch.setattr(tunnel_status.subprocess, "run", _fake_run)
+        monkeypatch.setattr(tunnel_status, "openvpn_process_running", lambda *a, **k: True)
         status = tunnel_status.check_tunnel_status("10.129.0.0/16")
         assert status.ready is True
         assert status.tunnel_interface_name == "tun0"
@@ -568,10 +569,12 @@ class TestCheckTunnelStatus:
             )
 
         monkeypatch.setattr(tunnel_status.subprocess, "run", _fake_run)
+        monkeypatch.setattr(tunnel_status, "openvpn_process_running", lambda *a, **k: True)
         status = tunnel_status.check_tunnel_status("10.129.0.0/16")
         assert status.tunnel_interface_present is True
         assert status.tunnel_interface_name == "tun0"
         assert status.route_present is True
+        assert status.route_via_tunnel is True
         assert status.ready is True
 
     def test_malformed_cidr_never_calls_subprocess(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -600,8 +603,9 @@ class TestCheckTunnelStatus:
         status = tunnel_status.check_tunnel_status("10.129.0.0/16")
         d = status.to_dict()
         assert set(d.keys()) == {
-            "tunnel_interface_present", "tunnel_interface_name",
-            "route_present", "route_cidr", "ready", "error",
+            "openvpn_running", "tunnel_interface_present", "tunnel_interface_name",
+            "tunnel_interface_up", "route_present", "route_via_tunnel",
+            "route_device", "route_cidr", "ready", "reason", "error",
         }
 
 
@@ -634,6 +638,11 @@ def _running_server(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(tunnel_status.subprocess, "run", _fake_ip_run)
     monkeypatch.setattr(route_check.subprocess, "run", _fake_ip_run)
+    # The layered readiness now also requires a running openvpn process
+    # (docker/vpn/tunnel_status.py). There is no real openvpn in the test
+    # process (and no /proc on macOS), so mock it as running for the
+    # "ready" fixture — the interface/route mocks above supply the rest.
+    monkeypatch.setattr(tunnel_status, "openvpn_process_running", lambda *a, **k: True)
     monkeypatch.setenv(readiness_server.ENV_ROUTE_CIDR, "10.129.0.0/16")
 
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), readiness_server.ReadinessHandler)
@@ -664,7 +673,15 @@ class TestReadinessServerHttp:
 
         with urllib.request.urlopen(f"{_running_server}/health", timeout=5) as resp:
             data = json.loads(resp.read())
-        assert set(data.keys()) == {"status", "service", "tunnel", "route_cidr"}
+        # The layered readiness fields (Phase: HTB VPN route fix) — a fixed,
+        # closed set. Every value is a bool / interface name / device name /
+        # the configured CIDR / a short reason string — never a secret, never
+        # the profile path, certificate, key, or an environment dump.
+        assert set(data.keys()) == {
+            "status", "service", "tunnel", "route_cidr", "openvpn_running",
+            "tunnel_interface", "tunnel_interface_present", "tunnel_interface_up",
+            "route_present", "route_via_tunnel", "route_device", "reason",
+        }
 
     def test_route_check_endpoint_valid_target(self, _running_server: str) -> None:
         import json

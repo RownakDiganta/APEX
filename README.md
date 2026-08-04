@@ -1189,6 +1189,59 @@ docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
   --vpn-service-url http://vpn:8090 --target "$HTB_TARGET" --port 80
 ```
 
+> **`would use route: False` / `device: eth0` is BLOCKING — do not proceed to a
+> live run.** It means the kernel would route the target through the Docker
+> bridge (`eth0`), not the OpenVPN tunnel. Wait for the tunnel, then re-check.
+>
+> **What "healthy" means (and the bug this replaced).** The `vpn` container is
+> reported *healthy* only when its readiness `/health` body reports
+> `tunnel: true`, which is the conjunction of four layered checks
+> (`docker/vpn/tunnel_status.py`): the **OpenVPN process is running**, a
+> **tunnel device is up**, the **HTB route is installed**, AND that **route
+> egresses via the tunnel** (not `eth0`). This is a two-level design: the Docker
+> healthcheck gates on that overall body readiness; `vpn_route_check --target`
+> then confirms your *specific* target uses the tunnel before a live run.
+>
+> Previously the Docker healthcheck gated only on `/health` returning HTTP 200,
+> but `/health` returns 200 unconditionally (tunnel state lives in the JSON
+> body) — so the container reported "healthy" the instant the readiness HTTP
+> sidecar started listening, *before* OpenVPN had connected or installed any
+> route. That is why `ip route get <target>` still resolved through `eth0`
+> despite a "healthy" container. Healthy now genuinely means the HTB route is
+> installed via the tunnel; if OpenVPN never connects or the profile does not
+> push the HTB route, the container stays *unhealthy* (and `kali`/`apex`, which
+> `depends_on: vpn: service_healthy`, never start) rather than silently
+> proceeding.
+>
+> **Troubleshooting a tunnel that will not become healthy.** The `/health` body
+> names the exact failing layer in its `reason` field (`VPN process is not
+> running` / `Tunnel interface is missing` / `... exists but is down` / `No HTB
+> route for 10.129.0.0/16 was installed (route pushing may be disabled)` / `HTB
+> route ... egresses via 'eth0' instead of the tunnel`). Inspect it and the
+> namespace directly (no secrets are printed):
+>
+> ```bash
+> # Layered readiness (reason names the failing layer):
+> docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
+>   exec vpn python3 -c "import urllib.request,json;print(json.dumps(json.load(urllib.request.urlopen('http://127.0.0.1:8090/health')),indent=2))"
+>
+> # OpenVPN connection + route-push log (no profile contents printed):
+> docker compose -f compose.yaml -f compose.htb.yaml --profile htb logs --no-color --tail=200 vpn
+>
+> # Tunnel interface, routes, and policy-routing tables inside the VPN namespace:
+> docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
+>   exec vpn sh -c 'ip addr; echo; ip rule; echo; ip route show; echo; ip route show table all'
+> ```
+>
+> If `No HTB route ... was installed` persists, the mounted `.ovpn` profile is
+> not pushing the lab route (some profiles disable route-pulling via
+> `route-nopull` / a `pull-filter ignore route`) — obtain a lab profile that
+> pushes the HTB network, or the profile is for a different HTB VPN region/mode.
+> APEX never fabricates a per-target `/32` route or replaces the default route
+> to force this. **macOS Docker Desktop:** OpenVPN runs inside the Linux VM;
+> `NET_ADMIN` + `/dev/net/tun` (granted only to `vpn`) are sufficient — no
+> `--privileged` is used or needed.
+
 **8. Live preflight** (validates configuration/report-dir/knowledge/policy/LLM,
 Kali health, and one harmless `curl --version` through the real remote backend
 — then exits without any engagement). It is routed through the live-run
