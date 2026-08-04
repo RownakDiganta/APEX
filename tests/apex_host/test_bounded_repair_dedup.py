@@ -391,10 +391,19 @@ class TestDeterministicRepair:
         assert result["repair_log"][0]["outcome"] == "succeeded"
         assert result["repair_log"][0]["kind"] == "raw_socket_to_tcp_connect"
 
-    def test_raw_socket_repair_is_terminal_when_already_tcp_connect(self) -> None:
-        plan = plan_raw_socket_repair(["-sT", "-sV", _TARGET], _TARGET)
-        assert plan.terminal is True
-        assert plan.repaired_args is None
+    def test_raw_socket_repair_is_terminal_only_with_unprivileged_flags(self) -> None:
+        # A bare -sT that failed with EPERM is missing --unprivileged (the flag
+        # that actually resolves it) — so it is repaired, not terminal.
+        repairable = plan_raw_socket_repair(["-sT", "-sV", _TARGET], _TARGET)
+        assert repairable.terminal is False
+        assert "--unprivileged" in (repairable.repaired_args or [])
+        # Only once --unprivileged -Pn -sT were all present and it STILL failed
+        # is the failure terminal.
+        terminal = plan_raw_socket_repair(
+            ["-sT", "--unprivileged", "-Pn", "-sV", _TARGET], _TARGET
+        )
+        assert terminal.terminal is True
+        assert terminal.repaired_args is None
 
 
 # ===========================================================================

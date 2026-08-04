@@ -629,7 +629,16 @@ class TaskDispatcher:
                 }, ExecutionDisposition.INVALID_TASK
             exec_args = norm.args
 
-        cmd = ToolCommand(tool=tool, args=exec_args, timeout_seconds=self._config.max_command_seconds)
+        # nmap gets its own, larger per-execution timeout (a full/version scan
+        # over VPN latency cannot finish in the general 30s max_command_seconds
+        # cap). Validated <= tool_service_timeout_seconds so the remote HTTP
+        # call never cuts it off. Every other tool keeps max_command_seconds.
+        tool_timeout = (
+            int(getattr(self._config, "nmap_execution_timeout_seconds", self._config.max_command_seconds))
+            if tool == "nmap"
+            else self._config.max_command_seconds
+        )
+        cmd = ToolCommand(tool=tool, args=exec_args, timeout_seconds=tool_timeout)
         try:
             result = await self._run_command_fn(cmd, self._config)
         except ValueError as exc:

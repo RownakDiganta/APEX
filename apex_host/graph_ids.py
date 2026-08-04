@@ -127,6 +127,18 @@ def service_id(ip: str, port: str | int, proto: str = "tcp") -> str:
     return f"service:{ip}:{port}/{proto}"
 
 
+def vhost_id(ip: str, hostname: str) -> str:
+    """Canonical ID for a virtual-host (name-based vhost) node discovered for a
+    host — a hostname the host answers to that is distinct from its IP (e.g.
+    revealed by an HTTP redirect ``Location`` header). Content-addressed on
+    ip+hostname so re-discovering the same vhost is an upsert, never a duplicate.
+
+    >>> vhost_id("10.10.10.14", "App.HTB")
+    'vhost:10.10.10.14:app.htb'
+    """
+    return f"vhost:{ip}:{hostname.strip().lower()}"
+
+
 def tech_slug(name: str) -> str:
     """Slug form of a technology name for use in ``tech_id``.
 

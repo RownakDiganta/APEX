@@ -66,11 +66,15 @@ def _host_node(target: str) -> Node:
     )
 
 
-def _service_node(target: str, port: str, service: str = "telnet") -> Node:
+def _service_node(target: str, port: str, service: str = "telnet", version: str = "1.0") -> Node:
+    # Default a non-empty version so the service represents the post-version
+    # (banner-probe) state. Under two-pass recon (§25.6) a service WITHOUT
+    # version first triggers a separate -sV follow-up scan; the banner-probe
+    # tests want a service whose version is already known.
     return Node(
         id=f"service:{target}:{port}/tcp",
         type="service",
-        props={"port": port, "proto": "tcp", "service": service, "state": "open"},
+        props={"port": port, "proto": "tcp", "service": service, "state": "open", "version": version},
         confidence=0.9,
         source="nmap",
         first_seen=now(),

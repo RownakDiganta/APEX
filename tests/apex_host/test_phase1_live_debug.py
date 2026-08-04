@@ -534,19 +534,24 @@ class TestNmapRawSocketCapabilitySeam:
         result = await planner.plan(_make_goal(), _empty_subgraph(), _empty_evidence())
         assert not isinstance(result, AbandonSignal)
         args = list(result)[0].params["args"]
+        # Two-pass recon (§25.6): the first pass is a bounded discovery scan —
+        # -sT (connect intent) present, but NO -sV (version detection is a
+        # separate follow-up on the discovered ports).
         assert "-sT" in args
-        assert "-sV" in args
-        assert args.index("-sT") < args.index("-sV")
+        assert "-sV" not in args
+        assert args[0] == "-sT"
 
     @pytest.mark.asyncio
     async def test_recon_planner_default_omits_sT_preserving_prior_behavior(self) -> None:
-        """Default construction (no raw_socket_capable kwarg) must be
-        byte-for-byte identical to pre-Phase-1 behavior."""
+        """Default construction (raw-socket-capable) omits -sT. Two-pass recon
+        (§25.6): the first pass is a bounded discovery scan (no -sV)."""
         planner = ReconPlanner(_TARGET, _make_registry())
         result = await planner.plan(_make_goal(), _empty_subgraph(), _empty_evidence())
         assert not isinstance(result, AbandonSignal)
         args = list(result)[0].params["args"]
-        assert args == ["-sV", "-T4", "-Pn", _TARGET]
+        assert "-sT" not in args
+        assert "-sV" not in args
+        assert "--top-ports" in args and args[-1] == _TARGET
 
     @pytest.mark.asyncio
     async def test_recon_deterministic_direct_construction_raw_socket_capable_true_by_default(self) -> None:

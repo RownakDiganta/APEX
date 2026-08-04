@@ -935,7 +935,8 @@ against a real running instance of this image during Infra Phase 6
 for Infra Phase 4 — `RemoteToolBackend` has now been exercised against a
 real Dockerized service, not just in-process. One notable,
 empirically-verified finding: `nmap`'s default/SYN-scan mode does **not**
-work unprivileged inside this container (`-sT` is required) — see
+work unprivileged inside this container (`-sT` **plus** `--unprivileged`
+and `-Pn` are required — see the note below) — see
 [`docs/kali-container.md`](docs/kali-container.md) §5 for the full
 capability investigation. Full detail on every installed/excluded tool,
 the build design, and all nine parts of this phase's runtime validation:
@@ -964,6 +965,26 @@ detected, `"nmap_execution_failed"` for any other nonzero-exit failure,
 therefore in the episode/report, never used to fabricate a fake successful
 port/service discovery (that remains driven entirely by whether the output
 text matches nmap's real format).
+
+**`--unprivileged -Pn` are injected too (`-sT` alone was not enough).** A
+later authorized live HTB test showed every scan STILL failing with
+`Couldn't open a raw socket. Error: (1) Operation not permitted` even after
+`-sT` was emitted: `nmap` runs as `uid 0` inside the container but without
+`CAP_NET_RAW`, so it assumes raw-socket privilege for its default
+host-discovery ping probes and hits `EPERM` even on a connect scan. The
+single authoritative nmap path
+(`apex_host.tools.nmap_command.normalize_nmap_command`) now normalizes
+**every** nmap invocation for the detected backend capability and, on an
+unprivileged/unknown backend, injects `--unprivileged` (forces nmap's pure
+connect-socket code path despite being root) and `-Pn` (skips host discovery)
+alongside `-sT`. Raw-socket-only features that have no faithful unprivileged
+equivalent — UDP (`-sU`), OS detection (`-O`), and `--traceroute` — are
+truthfully refused (`error_category="unsupported_capability"`), never silently
+downgraded to a plain TCP scan. Kali stays unprivileged: **no `NET_RAW` or
+`NET_ADMIN` is granted** to `apex`/`kali` (only the `vpn` service gets
+`NET_ADMIN` + `/dev/net/tun`). The deterministic raw-socket repair adds
+`--unprivileged -Pn` once (a distinct, non-suppressed action) and is terminal
+only once those flags were already present and it still failed.
 
 **Docker Compose integration (Infra Phase 7):** `compose.yaml` wires the
 APEX application and Kali tool-service images together on a dedicated,
@@ -1241,6 +1262,30 @@ docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
 > to force this. **macOS Docker Desktop:** OpenVPN runs inside the Linux VM;
 > `NET_ADMIN` + `/dev/net/tun` (granted only to `vpn`) are sufficient — no
 > `--privileged` is used or needed.
+>
+> If `Tunnel interface is missing` persists **while the log shows `VERIFY OK`
+> for the HTB server certificate followed by repeating `TLS Error: TLS key
+> negotiation failed to occur within 60 seconds` → `TLS handshake failed` →
+> `SIGUSR1[soft,tls-error] received, process restarting`**, the profile is valid
+> and the HTB server is reachable and authenticated, but the encrypted data path
+> never completes — an **operational/network** condition, not a code fault (the
+> container side is proven healthy in the same session: `/dev/net/tun` present,
+> `NET_ADMIN` granted, profile parsed, no tun-creation error). This commonly
+> appears after a previously-working session when the profile's server rotates
+> or becomes congested. Remedies, in order: (1) re-download a fresh profile from
+> **HTB → Access → OpenVPN**, choosing a *different* server than the one named
+> in the log's `CN=` (the free `*-free-*` servers are frequently overloaded),
+> and overwrite `secrets/htb.ovpn`; (2) if your network blocks the profile's UDP
+> port (the log shows `UDPv4 link remote: ...:<port>`), download HTB's **TCP**
+> profile variant (TCP/443, which traverses firewalls that drop UDP) and
+> overwrite `secrets/htb.ovpn`; (3) confirm the profile's VPN product matches the
+> target's network — a `10.129.x.x` target needs the **Machines/Labs** VPN, not
+> a Starting Point / Release Arena / Fortress profile. After swapping the profile:
+> `docker compose -f compose.yaml -f compose.htb.yaml --profile htb restart vpn`,
+> wait ~30–45s, and confirm `"tunnel": true` in `/health` before starting `kali`.
+> The layered healthcheck correctly stays *unhealthy* until a real tunnel exists
+> — this is the intended Infra Phase 10 behavior; do not relax it to force
+> `kali`/`apex` to start.
 
 **8. Live preflight** (validates configuration/report-dir/knowledge/policy/LLM,
 Kali health, and one harmless `curl --version` through the real remote backend
@@ -1261,6 +1306,7 @@ docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
   --tool-backend remote \
   --tool-service-url http://vpn:8080 \
   --tool-service-timeout 120 \
+  --nmap-timeout 120 \
   --use-llm --llm-provider openai --llm-model gpt-5.5 \
   --max-turns 20 \
   --no-dry-run --confirm-live --preflight-only \
@@ -1298,6 +1344,7 @@ docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
   --tool-backend remote \
   --tool-service-url http://vpn:8080 \
   --tool-service-timeout 120 \
+  --nmap-timeout 120 \
   --use-llm --llm-provider openai --llm-model gpt-5.5 \
   --max-turns 20 \
   --max-llm-calls 20 --max-llm-calls-per-phase 4 \
@@ -1309,6 +1356,16 @@ docker compose -f compose.yaml -f compose.htb.yaml --profile htb \
 
 Reports land in `./run_reports/` on the host. `user_flag_verified` is the only
 benchmark-success outcome.
+
+`--nmap-timeout` is the per-execution nmap scan cap (default 90s), **separate**
+from `--tool-service-timeout` (the remote HTTP request budget). A full version
+scan over VPN latency needs more than the general 30s per-tool cap; set
+`--nmap-timeout` to a practical value **at or below** `--tool-service-timeout`
+(they are validated — a larger nmap timeout is rejected, since the HTTP call
+would cut the scan off). The recon phase is also bounded automatically: the
+first scan is a fast top-ports discovery pass (`--nmap-top-ports`, default 1000)
+without `-sV`, and version detection runs as a smaller follow-up scan on only
+the open ports (§25.6 in CLAUDE.md).
 
 **LLM planner-call budget (important).** `--max-llm-calls` defaults to a
 deliberately conservative **5** — too low for a real multi-phase engagement,
@@ -2273,6 +2330,28 @@ fabricating evidence for a later, capability-dependent phase. `web` and
 `credential` retain their existing forced-advance behavior — by the time
 either phase's own budget is checked, the prerequisite evidence for being
 in that phase already exists for real.
+
+A successful **`curl` HTTP fetch** is genuine service evidence: a real HTTP
+response (a parsed status line, or a returned HTML body) records an HTTP
+`service` node (port 80/443 or the URL's explicit port, full provenance) in
+addition to the `endpoint`, so a live web server proven by curl does **not**
+trip the "no services discovered" termination — and the fetched endpoint is
+marked `fetched=True` so it counts as web content even when a GET body carries
+no status line. This is real HTTP evidence, never fabricated: a non-HTML or
+failed response records no service node (CLAUDE.md §28.7).
+
+**Name-based virtual hosts** are discovered and re-fetched. When `curl
+http://<ip>/` returns a 3xx redirect to a NEW hostname (e.g. an empty 301 with
+`Location: http://<vhost>/` — a common nginx name-based-vhost setup where the
+bare IP serves nothing), the parser records a generic **`vhost`** node
+(discovered from the redirect, never hardcoded), and the web planner re-fetches
+with `curl --resolve <vhost>:<port>:<ip> http://<vhost>/` so the request
+connects to the authorized IP but sends the vhost `Host` header — nginx then
+serves the real app, and form/technology/link discovery runs against it instead
+of the empty 301. The policy scope gate authorizes the vhost fetch **only** when
+it is pinned via `--resolve` to an already-authorized IP (a raw off-scope host,
+or a pin to an unauthorized IP, stays blocked); the safety allowlist accepts the
+`--resolve` value unchanged (no shell metacharacters). See CLAUDE.md §28.8.
 
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)

@@ -149,25 +149,33 @@ class WebEvidence:
 
 def _has_web_content(subgraph: "SubgraphView") -> bool:
     """True when the EKG holds meaningful web evidence: a fetched page (an
-    ``endpoint`` actually browsed or carrying a real HTTP status), a ``form``
-    or ``web_opportunity`` (only produced by web parsing), or a ``tech`` node
-    that accompanies an ``endpoint`` (web fingerprinting produces endpoint+tech
-    together). A discovered-but-unfetched link, or an endpoint from a
-    policy-blocked/failed request, never qualifies.
+    ``endpoint`` actually browsed, marked ``fetched``, or carrying a real HTTP
+    status), a ``form`` or ``web_opportunity`` (only produced by web parsing),
+    or a ``tech`` node that accompanies an ``endpoint`` (web fingerprinting
+    produces endpoint+tech together). A discovered-but-unfetched link, or an
+    endpoint from a policy-blocked/failed request, never qualifies.
 
     A BARE ``tech`` node (no endpoint present) does NOT count: nmap version
     detection (``-sV``) produces ``service``+``tech`` nodes with no endpoint,
     and counting that as "web discovery complete" would skip the web phase
     entirely on any versioned HTTP service — the demonstrated regression the
-    recon->web release-gate scenario guards against. See CLAUDE.md §26.3/§28."""
+    recon->web release-gate scenario guards against. See CLAUDE.md §26.3/§28.
+
+    A successful ``curl`` fetch marks its endpoint ``fetched=True`` (the HEAD
+    path also sets a numeric ``status``); a GET body carries no status line, so
+    the ``fetched`` marker is what makes a real, live HTTP endpoint count as
+    web content per §28.6 — the fix for a fetched endpoint being ignored."""
     has_endpoint = any(n.type == "endpoint" for n in subgraph.nodes)
     for n in subgraph.nodes:
-        if n.type in ("form", "web_opportunity"):
+        if n.type in ("form", "web_opportunity", "vhost"):
+            # A `vhost` is a non-IP hostname discovered from an HTTP redirect —
+            # learning the real app's virtual host IS meaningful web progress
+            # (it unblocks a Host-aware re-fetch). §28.8.
             return True
         if n.type == "tech" and has_endpoint:
             return True
         if n.type == "endpoint":
-            if n.props.get("browsed") is True:
+            if n.props.get("browsed") is True or n.props.get("fetched") is True:
                 return True
             status = str(n.props.get("status", "")).strip()
             if status.isdigit():

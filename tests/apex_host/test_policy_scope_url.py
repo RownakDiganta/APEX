@@ -24,7 +24,12 @@ from apex_host.execution.registry import TaskRegistry
 from apex_host.policy import PolicyAdvisor
 from apex_host.policy.models import ScopePolicy
 from apex_host.policy.policy_loader import _ALWAYS_BLOCKED_TOOLS, load_policy
-from apex_host.policy.scope import NormalizedTarget, normalize_target, target_in_scope
+from apex_host.policy.scope import (
+    NormalizedTarget,
+    normalize_target,
+    resolve_pin_authorizes,
+    target_in_scope,
+)
 from apex_host.types import ToolResult
 from memfabric.ids import new_id
 from memfabric.types import TaskSpec
@@ -253,6 +258,62 @@ class TestAdvisorSecurityBlocked:
         task = _make_task("curl", target=redirect_target, args=["-s", redirect_target])
         decision = advisor.review_task(task, "web", _fake_evidence(), config)
         assert decision.is_blocked and decision.rule_name == "target_in_scope"
+
+
+class TestVhostResolvePin:
+    """A name-based vhost target is in scope only when pinned via
+    ``curl --resolve <vhost>:<port>:<authorized-ip>`` to an authorized host."""
+
+    def test_pin_helper_authorizes_authorized_ip(self) -> None:
+        assert resolve_pin_authorizes(
+            "foo.htb", ["--resolve", f"foo.htb:80:{_HOST}", "http://foo.htb"], [_HOST]
+        ) is True
+
+    def test_pin_helper_rejects_offscope_ip(self) -> None:
+        assert resolve_pin_authorizes(
+            "foo.htb", ["--resolve", f"foo.htb:80:{_OTHER}", "http://foo.htb"], [_HOST]
+        ) is False
+
+    def test_pin_helper_rejects_wrong_host(self) -> None:
+        # --resolve pins a DIFFERENT host than the target — no authorization.
+        assert resolve_pin_authorizes(
+            "foo.htb", ["--resolve", f"bar.htb:80:{_HOST}", "http://foo.htb"], [_HOST]
+        ) is False
+
+    def test_vhost_with_resolve_pin_approved(self) -> None:
+        advisor, config = _advisor()
+        task = _make_task(
+            "curl", target="http://foo.htb",
+            args=["-s", "-I", "--resolve", f"foo.htb:80:{_HOST}", "http://foo.htb"],
+        )
+        decision = advisor.review_task(task, "web", _fake_evidence(), config)
+        assert decision.is_approved, f"{decision.rule_name}: {decision.reason}"
+
+    def test_vhost_without_pin_blocked(self) -> None:
+        advisor, config = _advisor()
+        task = _make_task("curl", target="http://foo.htb", args=["-s", "-I", "http://foo.htb"])
+        decision = advisor.review_task(task, "web", _fake_evidence(), config)
+        assert decision.is_blocked and decision.rule_name == "target_in_scope"
+
+    def test_vhost_pinned_to_offscope_ip_blocked(self) -> None:
+        advisor, config = _advisor()
+        task = _make_task(
+            "curl", target="http://foo.htb",
+            args=["-s", "-I", "--resolve", f"foo.htb:80:{_OTHER}", "http://foo.htb"],
+        )
+        decision = advisor.review_task(task, "web", _fake_evidence(), config)
+        assert decision.is_blocked and decision.rule_name == "target_in_scope"
+
+    def test_pin_respects_port_restriction(self) -> None:
+        # Pinned port must be permitted when the policy restricts ports.
+        assert resolve_pin_authorizes(
+            "foo.htb", ["--resolve", f"foo.htb:8080:{_HOST}"], [_HOST],
+            allowed_ports=frozenset({80, 443}),
+        ) is False
+        assert resolve_pin_authorizes(
+            "foo.htb", ["--resolve", f"foo.htb:80:{_HOST}"], [_HOST],
+            allowed_ports=frozenset({80, 443}),
+        ) is True
 
 
 # ---------------------------------------------------------------------------

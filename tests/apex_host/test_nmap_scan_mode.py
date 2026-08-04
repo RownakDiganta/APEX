@@ -36,15 +36,34 @@ def _scan_flags(args: list[str]) -> list[str]:
 
 class TestNormalizeUnprivileged:
     def test_unprivileged_forces_sT(self) -> None:
-        # A privileged default (no scan flag) on an unprivileged backend.
+        # A privileged default (no scan flag) on an unprivileged backend:
+        # -sT is not enough on its own — nmap as uid 0 without CAP_NET_RAW
+        # still attempts raw-socket host discovery — so --unprivileged and
+        # -Pn are injected too.
         r = nc.normalize_nmap_command(["-sV", "-T4", "-Pn", _HOST], _HOST, capability=nc.UNPRIVILEGED)
-        assert r.args == ["-sT", "-sV", "-T4", "-Pn", _HOST]
+        assert r.args == ["-sT", "--unprivileged", "-Pn", "-sV", "-T4", _HOST]
         assert r.transport == nc.TRANSPORT_TCP_CONNECT
         assert r.unsupported is False
+
+    def test_unprivileged_injects_unprivileged_and_pn(self) -> None:
+        # The exact flags that resolve the demonstrated EPERM failure.
+        r = nc.normalize_nmap_command(["-sV", _HOST], _HOST, capability=nc.UNPRIVILEGED)
+        assert "--unprivileged" in r.args and "-Pn" in r.args and "-sT" in r.args
+
+    def test_unprivileged_no_duplicate_injected_flags(self) -> None:
+        # A planner/LLM that already supplied --unprivileged/-Pn must not get
+        # them doubled.
+        r = nc.normalize_nmap_command(
+            ["-sT", "--unprivileged", "-Pn", "-sV", _HOST], _HOST, capability=nc.UNPRIVILEGED,
+        )
+        assert r.args.count("--unprivileged") == 1
+        assert r.args.count("-Pn") == 1
+        assert _scan_flags(r.args) == ["-sT"]
 
     def test_unprivileged_rewrites_sS_to_sT(self) -> None:
         r = nc.normalize_nmap_command(["-sS", "-sV", _HOST], _HOST, capability=nc.UNPRIVILEGED)
         assert "-sS" not in r.args and "-sT" in r.args
+        assert "--unprivileged" in r.args and "-Pn" in r.args
         assert r.transport == nc.TRANSPORT_TCP_CONNECT
 
     def test_exactly_one_tcp_scan_mode(self) -> None:
@@ -54,9 +73,9 @@ class TestNormalizeUnprivileged:
 
     def test_equivalent_to_documented_command(self) -> None:
         r = nc.normalize_nmap_command(["-sV", "-Pn", "-T4", _HOST], _HOST, capability=nc.UNPRIVILEGED)
-        # Equivalent to `nmap -sT -sV -Pn -T4 <target>` (order of preserved
-        # flags follows the input; scan mode is prepended; target trails).
-        assert set(r.args) == {"-sT", "-sV", "-Pn", "-T4", _HOST}
+        # Equivalent to `nmap -sT --unprivileged -Pn -sV -T4 <target>`
+        # (scan mode + unprivileged flags prepended; kept flags follow; target trails).
+        assert set(r.args) == {"-sT", "--unprivileged", "-sV", "-Pn", "-T4", _HOST}
         assert r.args[0] == "-sT" and r.args[-1] == _HOST
 
     def test_unknown_capability_defaults_to_sT(self) -> None:
@@ -134,9 +153,40 @@ class TestNormalizeUdp:
         r = nc.normalize_nmap_command(["-sU", "-sV", _HOST], _HOST, capability=nc.RAW_SOCKET)
         assert r.unsupported is False and "-sU" in r.args
 
-    def test_udp_never_silently_becomes_tcp(self) -> None:
+    def test_udp_never_silently_becomes_tcp_precheck(self) -> None:
         r = nc.normalize_nmap_command(["-sU", _HOST], _HOST, capability=nc.UNPRIVILEGED)
         assert "-sT" not in r.args
+
+
+class TestNormalizeRawOnlyFeatures:
+    """-O and --traceroute need raw sockets and have no faithful unprivileged
+    equivalent — they are refused truthfully, never silently dropped so a
+    plain TCP scan is presented as if it ran them."""
+
+    def test_os_detection_unsupported_on_unprivileged(self) -> None:
+        r = nc.normalize_nmap_command(["-sV", "-O", _HOST], _HOST, capability=nc.UNPRIVILEGED)
+        assert r.unsupported is True and r.args == []
+        assert "-O" in r.reason
+
+    def test_traceroute_unsupported_on_unprivileged(self) -> None:
+        r = nc.normalize_nmap_command(["-sV", "--traceroute", _HOST], _HOST, capability=nc.UNPRIVILEGED)
+        assert r.unsupported is True and r.args == []
+
+    def test_os_detection_unsupported_on_unknown(self) -> None:
+        r = nc.normalize_nmap_command(["-sV", "-O", _HOST], _HOST, capability=nc.UNKNOWN)
+        assert r.unsupported is True
+
+    def test_os_detection_not_silently_downgraded_to_tcp(self) -> None:
+        # It must NOT come back as a plain -sT scan pretending to be OS detection.
+        r = nc.normalize_nmap_command(["-sV", "-O", _HOST], _HOST, capability=nc.UNPRIVILEGED)
+        assert "-sT" not in r.args and r.args == []
+
+    def test_os_detection_allowed_on_raw_capable(self) -> None:
+        # On a raw-capable backend the request is not refused (pre-existing
+        # behavior: -O is not in the safe allowlist so it is dropped, but the
+        # scan itself still runs — never an unsupported refusal).
+        r = nc.normalize_nmap_command(["-sV", "-O", _HOST], _HOST, capability=nc.RAW_SOCKET)
+        assert r.unsupported is False
 
 
 # ---------------------------------------------------------------------------
@@ -144,20 +194,42 @@ class TestNormalizeUdp:
 # ---------------------------------------------------------------------------
 
 class TestRepairPlan:
-    def test_privileged_failure_rewrites_to_sT(self) -> None:
+    def test_privileged_failure_rewrites_with_unprivileged_flags(self) -> None:
         plan = nc.plan_raw_socket_repair(["-sV", "-T4", "-Pn", _HOST], _HOST)
         assert plan.terminal is False
-        assert plan.repaired_args is not None and "-sT" in plan.repaired_args
+        assert plan.repaired_args is not None
+        # The rewrite adds the flags that actually resolve the EPERM.
+        assert "-sT" in plan.repaired_args
+        assert "--unprivileged" in plan.repaired_args
+        assert "-Pn" in plan.repaired_args
         assert plan.transport == nc.TRANSPORT_TCP_CONNECT
 
     def test_syn_failure_rewrites_to_sT(self) -> None:
         plan = nc.plan_raw_socket_repair(["-sS", "-sV", _HOST], _HOST)
         assert plan.terminal is False and "-sS" not in (plan.repaired_args or [])
         assert "-sT" in (plan.repaired_args or [])
+        assert "--unprivileged" in (plan.repaired_args or [])
 
-    def test_already_sT_is_terminal(self) -> None:
+    def test_sT_without_unprivileged_is_repaired_not_terminal(self) -> None:
+        # A bare -sT -Pn (no --unprivileged) that failed with EPERM is NOT
+        # terminal — it is missing the flag that actually resolves the error.
         plan = nc.plan_raw_socket_repair(["-sT", "-sV", "-Pn", _HOST], _HOST)
+        assert plan.terminal is False
+        assert "--unprivileged" in (plan.repaired_args or [])
+
+    def test_repaired_command_is_a_distinct_fingerprint(self) -> None:
+        # The repair must produce a materially different action so it is not
+        # dedup-suppressed as a repeat of the failed command.
+        failed = ["-sT", "-sV", "-Pn", _HOST]
+        plan = nc.plan_raw_socket_repair(failed, _HOST)
+        assert plan.repaired_args is not None
+        assert nc.canonical_fingerprint_args(plan.repaired_args, _HOST) != \
+            nc.canonical_fingerprint_args(failed, _HOST)
+
+    def test_terminal_only_when_unprivileged_flags_already_present(self) -> None:
+        plan = nc.plan_raw_socket_repair(["-sT", "--unprivileged", "-Pn", "-sV", _HOST], _HOST)
         assert plan.terminal is True and plan.repaired_args is None
+        assert "--unprivileged" in plan.reason
 
     def test_udp_failure_is_terminal(self) -> None:
         plan = nc.plan_raw_socket_repair(["-sU", _HOST], _HOST)
@@ -258,6 +330,10 @@ class TestDispatcherIntegration:
         assert "-sT" in args, f"remote backend must run -sT, got {args}"
         assert "-sS" not in args
         assert _scan_flags(args) == ["-sT"], "exactly one TCP scan mode"
+        # The flags that actually resolve the EPERM on a root-but-no-NET_RAW
+        # backend must reach the runner, not just -sT.
+        assert "--unprivileged" in args, f"remote backend must run --unprivileged, got {args}"
+        assert "-Pn" in args, f"remote backend must run -Pn, got {args}"
 
     @pytest.mark.asyncio
     async def test_remote_backend_never_sends_sS(self) -> None:
@@ -279,6 +355,15 @@ class TestDispatcherIntegration:
         disp = _dispatcher("remote", calls)
         result = await disp.dispatch(_nmap_task(["-sU", _HOST]), _context())
         assert calls == [], "unsupported UDP scan must never reach the runner"
+        assert result.disposition == ExecutionDisposition.INVALID_TASK
+        assert result.tool_result_dict.get("error_category") == "unsupported_capability"
+
+    @pytest.mark.asyncio
+    async def test_remote_os_detection_is_unsupported_and_never_runs(self) -> None:
+        calls: list[tuple[str, list[str]]] = []
+        disp = _dispatcher("remote", calls)
+        result = await disp.dispatch(_nmap_task(["-sV", "-O", _HOST]), _context())
+        assert calls == [], "OS detection must never reach the runner on an unprivileged backend"
         assert result.disposition == ExecutionDisposition.INVALID_TASK
         assert result.tool_result_dict.get("error_category") == "unsupported_capability"
 
@@ -422,12 +507,32 @@ class TestDeterministicRepair:
         assert calls and "-sS" not in calls[0][1]
 
     @pytest.mark.asyncio
-    async def test_already_sT_failure_is_terminal(self) -> None:
+    async def test_sT_without_unprivileged_is_repaired_not_terminal(self) -> None:
+        # A bare -sT -Pn that failed with EPERM is missing --unprivileged, so
+        # the repair adds it and re-executes exactly once (not terminal).
         calls: list[tuple[str, list[str]]] = []
         deps = _make_deps(calls)
         repair_agent = make_repair_node(deps)
         result = await repair_agent(_raw_socket_state(["-sT", "-sV", "-Pn", _HOST]))  # type: ignore[arg-type]
-        # No re-execution — a -sT command that still failed is terminal.
+        assert len(calls) == 1
+        _tool, args = calls[0]
+        assert "--unprivileged" in args and "-sT" in args
+        # It was NOT recorded as a terminal failure.
+        assert not any(
+            d.get("disposition") == "raw_socket_terminal"
+            for d in (result.get("duplicate_actions") or [])
+        )
+
+    @pytest.mark.asyncio
+    async def test_already_unprivileged_failure_is_terminal(self) -> None:
+        calls: list[tuple[str, list[str]]] = []
+        deps = _make_deps(calls)
+        repair_agent = make_repair_node(deps)
+        # Already had --unprivileged -Pn -sT and still failed → terminal.
+        result = await repair_agent(
+            _raw_socket_state(["-sT", "--unprivileged", "-Pn", "-sV", _HOST])  # type: ignore[arg-type]
+        )
+        # No re-execution — the unprivileged flags were already present.
         assert calls == []
         entries = result.get("duplicate_actions") or []
         assert entries and entries[0]["disposition"] == "raw_socket_terminal"

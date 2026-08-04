@@ -210,6 +210,25 @@ def validate_combinations(config: ApexConfig) -> list[str]:
             f"tool_service_timeout_seconds={config.tool_service_timeout_seconds} must not be negative"
         )
 
+    # nmap per-execution timeout (§25.6). Must be positive and must not exceed
+    # the remote tool-service HTTP budget, or the outer request would cut the
+    # scan off before nmap finishes — the exact class of failure this field
+    # exists to prevent.
+    if config.nmap_execution_timeout_seconds <= 0:
+        problems.append(
+            f"nmap_execution_timeout_seconds={config.nmap_execution_timeout_seconds} must be positive"
+        )
+    elif config.nmap_execution_timeout_seconds > config.tool_service_timeout_seconds:
+        problems.append(
+            f"nmap_execution_timeout_seconds={config.nmap_execution_timeout_seconds} must not exceed "
+            f"tool_service_timeout_seconds={config.tool_service_timeout_seconds} "
+            "(the remote HTTP call would cut the scan off before nmap finishes)"
+        )
+    if config.nmap_top_ports < 1 or config.nmap_top_ports > 65535:
+        problems.append(
+            f"nmap_top_ports={config.nmap_top_ports} must be in the range 1..65535"
+        )
+
     return problems
 
 

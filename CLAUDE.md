@@ -970,7 +970,8 @@ it becomes a staged `KnowledgeEntry` at confidence 0.25–0.3.
 | `host` | A reachable IP/hostname | `ip`, `target` |
 | `service` | An open port / protocol binding | `port`, `proto`, `service`, `version` |
 | `tech` | An identified product or library | `name`, `version` |
-| `endpoint` | An HTTP path/URL | `url`, `status`, `server` |
+| `endpoint` | An HTTP path/URL | `url`, `status`, `server`, `fetched` |
+| `vhost` (§28.8) | A name-based virtual host DISCOVERED for a host (e.g. from an HTTP redirect `Location`) — never hardcoded | `hostname`, `ip`, `discovered_from`, `source_status` |
 | `auth_flow` | A login mechanism or credential boundary | `url`, `hint` |
 | `credential` | A captured credential or token | `username`, `secret_hint` |
 | `access_state` | Current privilege level reached | `level`, `evidence` |
@@ -5709,6 +5710,19 @@ Dockerfile healthcheck contract. `tests/docker/test_vpn_scripts.py` and
 still requires an operator (none is committed; the normal test suite never needs
 one).
 
+**Operational note (environmental, not a code fault):** a `vpn` container that
+stays unhealthy with `/health` `reason: "Tunnel interface is missing"` while the
+OpenVPN log shows the HTB server cert `VERIFY OK` followed by repeating
+`TLS Error: TLS key negotiation failed to occur within 60 seconds` /
+`SIGUSR1[soft,tls-error] received, process restarting` is an operational/network
+condition (congested or rotated HTB server, or a network blocking the profile's
+UDP port), **not** a healthcheck/entrypoint/tunnel_status regression — the
+layered healthcheck (§ Infra Phase 10 CORRECTION) is behaving correctly by
+refusing to report a non-existent tunnel as healthy. Remedy is a fresh/different
+HTB `.ovpn` (or the TCP profile variant), never a code change. See the README
+"Troubleshooting a tunnel that will not become healthy" block for the operator
+steps.
+
 ---
 
 ### Infra Phase 11 — GitHub Actions CI and GHCR image publishing ✓ CODE COMPLETE — GITHUB RUN VALIDATION REQUIRED
@@ -9335,24 +9349,50 @@ execution chokepoint — `apex_host.execution.dispatcher._run_command` — to
 **every** nmap task (deterministic-planner, LLM-planned, or repaired), so no
 privileged scan can reach an unprivileged backend:
 
-- **Unprivileged / unknown → exactly one `-sT`** (TCP connect). Equivalent to
-  `nmap -sT -sV -Pn -T4 <authorized-target>`. Never emits `-sS`, never relies
-  on nmap's privileged default.
+- **Unprivileged / unknown → exactly one `-sT` PLUS injected `--unprivileged`
+  and `-Pn`.** Equivalent to `nmap -sT --unprivileged -Pn -sV -T4
+  <authorized-target>`. Never emits `-sS`, never relies on nmap's privileged
+  default. `-sT` **alone is not sufficient**: nmap running as `uid 0` in the
+  restricted Kali tool-service container (no `CAP_NET_RAW`) still attempts
+  raw-socket host-discovery ping probes and hard-fails with `Couldn't open a
+  raw socket. Error: (1) Operation not permitted` even on a connect scan.
+  `--unprivileged` forces nmap onto the pure connect-socket code path despite
+  being root; `-Pn` skips host discovery entirely. Both are de-duplicated
+  against any the planner/LLM already supplied (never doubled).
 - **`raw_socket` may keep the existing privileged strategy** — an explicit
   `-sS`, or nmap's SYN default (no scan flag) — but only that; an arbitrary
-  exotic raw scan is still downgraded to `-sT`.
+  exotic raw scan is still downgraded to `-sT` (no `--unprivileged` injection
+  on a raw-capable backend — the operator has the privilege they chose).
 - **The LLM cannot inject arbitrary nmap arguments.** Only a fixed allowlist
-  survives (`-sV`, `-Pn`, `-n`, `--open`, `-v`/`-vv`, `-6`, `-T0..-T5`, and the
-  bounded value flags `-p <ports>` / `--top-ports <n>`); scripts (`--script`),
-  output files (`-oN`/`-oX`/`-oG`/`-oA`/`-oS`), input lists (`-iL`/`-iR`), and
-  any extra positional target are dropped. Shell operators are already blocked
-  by `apex_host.tools.safety`. The single positional is always exactly the
-  authorized target. Existing safe flags (bounded ports, `-T` timing, `-Pn`,
-  and the runner.py subprocess timeout) are preserved.
-- **UDP is never silently converted to TCP.** `-sU` on a non-raw-socket
-  backend returns `unsupported=True` and the dispatcher yields a clear
-  `error_category="unsupported_capability"` result (disposition
-  `INVALID_TASK`) — the scan is never executed and never rewritten to TCP.
+  survives (`-sV`, `-Pn`, `-n`, `--open`, `-v`/`-vv`, `-6`, `--unprivileged`,
+  `-T0..-T5`, and the bounded value flags `-p <ports>` / `--top-ports <n>`);
+  scripts (`--script`), output files (`-oN`/`-oX`/`-oG`/`-oA`/`-oS`), input
+  lists (`-iL`/`-iR`), and any extra positional target are dropped. Shell
+  operators are already blocked by `apex_host.tools.safety`. The single
+  positional is always exactly the authorized target. Existing safe flags
+  (bounded ports, `-T` timing, `-Pn`, and the runner.py subprocess timeout)
+  are preserved.
+- **Raw-socket-only features are truthfully refused, never silently
+  downgraded.** On a non-raw-socket backend `-sU` (UDP), `-O` (OS detection),
+  and `--traceroute` each return `unsupported=True` and the dispatcher yields a
+  clear `error_category="unsupported_capability"` result (disposition
+  `INVALID_TASK`) — the scan is never executed and never rewritten to a plain
+  TCP scan that would misrepresent what ran. TCP-family raw *scan types*
+  (`-sS`/`-sA`/`-sW`/`-sM`/…) DO have a faithful unprivileged equivalent and
+  are converted to `-sT`.
+
+> **Correction (nmap `--unprivileged` fix):** the original §25 (commit
+> `e047a50`) forced `-sT` on an unprivileged backend but did NOT inject
+> `--unprivileged`/`-Pn`, so a live HTB engagement still hard-failed every
+> scan with `Couldn't open a raw socket. Error: (1) Operation not permitted`
+> (nmap as `uid 0` without `CAP_NET_RAW` assumes raw-socket privilege even on a
+> connect scan). The normalizer now injects `--unprivileged -Pn` on the
+> unprivileged/unknown path, and `-O`/`--traceroute` join `-sU` as truthful
+> unsupported-capability refusals. `--unprivileged` is a fingerprinted flag
+> (§27.2) so the repaired command is a distinct, non-dedup-suppressed action.
+> Kali stays unprivileged — no `NET_RAW`/`NET_ADMIN` was granted (§22 Infra
+> Phase 6/7 prohibition unchanged). This corrects §25.2/§25.3 in place because
+> §25 documents current binding behavior, not a historical phase record.
 
 ### 25.3 Bounded one-time deterministic raw-socket repair
 
@@ -9362,12 +9402,20 @@ lacks privilege), `apex_host.orchestration.repair_node.repair_agent` runs a
 **deterministic** repair (before the LLM `RepairEngine`) via
 `nmap_command.plan_raw_socket_repair`:
 
-- retries **at most once**, rewriting to the equivalent `-sT` scan
-  (`repair_kind="raw_socket_to_tcp_connect"`); the original privileged
-  fingerprint is marked `SUPERSEDED` so it is never re-executed;
-- **if the failed command already used `-sT`** (or was a UDP scan), the
-  failure is **terminal** — the fingerprint is marked `FAILED_TERMINAL` and a
-  `raw_socket_terminal` entry is recorded; no re-dispatch, no loop.
+- retries **at most once**, rewriting to add `--unprivileged -Pn -sT`
+  (`repair_kind="raw_socket_to_tcp_connect"`); because `--unprivileged` is a
+  fingerprinted flag (§27.2), the rewrite is a **distinct** action from the
+  failure and is not dedup-suppressed. The original fingerprint is marked
+  `SUPERSEDED` so it is never re-executed. The decision is made on the args
+  that **actually executed** (the normalized args on the tool result, which
+  already carry any injected `--unprivileged`/`-Pn`), not the pre-normalization
+  planner args;
+- **if the failed command already had all of `--unprivileged`, `-Pn`, and
+  `-sT`** (or was a UDP scan), the failure is **terminal** — the fingerprint is
+  marked `FAILED_TERMINAL` and a `raw_socket_terminal` entry is recorded; no
+  re-dispatch, no loop. A bare `-sT` that is missing `--unprivileged` is NOT
+  terminal (it is missing the flag that actually resolves the EPERM) — it is
+  repaired.
 
 The bounded-retry taxonomy (§ Action Fingerprinting) still applies on top —
 `ApexConfig.max_repair_attempts` and `max_fingerprint_retries` cap everything.
@@ -9386,13 +9434,63 @@ exposing secrets or excessive raw command content.
 ### 25.5 Tests
 
 `tests/apex_host/test_nmap_scan_mode.py`: `normalize_nmap_command` (unprivileged
-`-sT`, raw-capable privileged, unknown-defaults-safely, exactly-one-scan-mode,
-injection/extra-target stripping, UDP-unsupported), `plan_raw_socket_repair`
-(rewrite / already-`-sT`-terminal / UDP-terminal), `backend_raw_socket_capability`
-(three-state), dispatcher integration (remote runs `-sT`, never `-sS`; local
-keeps privileged; UDP unsupported never runs; diagnostics fields), and the
-deterministic `repair_agent` (one `-sT` re-execution, privileged never run
-verbatim, already-`-sT` terminal). Fake runner only — no real scans.
+`-sT` **plus injected `--unprivileged -Pn`**, no doubled injected flags,
+raw-capable privileged, unknown-defaults-safely, exactly-one-scan-mode,
+injection/extra-target stripping, UDP/`-O`/`--traceroute` unsupported refusals),
+`plan_raw_socket_repair` (rewrite adds `--unprivileged -Pn`, distinct
+fingerprint, terminal **only** when `--unprivileged -Pn -sT` already present,
+UDP-terminal), `backend_raw_socket_capability` (three-state), dispatcher
+integration (remote runs `--unprivileged -Pn -sT`, never `-sS`; local keeps
+privileged; UDP/`-O` unsupported never run; diagnostics fields), and the
+deterministic `repair_agent` (bare-`-sT` repaired once, privileged never run
+verbatim, already-`--unprivileged` terminal). The §28.7 release-gate scenario
+`unprivileged_backend_completes_connect_scan` drives the real compiled graph
+against a fake backend that returns EPERM without `--unprivileged` and proves
+recon completes (service node produced, zero raw-socket failures) instead of
+dead-ending. Fake runner only — no real scans.
+
+### 25.6 Nmap execution timeout and the two-pass (discovery → version) scan
+
+Fixes the follow-on live failure: the one scan that cleared raw sockets
+(`-sT --unprivileged -Pn ...`) then **timed out at 30s** — a full `-sV` over the
+default 1000 ports across HTB VPN latency cannot finish in 30s.
+
+**The timeout is a dedicated, validated `ApexConfig` field, not the HTTP
+budget.** `ApexConfig.max_command_seconds` (30) is the general per-tool cap;
+`ApexConfig.tool_service_timeout_seconds` (120) is the remote HTTP request
+budget. Neither is the right lever for nmap. `ApexConfig.nmap_execution_timeout_seconds`
+(default **90.0**, CLI `--nmap-timeout`) is the per-execution nmap cap. The
+dispatcher passes it as the `ToolCommand.timeout_seconds` for **every** nmap
+task (`_run_command`); `runner.py` caps by the larger of `max_command_seconds`
+and this field so a local backend honors it too. It is validated in
+`apex_host.eval.check_config.validate_combinations` (§28.4 convention): must be
+`> 0` and **`<= tool_service_timeout_seconds`** so the outer HTTP call never
+cuts the scan off before nmap finishes.
+
+**The first unprivileged recon scan is a bounded two-pass scan** (deterministic,
+in `_ReconDeterministic`, not memfabric):
+
+- **Pass 1 — fast port discovery, no `-sV`:** `nmap [-sT] -Pn -T4 --top-ports
+  <N> --max-retries 2 --host-timeout <bound> <target>` where `N =
+  ApexConfig.nmap_top_ports` (default **1000**, range 1..65535, CLI
+  `--nmap-top-ports`) and `<bound>` is derived a margin below the execution
+  timeout (`{exec-10}s`) so nmap self-terminates gracefully before the outer
+  SIGTERM. Omitting `-sV` is what lets it complete.
+- **Pass 2 — version detection on ONLY the open ports:** once services are
+  discovered but none carry version info, a separate, smaller `nmap [-sT] -Pn
+  -sV -p <open-ports> --max-retries 2 --host-timeout <bound> <target>`. Once any
+  service has a version, recon proceeds to banner probes. The two scans have
+  distinct fingerprints (different args) so neither dedup-suppresses the other;
+  `--max-retries`/`--host-timeout` are preserved by `normalize_nmap_command`
+  (added to its value-flag allowlist) and are fingerprinted like `-p`.
+
+`nmap_top_ports` / `nmap_execution_timeout_seconds` are threaded into the recon
+planner via `build_planners` (`dependencies.py`). Tests:
+`tests/apex_host/test_nmap_two_pass_timeout.py` (fakes only) — field parsing,
+validation (rejected when `> tool_service_timeout_seconds`, non-positive, or
+top-ports out of range), the bounded first pass omitting `-sV` and carrying the
+bounds, the version follow-up on only the open ports, and a fake slow (45s) scan
+that times out at a 20s budget but completes under the 90s nmap timeout.
 
 ---
 
@@ -9459,9 +9557,12 @@ first-turn `done` still produces a proper outcome.
 web discovery complete ONLY on **meaningful evidence**, never because web tasks
 were merely attempted:
 
-- a fetched page — an `endpoint` node actually browsed (`browsed=True`) or
-  carrying a real HTTP `status` (the curl/ffuf/gobuster/browser parsers set
-  these on a successful response);
+- a fetched page — an `endpoint` node actually browsed (`browsed=True`),
+  marked `fetched=True` (a successful curl fetch — see §28.7), or carrying a
+  real HTTP `status` (the curl/ffuf/gobuster/browser parsers set these on a
+  successful response). A successful curl fetch ALSO records an HTTP `service`
+  node so recon does not die "no services discovered" with a live web server
+  present (§28.7);
 - a structured artifact that could only come from fetched content — a `form`,
   `tech`, or `web_opportunity` node;
 - (in `GlobalPlanner`) a terminal, classified inability — the web phase's own
@@ -9592,13 +9693,17 @@ Canonicalization is TOOL-AWARE (`_canonical_args` / `_canonical_target`):
 - **Deterministic repair runs BEFORE the LLM and consumes no LLM budget.**
   `apex_host.orchestration.repair_node` handles a classified nmap
   `raw_socket_permission_denied` via
-  `apex_host.tools.nmap_command.plan_raw_socket_repair` — rewriting ONCE to
-  the equivalent unprivileged `-sT` scan (a distinct fingerprint → the
-  original is marked `SUPERSEDED`), or, when the failed command already used
-  `-sT` (or was UDP), marking the original `FAILED_TERMINAL` with NO
-  resubmission. `deps.repair_engine` (the LLM path) is never consulted on this
-  branch. A repair that reproduces the same normalized action is rejected
-  before dispatch (`repair_no_change`).
+  `apex_host.tools.nmap_command.plan_raw_socket_repair` — rewriting ONCE to add
+  `--unprivileged -Pn -sT` (a distinct fingerprint, since `--unprivileged` is a
+  fingerprinted flag per §27.2 → the original is marked `SUPERSEDED`), or, when
+  the executed command already had `--unprivileged -Pn -sT` (or was UDP),
+  marking the original `FAILED_TERMINAL` with NO resubmission. The decision is
+  made on the args that actually executed (`tool_result["args"]`, already
+  carrying any injected flags), not the planner args. `deps.repair_engine` (the
+  LLM path) is never consulted on this branch. A repair that reproduces the
+  same normalized action is rejected before dispatch (`repair_no_change`).
+  (Correction: a bare `-sT` failure is no longer treated as terminal — `-sT`
+  alone does not resolve the EPERM; see §25.2's correction note.)
 
 ### 27.4 Stall reason semantics
 
@@ -9734,6 +9839,105 @@ control-flow regression the recon→web release-gate scenario now guards). A
 (web fingerprinting produces endpoint+tech together); `form`/`web_opportunity`
 and a fetched-endpoint (browsed / real HTTP status) remain unambiguous web
 evidence.
+
+### 28.7 Fetched-endpoint → web-content + service evidence (curl HTTP fetch)
+
+Fixes the demonstrated gap where `curl http://target/` returned a real nginx
+301, an `endpoint` node existed, yet the engagement died in recon with
+`web_evidence_complete=false`, `web_reason="no_web_content_evidence"`, and
+"no services discovered" — a live, fetched HTTP endpoint was ignored. Two
+root causes, both in `apex_host` (memfabric untouched; all writes are
+`MemoryAPI` deltas, never store-direct):
+
+1. **The curl GET-body parser produced an endpoint with no `status`/fetched
+   marker.** A GET body carries no HTTP status line, so `CommandParser
+   .parse_curl_body` set only `{url, title}` and `_has_web_content` (which
+   keys on `browsed`/numeric `status`) ignored it. Both curl paths now mark
+   the base endpoint **`fetched=True`** (a successful HTML body, or a parsed
+   `HTTP/` status line, both prove a real fetch); `_has_web_content` counts a
+   `fetched` endpoint as web content per §28.6. A bare endpoint (a
+   discovered-but-unfetched link) and a bare `tech` node still do NOT count —
+   the §28.6 guards are preserved.
+
+2. **Neither curl path recorded a `service` node**, so recon's "no services
+   discovered" termination (`GlobalPlanner.decide_phase`: recon budget
+   exhausted AND `"service" not in node_types_seen` → `done`) fired even with a
+   web server sitting right there. Both curl paths now record an HTTP
+   `service` node (`_http_service_from_url`) — port from the URL's explicit
+   port else the scheme default (80/443), `service="http"/"https"`,
+   `state=open`, full provenance (`source=curl`/`curl_body`) and confidence.
+   Recorded **only on a real HTTP response** (a parsed status line, or a
+   returned HTML body) — never fabricated; a non-HTML/failed response falls
+   back to a `KnowledgeEntry` and records no service. With the service node
+   present, recon no longer dies "no services discovered" and advances to web.
+
+Tests (fakes only): `tests/apex_host/test_web_planner.py` /
+`test_recon_parser.py` (a successful curl 301 yields both a `fetched` endpoint
+and an http `service`; non-HTML records no service; explicit port / https
+443); `test_credential_phase_gate.py` (`_has_web_content` true for a fetched
+endpoint, false for a bare endpoint / bare tech; recon with a curl service +
+zero nmap services advances to web instead of terminating, while an
+endpoint-only graph still terminates). Release-gate scenario
+`curl_only_web_discovery` drives the real `CommandParser` + `MemoryAPI` +
+`GlobalPlanner` end to end.
+
+### 28.8 vhost discovery from redirects + Host-aware (`--resolve`) fetch
+
+Fixes the demonstrated gap where the target's real app is a name-based virtual
+host: `curl http://<ip>/` returned an empty 301 with `Location:
+http://<vhost>/`, the Kali container could not resolve `<vhost>`, nothing sent
+a `Host` header or followed the redirect, and the web agent was blind. Generic
+— the vhost is always **DISCOVERED** from the redirect, never hardcoded
+(§11.2). Three parts (memfabric untouched; all writes via `MemoryAPI` deltas):
+
+1. **Parser records a `vhost` node from a 3xx `Location`.** `CommandParser
+   ._parse_curl_headers` captured the `Location` header but discarded it. It now
+   calls `_redirect_vhost(location, url_host)`: when a 3xx redirects to a NEW
+   hostname (a validated DNS hostname, not an IP, distinct from the fetched
+   host), it records a **`vhost`** node (new node type — §12.8; id
+   `graph_ids.vhost_id(ip, hostname)`, content-addressed) with
+   `{hostname, ip, discovered_from, source_status}`, provenance and confidence,
+   linked `host --exposes--> vhost`. A same-host (IP→IP) or relative redirect
+   creates no vhost. `phase_gates._has_web_content` counts a `vhost` node as web
+   content (learning the vhost IS web progress — it unblocks the re-fetch).
+
+2. **Web executor re-fetches with `curl --resolve <vhost>:<port>:<ip>`.**
+   `_WebDeterministic.plan` selects the highest-confidence `vhost` node
+   (`_select_vhost`) and, when present, targets `http://<vhost>/` with
+   `--resolve <vhost>:<port>:<authorized-ip>` — curl connects to the authorized
+   IP but sends the vhost `Host` header, so nginx serves the real app and the
+   redirect chain / relative links resolve correctly. `--resolve` is preferred
+   over `-H Host:`; the opt-in ffuf/gobuster paths fuzz the resolvable IP URL
+   with a `-H Host: <vhost>` header. The `--resolve` value (`host:port:ip`) and
+   vhost URL carry no shell metacharacters, so `tools/safety.py`'s generic
+   allowlist accepts them unchanged (no curl-specific special-casing added).
+
+3. **Policy authorizes the pinned vhost fetch.** A raw `http://<vhost>/` target
+   is off-scope by host equality. `scope.resolve_pin_authorizes` +
+   `rules.check_target_in_scope` authorize it **only** when the task pins it via
+   `--resolve <vhost>:<port>:<authorized-ip>` to an already-authorized host (and
+   a permitted port, if the policy restricts ports) — the request's real
+   destination is the authorized IP. A vhost with no pin, or pinned to an
+   off-scope IP, stays blocked; a redirect is still never auto-followed.
+
+**Endpoint/host linkage:** a vhost fetch's `params["target"]` is the vhost URL,
+so endpoint IDs/URLs are vhost-scoped (links resolve). `parse_observation`
+passes `host_ip=state["target"]` (the authorized host) in the parser metadata so
+the `exposes` edges and the merged `service` node attach to the EXISTING
+`host:<ip>` node — never a non-existent `host:<vhost>` that would dangle and roll
+back the transactional batch. Absent `host_ip` (every pre-existing caller/test),
+behavior is byte-for-byte unchanged.
+
+Tests: `tests/apex_host/test_recon_parser.py` (301→new-host yields a vhost node +
+host→vhost edge; same-host / relative redirect yields none),
+`test_credential_phase_gate.py` (vhost is web content),
+`test_web_planner.py` (vhost → `--resolve` Host-aware curl; no vhost → IP, no
+`--resolve`; args pass the safety gate), `test_policy_scope_url.py`
+(`resolve_pin_authorizes` + the gate: pinned-to-authorized-IP approved,
+no-pin / off-scope-pin / port-excluded blocked). Release-gate scenario
+`vhost_redirect_web_discovery` drives recon-:80 → IP-301 → vhost node →
+WebPlanner `--resolve` task → PolicyAdvisor approval → vhost body fetch →
+discovered content, end to end.
 
 ### 28.7 Release gate
 

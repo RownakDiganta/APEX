@@ -110,9 +110,29 @@ class TestWebEvidence:
         sg = _subgraph(_node("endpoint", {"url": f"http://{_HOST}/", "browsed": True}))
         assert web_evidence_status(sg).complete is True
 
+    def test_fetched_endpoint_is_complete(self) -> None:
+        # A successful curl GET marks its endpoint fetched=True even though the
+        # body carries no status line — a live, fetched HTTP endpoint is web
+        # content per §28.6 (the fix for a fetched endpoint being ignored).
+        sg = _subgraph(_node("endpoint", {"url": f"http://{_HOST}/", "fetched": True}))
+        assert web_evidence_status(sg).complete is True
+        assert web_evidence_status(sg).reason == pg.WEB_EVIDENCE_CONTENT
+
+    def test_bare_endpoint_no_marker_is_not_content(self) -> None:
+        # An endpoint with neither status, browsed, nor fetched (a
+        # discovered-but-unfetched link) is not meaningful content.
+        sg = _subgraph(_node("endpoint", {"url": f"http://{_HOST}/x"}))
+        assert web_evidence_status(sg).complete is False
+
     def test_form_and_opportunity_are_complete(self) -> None:
         for t in ("form", "web_opportunity"):
             assert web_evidence_status(_subgraph(_node(t, {}))).complete is True
+
+    def test_vhost_node_is_web_content(self) -> None:
+        # A vhost discovered from an HTTP redirect is meaningful web progress —
+        # it unblocks a Host-aware re-fetch of the real app (§28.8).
+        sg = _subgraph(_node("vhost", {"hostname": "app.htb", "ip": _HOST}))
+        assert web_evidence_status(sg).complete is True
 
     def test_bare_tech_node_is_not_web_content(self) -> None:
         # A bare `tech` node with no endpoint is produced by nmap version
@@ -147,6 +167,40 @@ class TestWebEvidence:
 class TestDecidePhaseGate:
     def _gp(self) -> GlobalPlanner:
         return GlobalPlanner(max_turns=20)
+
+    def test_curl_only_service_avoids_no_services_termination(self) -> None:
+        # Recon budget exhausted with a live HTTP endpoint+service proven by
+        # curl (zero nmap services) must NOT die "no services discovered" — the
+        # service node counts as progress. Contrast the endpoint-only case,
+        # which correctly still terminates.
+        gp = GlobalPlanner(max_turns=20, phase_budgets={"recon": 1})
+        gp.record_turn(ApexPhase.recon)  # exhaust recon budget
+        assert gp.budget_remaining(ApexPhase.recon) == 0
+
+        # A curl-only web target: host + fetched endpoint + recorded service.
+        phase = gp.decide_phase(
+            node_types_seen={"host", "endpoint", "service"},
+            turn_count=2, current_phase=ApexPhase.recon.value,
+            has_web_capability=True, has_credential_hypothesis=False,
+            web_evidence_complete=False,
+        )
+        assert phase != ApexPhase.done
+        assert phase == ApexPhase.web
+
+    def test_endpoint_only_no_service_still_terminates(self) -> None:
+        # Guard: an endpoint with NO service node (pre-fix curl behavior) still
+        # terminates "no services discovered" once recon is exhausted, so the
+        # fix is specifically the curl-records-a-service change, not a
+        # weakening of the termination.
+        gp = GlobalPlanner(max_turns=20, phase_budgets={"recon": 1})
+        gp.record_turn(ApexPhase.recon)
+        phase = gp.decide_phase(
+            node_types_seen={"host", "endpoint"},
+            turn_count=2, current_phase=ApexPhase.recon.value,
+            has_web_capability=True, has_credential_hypothesis=False,
+            web_evidence_complete=False,
+        )
+        assert phase == ApexPhase.done
 
     def test_http_no_content_no_creds_stays_web(self) -> None:
         # Open HTTP port, no fetched page, no credentials → remain in web

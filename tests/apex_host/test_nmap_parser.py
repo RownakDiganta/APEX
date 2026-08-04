@@ -19,7 +19,7 @@ from typing import Any
 
 from memfabric.api import MemoryAPI
 from memfabric.config import Config
-from memfabric.ids import new_id
+from memfabric.ids import new_id, now
 from memfabric.stores.episodic_jsonl import JSONLEpisodicStore
 from memfabric.stores.graph_networkx import NetworkXGraphStore
 from memfabric.stores.kv_memory import InMemoryKVStore
@@ -28,6 +28,7 @@ from memfabric.stores.vector_faiss import FaissVectorIndex
 from memfabric.types import (
     EvidenceBundle,
     Goal,
+    Node,
     SubgraphView,
 )
 
@@ -418,12 +419,26 @@ class TestReconPlannerNmapArgs:
         assert "-Pn" in nmap_task.params["args"]
 
     async def test_nmap_args_include_sv(self) -> None:
+        # Two-pass recon (§25.6): the FIRST pass is a bounded discovery scan
+        # with NO -sV; -sV is a separate follow-up on the discovered ports.
         registry = ToolRegistry(allowed_tools=["nmap"])
         planner = ReconPlanner(_TARGET, registry)
         result = await planner.plan(_goal(), _empty_subgraph(), _empty_evidence())
         assert isinstance(result, list)
-        nmap_task = next(t for t in result if t.params.get("tool") == "nmap")
-        assert "-sV" in nmap_task.params["args"]
+        first = next(t for t in result if t.params.get("tool") == "nmap")
+        assert "-sV" not in first.params["args"]
+        assert "--top-ports" in first.params["args"]
+        # Follow-up: an unversioned service triggers the -sV version scan.
+        svc_node = Node(
+            id=f"service:{_TARGET}:22/tcp", type="service",
+            props={"port": "22", "proto": "tcp", "service": "ssh", "state": "open", "version": ""},
+            confidence=0.9, source="nmap", first_seen=now(), last_seen=now(),
+        )
+        svc = SubgraphView(anchor=_ANCHOR, nodes=[svc_node], edges=[], depth=2)
+        follow = await planner.plan(_goal(), svc, _empty_evidence())
+        assert isinstance(follow, list)
+        version_task = next(t for t in follow if t.params.get("tool") == "nmap")
+        assert "-sV" in version_task.params["args"]
 
     async def test_nmap_args_include_t4(self) -> None:
         registry = ToolRegistry(allowed_tools=["nmap"])

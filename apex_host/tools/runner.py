@@ -99,7 +99,16 @@ async def run_command(cmd: ToolCommand, config: "ApexConfig") -> ToolResult:
         )
 
     grace = float(getattr(config, "subprocess_sigterm_grace_seconds", _DEFAULT_SIGTERM_GRACE))
-    timeout = min(cmd.timeout_seconds, config.max_command_seconds)
+    # max_command_seconds is the general per-tool cap, but nmap needs a larger,
+    # separately-validated timeout (nmap_execution_timeout_seconds) which the
+    # dispatcher already sets on the ToolCommand. Cap by the LARGER of the two
+    # so an nmap command's longer timeout is honored while every other tool
+    # still cannot exceed max_command_seconds.
+    ceiling = max(
+        config.max_command_seconds,
+        int(getattr(config, "nmap_execution_timeout_seconds", config.max_command_seconds)),
+    )
+    timeout = min(cmd.timeout_seconds, ceiling)
     start = time.monotonic()
     proc: asyncio.subprocess.Process | None = None
     try:

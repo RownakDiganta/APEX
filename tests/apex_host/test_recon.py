@@ -48,11 +48,16 @@ def _empty_evidence() -> EvidenceBundle:
 
 
 def _service_subgraph(*services: dict[str, Any], target: str = _TARGET) -> SubgraphView:
+    # Default a non-empty version so a service represents the post-version
+    # (banner-probe) state. Under the two-pass recon flow (§25.6) a service
+    # WITHOUT version info first triggers a separate -sV follow-up scan; tests
+    # exercising the banner phase want a service whose version is already
+    # known. Individual callers may still override "version" explicitly.
     nodes = [
         Node(
             id=f"service:{target}:{svc['port']}/tcp",
             type="service",
-            props=svc,
+            props={"version": "1.0", **svc},
             confidence=0.9,
             source="nmap",
             first_seen=now(),
@@ -87,8 +92,12 @@ class TestReconPlannerNmapPhase:
         task = list(result)[0]
         args = task.params["args"]
         assert _TARGET in args
-        assert "-sV" in args
+        # Two-pass recon (§25.6): the FIRST pass is a fast, bounded port
+        # discovery scan — no -sV — so it completes instead of timing out.
+        assert "-sV" not in args
         assert "-T4" in args
+        assert "--top-ports" in args
+        assert "--host-timeout" in args
 
     async def test_nmap_task_has_parser_nmap(self) -> None:
         planner = ReconPlanner(_TARGET, _registry("nmap"))

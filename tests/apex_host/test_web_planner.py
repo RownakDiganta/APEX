@@ -184,6 +184,70 @@ class TestWebPlannerCurlTasks:
 
 
 # ---------------------------------------------------------------------------
+# Host-aware (vhost) curl — issued when a vhost was discovered from a redirect
+# ---------------------------------------------------------------------------
+
+from memfabric.ids import now as _now  # noqa: E402
+from memfabric.types import Node as _Node  # noqa: E402
+
+
+def _vhost_subgraph(hostname: str = "foo.htb", ip: str = _TARGET) -> SubgraphView:
+    vhost = _Node(
+        id=f"vhost:{ip}:{hostname}", type="vhost",
+        props={"hostname": hostname, "ip": ip, "discovered_from": "http_redirect"},
+        confidence=0.8, source="curl", first_seen=_now(), last_seen=_now(),
+    )
+    return SubgraphView(anchor=_ANCHOR, nodes=[vhost], edges=[], depth=2)
+
+
+class TestWebPlannerVhost:
+    async def test_head_curl_uses_resolve_for_discovered_vhost(self) -> None:
+        planner = _planner(tools=["curl"])
+        result = await planner.plan(_goal(), _vhost_subgraph("foo.htb"), _empty_evidence())
+        assert isinstance(result, list)
+        head = next(t for t in result if t.params.get("parser") == "command")
+        args = head.params["args"]
+        assert "--resolve" in args
+        assert f"foo.htb:80:{_TARGET}" in args
+        assert "http://foo.htb" in args
+        # Targets the vhost URL so relative links / redirects resolve against it.
+        assert head.params["target"] == "http://foo.htb"
+
+    async def test_body_curl_uses_resolve_for_discovered_vhost(self) -> None:
+        planner = _planner(tools=["curl"])
+        result = await planner.plan(_goal(), _vhost_subgraph("foo.htb"), _empty_evidence())
+        assert isinstance(result, list)
+        body = next(t for t in result if t.params.get("parser") == "curl_body")
+        assert "--resolve" in body.params["args"]
+        assert f"foo.htb:80:{_TARGET}" in body.params["args"]
+
+    async def test_no_vhost_uses_ip_no_resolve(self) -> None:
+        # Without a discovered vhost, curl targets the IP with no --resolve
+        # (unchanged behavior).
+        planner = _planner(tools=["curl"])
+        result = await planner.plan(_goal(), _empty_subgraph(), _empty_evidence())
+        assert isinstance(result, list)
+        for t in result:
+            assert "--resolve" not in t.params["args"]
+            assert _TARGET in t.params["target"]
+
+    async def test_vhost_curl_args_have_no_shell_operators(self) -> None:
+        # The --resolve value (host:port:ip) and vhost URL carry no shell
+        # metacharacters, so the generic safety gate accepts them unchanged.
+        from apex_host.tools.safety import check_command
+        from apex_host.types import ToolCommand
+        from apex_host.config import ApexConfig
+
+        planner = _planner(tools=["curl"])
+        result = await planner.plan(_goal(), _vhost_subgraph("foo.htb"), _empty_evidence())
+        assert isinstance(result, list)
+        cfg = ApexConfig(target=_TARGET, allowed_tools=["curl"])
+        for t in result:
+            # Does not raise — the vhost-aware args pass the safety allowlist.
+            check_command(ToolCommand(tool="curl", args=t.params["args"]), cfg)
+
+
+# ---------------------------------------------------------------------------
 # CommandParser.parse_curl_body — HTML title + relative link extraction
 # ---------------------------------------------------------------------------
 
@@ -240,8 +304,44 @@ class TestCommandParserCurlBody:
     def test_creates_exposes_edge_from_host(self) -> None:
         parsed = self._PARSER.parse_curl_body(self._raw(_HTML_WITH_TITLE))
         exposes = [e for e in parsed.edge_deltas if e.type == "exposes"]
-        assert len(exposes) == 1
-        assert exposes[0].from_id == "host:10.10.10.80"
+        # host -> endpoint AND host -> service (a successful fetch proves a
+        # live HTTP service — see test_curl_body_records_http_service).
+        assert all(e.from_id == "host:10.10.10.80" for e in exposes)
+        to_ids = {e.to_id for e in exposes}
+        assert any(tid.startswith("endpoint:") for tid in to_ids)
+        assert any(tid.startswith("service:") for tid in to_ids)
+
+    def test_base_endpoint_marked_fetched(self) -> None:
+        # A returned HTML body is a successful HTTP fetch — the base endpoint is
+        # marked fetched so the web-evidence gate counts it (§28.6).
+        parsed = self._PARSER.parse_curl_body(self._raw(_HTML_WITH_TITLE))
+        base = next(n for n in parsed.node_deltas if n.props.get("url") == "http://10.10.10.80")
+        assert base.props.get("fetched") is True
+
+    def test_curl_body_records_http_service(self) -> None:
+        # Recon's "no services discovered" termination must not fire when a live
+        # HTTP server was proven by curl — the fetch records a service node.
+        parsed = self._PARSER.parse_curl_body(self._raw(_HTML_WITH_TITLE))
+        services = [n for n in parsed.node_deltas if n.type == "service"]
+        assert len(services) == 1
+        svc = services[0]
+        assert svc.props["port"] == "80"
+        assert svc.props["service"] == "http"
+        assert svc.props["state"] == "open"
+        assert svc.props["proto"] == "tcp"
+        assert svc.source == "curl_body"      # provenance
+        assert 0.0 < svc.confidence <= 1.0     # confidence
+
+    def test_curl_body_service_uses_explicit_port(self) -> None:
+        parsed = self._PARSER.parse_curl_body(self._raw(_HTML_WITH_TITLE, target="10.10.10.80:8080"))
+        svc = next(n for n in parsed.node_deltas if n.type == "service")
+        assert svc.props["port"] == "8080"
+
+    def test_non_html_body_records_no_service(self) -> None:
+        # A non-HTML response is not proof of a live HTTP service (falls back to
+        # a KnowledgeEntry) — no fabricated service node.
+        parsed = self._PARSER.parse_curl_body(self._raw(_NOT_HTML))
+        assert not any(n.type == "service" for n in parsed.node_deltas)
 
     def test_extracts_relative_link_nodes(self) -> None:
         parsed = self._PARSER.parse_curl_body(self._raw(_HTML_WITH_TITLE))

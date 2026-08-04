@@ -51,6 +51,7 @@ from memfabric.types import (
     ClaimDependency,
     EvidenceBundle,
     Goal,
+    Node,
     SubgraphView,
     TaskSpec,
 )
@@ -109,11 +110,35 @@ class _WebDeterministic:
             key=lambda c: c.confidence,
             reverse=True,
         )
-        base_url = (
+        ip_base_url = (
             _url_from_cap(web_caps[0].target, web_caps[0].port)
             if web_caps
             else _base_url(self._target)
         )
+        web_port = web_caps[0].port if web_caps else "80"
+
+        # When a name-based virtual host has been DISCOVERED for this target
+        # (e.g. from a 301 Location header — recorded by CommandParser as a
+        # `vhost` node), fetch the real app under that host. `curl --resolve
+        # <vhost>:<port>:<ip>` connects to the AUTHORIZED IP but sends the vhost
+        # Host header and requests the vhost URL, so the redirect chain and
+        # relative links resolve against the real app instead of the empty IP
+        # 301. The vhost is always runtime-discovered, never hardcoded (§28.8).
+        vhost_node = self._select_vhost(subgraph)
+        resolve_args: list[str] = []
+        if vhost_node is not None:
+            vhost = str(vhost_node.props.get("hostname", "")).strip()
+            vip = str(vhost_node.props.get("ip") or self._target).strip()
+            scheme = "https" if web_port in ("443", "8443") else "http"
+            suffix = f":{web_port}" if web_port not in ("80", "443") else ""
+            base_url = f"{scheme}://{vhost}{suffix}"
+            # curl --resolve pins the vhost's DNS to the authorized IP — the
+            # policy scope gate authorizes this via the pin (never a raw
+            # off-scope host). Value is host:port:ip, no shell metacharacters.
+            resolve_args = ["--resolve", f"{vhost}:{web_port}:{vip}"]
+        else:
+            base_url = ip_base_url
+
         # Record which capability (and therefore which node) drives the URL choice
         # so the conflict guard can block precisely when that node is contested.
         web_claim_deps: tuple[ClaimDependency, ...] = (
@@ -137,7 +162,7 @@ class _WebDeterministic:
                     executor_domain="web",
                     params={
                         "tool": "curl",
-                        "args": ["-s", "-I", base_url],
+                        "args": ["-s", "-I", *resolve_args, base_url],
                         "target": base_url,
                         "parser": "command",
                     },
@@ -154,7 +179,7 @@ class _WebDeterministic:
                     executor_domain="web",
                     params={
                         "tool": "curl",
-                        "args": ["-s", base_url],
+                        "args": ["-s", *resolve_args, base_url],
                         "target": base_url,
                         "parser": "curl_body",
                     },
@@ -166,7 +191,15 @@ class _WebDeterministic:
 
         # Wordlist-based directory discovery — opt-in only.
         # Neither ffuf nor gobuster are emitted without an explicit wordlist.
+        # ffuf/gobuster fuzz the AUTHORIZED IP URL (which resolves in the
+        # container) and, when a vhost is known, carry a `-H Host: <vhost>`
+        # header so nginx serves the real app under that vhost.
         if self._wordlist:
+            host_header_args = (
+                ["-H", f"Host: {vhost_node.props.get('hostname', '')}"]
+                if vhost_node is not None
+                else []
+            )
             if self._registry.get("ffuf") is not None:
                 tasks.append(
                     TaskSpec(
@@ -176,12 +209,13 @@ class _WebDeterministic:
                         params={
                             "tool": "ffuf",
                             "args": [
-                                "-u", f"{base_url}/FUZZ",
+                                "-u", f"{ip_base_url}/FUZZ",
                                 "-w", self._wordlist,
+                                *host_header_args,
                                 "-mc", "200,301,302,403",
                                 "-maxtime", "60",
                             ],
-                            "target": base_url,
+                            "target": ip_base_url,
                             "parser": "ffuf",
                         },
                         subgraph_anchor=goal.anchor_node,
@@ -199,12 +233,13 @@ class _WebDeterministic:
                             "tool": "gobuster",
                             "args": [
                                 "dir",
-                                "-u", base_url,
+                                "-u", ip_base_url,
                                 "-w", self._wordlist,
+                                *host_header_args,
                                 "-q",
                                 "--no-progress",
                             ],
-                            "target": base_url,
+                            "target": ip_base_url,
                             "parser": "gobuster",
                         },
                         subgraph_anchor=goal.anchor_node,
@@ -222,6 +257,22 @@ class _WebDeterministic:
                 )
             )
         return tasks
+
+    @staticmethod
+    def _select_vhost(subgraph: SubgraphView) -> Node | None:
+        """Return the highest-confidence ``vhost`` node with a non-empty
+        hostname, or ``None``. Deterministic tie-break by hostname so the same
+        subgraph always yields the same vhost (blackboard model — reads the
+        subgraph only)."""
+        vhosts = [
+            n for n in subgraph.nodes
+            if n.type == "vhost" and str(n.props.get("hostname", "")).strip()
+        ]
+        if not vhosts:
+            return None
+        return sorted(
+            vhosts, key=lambda n: (-float(n.confidence), str(n.props.get("hostname", "")))
+        )[0]
 
 
 class WebPlanner:

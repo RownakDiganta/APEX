@@ -31,6 +31,20 @@ class ApexConfig:
     target: str
     payload_repo_path: str = "./payloads"
     max_command_seconds: int = 30
+    # nmap_execution_timeout_seconds: per-execution timeout for an nmap scan,
+    # SEPARATE from (and larger than) max_command_seconds. max_command_seconds
+    # (30s) is the general per-tool cap; a full/version nmap scan over HTB VPN
+    # latency cannot finish in 30s and was being SIGTERM'd mid-scan. This is
+    # the real limit — distinct from tool_service_timeout_seconds (the remote
+    # HTTP request budget). It MUST be <= tool_service_timeout_seconds so the
+    # outer HTTP call never cuts the scan off before nmap finishes (validated
+    # in apex_host.eval.check_config.validate_combinations). CLI: --nmap-timeout.
+    nmap_execution_timeout_seconds: float = 90.0
+    # nmap_top_ports: breadth of the fast first-pass port-DISCOVERY scan
+    # (`--top-ports N`, WITHOUT -sV) so it completes under the bound; service/
+    # version detection is a separate, smaller follow-up scan on only the open
+    # ports found. Range 1..65535. CLI: --nmap-top-ports.
+    nmap_top_ports: int = 1000
     allowed_tools: list[str] = field(
         default_factory=lambda: ["nmap", "curl", "python3", "nc"]
     )
@@ -666,6 +680,8 @@ class ApexConfig:
             # arguments are visible in shell history and process listings
             # (`ps`) while environment variables set via `export` are not.
             "tool_backend": _g("tool_backend", "local"),
+            "nmap_execution_timeout_seconds": _g("nmap_timeout", 90.0),
+            "nmap_top_ports": _g("nmap_top_ports", 1000),
             "tool_service_url": _g("tool_service_url", None),
             # None (unset) means "derive automatically from tool_backend" —
             # see apex_host.tools.backend.backend_supports_raw_sockets().

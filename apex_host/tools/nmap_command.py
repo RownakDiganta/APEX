@@ -1,5 +1,5 @@
 # nmap_command.py
-# The single authoritative Nmap command normalizer: selects an unprivileged TCP-connect (-sT) scan when the execution backend lacks raw sockets, enforces exactly one scan mode, drops LLM-injected dangerous flags/extra targets, never silently converts UDP to TCP, plans a deterministic one-time raw-socket repair, and produces the order-independent canonical fingerprint token list for semantic duplicate suppression.
+# The single authoritative Nmap command normalizer: on a backend without raw-socket privilege it forces an unprivileged TCP-connect scan (-sT) AND injects --unprivileged and -Pn (so nmap running as uid 0 without CAP_NET_RAW never attempts raw-socket host discovery/OS probing and hard-fails with EPERM), enforces exactly one scan mode, drops LLM-injected dangerous flags/extra targets, truthfully refuses raw-only features (-sU/-O/--traceroute) rather than silently downgrading them, plans a deterministic one-time raw-socket repair, and produces the order-independent canonical fingerprint token list for semantic duplicate suppression.
 """Nmap command construction/normalization for the execution chokepoint.
 
 Every nmap invocation — whether its args came from the deterministic
@@ -23,7 +23,20 @@ Design guarantees
   unprivileged ``-sT`` behavior. Only an explicit ``RAW_SOCKET`` capability
   permits the existing privileged strategy.
 - **Exactly one scan mode** is emitted. On an unprivileged/unknown backend
-  that is always a single ``-sT``.
+  that is always a single ``-sT``, and the command additionally gets
+  ``--unprivileged`` and ``-Pn`` injected. ``-sT`` alone is NOT sufficient:
+  nmap running as ``uid 0`` in the restricted Kali tool-service container
+  (no ``CAP_NET_RAW``) still assumes raw-socket privilege for its default
+  host-discovery ping probes and fails with ``Couldn't open a raw socket.
+  Error: (1) Operation not permitted`` even on a connect scan. ``-Pn`` skips
+  host discovery entirely and ``--unprivileged`` tells nmap to take the pure
+  connect-socket code path despite being root.
+- **Raw-socket-only features are truthfully refused, never silently
+  downgraded.** On a non-raw-socket backend a UDP scan (``-sU``), OS detection
+  (``-O``), and ``--traceroute`` each return ``unsupported=True`` with a clear
+  reason rather than a rewritten TCP scan that would misrepresent what ran.
+  TCP-family raw scan types (``-sS``/``-sA``/``-sW``/``-sM``/…) are instead
+  converted to ``-sT`` — they have a faithful unprivileged equivalent.
 - **The LLM cannot inject arbitrary nmap arguments.** Only a small, fixed
   allowlist of safe flags survives (``-sV``, ``-Pn``, ``-n``, ``--open``,
   ``-v``/``-vv``, ``-6``, ``-T0``..``-T5``, and the bounded value flags
@@ -61,6 +74,15 @@ _TCP_CONNECT_FLAG = "-sT"
 _TCP_SYN_FLAG = "-sS"
 _UDP_FLAG = "-sU"
 _PING_FLAG = "-sn"
+#: The two flags injected on an unprivileged/unknown backend so nmap running
+#: as uid 0 without CAP_NET_RAW does not attempt raw-socket operations. Both
+#: are the actual resolution for the demonstrated EPERM failure.
+_UNPRIVILEGED_FLAG = "--unprivileged"
+_PN_FLAG = "-Pn"
+#: Raw-socket-only feature flags that have NO faithful unprivileged equivalent.
+#: On a non-raw-socket backend these are refused (unsupported_capability),
+#: never silently dropped so a plain TCP scan is presented as if it ran them.
+_RAW_ONLY_FEATURE_FLAGS: tuple[str, ...] = ("-O", "--traceroute")
 
 # Every nmap scan-mode selector token, mapped to a coarse intent. Anything
 # not listed here is not a scan-mode token.
@@ -77,14 +99,34 @@ _SCAN_MODE_INTENT: dict[str, str] = {
     "-sL": "tcp",
 }
 
-# Safe boolean flags preserved verbatim.
+# Safe boolean flags preserved verbatim. ``--unprivileged`` is included so it
+# (a) survives normalization when injected and (b) is reflected in the canonical
+# fingerprint — a command carrying ``--unprivileged`` is a materially DIFFERENT
+# action from one without it, which is what makes the deterministic raw-socket
+# repair a distinct, non-dedup-suppressed action (§27.2).
 _SAFE_BOOL_FLAGS: frozenset[str] = frozenset({
-    "-sV", "-Pn", "-n", "--open", "-v", "-vv", "-6",
+    "-sV", "-Pn", "-n", "--open", "-v", "-vv", "-6", "--unprivileged",
 })
 # Safe value flags: kept only with a validated value token.
 _PORTS_VALUE_RE = re.compile(r"^[TU]?:?[0-9][0-9,\-]*$")
 _TOP_PORTS_VALUE_RE = re.compile(r"^[0-9]{1,5}$")
 _TIMING_RE = re.compile(r"^-T[0-5]$")
+# Bounding value flags for the two-pass recon scans (§25.6). --max-retries
+# takes a small integer; --host-timeout takes a bare number or an nmap
+# duration (`90s`, `2m`, `500ms`, `1h`). Both are safe (bounded, no shell
+# metacharacters) and are preserved so the fast first-pass discovery scan
+# actually stays bounded end-to-end.
+_MAX_RETRIES_VALUE_RE = re.compile(r"^[0-9]{1,2}$")
+_HOST_TIMEOUT_VALUE_RE = re.compile(r"^[0-9]+(ms|s|m|h)?$")
+#: Value flags handled as (flag, validated-value) pairs. Maps each flag to the
+#: regex its value must match; a flag whose value is missing or malformed is
+#: dropped (flag name only recorded in `dropped`).
+_VALUE_FLAG_PATTERNS: dict[str, re.Pattern[str]] = {
+    "-p": _PORTS_VALUE_RE,
+    "--top-ports": _TOP_PORTS_VALUE_RE,
+    "--max-retries": _MAX_RETRIES_VALUE_RE,
+    "--host-timeout": _HOST_TIMEOUT_VALUE_RE,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,16 +198,9 @@ def _keep_safe_flags(args: list[str], target: str) -> tuple[list[str], list[str]
             kept.append(token)
             i += 1
             continue
-        if token == "-p":
-            if i + 1 < n and _PORTS_VALUE_RE.match(args[i + 1]):
-                kept.extend([token, args[i + 1]])
-                i += 2
-            else:
-                dropped.append(token)
-                i += 1
-            continue
-        if token == "--top-ports":
-            if i + 1 < n and _TOP_PORTS_VALUE_RE.match(args[i + 1]):
+        value_pattern = _VALUE_FLAG_PATTERNS.get(token)
+        if value_pattern is not None:
+            if i + 1 < n and value_pattern.match(args[i + 1]):
                 kept.extend([token, args[i + 1]])
                 i += 2
             else:
@@ -197,6 +232,23 @@ def normalize_nmap_command(
     intent = _classify_scan_intent(original)
     kept, dropped = _keep_safe_flags(original, target)
 
+    # Raw-socket-only features (OS detection, traceroute) have no faithful
+    # unprivileged equivalent — refuse them truthfully rather than silently
+    # dropping them and running a plain TCP scan that lacks them. TCP-family
+    # raw *scan types* are handled below (converted to -sT), not here.
+    if not privileged_allowed:
+        raw_feature = next((f for f in _RAW_ONLY_FEATURE_FLAGS if f in original), None)
+        if raw_feature is not None:
+            return NmapNormalization(
+                args=[], transport=TRANSPORT_TCP_CONNECT, capability=cap,
+                unsupported=True,
+                reason=(
+                    f"{raw_feature} requires raw-socket privilege the backend "
+                    "lacks; not silently downgrading to a plain TCP scan"
+                ),
+                changed=True, dropped=dropped,
+            )
+
     # UDP must never be silently converted to TCP.
     if intent == "udp":
         if privileged_allowed:
@@ -223,22 +275,41 @@ def normalize_nmap_command(
 
     # TCP / service scan intent (tcp_connect, tcp_syn, generic tcp, or none).
     if privileged_allowed and intent == "tcp_syn":
-        scan_flag, transport = [_TCP_SYN_FLAG], TRANSPORT_TCP_SYN
-    elif privileged_allowed and intent is None:
+        normalized = [_TCP_SYN_FLAG, *kept, target]
+        return NmapNormalization(
+            args=normalized, transport=TRANSPORT_TCP_SYN, capability=cap,
+            changed=normalized != original, dropped=dropped,
+        )
+    if privileged_allowed and intent is None:
         # Raw-capable, no explicit scan → nmap's privileged SYN default
         # (the existing strategy). No scan flag emitted.
-        scan_flag, transport = [], TRANSPORT_TCP_SYN
-    else:
-        # Everything else — unprivileged/unknown (any intent), an explicit
-        # -sT, or a generic raw TCP scan on a raw-capable backend — becomes a
-        # single unprivileged TCP-connect scan. The LLM can never select an
-        # arbitrary exotic raw scan type: only -sS (SYN) and the SYN default
-        # survive on a raw-capable backend; everything else is -sT.
-        scan_flag, transport = [_TCP_CONNECT_FLAG], TRANSPORT_TCP_CONNECT
+        normalized = [*kept, target]
+        return NmapNormalization(
+            args=normalized, transport=TRANSPORT_TCP_SYN, capability=cap,
+            changed=normalized != original, dropped=dropped,
+        )
+    if privileged_allowed:
+        # Raw-capable with an explicit -sT or a generic raw TCP scan
+        # (-sA/-sW/-sM/…) → a single -sT. No --unprivileged/-Pn injection:
+        # the operator has raw privilege and chose (or gets collapsed to) a
+        # connect scan; we do not rewrite their host-discovery behavior.
+        normalized = [_TCP_CONNECT_FLAG, *kept, target]
+        return NmapNormalization(
+            args=normalized, transport=TRANSPORT_TCP_CONNECT, capability=cap,
+            changed=normalized != original, dropped=dropped,
+        )
 
-    normalized = [*scan_flag, *kept, target]
+    # Unprivileged / unknown backend (any intent, or an explicit raw scan
+    # type): force a single -sT AND inject --unprivileged and -Pn. -sT alone
+    # is insufficient — nmap running as uid 0 without CAP_NET_RAW still
+    # attempts raw-socket host-discovery ping probes and fails with EPERM.
+    # --unprivileged forces the pure connect-socket path; -Pn skips discovery.
+    # Both are de-duplicated against any the planner/LLM already supplied so a
+    # doubled -Pn / --unprivileged is never emitted.
+    kept_wo = [k for k in kept if k not in (_UNPRIVILEGED_FLAG, _PN_FLAG)]
+    normalized = [_TCP_CONNECT_FLAG, _UNPRIVILEGED_FLAG, _PN_FLAG, *kept_wo, target]
     return NmapNormalization(
-        args=normalized, transport=transport, capability=cap,
+        args=normalized, transport=TRANSPORT_TCP_CONNECT, capability=cap,
         changed=normalized != original, dropped=dropped,
     )
 
@@ -289,7 +360,7 @@ def canonical_fingerprint_args(args: list[str], target: str) -> list[str]:
     n = len(kept)
     while i < n:
         tok = kept[i]
-        if tok in ("-p", "--top-ports") and i + 1 < n:
+        if tok in _VALUE_FLAG_PATTERNS and i + 1 < n:
             pairs.append((tok, kept[i + 1]))
             i += 2
         else:
@@ -310,30 +381,51 @@ def plan_raw_socket_repair(args: list[str], target: str) -> NmapRepairPlan:
     """Deterministic, bounded repair for a classified
     ``raw_socket_permission_denied`` nmap failure.
 
-    - If the failed command already used ``-sT`` (TCP connect), the failure
-      is **terminal** — a connect scan does not need raw sockets, so retrying
-      the same transport would loop.
+    The flags that actually resolve the EPERM are ``--unprivileged`` and
+    ``-Pn`` (alongside ``-sT``) — a bare ``-sT`` is NOT enough, because nmap
+    as uid 0 still attempts raw-socket host discovery. So:
+
     - If it was a UDP scan, it is **terminal** — UDP cannot be converted to
       TCP without changing the operator's intent.
-    - Otherwise, return the equivalent unprivileged ``-sT`` command to run
-      exactly once.
+    - If the failed command **already had all three of** ``--unprivileged``,
+      ``-Pn``, and ``-sT`` and still failed, the failure is **terminal** —
+      the unprivileged flags are already present, so retrying would loop.
+    - Otherwise, return the equivalent unprivileged command with
+      ``--unprivileged -Pn -sT`` added (via
+      :func:`normalize_nmap_command`). Because ``--unprivileged`` is a
+      fingerprinted flag (see :func:`canonical_fingerprint_args`), the
+      rewritten command is a DISTINCT action from the failed one and is not
+      dedup-suppressed.
+
+    *args* should be the command that actually executed (the normalized args
+    recorded on the tool result) so the terminal decision reflects what nmap
+    was really given — not the pre-normalization planner args.
     """
     original = [str(a) for a in args]
     intent = _classify_scan_intent(original)
 
-    if intent == "tcp_connect":
-        return NmapRepairPlan(
-            terminal=True, repaired_args=None, transport=TRANSPORT_TCP_CONNECT,
-            reason="command already used -sT (TCP connect); raw-socket failure is terminal",
-        )
     if intent == "udp":
         return NmapRepairPlan(
             terminal=True, repaired_args=None, transport=TRANSPORT_UDP,
             reason="UDP scan cannot be repaired to a TCP scan without changing intent",
         )
 
+    already_unprivileged = (
+        intent == "tcp_connect"
+        and _UNPRIVILEGED_FLAG in original
+        and _PN_FLAG in original
+    )
+    if already_unprivileged:
+        return NmapRepairPlan(
+            terminal=True, repaired_args=None, transport=TRANSPORT_TCP_CONNECT,
+            reason=(
+                "command already used --unprivileged -Pn -sT; raw-socket "
+                "failure is terminal"
+            ),
+        )
+
     rewritten = normalize_nmap_command(original, target, capability=UNPRIVILEGED)
     return NmapRepairPlan(
         terminal=False, repaired_args=rewritten.args, transport=rewritten.transport,
-        reason="rewrote to an unprivileged -sT TCP-connect scan",
+        reason="rewrote to an unprivileged -sT scan with --unprivileged -Pn",
     )

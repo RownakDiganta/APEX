@@ -829,6 +829,300 @@ async def scenario_recon_web_engagement_regression() -> ScenarioResult:
     )
 
 
+class _UnprivilegedNmapBackend:
+    """A synthetic ``ToolBackend`` that faithfully models the restricted Kali
+    tool-service container: nmap runs as uid 0 but WITHOUT ``CAP_NET_RAW``, so
+    any nmap invocation lacking ``--unprivileged`` fails with the demonstrated
+    ``Couldn't open a raw socket. Error: (1) Operation not permitted`` (rc=1);
+    an invocation carrying ``--unprivileged`` completes a connect scan and
+    returns open ports. Never a real subprocess or network call."""
+
+    name = "fake-unprivileged-nmap"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[str]]] = []
+        self.raw_socket_failures = 0
+
+    async def execute(
+        self, tool: str, arguments: list[str], *,
+        timeout_seconds: float | None = None, stdin: str | None = None,
+    ) -> Any:
+        from apex_host.types import ToolCommand, ToolResult
+
+        self.calls.append((tool, list(arguments)))
+        cmd = ToolCommand(tool=tool, args=list(arguments), timeout_seconds=int(timeout_seconds or 30))
+        if tool == "nmap" and "--unprivileged" not in arguments:
+            # Exactly what the real container does for a raw-socket scan mode
+            # attempted by root without NET_RAW.
+            self.raw_socket_failures += 1
+            return ToolResult(
+                command=cmd, stdout="",
+                stderr="Couldn't open a raw socket. Error: (1) Operation not permitted QUITTING!",
+                returncode=1, duration_seconds=0.001, dry_run=True,
+                backend=self.name, error=None,
+            )
+        stdout = ""
+        if tool == "nmap":
+            stdout = (
+                f"Nmap scan report for {_TARGET}\n"
+                "Host is up.\n"
+                "PORT   STATE SERVICE VERSION\n"
+                "22/tcp open  ssh     OpenSSH 8.2p1 Ubuntu\n"
+            )
+        return ToolResult(
+            command=cmd, stdout=stdout, stderr="", returncode=0,
+            duration_seconds=0.001, dry_run=True, backend=self.name, error=None,
+        )
+
+
+async def scenario_unprivileged_backend_completes_connect_scan() -> ScenarioResult:
+    """14. An unprivileged backend COMPLETES a connect scan (does not dead-end).
+
+    Models the restricted Kali container (uid 0, no CAP_NET_RAW). Drives the
+    REAL compiled graph. The single authoritative nmap path must inject
+    ``--unprivileged -Pn -sT`` so the FIRST scan succeeds and a service node is
+    produced — instead of the demonstrated failure where every scan hit
+    ``Couldn't open a raw socket`` and recon dead-ended. Fails the gate if:
+
+    - any nmap invocation reached the backend WITHOUT ``--unprivileged``
+      (i.e. the backend ever saw a raw-socket EPERM);
+    - a ``raw_socket_terminal`` disposition was recorded;
+    - recon produced no ``service`` node.
+    """
+    from apex_host.config import ApexConfig
+    from apex_host.graph_state import ApexGraphState
+    from apex_host.llm.router import FakeModelRouter
+    from apex_host.orchestration.builder import build_apex_graph
+    from apex_host.planning.budget import LLMBudgetTracker
+    from apex_host.tools.registry import ToolRegistry
+
+    api = _make_api()
+    config = ApexConfig(
+        target=_TARGET, dry_run=True, max_turns=5, tool_backend="remote",
+        allowed_tools=["nmap", "nc"], use_llm=False,
+        max_llm_calls_per_run=10, max_llm_calls_per_phase=3,
+    )
+    backend = _UnprivilegedNmapBackend()
+    budget = LLMBudgetTracker(max_per_run=10, max_per_phase=3)
+    registry = ToolRegistry.from_config(config)
+    graph = build_apex_graph(
+        api, registry, config,
+        model_router=FakeModelRouter(), budget_tracker=budget, tool_backend=backend,
+    )
+    initial: ApexGraphState = {
+        "run_id": "release-gate-unpriv-nmap", "target": _TARGET, "phase": "recon",
+        "goal": f"Begin engagement against {_TARGET}", "current_task": None,
+        "evidence_summary": "", "findings": [], "error_episodes": [],
+        "last_tool_result": None, "last_error": None, "completed": False,
+        "turn_count": 0, "planner_decisions": [], "tool_results": None,
+        "repair_count": 0, "policy_decisions": [], "duplicate_actions": [],
+        "completed_fingerprints": [], "execution_backend_log": [],
+        "diagnostic_events": [], "credential_validation_log": [], "repair_log": [],
+        "outcome": "", "termination_reason": "", "termination_phase": "",
+        "stall_reason": "", "privilege_state": "", "privilege_summary": {},
+        "opportunity_ids": [], "attempted_opportunities": [],
+        "enumeration_complete": False, "web_session_state": {},
+        "workflow_summary": {}, "phase_selection": {}, "learning_summary": {},
+        "task_latency_log": [], "objective_status": "", "objective_summary": {},
+        "direct_file_read_log": [], "bounded_command_log": [],
+        "capability_discovery_log": [], "execution_diagnostics": [],
+    }
+    final_state: ApexGraphState = await graph.ainvoke(initial)
+
+    problems: list[str] = []
+    nmap_calls = [args for (tool, args) in backend.calls if tool == "nmap"]
+    if not nmap_calls:
+        problems.append("no nmap scan ever reached the backend")
+    for args in nmap_calls:
+        if "--unprivileged" not in args or "-Pn" not in args or "-sT" not in args:
+            problems.append(f"nmap reached the unprivileged backend without --unprivileged -Pn -sT: {args}")
+    if backend.raw_socket_failures:
+        problems.append(f"backend saw {backend.raw_socket_failures} raw-socket EPERM failure(s)")
+    if any(str(d.get("disposition")) == "raw_socket_terminal" for d in final_state.get("duplicate_actions") or []):
+        problems.append("recon dead-ended on a raw_socket_terminal disposition")
+
+    subgraph = await api.get_subgraph(_ANCHOR, depth=5)
+    if "service" not in {n.type for n in subgraph.nodes}:
+        problems.append("connect scan produced no service node (recon dead-ended)")
+
+    if problems:
+        return ScenarioResult("unprivileged_backend_completes_connect_scan", False, "; ".join(problems))
+    return ScenarioResult(
+        "unprivileged_backend_completes_connect_scan", True,
+        f"unprivileged backend completed a connect scan: {len(nmap_calls)} "
+        f"--unprivileged -Pn -sT scan(s), 0 raw-socket failures, service node created",
+    )
+
+
+async def scenario_curl_only_web_discovery() -> ScenarioResult:
+    """15. A live HTTP endpoint proven by curl (zero nmap services) counts.
+
+    Reproduces the demonstrated gap: `curl http://target/` succeeded with a real
+    nginx response and an endpoint node was created, yet the engagement died in
+    recon "no services discovered" with web_evidence_complete=false. Drives the
+    REAL CommandParser + MemoryAPI (Invariant 1: deltas only) + GlobalPlanner.
+    Fails the gate if the successful fetch does not produce a service node, if
+    the fetched endpoint is not counted as web content, or if recon still
+    terminates "no services discovered" with a service present.
+    """
+    from memfabric.types import RawObservation
+
+    from apex_host.parsers.command_parser import CommandParser
+    from apex_host.planners.global_planner import GlobalPlanner
+    from apex_host.planners.phase_gates import web_evidence_status
+    from apex_host.types import ApexPhase
+
+    api = _make_api()
+    await _seed_node(api, _ANCHOR, "host", {"ip": _TARGET})
+
+    # A real nginx 301 HTML body (what `curl http://target/` returns).
+    body = (
+        "<html><head><title>301 Moved Permanently</title></head><body>"
+        "<center><h1>301 Moved Permanently</h1></center><hr><center>nginx</center>"
+        "</body></html>"
+    )
+    parsed = CommandParser().parse_curl_body(
+        RawObservation(raw=body, metadata={"source": "curl_body", "target": f"http://{_TARGET}/"})
+    )
+    # All writes go through MemoryAPI (never the store directly).
+    await api.apply_deltas(nodes=parsed.node_deltas, edges=parsed.edge_deltas)
+
+    subgraph = await api.get_subgraph(_ANCHOR, depth=5)
+    node_types = {n.type for n in subgraph.nodes}
+
+    problems: list[str] = []
+    if "service" not in node_types:
+        problems.append("successful curl fetch produced no service node")
+    if not any(n.type == "endpoint" and n.props.get("fetched") is True for n in subgraph.nodes):
+        problems.append("fetched endpoint not marked fetched")
+    # Only recorded on a real HTTP response — never fabricated.
+    svc = next((n for n in subgraph.nodes if n.type == "service"), None)
+    if svc is not None and svc.props.get("service") != "http":
+        problems.append(f"service node is not http: {svc.props.get('service')!r}")
+
+    if not web_evidence_status(subgraph).complete:
+        problems.append("fetched HTTP endpoint not counted as web content")
+
+    # Recon budget exhausted with the curl-proven service must NOT die
+    # "no services discovered"; it advances toward web.
+    gp = GlobalPlanner(max_turns=20, phase_budgets={"recon": 1})
+    gp.record_turn(ApexPhase.recon)
+    phase = gp.decide_phase(
+        node_types_seen=node_types, turn_count=2, current_phase=ApexPhase.recon.value,
+        has_web_capability=True, has_credential_hypothesis=False, web_evidence_complete=False,
+    )
+    if phase == ApexPhase.done:
+        problems.append("recon still terminated 'no services discovered' with a curl service present")
+
+    if problems:
+        return ScenarioResult("curl_only_web_discovery", False, "; ".join(problems))
+    return ScenarioResult(
+        "curl_only_web_discovery", True,
+        "curl fetch recorded a service + fetched endpoint; counted as web content; "
+        f"recon advanced to {phase.value} instead of dead-ending",
+    )
+
+
+async def scenario_vhost_redirect_web_discovery() -> ScenarioResult:
+    """16. A name-based vhost discovered from a 301 unblocks web discovery.
+
+    Reproduces the demonstrated gap: recon finds :80, but `curl http://ip/`
+    returns an empty 301 pointing at a NEW vhost the container cannot resolve,
+    so the web agent was blind. Drives the REAL CommandParser + MemoryAPI
+    (Invariant 1) + WebPlanner + PolicyAdvisor. Fails the gate if the redirect
+    does not yield a vhost node, if the web planner does not re-fetch with a
+    `--resolve` Host-aware curl, if policy blocks that pinned fetch, or if the
+    vhost fetch does not discover the real app's content. The vhost is
+    DISCOVERED from the redirect — never hardcoded.
+    """
+    from memfabric.types import EvidenceBundle, Goal, RawObservation
+
+    from apex_host.config import ApexConfig
+    from apex_host.parsers.command_parser import CommandParser
+    from apex_host.planners.phase_gates import web_evidence_status
+    from apex_host.planners.web_planner import WebPlanner
+    from apex_host.policy import PolicyAdvisor
+    from apex_host.policy.policy_loader import load_policy
+    from apex_host.tools.registry import ToolRegistry
+
+    _VHOST = "app.example.htb"  # a value that only appears in the fake redirect
+    api = _make_api()
+    await _seed_node(api, _ANCHOR, "host", {"ip": _TARGET})
+    await _seed_node(api, f"service:{_TARGET}:80/tcp", "service",
+                     {"port": "80", "proto": "tcp", "state": "open", "service": "http"})
+    await _seed_edge(api, _ANCHOR, f"service:{_TARGET}:80/tcp", "exposes")
+
+    parser = CommandParser()
+    problems: list[str] = []
+
+    # 1. curl the bare IP → empty 301 pointing at the vhost.
+    ip_301 = (
+        f"HTTP/1.1 301 Moved Permanently\r\nServer: nginx\r\n"
+        f"Location: http://{_VHOST}/\r\nContent-Length: 162\r\n"
+    )
+    p1 = parser.parse(RawObservation(raw=ip_301, metadata={"source": "curl", "target": f"http://{_TARGET}"}))
+    await api.apply_deltas(nodes=p1.node_deltas, edges=p1.edge_deltas)
+    subgraph = await api.get_subgraph(_ANCHOR, depth=5)
+    vhost_nodes = [n for n in subgraph.nodes if n.type == "vhost"]
+    if not vhost_nodes:
+        problems.append("301 redirect to a new host produced no vhost node")
+    elif vhost_nodes[0].props.get("hostname") != _VHOST:
+        problems.append(f"vhost hostname wrong: {vhost_nodes[0].props.get('hostname')!r}")
+    if not web_evidence_status(subgraph).complete:
+        problems.append("discovered vhost not counted as web content")
+
+    # 2. The web planner re-fetches with a --resolve Host-aware curl.
+    config = ApexConfig(target=_TARGET, dry_run=True, allowed_tools=["curl"])
+    planner = WebPlanner(_TARGET, ToolRegistry.from_config(config))
+    goal = Goal(id="rg-vhost", description="web", phase="web", anchor_node=_ANCHOR)
+    tasks = await planner.plan(goal, subgraph, EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[]))
+    if not isinstance(tasks, list) or not tasks:
+        problems.append("web planner produced no vhost re-fetch task")
+        return ScenarioResult("vhost_redirect_web_discovery", False, "; ".join(problems))
+    head = next((t for t in tasks if t.params.get("parser") == "command"), None)
+    if head is None or "--resolve" not in head.params["args"] or _VHOST not in " ".join(head.params["args"]):
+        problems.append("web planner did not issue a --resolve Host-aware curl for the vhost")
+
+    # 3. Policy authorizes the pinned vhost fetch (never blocks it).
+    advisor = PolicyAdvisor(load_policy(config), config)
+    empty_ev = EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[])
+    if head is not None:
+        decision = advisor.review_task(head, "web", empty_ev, config)
+        if not decision.is_approved:
+            problems.append(f"policy blocked the pinned vhost fetch: {decision.rule_name}")
+
+    # 4. The vhost fetch discovers the real app's content (a form login page).
+    # host_ip pins the endpoints to the authorized host node (as parsing_node
+    # does in production) so the deltas apply without a dangling edge.
+    vhost_body = (
+        f"<!DOCTYPE html><html><head><title>{_VHOST} — Login</title></head>"
+        "<body><form action=\"/login\"><input name=\"user\"></form>"
+        "<a href=\"/dashboard\">Dashboard</a></body></html>"
+    )
+    p2 = parser.parse_curl_body(
+        RawObservation(
+            raw=vhost_body,
+            metadata={"source": "curl_body", "target": f"http://{_VHOST}", "host_ip": _TARGET},
+        )
+    )
+    await api.apply_deltas(nodes=p2.node_deltas, edges=p2.edge_deltas)
+    subgraph2 = await api.get_subgraph(_ANCHOR, depth=6)
+    vhost_endpoints = [
+        n for n in subgraph2.nodes
+        if n.type == "endpoint" and _VHOST in str(n.props.get("url", ""))
+    ]
+    if not vhost_endpoints:
+        problems.append("vhost fetch discovered no endpoint under the vhost URL")
+
+    if problems:
+        return ScenarioResult("vhost_redirect_web_discovery", False, "; ".join(problems))
+    return ScenarioResult(
+        "vhost_redirect_web_discovery", True,
+        f"301 revealed vhost {_VHOST}; web re-fetched with --resolve (policy approved); "
+        f"discovered {len(vhost_endpoints)} vhost endpoint(s) — web agent no longer blind",
+    )
+
+
 SCENARIOS: list[Any] = [
     scenario_ssh_success,
     scenario_dfr_success,
@@ -843,6 +1137,9 @@ SCENARIOS: list[Any] = [
     scenario_duplicate_evidence,
     scenario_restart_replay,
     scenario_recon_web_engagement_regression,
+    scenario_unprivileged_backend_completes_connect_scan,
+    scenario_curl_only_web_discovery,
+    scenario_vhost_redirect_web_discovery,
 ]
 
 

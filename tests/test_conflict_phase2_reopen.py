@@ -837,7 +837,9 @@ class TestPlannerDependencyPropagation:
         """ReconPlanner nc banner task declares deps on service.port and service.state."""
         reg = _registry("nmap", "nc")
         planner = _ReconDeterministic(_TARGET, reg)
-        svc = _service_node("23", "telnet", "tcp", "open")
+        # A version is present so recon is past the two-pass version scan (§25.6)
+        # and reaches the nc banner-probe phase whose deps this test checks.
+        svc = _service_node("23", "telnet", "tcp", "open", version="1.0")
         sg = _subgraph(svc)
         ev = EvidenceBundle(query="", entries=[], subgraph=sg, tiers_queried=[])
         result = await planner.plan(_goal(), sg, ev)

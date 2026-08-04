@@ -98,7 +98,15 @@ def make_repair_node(deps: "OrchestrationDeps") -> Any:
         if failed_tool == "nmap" and error_category == "raw_socket_permission_denied":
             from apex_host.tools.nmap_command import plan_raw_socket_repair
 
-            failed_args = [str(a) for a in failed_task_params.get("args", [])]
+            # Decide on the command that ACTUALLY executed (the normalized args
+            # recorded on the tool result — which already include any injected
+            # --unprivileged/-Pn), falling back to the planner args. This makes
+            # the terminal-vs-rewrite decision honest: a scan that already ran
+            # with --unprivileged -Pn -sT and still failed is terminal.
+            executed_args = tool_result.get("args")
+            failed_args = [
+                str(a) for a in (executed_args if executed_args else failed_task_params.get("args", []))
+            ]
             rs_target = str(failed_task_params.get("target", deps.config.target))
             plan = plan_raw_socket_repair(failed_args, rs_target)
             if plan.terminal:

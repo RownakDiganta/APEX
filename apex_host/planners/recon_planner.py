@@ -11,23 +11,31 @@ provided it constructs a ``PlanningEngine`` and routes through it; otherwise
 it delegates directly to ``_ReconDeterministic``.  The public ``plan()``
 signature is identical in both cases so ``graph.py`` needs no changes.
 
-Two-phase deterministic logic:
+Two-pass deterministic logic (§25.6):
 
 Phase 1 — no service nodes in subgraph:
-    Emit one ``nmap -sV -T4 -Pn <target>`` TaskSpec.
+    Emit one fast, bounded port-DISCOVERY scan
+    (``nmap [-sT] -Pn -T4 --top-ports N --max-retries 2 --host-timeout <bound>
+    <target>``) — NO ``-sV``, so it completes within the timeout instead of a
+    full 1000-port version scan that times out over VPN latency.
 
-Phase 2 — service nodes exist:
+Phase 2 — service nodes exist but none have version info yet:
+    Emit a separate, smaller ``-sV`` scan on ONLY the discovered open ports
+    (``nmap [-sT] -Pn -sV -p <open-ports> --max-retries 2 --host-timeout
+    <bound> <target>``). Once versions are populated, recon moves on.
+
+Phase 3 — service nodes with version info exist:
     Derive capabilities from the subgraph via ``capabilities_from_subgraph``
     and emit up to _MAX_BANNER_TASKS nc banner-probe TaskSpecs for open TCP
-    services that carry a probeable capability.  Falls back to another nmap
-    if no suitable probe targets are found.
+    services that carry a probeable capability.  Falls back to a bounded
+    version scan if no suitable probe targets are found.
 
 All emitted args are **complete** (target already included), so
 ``graph.py:_run_one_task`` never needs to append target separately.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from memfabric.ids import new_id, now
 from memfabric.types import (
@@ -67,10 +75,24 @@ class _ReconDeterministic:
     """Pure rule-based recon planner — the fallback for PlanningEngine."""
 
     def __init__(
-        self, target: str, registry: ToolRegistry, *, raw_socket_capable: bool = True
+        self,
+        target: str,
+        registry: ToolRegistry,
+        *,
+        raw_socket_capable: bool = True,
+        top_ports: int = 1000,
+        execution_timeout_seconds: float = 90.0,
     ) -> None:
         self._target = target
         self._registry = registry
+        # Two-pass scan bounding (§25.6): the first pass is a fast port
+        # DISCOVERY scan over the top-N ports (no -sV); version detection is a
+        # separate, smaller follow-up scan on only the ports found open. Both
+        # carry a --host-timeout derived from the per-execution nmap timeout
+        # (a margin below it) so nmap self-terminates gracefully before the
+        # outer SIGTERM, and --max-retries 2 to bound VPN-latency retransmits.
+        self._top_ports = top_ports
+        self._host_timeout = f"{max(10, int(execution_timeout_seconds) - 10)}s"
         # Capability seam (apex_host.tools.backend.backend_supports_raw_sockets):
         # when the execution backend lacks CAP_NET_RAW/root (the Kali
         # tool-service container's own documented non-root, zero-capability
@@ -87,49 +109,108 @@ class _ReconDeterministic:
     ) -> list[TaskSpec] | AbandonSignal:
         service_nodes = [n for n in subgraph.nodes if n.type == "service"]
 
+        # Pass 1 — no services known yet: a fast, bounded port-DISCOVERY scan
+        # (top-N ports, no -sV) so it completes within the timeout instead of
+        # a full 1000-port -sV that times out over VPN latency.
         if not service_nodes:
-            return self._nmap_task(goal)
+            return self._discovery_scan(goal)
+
+        # Pass 2 — services discovered but none have version info yet: a
+        # separate, smaller -sV scan on ONLY the open ports. This is where
+        # service/version detection happens, decoupled from discovery.
+        version_task = self._version_scan(goal, service_nodes)
+        if version_task is not None:
+            return version_task
 
         banner_tasks = self._banner_tasks(goal, subgraph)
-        return banner_tasks if banner_tasks else self._nmap_task(goal)
+        if banner_tasks:
+            return banner_tasks
+        # Fallback: a bounded -sV scan on the discovered ports. If there are no
+        # scannable ports it returns None; an empty task list is a valid
+        # "nothing to do this turn" result (stall/termination handles it).
+        fallback = self._version_scan_all(goal, service_nodes)
+        return fallback if fallback is not None else banner_tasks
 
     # ------------------------------------------------------------------
     # Internal builders
     # ------------------------------------------------------------------
 
-    def _nmap_task(self, goal: Goal) -> list[TaskSpec] | AbandonSignal:
+    # -sT (TCP connect scan) is prepended when the backend cannot open raw
+    # sockets. The dispatcher's single authoritative nmap path
+    # (apex_host.tools.nmap_command.normalize_nmap_command) additionally
+    # injects --unprivileged and -Pn on an unprivileged backend, so the
+    # planner only needs to signal the connect-scan intent.
+    def _scan_prefix(self) -> list[str]:
+        return [] if self._raw_socket_capable else ["-sT"]
+
+    def _bounds(self) -> list[str]:
+        # Bound retransmits and per-host scan time so a scan cannot run to the
+        # hard execution timeout. --host-timeout is a margin below the
+        # per-execution nmap timeout (see __init__).
+        return ["--max-retries", "2", "--host-timeout", self._host_timeout]
+
+    def _service_ports(self, service_nodes: list[Any]) -> list[str]:
+        ports = {
+            str(n.props.get("port"))
+            for n in service_nodes
+            if str(n.props.get("port") or "").strip()
+        }
+        return sorted(ports, key=lambda p: int(p) if p.isdigit() else 1 << 20)
+
+    def _nmap_taskspec(self, goal: Goal, args: list[str]) -> TaskSpec:
+        host_node_id = f"host:{self._target}"
+        return TaskSpec(
+            id=new_id(),
+            goal_id=goal.id,
+            executor_domain="recon",
+            params={"tool": "nmap", "args": args, "target": self._target, "parser": "nmap"},
+            subgraph_anchor=goal.anchor_node,
+            phase=goal.phase,
+            # Nmap probes the host IP — depends on ip being undisputed.
+            claim_dependencies=(ClaimDependency(node_id=host_node_id, field_name="ip"),),
+        )
+
+    def _discovery_scan(self, goal: Goal) -> list[TaskSpec] | AbandonSignal:
+        """Pass 1: fast, bounded port discovery over the top-N ports — no -sV,
+        so it completes within the timeout instead of timing out."""
         if self._registry.get("nmap") is None:
             return AbandonSignal(reason="nmap not available in allowed_tools")
-        host_node_id = f"host:{self._target}"
-        # -sT (TCP connect scan) is required, not optional, when the
-        # backend cannot open raw sockets — without it nmap's default scan
-        # mode hard-fails with a permission error and produces no port/
-        # service data at all (nmap does not silently fall back to -sT on
-        # its own). Prepended, never appended, to match the documented
-        # `nmap -sT -sV -T4 <target>` command shape exactly.
-        scan_mode_args = [] if self._raw_socket_capable else ["-sT"]
-        return [
-            TaskSpec(
-                id=new_id(),
-                goal_id=goal.id,
-                executor_domain="recon",
-                params={
-                    "tool": "nmap",
-                    # -Pn skips host-discovery ping — required on HTB networks
-                    # where ICMP is blocked; without it nmap reports "host down"
-                    # and exits with rc=1 even when the target is reachable.
-                    "args": [*scan_mode_args, "-sV", "-T4", "-Pn", self._target],
-                    "target": self._target,
-                    "parser": "nmap",
-                },
-                subgraph_anchor=goal.anchor_node,
-                phase=goal.phase,
-                # Nmap probes the host IP — depends on ip being undisputed.
-                claim_dependencies=(
-                    ClaimDependency(node_id=host_node_id, field_name="ip"),
-                ),
-            )
+        args = [
+            *self._scan_prefix(), "-Pn", "-T4",
+            "--top-ports", str(self._top_ports), *self._bounds(), self._target,
         ]
+        return [self._nmap_taskspec(goal, args)]
+
+    def _version_scan(
+        self, goal: Goal, service_nodes: list[Any]
+    ) -> list[TaskSpec] | None:
+        """Pass 2: a smaller -sV scan on ONLY the open ports, emitted only when
+        no service has version info yet (once versions are populated, recon
+        moves on to banner probes). ``None`` means no version scan is needed."""
+        if self._registry.get("nmap") is None:
+            return None
+        already_versioned = any(
+            str(n.props.get("version") or "").strip() for n in service_nodes
+        )
+        if already_versioned:
+            return None
+        return self._version_scan_all(goal, service_nodes)
+
+    def _version_scan_all(
+        self, goal: Goal, service_nodes: list[Any]
+    ) -> list[TaskSpec] | None:
+        """Build a bounded -sV scan targeting exactly the discovered open
+        ports (a small port set, not the full default 1000)."""
+        if self._registry.get("nmap") is None:
+            return None
+        ports = self._service_ports(service_nodes)
+        if not ports:
+            return None
+        args = [
+            *self._scan_prefix(), "-Pn", "-sV",
+            "-p", ",".join(ports), *self._bounds(), self._target,
+        ]
+        return [self._nmap_taskspec(goal, args)]
 
     def _banner_tasks(
         self, goal: Goal, subgraph: SubgraphView
@@ -213,8 +294,13 @@ class ReconPlanner:
         guard: "LLMPolicyGuard | None" = None,
         gateway: "LLMGateway | None" = None,
         raw_socket_capable: bool = True,
+        top_ports: int = 1000,
+        execution_timeout_seconds: float = 90.0,
     ) -> None:
-        self._core = _ReconDeterministic(target, registry, raw_socket_capable=raw_socket_capable)
+        self._core = _ReconDeterministic(
+            target, registry, raw_socket_capable=raw_socket_capable,
+            top_ports=top_ports, execution_timeout_seconds=execution_timeout_seconds,
+        )
         self._engine: PlanningEngine | None = None
         self._last_decision: PlanDecision | None = None
         if model_router is not None:

@@ -140,7 +140,13 @@ def parse_single_result(
         )
         return parsed, tool_name
     if parser_name == "curl_body":
-        raw = RawObservation(raw=stdout, metadata={"source": "curl_body", "target": target})
+        # host_ip = the authorized engagement host, so a Host-aware vhost fetch
+        # (target = the vhost URL) links its endpoints/service to the existing
+        # host node instead of a non-existent host:<vhost> (§28.8).
+        raw = RawObservation(
+            raw=stdout,
+            metadata={"source": "curl_body", "target": target, "host_ip": state["target"]},
+        )
         return _COMMAND.parse_curl_body(raw), tool_name
     if parser_name == "priv_esc":
         # Phase 13 — two producers share this parser field: searchsploit's
@@ -217,7 +223,11 @@ def parse_single_result(
             is_last_candidate=bool(tool_result.get("is_last_candidate", False)),
         )
         return parsed, tool_name
-    raw = RawObservation(raw=stdout, metadata={"source": tool_name, "target": target})
+    # host_ip lets the curl HEAD parser (source="curl") attach exposes edges to
+    # the authorized host node for a Host-aware vhost fetch (§28.8).
+    raw = RawObservation(
+        raw=stdout, metadata={"source": tool_name, "target": target, "host_ip": state["target"]}
+    )
     return _COMMAND.parse(raw), tool_name
 
 

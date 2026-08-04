@@ -36,7 +36,12 @@ from typing import TYPE_CHECKING
 
 from apex_host.planners.priv_esc_opportunities import ENUM_COMMANDS as _ENUM_COMMANDS
 from apex_host.policy.models import PolicyDecision, PolicyStatus
-from apex_host.policy.scope import canonical_allowed_hosts, normalize_target, target_in_scope
+from apex_host.policy.scope import (
+    canonical_allowed_hosts,
+    normalize_target,
+    resolve_pin_authorizes,
+    target_in_scope,
+)
 from apex_host.verification.user_flag import is_bounded_candidate_path
 
 if TYPE_CHECKING:
@@ -194,6 +199,18 @@ def check_target_in_scope(
 
     match = target_in_scope(raw_target, policy.allowed_targets, allowed_ports=policy.allowed_ports)
     if not match.allowed:
+        # A name-based virtual host (e.g. a vhost discovered from a redirect) is
+        # in scope when the task pins it via `curl --resolve <vhost>:<port>:<ip>`
+        # to an AUTHORIZED IP — the request's real destination is that IP, not a
+        # DNS lookup of the vhost. Only authorizes when the pinned address is
+        # already in scope; a raw off-scope host with no such pin stays blocked.
+        if match.normalized is not None and resolve_pin_authorizes(
+            match.normalized.host,
+            task.params.get("args", []),
+            policy.allowed_targets,
+            allowed_ports=policy.allowed_ports,
+        ):
+            return None
         return PolicyDecision(
             status=PolicyStatus.blocked,
             rule_name="target_in_scope",

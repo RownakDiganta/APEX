@@ -165,6 +165,50 @@ def canonical_allowed_hosts(allowed_targets: Iterable[str]) -> frozenset[str]:
     return frozenset(hosts)
 
 
+def resolve_pin_authorizes(
+    target_host: str,
+    args: Iterable[object],
+    allowed_targets: Iterable[str],
+    *,
+    allowed_ports: Iterable[int] | None = None,
+) -> bool:
+    """True iff a ``curl --resolve <host>:<port>:<addr>`` entry in *args* pins
+    *target_host* to an **authorized** IP (a host in *allowed_targets*).
+
+    This is what makes a name-based virtual-host fetch in scope: the request's
+    real network destination is the pinned address, not a DNS lookup of the
+    (possibly off-scope-looking) vhost name. Authorization therefore follows
+    the pinned address, which must be an already-authorized host, and — when
+    the policy restricts ports — the pinned port must be permitted. A pin to a
+    non-authorized address (or a malformed entry) authorizes nothing.
+    """
+    canon_target = _canonical_host(target_host)
+    if canon_target is None:
+        return False
+    allowed_hosts = canonical_allowed_hosts(allowed_targets)
+    permitted_ports = frozenset(allowed_ports) if allowed_ports is not None else None
+    tokens = [str(a) for a in args]
+    for i, tok in enumerate(tokens):
+        if tok != "--resolve" or i + 1 >= len(tokens):
+            continue
+        # curl --resolve format: <host>:<port>:<address>
+        bits = tokens[i + 1].split(":", 2)
+        if len(bits) != 3:
+            continue
+        pin_host, pin_port, pin_addr = bits
+        if _canonical_host(pin_host) != canon_target:
+            continue
+        if not pin_port.isdigit():
+            continue
+        if permitted_ports is not None and int(pin_port) not in permitted_ports:
+            continue
+        # The pinned address (IPv6 may be bracketed) must be an authorized host.
+        addr = _canonical_host(pin_addr.strip().strip("[]"))
+        if addr is not None and addr in allowed_hosts:
+            return True
+    return False
+
+
 def target_in_scope(
     raw_target: str,
     allowed_targets: Iterable[str],

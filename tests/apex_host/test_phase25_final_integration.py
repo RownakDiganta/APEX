@@ -675,8 +675,11 @@ class TestReporting:
 class TestReleaseGateScenarios:
     @pytest.mark.asyncio
     async def test_all_scenarios_registered(self) -> None:
-        # 12 Phase-25 scenarios + the Phase-28 recon->web regression scenario.
-        assert len(SCENARIOS) == 13
+        # 12 Phase-25 scenarios + the Phase-28 recon->web regression scenario
+        # + the nmap unprivileged-connect-scan (--unprivileged) scenario
+        # + the curl-only web-discovery (fetched-endpoint→service) scenario
+        # + the vhost-redirect web-discovery (--resolve Host-aware) scenario.
+        assert len(SCENARIOS) == 16
 
     @pytest.mark.asyncio
     async def test_full_release_gate_passes(self) -> None:

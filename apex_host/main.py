@@ -202,6 +202,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tool-service-timeout", dest="tool_service_timeout", type=float, default=None, metavar="SECS",
         help="Overall request timeout budget in seconds for the remote tool backend (default: 120.0).",
     )
+    parser.add_argument(
+        "--nmap-timeout", dest="nmap_timeout", type=float, default=None, metavar="SECS",
+        help=(
+            "Per-execution nmap scan timeout in seconds (default: 90.0). Separate from, "
+            "and larger than, the general per-tool cap; must be <= --tool-service-timeout "
+            "so the remote HTTP call does not cut the scan off."
+        ),
+    )
+    parser.add_argument(
+        "--nmap-top-ports", dest="nmap_top_ports", type=int, default=None, metavar="N",
+        help="Breadth of the fast first-pass nmap port-discovery scan (--top-ports N, default: 1000).",
+    )
     raw_socket_group = parser.add_mutually_exclusive_group()
     raw_socket_group.add_argument(
         "--tool-backend-raw-socket-capable", dest="tool_backend_raw_socket_capable",

@@ -91,6 +91,27 @@ HTTP/1.1 200 OK
 Content-Type: text/html
 """
 
+# A name-based vhost redirect: the bare IP returns an empty 301 pointing at a
+# NEW hostname (the real app's virtual host).
+_CURL_VHOST_REDIRECT = """\
+HTTP/1.1 301 Moved Permanently
+Server: nginx
+Location: http://app.example.htb/
+Content-Length: 162
+"""
+
+# Same-host redirect (IP -> same IP path): must NOT create a vhost.
+_CURL_SAME_HOST_REDIRECT = """\
+HTTP/1.1 301 Moved Permanently
+Location: http://10.10.10.14/app/
+"""
+
+# Relative redirect: no host at all — must NOT create a vhost.
+_CURL_RELATIVE_REDIRECT = """\
+HTTP/1.1 302 Found
+Location: /login
+"""
+
 _SSH_BANNER = "SSH-2.0-OpenSSH_8.4p1 Ubuntu-5+ubuntu20.04.1"
 _FTP_VSFTPD_BANNER = "220 (vsFTPd 3.0.3)"
 _FTP_PROFTPD_BANNER = "220 ProFTPD 1.3.5e Server"
@@ -356,8 +377,38 @@ class TestCommandParserCurl:
     def test_curl_host_to_endpoint_exposes_edge(self) -> None:
         parsed = CommandParser().parse(self._raw(_CURL_APACHE))
         exposes = [e for e in parsed.edge_deltas if e.type == "exposes"]
-        assert len(exposes) == 1
-        assert exposes[0].from_id == "host:10.10.10.14"
+        # host -> endpoint AND host -> service (a successful HTTP response
+        # proves a live HTTP service).
+        assert all(e.from_id == "host:10.10.10.14" for e in exposes)
+        to_ids = {e.to_id for e in exposes}
+        assert any(tid.startswith("endpoint:") for tid in to_ids)
+        assert any(tid.startswith("service:") for tid in to_ids)
+
+    def test_curl_head_marks_endpoint_fetched(self) -> None:
+        parsed = CommandParser().parse(self._raw(_CURL_APACHE))
+        endpoint = next(n for n in parsed.node_deltas if n.type == "endpoint")
+        assert endpoint.props.get("fetched") is True
+
+    def test_curl_head_records_http_service(self) -> None:
+        # A real HTTP status line proves a live HTTP service (recon's "no
+        # services discovered" termination must not fire).
+        parsed = CommandParser().parse(self._raw(_CURL_APACHE))
+        services = [n for n in parsed.node_deltas if n.type == "service"]
+        assert len(services) == 1
+        svc = services[0]
+        assert svc.props["port"] == "80"
+        assert svc.props["service"] == "http"
+        assert svc.props["state"] == "open"
+        assert svc.source == "curl"            # provenance
+        assert 0.0 < svc.confidence <= 1.0     # confidence
+        # The server-header version is carried onto the service node.
+        assert svc.props["version"] == "2.4.41"
+
+    def test_curl_https_service_on_443(self) -> None:
+        parsed = CommandParser().parse(self._raw(_CURL_NGINX, target="https://10.10.10.14/"))
+        svc = next(n for n in parsed.node_deltas if n.type == "service")
+        assert svc.props["port"] == "443"
+        assert svc.props["service"] == "https"
 
     def test_curl_nginx_produces_nginx_tech(self) -> None:
         parsed = CommandParser().parse(self._raw(_CURL_NGINX))
@@ -372,6 +423,35 @@ class TestCommandParserCurl:
         assert tech_nodes == []
         endpoints = [n for n in parsed.node_deltas if n.type == "endpoint"]
         assert len(endpoints) == 1
+
+    def test_redirect_to_new_host_creates_vhost_node(self) -> None:
+        parsed = CommandParser().parse(self._raw(_CURL_VHOST_REDIRECT))
+        vhosts = [n for n in parsed.node_deltas if n.type == "vhost"]
+        assert len(vhosts) == 1
+        v = vhosts[0]
+        assert v.props["hostname"] == "app.example.htb"
+        assert v.props["ip"] == "10.10.10.14"
+        assert v.props["discovered_from"] == "http_redirect"
+        assert v.source == "curl"            # provenance
+        assert 0.0 < v.confidence <= 1.0     # confidence
+
+    def test_vhost_linked_to_host_via_exposes(self) -> None:
+        parsed = CommandParser().parse(self._raw(_CURL_VHOST_REDIRECT))
+        vhost = next(n for n in parsed.node_deltas if n.type == "vhost")
+        exposes_to_vhost = [
+            e for e in parsed.edge_deltas
+            if e.type == "exposes" and e.to_id == vhost.id
+        ]
+        assert len(exposes_to_vhost) == 1
+        assert exposes_to_vhost[0].from_id == "host:10.10.10.14"
+
+    def test_same_host_redirect_creates_no_vhost(self) -> None:
+        parsed = CommandParser().parse(self._raw(_CURL_SAME_HOST_REDIRECT))
+        assert not any(n.type == "vhost" for n in parsed.node_deltas)
+
+    def test_relative_redirect_creates_no_vhost(self) -> None:
+        parsed = CommandParser().parse(self._raw(_CURL_RELATIVE_REDIRECT))
+        assert not any(n.type == "vhost" for n in parsed.node_deltas)
 
     def test_non_curl_unknown_output_becomes_knowledge_entry(self) -> None:
         raw = RawObservation(raw="some gobbledygook output", metadata={"source": "unknown_tool"})
