@@ -10176,6 +10176,61 @@ validation; `last_reason` names each specific rejection; `summarize_subgraph`
 surfaces the vhost + `--resolve` hint; `_candidate_task_descriptions` renders
 web/recon shapes and never credential ones).
 
+### 28.11 Curl header responses are header-parsed regardless of the plan's `parser` field
+
+> **Numbering note:** §28 has a pre-existing duplicate-heading collision (two
+> `### 28.7` — "Fetched-endpoint…" and "Release gate" — and two `### 28.8` —
+> "vhost discovery" and "Tests"). The highest unique heading is §28.10, so this
+> section takes the next free number, **§28.11**. Nothing was renumbered.
+
+Fixes a live failure the §28.8 vhost fix could not prevent: the vhost code was
+present in HEAD and passed the `vhost_redirect_web_discovery` release-gate
+scenario, yet did **not** run in a real `--use-llm` engagement
+(`run_reports/live.json`, 20:51, against 10.129.40.164). `curl -s -I
+http://10.129.40.164` returned `301 → Location: http://2million.htb/`, but the
+live graph had **no vhost node**, the web planner emitted only bare-IP curls,
+and it terminated `no_actionable_task` at turn 2.
+
+**Root cause (a routing gap, not missing vhost logic).** `_redirect_vhost` lives
+**only** inside `CommandParser._parse_curl_headers`, which
+`parse_single_result` reaches only for `parser="command"` /
+`source=="curl"`. The live LLM plan mislabeled the `curl -s -I` HEAD task as
+**`parser="banner"`** (valid per the `Validator`, which does not cross-check
+tool-vs-parser). So `parse_single_result` routed the HEAD result to
+`BannerParser`, which stored the 301 header block — `Location:
+http://2million.htb/` and all — as a `service` node's `banner` prop (the
+smoking gun in `live_graph.json`: `service:…:80/tcp` `source=curl_body` with a
+`banner` containing the Location) instead of extracting the redirect into a
+`vhost` node. No vhost → the §28.8 `WebPlanner._select_vhost` override never
+fired → bare-IP curls → `no_actionable_task`.
+
+**Fix (in `apex_host/orchestration/parsing_node.py::parse_single_result`).** A
+`curl` result whose stdout is an HTTP header response
+(`tool == "curl" and stdout.lstrip().startswith("HTTP/")`) is **always**
+header-parsed by `CommandParser.parse` (with `source="curl"`,
+`host_ip=state["target"]`), **regardless of the `parser` field** the plan
+assigned. `curl` never emits a raw TCP banner, so a `"HTTP/"`-prefixed curl
+stdout is unambiguously an HTTP header response — routing it by actual shape
+makes vhost discovery independent of the planner's parser guess. A curl **body**
+response (HTML) does not start with `"HTTP/"` and still routes to
+`parse_curl_body`; `nc`/`netcat` banners (`tool != "curl"`) are untouched. No new
+vhost logic was added, no extra LLM call, and `safety.py`/`memfabric` are
+unchanged.
+
+**Test faithfulness (the core deliverable).** The `vhost_redirect_web_discovery`
+release-gate scenario previously hand-fed `CommandParser().parse(raw=<header>,
+source="curl")` — forcing the header path directly, so it passed while live
+failed. It now drives the **real router** (`parse_single_result`) with the
+**exact live mislabel** (`parser="banner"`) on a 301 curl result, then asserts a
+`vhost` node was created and the LLM-on `WebPlanner` still overrides the bare-IP
+plan with a `--resolve -L` fetch. Verified it **fails** without the fix (with the
+router guard reverted, the gate reports "301 redirect to a new host produced no
+vhost node") and **passes** with it. Router-level unit coverage:
+`tests/apex_host/test_recon_parser.py::TestCurlHeaderRouting` (a curl header
+mislabeled `banner`/`curl_body` still yields a vhost; a correct `command` label
+still works; a curl HTML body is **not** swept into the header path; an
+`nc` banner is unaffected).
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

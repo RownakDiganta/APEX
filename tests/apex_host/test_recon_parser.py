@@ -526,6 +526,64 @@ class TestCommandParserCurl:
 
 
 # ---------------------------------------------------------------------------
+# parse_single_result routing (§28.11) — a curl HTTP header response is
+# header-parsed regardless of the `parser` field a plan/LLM assigned, so
+# vhost discovery does not depend on the planner's parser guess. This is the
+# live-failure regression: the LLM mislabeled `curl -s -I` as parser="banner",
+# so the 301 Location never reached _redirect_vhost and no vhost was created.
+# ---------------------------------------------------------------------------
+class TestCurlHeaderRouting:
+    @staticmethod
+    def _route(parser: str, stdout: str, *, tool: str = "curl") -> object:
+        from apex_host.orchestration.parsing_node import parse_single_result
+
+        obs, _src = parse_single_result(
+            {
+                "tool": tool, "parser": parser,
+                "args": ["-s", "-I", "http://10.129.40.164"],
+                "target": "http://10.129.40.164", "stdout": stdout,
+            },
+            {"target": "10.129.40.164"},  # ApexGraphState-shaped
+        )
+        return obs
+
+    def test_curl_header_mislabeled_banner_still_yields_vhost(self) -> None:
+        # The exact live mistake: `curl -s -I` labeled parser="banner".
+        obs = self._route("banner", _CURL_VHOST_REDIRECT)
+        vhosts = [n for n in obs.node_deltas if n.type == "vhost"]  # type: ignore[attr-defined]
+        assert len(vhosts) == 1
+        assert vhosts[0].props["hostname"] == "app.example.htb"
+        assert vhosts[0].props["ip"] == "10.129.40.164"
+
+    def test_curl_header_mislabeled_curl_body_still_yields_vhost(self) -> None:
+        obs = self._route("curl_body", _CURL_VHOST_REDIRECT)
+        assert any(n.type == "vhost" for n in obs.node_deltas)  # type: ignore[attr-defined]
+
+    def test_curl_header_command_parser_yields_vhost(self) -> None:
+        # The correct label still works (no regression).
+        obs = self._route("command", _CURL_VHOST_REDIRECT)
+        assert any(n.type == "vhost" for n in obs.node_deltas)  # type: ignore[attr-defined]
+
+    def test_curl_html_body_not_forced_to_header_parser(self) -> None:
+        # A curl BODY response (HTML, no "HTTP/" prefix) still routes to
+        # parse_curl_body — it must NOT be swept into the header path.
+        body = (
+            "<!DOCTYPE html><html><head><title>301 Moved Permanently</title>"
+            "</head><body><center>nginx</center></body></html>"
+        )
+        obs = self._route("curl_body", body)
+        # No vhost (the body has no Location header) and an endpoint was made.
+        assert not any(n.type == "vhost" for n in obs.node_deltas)  # type: ignore[attr-defined]
+        assert any(n.type == "endpoint" for n in obs.node_deltas)  # type: ignore[attr-defined]
+
+    def test_non_curl_banner_still_routes_to_banner_parser(self) -> None:
+        # An nc/netcat banner is unaffected — only tool=="curl" is re-routed.
+        ssh = "SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5"
+        obs = self._route("banner", ssh, tool="nc")
+        assert not any(n.type == "vhost" for n in obs.node_deltas)  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
 # BannerParser — nc/netcat banner detection
 # ---------------------------------------------------------------------------
 

@@ -95,6 +95,22 @@ def parse_single_result(
     stdout = tool_result.get("stdout", "")
     parser_name = tool_result.get("parser", "command")
     tool_name = tool_result.get("tool", "")
+    # §28.11 — a curl HTTP *header* response (`curl -s -I` / `-i`, stdout starts
+    # with "HTTP/") is ALWAYS header-parsed by CommandParser.parse, regardless of
+    # the `parser` field the plan (an LLM) assigned. A live engagement mislabeled
+    # `curl -s -I` as parser="banner", so its 301 `Location:` header was stored as
+    # a service banner and `_redirect_vhost` — which lives only in the header path
+    # — never ran, producing NO vhost node, so the §28.8 vhost `--resolve` override
+    # never fired (bare-IP curls → no_actionable_task). curl never emits a raw TCP
+    # banner, so a "HTTP/"-prefixed curl stdout is unambiguously an HTTP header
+    # response: routing it by actual shape makes vhost discovery independent of the
+    # planner's parser guess. A curl *body* response (HTML) does not start with
+    # "HTTP/" and still routes to parse_curl_body below.
+    if tool_name == "curl" and stdout.lstrip().startswith("HTTP/"):
+        raw = RawObservation(
+            raw=stdout, metadata={"source": "curl", "target": target, "host_ip": state["target"]}
+        )
+        return _COMMAND.parse(raw), "curl"
     if parser_name == "nmap" or tool_name == "nmap":
         return _NMAP.parse_text(stdout, target=target), tool_name
     if parser_name == "ffuf":

@@ -1055,12 +1055,31 @@ async def scenario_vhost_redirect_web_discovery() -> ScenarioResult:
     parser = CommandParser()
     problems: list[str] = []
 
-    # 1. curl the bare IP → empty 301 pointing at the vhost.
+    # 1. `curl -s -I` the bare IP → a 301 pointing at the vhost. Route it through
+    #    the REAL parser router (parse_single_result), NOT parser.parse directly,
+    #    AND with parser="banner" — the exact mislabel a live LLM plan produced
+    #    (§28.11). Faithfulness is the whole point: the previous version hand-fed
+    #    parser.parse(source="curl"), forcing the header path, so it passed while
+    #    the live engagement (which mislabeled the HEAD curl as parser="banner")
+    #    routed to BannerParser and produced NO vhost node. This step now fails
+    #    the gate if that routing regresses.
+    from typing import cast
+
+    from apex_host.graph_state import ApexGraphState
+    from apex_host.orchestration.parsing_node import parse_single_result
+
     ip_301 = (
         f"HTTP/1.1 301 Moved Permanently\r\nServer: nginx\r\n"
         f"Location: http://{_VHOST}/\r\nContent-Length: 162\r\n"
     )
-    p1 = parser.parse(RawObservation(raw=ip_301, metadata={"source": "curl", "target": f"http://{_TARGET}"}))
+    p1, _p1_src = parse_single_result(
+        {
+            "tool": "curl", "parser": "banner",  # the live mislabel
+            "args": ["-s", "-I", f"http://{_TARGET}"],
+            "target": f"http://{_TARGET}", "stdout": ip_301,
+        },
+        cast("ApexGraphState", {"target": _TARGET}),  # only state["target"] is read
+    )
     await api.apply_deltas(nodes=p1.node_deltas, edges=p1.edge_deltas)
     subgraph = await api.get_subgraph(_ANCHOR, depth=5)
     vhost_nodes = [n for n in subgraph.nodes if n.type == "vhost"]
