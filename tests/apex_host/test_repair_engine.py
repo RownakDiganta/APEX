@@ -442,7 +442,7 @@ class TestPromptBuilderFindings:
             candidate_tasks=candidates,
         )
         user_content = msgs[1]["content"]
-        assert "CANDIDATE TASKS" in user_content
+        assert "VALID NEXT ACTIONS" in user_content
         assert "nmap -sV target" in user_content
 
     def test_findings_capped_at_10(self) -> None:

@@ -126,6 +126,7 @@ class _WebDeterministic:
         # 301. The vhost is always runtime-discovered, never hardcoded (§28.8).
         vhost_node = self._select_vhost(subgraph)
         resolve_args: list[str] = []
+        follow_args: list[str] = []
         if vhost_node is not None:
             vhost = str(vhost_node.props.get("hostname", "")).strip()
             vip = str(vhost_node.props.get("ip") or self._target).strip()
@@ -136,6 +137,11 @@ class _WebDeterministic:
             # policy scope gate authorizes this via the pin (never a raw
             # off-scope host). Value is host:port:ip, no shell metacharacters.
             resolve_args = ["--resolve", f"{vhost}:{web_port}:{vip}"]
+            # -L follows the redirect chain so the REAL homepage loads (the
+            # vhost may itself redirect, e.g. / → /home). Only on the vhost path
+            # — a bare-IP fetch must NOT follow its redirect to the unresolvable
+            # vhost DNS.
+            follow_args = ["-L"]
         else:
             base_url = ip_base_url
 
@@ -162,7 +168,7 @@ class _WebDeterministic:
                     executor_domain="web",
                     params={
                         "tool": "curl",
-                        "args": ["-s", "-I", *resolve_args, base_url],
+                        "args": ["-s", "-I", *follow_args, *resolve_args, base_url],
                         "target": base_url,
                         "parser": "command",
                     },
@@ -179,7 +185,7 @@ class _WebDeterministic:
                     executor_domain="web",
                     params={
                         "tool": "curl",
-                        "args": ["-s", *resolve_args, base_url],
+                        "args": ["-s", *follow_args, *resolve_args, base_url],
                         "target": base_url,
                         "parser": "curl_body",
                     },
@@ -326,6 +332,26 @@ class WebPlanner:
     async def plan(
         self, goal: Goal, subgraph: SubgraphView, evidence: EvidenceBundle
     ) -> list[TaskSpec] | AbandonSignal:
+        # Deterministic vhost override (§28.8): when a name-based virtual host
+        # has been DISCOVERED for the target, the required next web action is a
+        # fixed, safe, Host-aware `--resolve` fetch of that vhost — a decision
+        # the LLM neither knows (it re-emits a bare-IP curl that only returns the
+        # known redirect stub) nor should override. So bypass the engine/LLM
+        # entirely and use the deterministic planner, which fetches the real app
+        # under the vhost. No extra LLM call is made for this decision.
+        if _WebDeterministic._select_vhost(subgraph) is not None:
+            self._last_decision = PlanDecision(
+                planner_model="deterministic",
+                confidence=1.0,
+                selected_task_count=0,
+                rejected_task_count=0,
+                reasoning_summary="vhost discovered — Host-aware --resolve fetch (deterministic override)",
+                fallback_used=True,
+                timestamp=now(),
+                phase=ApexPhase.web.value,
+            )
+            return await self._core.plan(goal, subgraph, evidence)
+
         if self._engine is not None:
             return await self._engine.plan(goal, ApexPhase.web, subgraph, evidence)
         self._last_decision = PlanDecision(

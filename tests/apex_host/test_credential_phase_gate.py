@@ -128,11 +128,38 @@ class TestWebEvidence:
         for t in ("form", "web_opportunity"):
             assert web_evidence_status(_subgraph(_node(t, {}))).complete is True
 
-    def test_vhost_node_is_web_content(self) -> None:
-        # A vhost discovered from an HTTP redirect is meaningful web progress —
-        # it unblocks a Host-aware re-fetch of the real app (§28.8).
+    def test_vhost_node_alone_is_not_web_complete(self) -> None:
+        # §28.8 (corrected) — discovering a vhost is progress that REQUIRES a
+        # Host-aware follow-up fetch, NOT completion. A vhost node on its own
+        # must NOT mark the web phase complete (else the phase moves on without
+        # ever fetching the real app behind the vhost).
         sg = _subgraph(_node("vhost", {"hostname": "app.htb", "ip": _HOST}))
+        assert web_evidence_status(sg).complete is False
+
+    def test_redirect_stub_endpoint_plus_vhost_is_not_complete(self) -> None:
+        # The bare-IP endpoint's only observation is a 3xx redirect to the
+        # vhost — a stub. It must NOT satisfy the web phase; the vhost fetch is
+        # the required next step.
+        sg = _subgraph(
+            _node("vhost", {"hostname": "app.htb", "ip": _HOST}),
+            _node("endpoint", {"url": f"http://{_HOST}/", "status": "301", "fetched": True}),
+        )
+        assert web_evidence_status(sg).complete is False
+
+    def test_vhost_url_fetch_completes_web(self) -> None:
+        # Once the vhost itself is fetched (an endpoint whose URL host is the
+        # vhost), web discovery is complete.
+        sg = _subgraph(
+            _node("vhost", {"hostname": "app.htb", "ip": _HOST}),
+            _node("endpoint", {"url": f"http://{_HOST}/", "status": "301", "fetched": True}),
+            _node("endpoint", {"url": "http://app.htb/", "status": "200", "fetched": True}),
+        )
         assert web_evidence_status(sg).complete is True
+
+    def test_redirect_status_endpoint_alone_is_not_complete(self) -> None:
+        # A 3xx-status endpoint is a redirect stub even with no vhost node yet.
+        sg = _subgraph(_node("endpoint", {"url": f"http://{_HOST}/", "status": "302"}))
+        assert web_evidence_status(sg).complete is False
 
     def test_bare_tech_node_is_not_web_content(self) -> None:
         # A bare `tech` node with no endpoint is produced by nmap version

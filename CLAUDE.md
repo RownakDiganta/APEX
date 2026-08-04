@@ -9909,19 +9909,45 @@ a `Host` header or followed the redirect, and the web agent was blind. Generic
    `graph_ids.vhost_id(ip, hostname)`, content-addressed) with
    `{hostname, ip, discovered_from, source_status}`, provenance and confidence,
    linked `host --exposes--> vhost`. A same-host (IP→IP) or relative redirect
-   creates no vhost. `phase_gates._has_web_content` counts a `vhost` node as web
-   content (learning the vhost IS web progress — it unblocks the re-fetch).
+   creates no vhost. **A `vhost` node does NOT, on its own, complete the web
+   phase** (see the §28.8-correction below) — discovering it is progress that
+   *requires* a follow-up fetch, and the bare-IP `301` endpoint is a
+   redirect **stub** that must not satisfy the web phase either.
 
-2. **Web executor re-fetches with `curl --resolve <vhost>:<port>:<ip>`.**
+2. **Web planner FORCES the Host-aware fetch when a vhost exists.**
    `_WebDeterministic.plan` selects the highest-confidence `vhost` node
-   (`_select_vhost`) and, when present, targets `http://<vhost>/` with
-   `--resolve <vhost>:<port>:<authorized-ip>` — curl connects to the authorized
-   IP but sends the vhost `Host` header, so nginx serves the real app and the
-   redirect chain / relative links resolve correctly. `--resolve` is preferred
-   over `-H Host:`; the opt-in ffuf/gobuster paths fuzz the resolvable IP URL
-   with a `-H Host: <vhost>` header. The `--resolve` value (`host:port:ip`) and
-   vhost URL carry no shell metacharacters, so `tools/safety.py`'s generic
-   allowlist accepts them unchanged (no curl-specific special-casing added).
+   (`_select_vhost`) and targets `http://<vhost>/` with `curl -s -L --resolve
+   <vhost>:<port>:<authorized-ip>` — curl connects to the authorized IP but
+   sends the vhost `Host` header (so nginx serves the real app), and `-L`
+   follows the redirect chain so the real homepage loads. Crucially, the
+   `WebPlanner` **wrapper** applies this as a *deterministic override*: when a
+   vhost node is present it bypasses the LLM engine entirely and uses the
+   deterministic planner (no extra LLM call). Without this, a valid LLM plan
+   re-emits a bare-IP `curl` that only returns the known `301` stub and the
+   `--resolve` action is never selected — the demonstrated live bug. The
+   HEAD (`inspect_technology`) and body (`discover_form`) probes both target
+   the vhost, so forms/tech are parsed from the REAL app, not the stub.
+   `--resolve` is preferred over `-H Host:`; the opt-in ffuf/gobuster paths
+   fuzz the resolvable IP URL with a `-H Host: <vhost>` header. The `--resolve`
+   value (`host:port:ip`), `-L`, and vhost URL carry no shell metacharacters,
+   so `tools/safety.py`'s generic allowlist accepts them unchanged (no
+   curl-specific special-casing added). The vhost fetch's fingerprint differs
+   from the IP curls' (different args), so it is never dedup-suppressed.
+
+**Correction (§28.8 — vhost/redirect-stub never completes the web phase):** an
+earlier version of this section made `_has_web_content` count a `vhost` node as
+web content, which had the opposite of the intended effect — it marked the web
+phase *complete* the instant a vhost was discovered, so `GlobalPlanner` moved on
+**without ever fetching the vhost**. Corrected: `phase_gates._has_web_content`
+now counts web-complete evidence only from the REAL app — a `form` /
+`web_opportunity`, or a fetched **non-redirect** endpoint (a 3xx-status endpoint
+is a stub and is excluded), and when a vhost is known, ONLY an endpoint whose
+URL host **is** that vhost (bare-IP endpoints are treated as stubs). A bare
+`vhost` node, a `301` stub endpoint, and (with a vhost in play) the stub's
+`Server`-header `tech` node all leave the web phase *incomplete*, so
+`_select_phase` keeps returning `web` and the deterministic override above runs
+the vhost fetch. The §28.6 bare-`tech`-node guard is preserved for the no-vhost
+case.
 
 3. **Policy authorizes the pinned vhost fetch.** A raw `http://<vhost>/` target
    is off-scope by host equality. `scope.resolve_pin_authorizes` +
@@ -9941,14 +9967,18 @@ behavior is byte-for-byte unchanged.
 
 Tests: `tests/apex_host/test_recon_parser.py` (301→new-host yields a vhost node +
 host→vhost edge; same-host / relative redirect yields none),
-`test_credential_phase_gate.py` (vhost is web content),
-`test_web_planner.py` (vhost → `--resolve` Host-aware curl; no vhost → IP, no
-`--resolve`; args pass the safety gate), `test_policy_scope_url.py`
-(`resolve_pin_authorizes` + the gate: pinned-to-authorized-IP approved,
-no-pin / off-scope-pin / port-excluded blocked). Release-gate scenario
-`vhost_redirect_web_discovery` drives recon-:80 → IP-301 → vhost node →
-WebPlanner `--resolve` task → PolicyAdvisor approval → vhost body fetch →
-discovered content, end to end.
+`test_credential_phase_gate.py` (a vhost node / a `301` redirect-stub endpoint
+does NOT complete web; only a vhost-URL fetch does), `test_web_planner.py`
+(vhost → `--resolve -L` Host-aware curl even with the LLM on — the deterministic
+override; distinct fingerprint from the IP curl; HEAD+body both target the
+vhost; no vhost → IP, no `--resolve`; args pass the safety gate),
+`test_policy_scope_url.py` (`resolve_pin_authorizes` + the gate:
+pinned-to-authorized-IP approved, no-pin / off-scope-pin / port-excluded
+blocked). Release-gate scenario `vhost_redirect_web_discovery` drives
+recon-:80 → IP-301 → vhost node (stub does NOT complete web) → the SELECTED web
+action is the `--resolve -L` vhost fetch (a bare-IP LLM plan overridden) →
+PolicyAdvisor approval → vhost body fetch discovers a form → web completes, end
+to end.
 
 ### 28.9 Honest terminal outcome for an unproductive phase (no fabricated `goal_completed`)
 
@@ -9998,6 +10028,51 @@ validation failure → deterministic vhost-aware fallback action). Release-gate
 scenario `web_incomplete_not_goal_completed` drives the real compiled graph and
 fails if the outcome is `goal_completed`, is a success, or exits 0 without a
 verified user flag.
+
+### 28.10 Web-phase LLM validation: diagnose the reason, surface valid shapes
+
+The web-phase LLM plan failed the `Validator` in multiple consecutive runs
+(`llm_error_category="validation"`, forcing the deterministic fallback every
+turn). Two root causes and fixes (validator safety rules unchanged; no secrets
+logged; §28 budget accounting intact; memfabric untouched):
+
+- **The specific rejection was opaque.** `llm_error_category="validation"` did
+  not say WHICH of the validator's checks failed. `Validator.last_reason` now
+  records the precise, **secret-free** reason — a category plus the offending
+  flag/tool/domain NAME or shell operator only, never an argument VALUE
+  (`tool_not_allowed:<tool>`, `malformed_json`, `schema_mismatch:<field-path>`,
+  `destructive_tool:<tool>`, `unknown_executor_domain:<domain>`,
+  `shell_operator:<op>`). `PlanningEngine._record_fallback` threads it into the
+  fallback `PlanDecision.reasoning_summary` so the report pinpoints it. The most
+  likely live cause is `tool_not_allowed`: asked to plan a web action with only
+  `curl`/`nc`/`nmap` allowlisted, the LLM proposes a web scanner
+  (`gobuster`/`ffuf`/`nikto`/…) not in `ApexConfig.allowed_tools`, which the
+  validator correctly rejects.
+
+- **The prompt never showed the LLM a valid shape.** The `PromptBuilder`'s
+  `candidate_tasks` section existed but was never wired — both `build_messages`
+  call sites (gateway + direct) omitted it, so the LLM never saw the concrete,
+  allowed-tool commands it could emit, and (for a vhost) had no way to express
+  the in-scope `--resolve` fetch. Now `PlanningEngine` passes
+  `_candidate_task_descriptions(cached_fallback, phase)` — the already-computed
+  deterministic fallback's tasks rendered as `tool args` lines — for the
+  info-gathering phases only (`web`/`recon`; credential/priv_esc/objective are
+  excluded, since their params can carry secrets). And `summarize_subgraph` now
+  renders a `vhost` node with its hostname AND the only in-scope fetch shape
+  (`curl -s -L --resolve <vhost>:<port>:<ip> http://<vhost>/`). So the web LLM
+  is shown a VALID plan to select or refine (a `curl` probe, or the pinned
+  vhost `--resolve` fetch) instead of guessing a disallowed scanner or an
+  off-scope raw-host URL. The validator's destructive/metacharacter/allowlist/
+  domain checks are **unchanged** — a genuinely malformed or off-scope plan is
+  still rejected.
+
+The deterministic fallback remains correct regardless (§28.8/§28.9 — a vhost
+forces the deterministic `--resolve` fetch via the `WebPlanner` override, so the
+LLM is not even consulted for the web phase once a vhost exists). Tests:
+`tests/apex_host/test_planning_engine.py` (a valid `--resolve` web plan passes
+validation; `last_reason` names each specific rejection; `summarize_subgraph`
+surfaces the vhost + `--resolve` hint; `_candidate_task_descriptions` renders
+web/recon shapes and never credential ones).
 
 ### 28.7 Release gate
 

@@ -2344,14 +2344,19 @@ failed response records no service node (CLAUDE.md §28.7).
 http://<ip>/` returns a 3xx redirect to a NEW hostname (e.g. an empty 301 with
 `Location: http://<vhost>/` — a common nginx name-based-vhost setup where the
 bare IP serves nothing), the parser records a generic **`vhost`** node
-(discovered from the redirect, never hardcoded), and the web planner re-fetches
-with `curl --resolve <vhost>:<port>:<ip> http://<vhost>/` so the request
-connects to the authorized IP but sends the vhost `Host` header — nginx then
-serves the real app, and form/technology/link discovery runs against it instead
-of the empty 301. The policy scope gate authorizes the vhost fetch **only** when
-it is pinned via `--resolve` to an already-authorized IP (a raw off-scope host,
-or a pin to an unauthorized IP, stays blocked); the safety allowlist accepts the
-`--resolve` value unchanged (no shell metacharacters). See CLAUDE.md §28.8.
+(discovered from the redirect, never hardcoded). Discovering the vhost, and the
+bare-IP `301` endpoint, are **redirect stubs** that do NOT complete the web
+phase — so the next web action is forced to be the Host-aware fetch: `curl -s
+-L --resolve <vhost>:<port>:<ip> http://<vhost>/` (the `-L` follows the redirect
+chain so the real homepage loads). This override is **deterministic and wins
+even with `--use-llm`**: when a vhost is known the web planner bypasses the LLM
+(which would otherwise re-emit a bare-IP curl that only returns the known stub)
+— no extra LLM call is made. `form`/`technology`/`link` discovery then runs
+against the real app, and the web phase completes only once a vhost-URL fetch
+succeeds. The policy scope gate authorizes the vhost fetch **only** when it is
+pinned via `--resolve` to an already-authorized IP (a raw off-scope host, or a
+pin to an unauthorized IP, stays blocked); the safety allowlist accepts the
+`--resolve`/`-L` values unchanged (no shell metacharacters). See CLAUDE.md §28.8.
 
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)

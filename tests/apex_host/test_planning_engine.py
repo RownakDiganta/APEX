@@ -29,7 +29,11 @@ from memfabric.types import (
 )
 
 from apex_host.llm.router import FakeModelRouter
-from apex_host.planning.engine import PlanningEngine, summarize_subgraph
+from apex_host.planning.engine import (
+    PlanningEngine,
+    _candidate_task_descriptions,
+    summarize_subgraph,
+)
 from apex_host.planning.prompt_builder import PromptBuilder
 from apex_host.planning.validator import Validator
 from apex_host.types import ApexPhase
@@ -266,6 +270,47 @@ class TestValidator:
         data["selected_tasks"][0]["executor_domain"] = "hacking"  # unknown
         assert v.validate(json.dumps(data), _ALLOWED_TOOLS) is None
 
+    def test_valid_vhost_resolve_web_plan_accepted(self) -> None:
+        # §28.8/§28.9 — a curl --resolve Host-aware web plan (the shape now
+        # surfaced in the prompt) must PASS validation so the LLM path succeeds
+        # on the web phase instead of always falling back.
+        v = self._v()
+        plan = json.dumps({
+            "reasoning": "fetch the discovered vhost via a pinned --resolve",
+            "confidence": 0.9,
+            "selected_tasks": [{
+                "tool": "curl",
+                "args": ["-s", "-L", "--resolve", "app.htb:80:192.0.2.10", "http://app.htb/"],
+                "parser": "command", "executor_domain": "web",
+                "target": "http://app.htb/", "rationale": "host-aware fetch",
+            }],
+            "rejected_tasks": [], "stop_reason": None, "next_phase": None,
+        })
+        out = v.validate(plan, ["curl"])
+        assert out is not None
+        assert out.selected_tasks[0].tool == "curl"
+        assert "--resolve" in out.selected_tasks[0].args
+        assert v.last_reason == ""
+
+    def test_last_reason_names_the_specific_rejection(self) -> None:
+        # The diagnostic: the specific failing check (secret-free — flag/tool/
+        # domain NAME or operator only) is captured, so a "validation" fallback
+        # is diagnosable rather than opaque.
+        v = self._v()
+        v.validate(_valid_output_json(tool="gobuster"), ["curl"])
+        assert v.last_reason == "tool_not_allowed:gobuster"
+        v.validate("not json {{", ["curl"])
+        assert v.last_reason == "malformed_json"
+        v.validate(_valid_output_json(tool="curl", args=["-s", "http://x | cat"]), ["curl"])
+        assert v.last_reason == "shell_operator:|"
+        data = json.loads(_valid_output_json())
+        data["selected_tasks"][0]["executor_domain"] = "hacking"
+        v.validate(json.dumps(data), _ALLOWED_TOOLS)
+        assert v.last_reason == "unknown_executor_domain:hacking"
+        # An accepted plan clears the reason.
+        assert v.validate(_valid_output_json(), _ALLOWED_TOOLS) is not None
+        assert v.last_reason == ""
+
     def test_stop_reason_preserved(self) -> None:
         v = self._v()
         out = v.validate(_valid_output_json(stop_reason="no viable path"), _ALLOWED_TOOLS)
@@ -411,6 +456,51 @@ class TestSummarizeSubgraph:
         sg = _subgraph(nodes=[host, svc], edges=[edge])
         result = summarize_subgraph(sg)
         assert "1" in result  # 1 edge
+
+    def test_vhost_node_surfaced_with_resolve_hint(self) -> None:
+        # §28.8/§28.9 — the EKG summary surfaces a discovered vhost AND the only
+        # in-scope way to fetch it, so the LLM emits a valid --resolve plan.
+        vhost = Node(
+            id=f"vhost:{_TARGET}:app.htb", type="vhost",
+            props={"hostname": "app.htb", "ip": _TARGET},
+            confidence=0.8, source="curl", first_seen=now(), last_seen=now(),
+        )
+        result = summarize_subgraph(_subgraph(nodes=[_host_node(), vhost]))
+        assert "app.htb" in result
+        assert "--resolve" in result
+        assert "virtual host" in result.lower()
+
+
+class TestCandidateTaskDescriptions:
+    def _curl_vhost_task(self) -> TaskSpec:
+        return TaskSpec(
+            id=new_id(), goal_id="g", executor_domain="web",
+            params={
+                "tool": "curl",
+                "args": ["-s", "-I", "-L", "--resolve", "app.htb:80:192.0.2.10", "http://app.htb/"],
+                "target": "http://app.htb/", "parser": "command",
+            },
+            subgraph_anchor="host:192.0.2.10", phase="web",
+        )
+
+    def test_web_candidates_render_the_vhost_resolve_shape(self) -> None:
+        descs = _candidate_task_descriptions([self._curl_vhost_task()], ApexPhase.web)
+        assert descs is not None
+        assert any("--resolve" in d and "app.htb" in d for d in descs)
+
+    def test_recon_candidates_rendered(self) -> None:
+        assert _candidate_task_descriptions([self._curl_vhost_task()], ApexPhase.recon) is not None
+
+    def test_credential_phase_candidates_never_rendered(self) -> None:
+        # Never surface credential/priv_esc/objective candidates — their params
+        # can carry sensitive material.
+        assert _candidate_task_descriptions([self._curl_vhost_task()], ApexPhase.credential) is None
+
+    def test_none_and_abandon_and_empty_return_none(self) -> None:
+        from memfabric.types import AbandonSignal
+        assert _candidate_task_descriptions(None, ApexPhase.web) is None
+        assert _candidate_task_descriptions(AbandonSignal(reason="x"), ApexPhase.web) is None
+        assert _candidate_task_descriptions([], ApexPhase.web) is None
 
 
 # ---------------------------------------------------------------------------

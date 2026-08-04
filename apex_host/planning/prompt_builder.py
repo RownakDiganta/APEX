@@ -161,10 +161,17 @@ class PromptBuilder:
                 conf = float(f.get("confidence", 0.0))
                 sections.append(f"  [{phase_str}] {title} (conf={conf:.2f})")
 
-        # Include candidate tasks the deterministic planner would emit
+        # Include candidate tasks the deterministic planner would emit. These
+        # are concrete, VALID, allowed-tool commands (e.g. a `curl -s -I` probe,
+        # or a pinned `curl --resolve <vhost>:<port>:<ip> http://<vhost>/` fetch
+        # when a virtual host was discovered). Select or refine one of these —
+        # do NOT invent a tool outside ALLOWED TOOLS or an off-scope raw-host URL.
         if candidate_tasks:
             sections.append("")
-            sections.append("CANDIDATE TASKS (deterministic planner suggestions):")
+            sections.append(
+                "VALID NEXT ACTIONS (concrete, allowed-tool commands — "
+                "select or refine one; do not invent other tools/targets):"
+            )
             for desc in candidate_tasks[:5]:
                 sections.append(f"  - {desc}")
 

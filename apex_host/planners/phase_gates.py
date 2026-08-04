@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from memfabric.types import SubgraphView
@@ -147,39 +148,72 @@ class WebEvidence:
     reason: str
 
 
+def _endpoint_url_host(url: str) -> str:
+    """Lowercased host of an endpoint URL (``http://host/path`` → ``host``)."""
+    return (urlsplit(url).hostname or "").strip().lower()
+
+
 def _has_web_content(subgraph: "SubgraphView") -> bool:
-    """True when the EKG holds meaningful web evidence: a fetched page (an
-    ``endpoint`` actually browsed, marked ``fetched``, or carrying a real HTTP
-    status), a ``form`` or ``web_opportunity`` (only produced by web parsing),
-    or a ``tech`` node that accompanies an ``endpoint`` (web fingerprinting
-    produces endpoint+tech together). A discovered-but-unfetched link, or an
-    endpoint from a policy-blocked/failed request, never qualifies.
+    """True when the EKG holds meaningful web evidence — content from the REAL
+    app, not a redirect stub.
 
-    A BARE ``tech`` node (no endpoint present) does NOT count: nmap version
-    detection (``-sV``) produces ``service``+``tech`` nodes with no endpoint,
-    and counting that as "web discovery complete" would skip the web phase
-    entirely on any versioned HTTP service — the demonstrated regression the
-    recon->web release-gate scenario guards against. See CLAUDE.md §26.3/§28.
+    Counts: a ``form`` or ``web_opportunity`` (only produced by parsing a real
+    body/browser fetch); a fetched, non-redirect ``endpoint`` (browsed, marked
+    ``fetched``, or carrying a real HTTP status that is NOT a 3xx redirect); and
+    (only when no vhost is known) a ``tech`` node accompanying an ``endpoint``.
 
-    A successful ``curl`` fetch marks its endpoint ``fetched=True`` (the HEAD
-    path also sets a numeric ``status``); a GET body carries no status line, so
-    the ``fetched`` marker is what makes a real, live HTTP endpoint count as
-    web content per §28.6 — the fix for a fetched endpoint being ignored."""
-    has_endpoint = any(n.type == "endpoint" for n in subgraph.nodes)
-    for n in subgraph.nodes:
-        if n.type in ("form", "web_opportunity", "vhost"):
-            # A `vhost` is a non-IP hostname discovered from an HTTP redirect —
-            # learning the real app's virtual host IS meaningful web progress
-            # (it unblocks a Host-aware re-fetch). §28.8.
+    Does NOT count:
+    - A BARE ``tech`` node (no endpoint present) — nmap ``-sV`` produces
+      ``service``+``tech`` with no endpoint; counting it would skip the web
+      phase on any versioned HTTP service (§26.3/§28.6 regression guard).
+    - A **redirect-stub** endpoint — one whose only observation is a 3xx status
+      (e.g. the bare IP returning ``301 → Location: http://<vhost>/``). The real
+      content lives behind the vhost; the stub must NOT satisfy the web phase.
+    - A ``vhost`` node on its own (§28.8 corrected) — discovering the vhost is
+      *progress that requires a follow-up fetch*, NOT completion. When a vhost
+      is known, ONLY a fetch of the vhost itself (an endpoint whose URL host is
+      that vhost) — or a ``form``/``web_opportunity`` from it — completes the
+      web phase; bare-IP endpoints are treated as redirect stubs. This is what
+      forces the Host-aware ``--resolve`` fetch as the required next web action
+      instead of letting the IP stub end the phase."""
+    nodes = list(subgraph.nodes)
+    vhost_names = {
+        str(n.props.get("hostname", "")).strip().lower()
+        for n in nodes
+        if n.type == "vhost" and str(n.props.get("hostname", "")).strip()
+    }
+
+    # A form / web_opportunity is real content — it can only come from a
+    # successful body/browser fetch of the app, never from a redirect stub.
+    if any(n.type in ("form", "web_opportunity") for n in nodes):
+        return True
+
+    for n in nodes:
+        if n.type != "endpoint":
+            continue
+        status = str(n.props.get("status", "")).strip()
+        if status.startswith("3"):
+            continue  # a redirect stub is not meaningful content on its own
+        fetched = (
+            n.props.get("browsed") is True
+            or n.props.get("fetched") is True
+            or status.isdigit()
+        )
+        if not fetched:
+            continue
+        # When a vhost is known, the bare-IP endpoints are redirect stubs — only
+        # a fetch of the vhost itself is the real app's content.
+        if vhost_names and _endpoint_url_host(str(n.props.get("url", ""))) not in vhost_names:
+            continue
+        return True
+
+    # tech+endpoint fingerprinting counts only when no vhost redirect is in play
+    # (with a vhost, the stub's Server-header tech must not end the phase before
+    # the real app behind the vhost is fetched).
+    if not vhost_names:
+        has_endpoint = any(n.type == "endpoint" for n in nodes)
+        if has_endpoint and any(n.type == "tech" for n in nodes):
             return True
-        if n.type == "tech" and has_endpoint:
-            return True
-        if n.type == "endpoint":
-            if n.props.get("browsed") is True or n.props.get("fetched") is True:
-                return True
-            status = str(n.props.get("status", "")).strip()
-            if status.isdigit():
-                return True
     return False
 
 

@@ -71,6 +71,13 @@ class Validator:
 
     def __init__(self, min_confidence: float = 0.0) -> None:
         self._min_confidence = min_confidence
+        #: Secret-free reason the most recent ``validate()`` call rejected the
+        #: output (or ``""`` when it accepted). Categories + offending
+        #: flag/tool/domain NAME only — never an argument VALUE. Read by
+        #: ``PlanningEngine`` to surface WHICH check failed (the previous
+        #: ``llm_error_category="validation"`` was too coarse to diagnose the
+        #: web-phase rejection). Instance state — one ``Validator`` per engine.
+        self.last_reason: str = ""
 
     def validate(
         self,
@@ -97,7 +104,9 @@ class Validator:
             A valid, safe ``PlannerOutput`` if all checks pass; ``None``
             otherwise (caller should fall back to the deterministic planner).
         """
+        self.last_reason = ""
         if not raw or not raw.strip():
+            self.last_reason = "empty_response"
             logger.warning("validator: empty LLM response")
             return None
 
@@ -106,6 +115,7 @@ class Validator:
         try:
             data = json.loads(json_str)
         except json.JSONDecodeError as exc:
+            self.last_reason = "malformed_json"
             logger.warning("validator: malformed JSON — %s", exc)
             return None
 
@@ -113,6 +123,10 @@ class Validator:
         try:
             output = PlannerOutput.model_validate(data)
         except ValidationError as exc:
+            # Only the offending field path (loc), never any VALUE.
+            errs = exc.errors()
+            loc = ".".join(str(p) for p in errs[0]["loc"]) if errs else "?"
+            self.last_reason = f"schema_mismatch:{loc}"
             logger.warning("validator: schema mismatch — %s", exc)
             return None
 
@@ -121,6 +135,7 @@ class Validator:
         for task in output.selected_tasks:
             # Destructive-command blocklist (unconditional)
             if task.tool in _DESTRUCTIVE_COMMANDS:
+                self.last_reason = f"destructive_tool:{task.tool}"
                 logger.warning(
                     "validator: destructive tool %r rejected (unconditional blocklist)",
                     task.tool,
@@ -129,6 +144,7 @@ class Validator:
 
             # Allowlist check
             if task.tool not in allowed_tools:
+                self.last_reason = f"tool_not_allowed:{task.tool}"
                 logger.warning(
                     "validator: unsupported tool %r (not in allowed_tools %s)",
                     task.tool,
@@ -138,6 +154,7 @@ class Validator:
 
             # Executor domain check
             if task.executor_domain not in domains:
+                self.last_reason = f"unknown_executor_domain:{task.executor_domain}"
                 logger.warning(
                     "validator: unknown executor_domain %r (known: %s)",
                     task.executor_domain,
@@ -149,6 +166,8 @@ class Validator:
             for token in task.args:
                 for op in _SHELL_OPERATORS:
                     if op in token:
+                        # Record the OPERATOR only — never the token value.
+                        self.last_reason = f"shell_operator:{op}"
                         logger.warning(
                             "validator: shell operator %r in arg token %r",
                             op,

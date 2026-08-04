@@ -1068,20 +1068,56 @@ async def scenario_vhost_redirect_web_discovery() -> ScenarioResult:
         problems.append("301 redirect to a new host produced no vhost node")
     elif vhost_nodes[0].props.get("hostname") != _VHOST:
         problems.append(f"vhost hostname wrong: {vhost_nodes[0].props.get('hostname')!r}")
-    if not web_evidence_status(subgraph).complete:
-        problems.append("discovered vhost not counted as web content")
+    # The redirect stub + vhost node must NOT complete the web phase — the
+    # real content is behind the vhost, so a follow-up fetch is required (§28.8).
+    if web_evidence_status(subgraph).complete:
+        problems.append("redirect-stub endpoint / bare vhost wrongly marked web complete")
 
-    # 2. The web planner re-fetches with a --resolve Host-aware curl.
+    # 2. The web planner MUST re-fetch with a --resolve -L Host-aware curl — and
+    # it must do so even with the LLM enabled (the LLM re-emits a bare-IP curl
+    # that only returns the known stub; the deterministic vhost override wins).
     config = ApexConfig(target=_TARGET, dry_run=True, allowed_tools=["curl"])
-    planner = WebPlanner(_TARGET, ToolRegistry.from_config(config))
     goal = Goal(id="rg-vhost", description="web", phase="web", anchor_node=_ANCHOR)
-    tasks = await planner.plan(goal, subgraph, EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[]))
+    empty = EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[])
+
+    class _BareIPLLM:  # a valid LLM plan that ignores the vhost (what the live LLM did)
+        def invoke(self, messages: Any) -> Any:
+            import json as _json
+
+            class _R:
+                content = _json.dumps({
+                    "reasoning": "probe the ip", "confidence": 0.9,
+                    "selected_tasks": [{
+                        "tool": "curl", "args": ["-s", "-I", f"http://{_TARGET}"],
+                        "parser": "command", "executor_domain": "web",
+                        "target": f"http://{_TARGET}", "rationale": "head probe",
+                    }],
+                    "rejected_tasks": [], "stop_reason": None, "next_phase": None,
+                })
+            return _R()
+
+    class _Router:
+        def planner_llm(self) -> Any: return _BareIPLLM()
+        def executor_llm(self) -> Any: return None
+        def parser_llm(self) -> Any: return None
+        def reflector_llm(self) -> Any: return None
+
+    planner = WebPlanner(_TARGET, ToolRegistry.from_config(config), model_router=_Router(), allowed_tools=["curl"])
+    tasks = await planner.plan(goal, subgraph, empty)
     if not isinstance(tasks, list) or not tasks:
         problems.append("web planner produced no vhost re-fetch task")
         return ScenarioResult("vhost_redirect_web_discovery", False, "; ".join(problems))
     head = next((t for t in tasks if t.params.get("parser") == "command"), None)
-    if head is None or "--resolve" not in head.params["args"] or _VHOST not in " ".join(head.params["args"]):
-        problems.append("web planner did not issue a --resolve Host-aware curl for the vhost")
+    if head is None:
+        problems.append("web planner produced no HEAD probe task")
+    else:
+        args = head.params["args"]
+        if "--resolve" not in args or _VHOST not in " ".join(args):
+            problems.append(f"web planner did not issue a --resolve vhost curl (LLM bare-IP won): {args}")
+        if "-L" not in args:
+            problems.append("vhost fetch does not follow redirects (-L) to load the real homepage")
+        if f"http://{_TARGET}" in args:
+            problems.append("web planner re-emitted the bare-IP stub fetch")
 
     # 3. Policy authorizes the pinned vhost fetch (never blocks it).
     advisor = PolicyAdvisor(load_policy(config), config)
@@ -1113,13 +1149,18 @@ async def scenario_vhost_redirect_web_discovery() -> ScenarioResult:
     ]
     if not vhost_endpoints:
         problems.append("vhost fetch discovered no endpoint under the vhost URL")
+    # Only AFTER the vhost homepage is fetched (a form was discovered) is the
+    # web phase complete — never on the stub alone.
+    if not web_evidence_status(subgraph2).complete:
+        problems.append("web phase not complete even after fetching the vhost app content")
 
     if problems:
         return ScenarioResult("vhost_redirect_web_discovery", False, "; ".join(problems))
     return ScenarioResult(
         "vhost_redirect_web_discovery", True,
-        f"301 revealed vhost {_VHOST}; web re-fetched with --resolve (policy approved); "
-        f"discovered {len(vhost_endpoints)} vhost endpoint(s) — web agent no longer blind",
+        f"301 revealed vhost {_VHOST}; stub did NOT complete web; the selected next web "
+        f"action was the --resolve -L vhost fetch (LLM bare-IP overridden); after the vhost "
+        f"fetch discovered a form, web completed — {len(vhost_endpoints)} vhost endpoint(s)",
     )
 
 

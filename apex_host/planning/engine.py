@@ -125,6 +125,16 @@ def summarize_subgraph(subgraph: SubgraphView | None) -> str:
             entry.append(f"port {port}" + (f" ({svc})" if svc else ""))
         elif node.type in ("endpoint", "auth_flow"):
             entry.append(str(node.props.get("url", node.id))[:60])
+        elif node.type == "vhost":
+            # Surface a discovered name-based virtual host AND the only in-scope
+            # way to fetch it, so the LLM emits a VALID plan (a pinned --resolve
+            # curl) instead of an off-scope raw-host URL or a disallowed tool.
+            hn = str(node.props.get("hostname", node.id))
+            ip = str(node.props.get("ip", ""))
+            entry.append(
+                f"{hn} (name-based virtual host — fetch ONLY via: "
+                f"curl -s -L --resolve {hn}:<port>:{ip or '<host-ip>'} http://{hn}/)"
+            )
         elif node.type == "tech":
             name = node.props.get("name", "")
             ver = node.props.get("version", "")
@@ -137,6 +147,41 @@ def summarize_subgraph(subgraph: SubgraphView | None) -> str:
         lines.append(f"  {ntype} ({len(items)}): " + ", ".join(items[:5]))
     lines.append(f"  edges: {len(subgraph.edges)}")
     return "\n".join(lines)
+
+
+# Phases whose deterministic candidate tasks are safe to surface verbatim in
+# the prompt — their task ``args`` are non-sensitive tool flags/URLs (nmap, nc,
+# curl). Credential/priv_esc/objective tasks are excluded (their params can
+# carry sensitive material), so their candidates are never rendered.
+_CANDIDATE_SAFE_PHASES = frozenset({ApexPhase.web, ApexPhase.recon})
+
+
+def _candidate_task_descriptions(
+    fallback: "list[TaskSpec] | AbandonSignal | None", phase: ApexPhase
+) -> list[str] | None:
+    """Render the deterministic fallback's tasks as human-readable ``tool args``
+    lines for the prompt's CANDIDATE TASKS section.
+
+    This is what lets the web LLM emit a VALID plan: it sees the concrete,
+    allowed-tool shapes it can select (a ``curl -s -I`` probe, and — when a
+    vhost was discovered — the pinned ``curl -s -L --resolve <vhost>:<port>:<ip>
+    http://<vhost>/`` fetch) instead of guessing a disallowed web scanner or an
+    off-scope raw-host URL that the validator/policy then rejects. Only rendered
+    for the info-gathering phases whose args are non-sensitive; returns ``None``
+    otherwise (so the prompt is byte-for-byte unchanged for those phases).
+    """
+    if phase not in _CANDIDATE_SAFE_PHASES:
+        return None
+    if not isinstance(fallback, list) or not fallback:
+        return None
+    descriptions: list[str] = []
+    for task in fallback[:5]:
+        tool = str(task.params.get("tool", "")).strip()
+        args = " ".join(str(a) for a in task.params.get("args", []))
+        line = f"{tool} {args}".strip()
+        if line:
+            descriptions.append(line)
+    return descriptions or None
 
 
 # ---------------------------------------------------------------------------
@@ -365,12 +410,19 @@ class PlanningEngine:
             else await self._fallback.plan(goal, subgraph, evidence)
         )
         fallback_task_count = 0 if isinstance(fallback_result, AbandonSignal) else len(fallback_result)
+        # Surface WHICH validator check rejected the LLM output (secret-free —
+        # a category + flag/tool/domain NAME, never an argument value) so the
+        # report's planner_decisions makes a "validation" fallback diagnosable
+        # instead of opaque. Only meaningful on the validation path.
+        reasoning = "deterministic"
+        if llm_error_category == "validation" and self._validator.last_reason:
+            reasoning = f"deterministic fallback — validator rejected: {self._validator.last_reason}"
         self._last_decision = PlanDecision(
             planner_model="deterministic",
             confidence=1.0,
             selected_task_count=0,
             rejected_task_count=0,
-            reasoning_summary="deterministic",
+            reasoning_summary=reasoning,
             fallback_used=True,
             timestamp=now(),
             phase=phase.value,
@@ -485,10 +537,12 @@ class PlanningEngine:
                 precomputed_fallback=cached_fallback,
             )
 
-        # Build prompt messages.
+        # Build prompt messages. Surface the deterministic candidate shapes
+        # (incl. the vhost --resolve fetch) so the LLM can emit a VALID plan.
         ekg_summary = summarize_subgraph(subgraph)
         messages = self._prompt_builder.build_messages(
-            goal, phase, evidence, ekg_summary, self._allowed_tools
+            goal, phase, evidence, ekg_summary, self._allowed_tools,
+            candidate_tasks=_candidate_task_descriptions(cached_fallback, phase),
         )
 
         ctx = LLMCallContext(
@@ -738,7 +792,8 @@ class PlanningEngine:
         # ------------------------------------------------------------------ #
         ekg_summary = summarize_subgraph(subgraph)
         messages = self._prompt_builder.build_messages(
-            goal, phase, evidence, ekg_summary, self._allowed_tools
+            goal, phase, evidence, ekg_summary, self._allowed_tools,
+            candidate_tasks=_candidate_task_descriptions(cached_fallback, phase),
         )
         chat_llm = cast(_LLMChatModel, llm)
 

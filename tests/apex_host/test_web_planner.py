@@ -221,6 +221,73 @@ class TestWebPlannerVhost:
         assert "--resolve" in body.params["args"]
         assert f"foo.htb:80:{_TARGET}" in body.params["args"]
 
+    async def test_vhost_curls_follow_redirects_with_dash_L(self) -> None:
+        # -L so the REAL homepage loads even if the vhost redirects (§28.8).
+        planner = _planner(tools=["curl"])
+        result = await planner.plan(_goal(), _vhost_subgraph("foo.htb"), _empty_evidence())
+        assert isinstance(result, list)
+        for t in result:
+            assert "-L" in t.params["args"], f"vhost curl must follow redirects: {t.params['args']}"
+
+    async def test_vhost_fetch_distinct_fingerprint_from_ip_curl(self) -> None:
+        from apex_host.planning.fingerprint import task_fingerprint
+        planner = _planner(tools=["curl"])
+        result = await planner.plan(_goal(), _vhost_subgraph("foo.htb"), _empty_evidence())
+        head = next(t for t in result if t.params.get("parser") == "command")
+        fp_vhost = task_fingerprint("web", "curl", head.params["args"], head.params["target"],
+                                    parser="command", executor_domain="web")
+        fp_ip = task_fingerprint("web", "curl", ["-s", "-I", f"http://{_TARGET}"], f"http://{_TARGET}",
+                                 parser="command", executor_domain="web")
+        assert fp_vhost != fp_ip, "vhost fetch must not dedup against the IP curl"
+
+    async def test_llm_on_still_forces_vhost_fetch_not_bare_ip(self) -> None:
+        # The demonstrated bug: with --use-llm, a valid LLM plan (bare-IP curl)
+        # was used and the vhost --resolve action was never selected. The
+        # deterministic vhost override must win, WITHOUT an extra LLM decision.
+        import json
+
+        class _BareIPLLM:
+            def invoke(self, messages: object) -> object:
+                class _R:
+                    content = json.dumps({
+                        "reasoning": "r", "confidence": 0.9,
+                        "selected_tasks": [{
+                            "tool": "curl", "args": ["-s", "-I", f"http://{_TARGET}"],
+                            "parser": "command", "executor_domain": "web",
+                            "target": f"http://{_TARGET}", "rationale": "probe",
+                        }],
+                        "rejected_tasks": [], "stop_reason": None, "next_phase": None,
+                    })
+                return _R()
+
+        class _Router:
+            def planner_llm(self) -> object: return _BareIPLLM()
+            def executor_llm(self) -> object: return None
+            def parser_llm(self) -> object: return None
+            def reflector_llm(self) -> object: return None
+
+        registry = ToolRegistry(allowed_tools=["curl"])
+        planner = WebPlanner(_TARGET, registry, model_router=_Router(), allowed_tools=["curl"])
+        result = await planner.plan(_goal(), _vhost_subgraph("foo.htb"), _empty_evidence())
+        assert isinstance(result, list) and result
+        head = next(t for t in result if t.params.get("parser") == "command")
+        assert "--resolve" in head.params["args"], "LLM bare-IP must be overridden by the vhost fetch"
+        assert "foo.htb" in " ".join(head.params["args"])
+        # The bare-IP stub fetch must NOT be emitted.
+        assert f"http://{_TARGET}" not in head.params["args"]
+
+    async def test_discover_form_and_tech_target_the_vhost(self) -> None:
+        # discover_form (curl_body) and inspect_technology (curl HEAD) both
+        # target the vhost via --resolve, so forms/tech are parsed from the
+        # REAL app, not the IP stub.
+        planner = _planner(tools=["curl"])
+        result = await planner.plan(_goal(), _vhost_subgraph("foo.htb"), _empty_evidence())
+        head = next(t for t in result if t.params.get("parser") == "command")     # inspect_technology
+        body = next(t for t in result if t.params.get("parser") == "curl_body")   # discover_form
+        for t in (head, body):
+            assert t.params["target"] == "http://foo.htb"
+            assert "--resolve" in t.params["args"]
+
     async def test_no_vhost_uses_ip_no_resolve(self) -> None:
         # Without a discovered vhost, curl targets the IP with no --resolve
         # (unchanged behavior).
