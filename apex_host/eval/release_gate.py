@@ -1623,6 +1623,116 @@ async def scenario_web_endpoint_fetch_loop() -> ScenarioResult:
     )
 
 
+class _ReconFtpFakeBackend:
+    """A synthetic ``ToolBackend`` that makes recon DISCOVER an FTP service (so
+    the engagement is still in current_phase="recon" when the credential gate
+    fires — the exact Fawn state, unlike a pre-seeded service which global_plan
+    would advance past before termination). nmap returns port 21/ftp only; no
+    web surface. Never a real subprocess or network call."""
+
+    name = "fake-recon-ftp"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[str]]] = []
+
+    async def execute(
+        self, tool: str, arguments: list[str], *,
+        timeout_seconds: float | None = None, stdin: str | None = None,
+    ) -> Any:
+        from apex_host.types import ToolCommand, ToolResult
+
+        self.calls.append((tool, list(arguments)))
+        cmd = ToolCommand(tool=tool, args=list(arguments), timeout_seconds=int(timeout_seconds or 30))
+        stdout = ""
+        if tool == "nmap":
+            stdout = (
+                f"Nmap scan report for {_TARGET}\n"
+                "Host is up (0.015s latency).\n"
+                "PORT   STATE SERVICE VERSION\n"
+                "21/tcp open  ftp     vsftpd 3.0.3\n"
+            )
+        return ToolResult(
+            command=cmd, stdout=stdout, stderr="", returncode=0,
+            duration_seconds=0.001, dry_run=True, backend="fake-recon-ftp", error=None,
+        )
+
+
+async def scenario_recon_service_no_credentials_honest_outcome() -> ScenarioResult:
+    """21. Recon DISCOVERS a service but no credential hypothesis → honest outcome.
+
+    The demonstrated Fawn/FTP bug through the REAL compiled graph: recon
+    discovers an FTP service (no web surface, no credentials), so the credential
+    phase is gated and the engagement stops while still in the recon phase —
+    with NO budget hit. Uses a fake nmap backend so the service is DISCOVERED
+    during the recon turn (a pre-seeded service would let global_plan advance
+    past recon before termination, missing the buggy branch). Fails the gate if
+    the stop is mislabeled ``phase_budget_exhausted``, if the reason falsely
+    claims "no services discovered", if it is reported as a success, or if a
+    real turn cap was reached. Label + reason correctness only.
+    """
+    from apex_host.config import ApexConfig
+    from apex_host.graph_state import ApexGraphState
+    from apex_host.llm.router import FakeModelRouter
+    from apex_host.orchestration.builder import build_apex_graph
+    from apex_host.orchestration.outcome import EngagementOutcome, exit_code_for
+    from apex_host.tools.registry import ToolRegistry
+
+    api = _make_api()  # NO seeded service — recon discovers it
+    config = ApexConfig(target=_TARGET, dry_run=True, max_turns=20, tool_backend="remote",
+                        allowed_tools=["nmap", "nc"], use_llm=False)  # NO username/password
+    backend = _ReconFtpFakeBackend()
+    registry = ToolRegistry.from_config(config)
+    graph = build_apex_graph(api, registry, config,
+                             model_router=FakeModelRouter(), tool_backend=backend)
+
+    initial: ApexGraphState = {
+        "run_id": "release-gate-fawn", "target": _TARGET, "phase": "recon",
+        "goal": f"Begin engagement against {_TARGET}", "current_task": None,
+        "evidence_summary": "", "findings": [], "error_episodes": [],
+        "last_tool_result": None, "last_error": None, "completed": False,
+        "turn_count": 0, "planner_decisions": [], "tool_results": None,
+        "repair_count": 0, "policy_decisions": [], "duplicate_actions": [],
+        "completed_fingerprints": [], "execution_backend_log": [],
+        "diagnostic_events": [], "credential_validation_log": [], "repair_log": [],
+        "outcome": "", "termination_reason": "", "termination_phase": "",
+        "stall_reason": "", "privilege_state": "", "privilege_summary": {},
+        "opportunity_ids": [], "attempted_opportunities": [],
+        "enumeration_complete": False, "web_session_state": {},
+        "workflow_summary": {}, "phase_selection": {}, "learning_summary": {},
+        "task_latency_log": [], "objective_status": "", "objective_summary": {},
+        "direct_file_read_log": [], "bounded_command_log": [],
+        "capability_discovery_log": [], "execution_diagnostics": [],
+    }
+    final_state: ApexGraphState = await graph.ainvoke(initial)
+
+    problems: list[str] = []
+    outcome = str(final_state.get("outcome", ""))
+    reason = str(final_state.get("termination_reason", ""))
+    turns = int(final_state.get("turn_count", 0))
+    # A service must actually have been discovered (else this isn't the tested case).
+    sub = await api.get_subgraph(_ANCHOR, depth=4)
+    if not any(n.type == "service" for n in sub.nodes):
+        problems.append("recon did not discover the FTP service — scenario setup broken")
+    if outcome == EngagementOutcome.phase_budget_exhausted.value:
+        problems.append("no-actionable stop mislabeled phase_budget_exhausted (no budget was hit)")
+    if outcome != EngagementOutcome.no_actionable_task.value:
+        problems.append(f"expected no_actionable_task, got {outcome!r}")
+    if outcome and exit_code_for(EngagementOutcome(outcome)) == 0:
+        problems.append(f"non-success stop reported exit 0: {outcome!r}")
+    if "no services discovered" in reason:
+        problems.append("reason falsely claims 'no services discovered' when an FTP service exists")
+    if turns >= 20:
+        problems.append(f"a real turn cap was reached ({turns}/20) — this was not the tested no-budget stop")
+
+    if problems:
+        return ScenarioResult("recon_service_no_credentials_honest_outcome", False, "; ".join(problems))
+    return ScenarioResult(
+        "recon_service_no_credentials_honest_outcome", True,
+        f"recon discovered FTP, no credential hypothesis → honest {outcome} at turn {turns}/20 "
+        "(never phase_budget_exhausted, never success, reason does not deny the discovered service)",
+    )
+
+
 SCENARIOS: list[Any] = [
     scenario_ssh_success,
     scenario_dfr_success,
@@ -1644,6 +1754,7 @@ SCENARIOS: list[Any] = [
     scenario_incomplete_scan_escalates_not_stall,
     scenario_web_content_enumeration,
     scenario_web_endpoint_fetch_loop,
+    scenario_recon_service_no_credentials_honest_outcome,
 ]
 
 

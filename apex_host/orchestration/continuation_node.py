@@ -210,6 +210,13 @@ def make_continuation_node(deps: "OrchestrationDeps") -> Any:
                     # False (web has a surface but produced no meaningful
                     # evidence). See evaluate_termination's done-fallback.
                     web_evidence_complete=web_complete_peek,
+                    # §28.14 — let the evaluator distinguish a genuine recon
+                    # budget exhaustion (no service) from a no-actionable-work
+                    # stop where a service WAS discovered but the credential
+                    # phase is gated (missing hypothesis). Label + reason only;
+                    # the run still stops where it stops.
+                    service_discovered=("service" in node_types_seen),
+                    credential_hypothesis_available=credential_hyp_available,
                 )
                 if not decision.terminate:
                     return {

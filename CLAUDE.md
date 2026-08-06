@@ -10359,6 +10359,58 @@ planner emits the `--resolve -L` fetch → routed through the real parser → `/
 becomes fetched → pending cleared → web completes. It **fails** if the planner
 ignores discovered endpoints (verified).
 
+### 28.14 Honest terminal label when recon found a service but the next phase is gated
+
+> **Numbering note:** highest unique §28 heading is §28.13 (the trailing
+> `### 28.7`/`### 28.8` are the known collision). This section is **§28.14**;
+> nothing was renumbered.
+
+Fixes a **mislabeled terminal outcome** (labeling only — no engagement-behavior,
+budget-accounting, or phase-gate change). A live run against Fawn (FTP) stopped
+at turn 1/20 (LLM 1/20, per-phase 1/4 — **no budget hit**) and reported
+`outcome="phase_budget_exhausted"` / `status="stopped_max_turns"` with reason
+"no services discovered" — but recon **had** discovered the FTP `service`; the
+real cause was the §26 credential gate: no credential hypothesis existed, so
+`GlobalPlanner._select_phase` returned `done` (the "no actionable credential
+hypothesis" path), not a budget limit.
+
+**Root cause (case b — a fallback label).** `evaluate_termination`
+(`apex_host/orchestration/outcome.py`), in the `next_phase == "done"` branch,
+had `if current_phase in ("priv_esc", "recon"): return phase_budget_exhausted`
+with reason "no services discovered" — applied to **any** recon→done stop,
+without checking whether a service exists or whether a budget counter actually
+reached its cap. The budget code was **not** at fault: `global_planner`'s
+recon-exhaustion return (line 251) requires `budget_remaining(recon)==0 AND
+"service" not in node_types_seen`, which never fired here (service present,
+budget ≠ 0).
+
+**Fix.** `evaluate_termination` gained two params (`service_discovered: bool =
+False`, `credential_hypothesis_available: bool = True`), and the recon branch now
+splits: **no service → genuine recon budget exhaustion → `phase_budget_exhausted`
+"no services discovered"** (unchanged); **service present → the stop is a gated
+next phase, not a budget limit → `no_actionable_task`** with an honest reason
+("service(s) discovered but no credential hypothesis available … — the credential
+phase is gated"). `priv_esc → done` stays `phase_budget_exhausted` (a genuine
+last-ladder budget exhaustion, §12C). `service_discovered` **defaults False** so
+every other caller/test keeps the prior label; `continuation_node.reflect_or_continue`
+(the one real caller) now passes `service_discovered=("service" in
+node_types_seen)` and `credential_hypothesis_available=credential_hyp_available`,
+both already computed there. `is_success_outcome` is unchanged
+(`no_actionable_task` stays non-success, exit 1); precedence is unchanged (an
+actual `max_turns` hit still wins).
+
+**Tests (through the real path).** `tests/apex_host/test_phase12c_outcomes.py`:
+`TestEvaluateTerminationPrecedence` (recon+service+no-hypothesis →
+`no_actionable_task`, reason has no "no services discovered"; recon+no-service and
+the defaulted path still `phase_budget_exhausted`; `max_turns` still wins) and a
+`TestContinuationNodeIntegration` test driving the **real** `reflect_or_continue`
+with `current_phase="recon"` + a service in the graph (a full-graph run wouldn't
+reproduce it — `global_plan` advances past a *pre-seeded* service before
+termination). Release-gate scenario `recon_service_no_credentials_honest_outcome`
+(§28.14) uses a fake nmap-FTP backend so recon **discovers** the service during
+the recon turn, then asserts the honest `no_actionable_task`. Both the tests and
+the scenario **fail** against the old logic (verified by reverting the fix).
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

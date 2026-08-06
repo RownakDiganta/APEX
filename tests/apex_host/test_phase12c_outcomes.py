@@ -278,6 +278,51 @@ class TestEvaluateTerminationPrecedence:
         assert decision.outcome is EngagementOutcome.no_actionable_task
         assert decision.success is False
 
+    def test_recon_done_with_service_but_no_cred_hypothesis_is_no_actionable(self) -> None:
+        # §28.14 — the demonstrated Fawn/FTP bug: recon found a service but the
+        # credential phase is gated (no hypothesis). This is NOT a budget limit —
+        # it must NOT be phase_budget_exhausted, and the reason must NOT falsely
+        # claim "no services discovered".
+        decision = evaluate_termination(
+            max_turns=20, turn_count=1, objective_verified=False,
+            next_phase="done", current_phase="recon", stall=_no_stall(),
+            service_discovered=True, credential_hypothesis_available=False,
+        )
+        assert decision.outcome is EngagementOutcome.no_actionable_task
+        assert decision.success is False
+        assert exit_code_for(decision.outcome) == 1
+        assert "no services discovered" not in decision.reason
+        assert "credential hypothesis" in decision.reason
+
+    def test_recon_done_no_service_is_still_phase_budget_exhausted(self) -> None:
+        # A GENUINE recon budget exhaustion (no service ever discovered) keeps
+        # phase_budget_exhausted — don't over-correct.
+        decision = evaluate_termination(
+            max_turns=20, turn_count=6, objective_verified=False,
+            next_phase="done", current_phase="recon", stall=_no_stall(),
+            service_discovered=False,
+        )
+        assert decision.outcome is EngagementOutcome.phase_budget_exhausted
+        assert "no services discovered" in decision.reason
+
+    def test_recon_done_default_service_flag_is_back_compatible(self) -> None:
+        # Callers that do not report service presence keep the prior label.
+        decision = evaluate_termination(
+            max_turns=20, turn_count=3, objective_verified=False,
+            next_phase="done", current_phase="recon", stall=_no_stall(),
+        )
+        assert decision.outcome is EngagementOutcome.phase_budget_exhausted
+
+    def test_max_turns_still_wins_over_service_present_recon_done(self) -> None:
+        # An actual turn-cap hit still reports max_turns_exhausted even with a
+        # service present (precedence unchanged).
+        decision = evaluate_termination(
+            max_turns=20, turn_count=20, objective_verified=False,
+            next_phase="done", current_phase="recon", stall=_no_stall(),
+            service_discovered=True, credential_hypothesis_available=False,
+        )
+        assert decision.outcome is EngagementOutcome.max_turns_exhausted
+
     def test_evaluator_never_emits_goal_completed(self) -> None:
         for phase in ("web", "credential", "objective"):
             decision = evaluate_termination(
@@ -928,6 +973,44 @@ class TestContinuationNodeIntegration:
         all_episodes = await api._episodic.all()
         terminal_entries = [e for e in all_episodes if e.action == "engagement_terminated"]
         assert len(terminal_entries) == 1
+
+    async def test_recon_service_no_credentials_is_honest_no_actionable_task(self) -> None:
+        """§28.14 — the Fawn/FTP bug through the REAL reflect_or_continue node:
+        the engagement is IN the recon phase (current_phase="recon") when recon
+        has discovered an FTP service but no credential hypothesis exists, so the
+        next-phase peek returns "done". This is the exact state that mislabeled
+        the stop `phase_budget_exhausted` with a false "no services discovered"
+        reason. Driving the real continuation node (not the full graph, whose
+        global_plan would advance past recon before termination given a
+        pre-seeded service) reproduces the buggy branch faithfully — it fails
+        against the old logic and passes with the §28.14 fix."""
+        from apex_host.orchestration.continuation_node import make_continuation_node
+
+        api = _make_api()
+        target = "10.129.44.139"
+        host_id = f"host:{target}"
+        await _seed_node(api, host_id, "host", {"ip": target})
+        await _seed_node(api, f"service:{target}:21/tcp", "service",
+                         {"port": "21", "proto": "tcp", "state": "open", "service": "ftp"})
+        await _seed_edge(api, host_id, f"service:{target}:21/tcp")
+
+        config = _make_config(target=target, max_turns=20)  # NO username/password
+        registry = ToolRegistry.from_config(config)
+        deps = _build_deps(api, config, registry)
+        node = make_continuation_node(deps)
+        state = _make_initial_state(target=target, phase="recon")
+        state["turn_count"] = 1  # nowhere near the 20-turn cap
+
+        result = await node(state)
+
+        assert result["completed"] is True
+        # The core fix: honest label, never phase_budget_exhausted, never success.
+        assert result["outcome"] == EngagementOutcome.no_actionable_task.value
+        assert result["outcome"] != EngagementOutcome.phase_budget_exhausted.value
+        assert exit_code_for(EngagementOutcome(result["outcome"])) == 1
+        # Reason text is truthful — a service WAS discovered.
+        assert "no services discovered" not in result["termination_reason"]
+        assert "credential hypothesis" in result["termination_reason"]
 
     async def test_web_phase_no_evidence_never_reports_goal_completed(self) -> None:
         """§28.9 — a web phase that discovered nothing useful (a fetched but

@@ -2350,6 +2350,17 @@ fabricating evidence for a later, capability-dependent phase. `web` and
 either phase's own budget is checked, the prerequisite evidence for being
 in that phase already exists for real.
 
+**Honest label when a service WAS found but the next phase is gated
+(§28.14):** `phase_budget_exhausted` is reserved for an *actual* budget/turn
+limit. When recon discovered a service but the next phase can't run for a
+missing prerequisite (e.g. an FTP-only target with no credential hypothesis,
+so the credential phase is gated), the engagement now stops with the honest
+`no_actionable_task` and a truthful reason ("service(s) discovered but no
+credential hypothesis available — the credential phase is gated") — **not** a
+false `phase_budget_exhausted` / "no services discovered". This is a
+label/reason correction only: the run still stops where it stops, stays a
+non-success (exit 1), and no budget accounting or phase-gate behavior changed.
+
 A successful **`curl` HTTP fetch** is genuine service evidence: a real HTTP
 response (a parsed status line, or a returned HTML body) records an HTTP
 `service` node (port 80/443 or the URL's explicit port, full provenance) in

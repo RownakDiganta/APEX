@@ -258,6 +258,8 @@ def evaluate_termination(
     current_phase: str,
     stall: "StallDecision",
     web_evidence_complete: bool | None = None,
+    service_discovered: bool = False,
+    credential_hypothesis_available: bool = True,
 ) -> TerminationDecision:
     """Pure termination evaluator — precedence levels 1 and 3-5 (see module
     docstring; level 2, upstream-preset outcomes, is handled by the caller
@@ -306,15 +308,46 @@ def evaluate_termination(
         # goal_completed/"without validated access" text, which would be
         # actively misleading here (the engagement got no evidence at
         # all, not merely no *validated access*).
-        if current_phase in ("priv_esc", "recon"):
-            reason = (
-                "no services discovered — recon exhausted its turn budget with no service evidence"
-                if current_phase == "recon"
-                else f"phase {current_phase!r} exhausted its turn budget with no further useful phase to advance to"
+        # recon reaching "done" has TWO distinct causes that must NOT share a
+        # label (§28.14): (1) a GENUINE recon budget exhaustion — global_planner
+        # returns done from recon ONLY when budget_remaining(recon)==0 AND
+        # "service" not in node_types_seen — which is a real budget limit; or
+        # (2) a service WAS discovered but the next phase is gated for a missing
+        # prerequisite (§26 — e.g. no credential hypothesis), so _select_phase
+        # returns done with NO budget hit. Case (2) mislabeled as
+        # phase_budget_exhausted (with a false "no services discovered" reason)
+        # was the demonstrated Fawn/FTP bug. `service_discovered` distinguishes
+        # them; it defaults False so a caller that does not report it keeps the
+        # pre-existing recon-budget-exhaustion label.
+        if current_phase == "recon":
+            if not service_discovered:
+                return TerminationDecision(
+                    terminate=True, outcome=EngagementOutcome.phase_budget_exhausted, success=False,
+                    reason="no services discovered — recon exhausted its turn budget with no service evidence",
+                    phase=current_phase, turn=turn_count,
+                )
+            # A service exists → recon did NOT exhaust its budget; the engagement
+            # reached done because the next phase is gated. Honest, non-budget
+            # outcome (never fabricates success; stays a non-success, exit 1).
+            if not credential_hypothesis_available:
+                reason = (
+                    "service(s) discovered but no credential hypothesis available "
+                    "(no operator credentials, discovered credentials, or auth-bypass "
+                    "opportunity) — the credential phase is gated"
+                )
+            else:
+                reason = "no actionable next step remained and the configured objective was not verified"
+            return TerminationDecision(
+                terminate=True, outcome=EngagementOutcome.no_actionable_task, success=False,
+                reason=reason, phase=current_phase, turn=turn_count,
             )
+        # priv_esc reaching "done" IS a genuine phase-budget exhaustion — it is
+        # the last ladder phase with nothing further to force-advance into (§12C).
+        if current_phase == "priv_esc":
             return TerminationDecision(
                 terminate=True, outcome=EngagementOutcome.phase_budget_exhausted, success=False,
-                reason=reason, phase=current_phase, turn=turn_count,
+                reason="phase 'priv_esc' exhausted its turn budget with no further useful phase to advance to",
+                phase=current_phase, turn=turn_count,
             )
         # Any OTHER phase (web / credential / objective) reaching "done" before
         # max_turns, with the objective NOT verified, means nothing further is
