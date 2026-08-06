@@ -218,10 +218,32 @@ class TestExecuteFtpValidateDirect:
 # §28.17 — POST /v1/ftp-read (bounded RETR of an approved flag file).
 # ---------------------------------------------------------------------------
 class _ReadFakeFTP(_FakeFTP):
+    """Faithful vsftpd anonymous-chroot double (§28.20): the flag file exists as
+    a BARE basename in the root landing dir. Only the root dir exists (a CWD to
+    any other dir 550s, like a chroot), and RETR must be issued with a bare
+    basename after CWD — an absolute-path RETR (the old, broken form) 550s."""
+
     retr_content: bytes = b"HTB{synthetic-not-a-real-flag}\n"
+    #: Basenames present in the root dir. `_install_read` resets this.
+    root_files: tuple[str, ...] = ("user.txt", "flag.txt")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cwd_path = "/"
+
+    def cwd(self, dirname: str) -> str:
+        if (dirname or "/").rstrip("/") in ("", "/"):
+            self.cwd_path = "/"
+            return "250 Directory changed to /"
+        raise ftplib.error_perm("550 Failed to change directory.")
 
     def retrbinary(self, cmd: str, cb: Any, blocksize: int = 8192) -> str:
         assert cmd.startswith("RETR ")
+        name = cmd.split("RETR ", 1)[1].strip()
+        # A bare basename in the (chroot) root resolves; an absolute path
+        # (`/flag.txt`) or a wrong basename does not.
+        if "/" in name or self.cwd_path != "/" or name not in type(self).root_files:
+            raise ftplib.error_perm("550 Failed to open file.")
         cb(type(self).retr_content)
         return "226"
 
@@ -230,6 +252,7 @@ def _install_read(monkeypatch: pytest.MonkeyPatch, *, connect_raises: Exception 
     _ReadFakeFTP.connect_raises = connect_raises
     _ReadFakeFTP.login_raises = None
     _ReadFakeFTP.retr_content = b"HTB{synthetic-not-a-real-flag}\n"
+    _ReadFakeFTP.root_files = ("user.txt", "flag.txt")
     monkeypatch.setattr(ftplib, "FTP", _ReadFakeFTP)
 
 
@@ -263,6 +286,30 @@ class TestFtpReadEndpoint:
         assert r.status_code == 200
         j = r.json()
         assert j["ok"] is True and "HTB{synthetic-not-a-real-flag}" in j["output"]
+
+    async def test_flag_read_uses_cwd_basename_form_not_absolute(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # §28.20 — the flag exists ONLY as a bare basename in the (chroot) root;
+        # the fake 550s an absolute-path RETR. A successful read here proves the
+        # server issues CWD /<dir> + RETR <basename>, not `RETR /flag.txt`.
+        # (This test FAILS if the server reverts to the absolute RETR form.)
+        _install_read(monkeypatch)
+        _ReadFakeFTP.root_files = ("flag.txt",)  # flag present only at the root
+        async with client_for(create_app(_settings())) as client:
+            r = await client.post("/v1/ftp-read", headers=auth_headers(), json=_read_body(path="/flag.txt"))
+        assert r.status_code == 200 and r.json()["ok"] is True
+
+    async def test_wrong_directory_component_is_clean_file_not_found(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # §28.20 — an allowlisted basename under a directory that does not exist
+        # in the chroot (the CWD 550s) is a clean file_not_found, not a crash.
+        _install_read(monkeypatch)
+        async with client_for(create_app(_settings())) as client:
+            r = await client.post(
+                "/v1/ftp-read", headers=auth_headers(), json=_read_body(path="/home/anonymous/flag.txt"),
+            )
+        j = r.json()
+        assert r.status_code == 200 and j["ok"] is False and j["error_code"] == "file_not_found"
 
     async def test_off_basename_path_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install_read(monkeypatch)

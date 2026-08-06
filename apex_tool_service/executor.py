@@ -530,8 +530,27 @@ def _ftp_read_sync(
                 return
             chunks.append(block)
 
+        # §28.20 — issue the RETR as CWD <dirname> + RETR <basename>, NOT
+        # `RETR <absolute-path>`. A leading-slash absolute path (e.g.
+        # `RETR /flag.txt`) does not resolve inside a vsftpd anonymous chroot,
+        # where the flag is served as the bare basename in the login directory;
+        # the demonstrated live 550 ("file does not exist or is not readable")
+        # was exactly this. CWD to the path's directory (the chroot root for
+        # `/flag.txt`) then RETR the basename — the form that resolves inside a
+        # chroot, and equivalent to the old absolute RETR on a non-chroot
+        # server. The caller already basename-allowlist-validated the full path
+        # (validate_bounded_path); this is still ONE bounded retrieve.
+        directory, _, basename = path.rpartition("/")
+        directory = directory or "/"  # a leading-slash path splits to ("", basename)
         try:
-            ftp.retrbinary(f"RETR {path}", _sink, blocksize=min(8192, max_output_bytes + 1))
+            ftp.cwd(directory)
+        except (ftplib.error_perm, ftplib.error_temp):
+            # The directory does not exist / is not reachable inside the chroot
+            # — the file is not readable there. Same clean outcome as a RETR miss.
+            return FtpReadResult(ok=False, error_code="file_not_found",
+                                 duration_seconds=time.monotonic() - start)
+        try:
+            ftp.retrbinary(f"RETR {basename}", _sink, blocksize=min(8192, max_output_bytes + 1))
         except ftplib.error_perm:
             return FtpReadResult(ok=False, error_code="file_not_found",
                                  duration_seconds=time.monotonic() - start)

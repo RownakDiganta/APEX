@@ -696,7 +696,10 @@ candidate rather than dedup-stalling on the first (§28.18). The
 tool-service enforces its own independent basename allowlist
 (`allowed_flag_basenames`) that must stay a superset of the client's
 requestable basenames — both default to `user.txt,flag.txt` and must be
-kept in sync (§28.19). Full design:
+kept in sync (§28.19). The bounded RETR is issued as `CWD <dir>` +
+`RETR <basename>` (not an absolute `RETR /flag.txt`) so it resolves inside
+a vsftpd anonymous chroot, where the flag is served as a bare basename in
+the login directory (§28.20). Full design:
 [`docs/user-flag-objective.md`](docs/user-flag-objective.md).
 
 **Access-capability abstraction (Phase 18B):** the objective's access

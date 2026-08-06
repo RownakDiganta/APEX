@@ -10549,15 +10549,16 @@ in-process) — it **fails** against the old in-process routing (verified).
 reachability gap; routing them through equivalent bounded tool-service
 operations is a documented follow-on (not in this change).
 
-> **Follow-on (§28.18, §28.19):** the FTP flag-read capability derived/registered/
-> routed correctly but still verified nothing live — first because the default
-> candidate paths never reached the FTP-root `/flag.txt` (and distinct candidate
-> reads shared one action fingerprint → duplicate-stall before the root path was
-> tried; fixed in §28.18), then because the tool-service's OWN
+> **Follow-on (§28.18, §28.19, §28.20):** the FTP flag-read capability derived/
+> registered/routed correctly but still verified nothing live, across three
+> layered causes — (§28.18) the default candidate paths never reached the FTP-root
+> `/flag.txt` (and distinct candidate reads shared one action fingerprint →
+> duplicate-stall before the root path was tried); (§28.19) the tool-service's OWN
 > `allowed_flag_basenames` (a second, server-side allowlist) still 400-rejected
-> `flag.txt` (fixed in §28.19 — the client and server basename lists must stay in
-> sync). All are PATH/fingerprint/allowlist-sync fixes; no capability-type
-> branching, `verify_user_flag` unchanged.
+> `flag.txt`; (§28.20) the server issued the RETR as an absolute `RETR /flag.txt`,
+> which a vsftpd anonymous chroot rejects — it must be `CWD /` + `RETR flag.txt`.
+> All are PATH/fingerprint/allowlist-sync/RETR-form fixes; no capability-type
+> branching, `verify_user_flag` unchanged, server allowlist + bounds unchanged.
 
 ### 28.17 FTP flag-read capability — closing the objective→flag-read loop for FTP
 
@@ -10743,6 +10744,55 @@ the REAL objective loop through the REAL in-process tool-service `/v1/ftp-read`
 reaching `user_flag_verified`; it **fails** against the pre-§28.19 server allowlist
 (`user.txt` only, which 400-rejects `flag.txt` before the RETR) — verified by
 reverting the server default.
+
+### 28.20 Bounded FTP RETR must use CWD + bare basename, not an absolute path (vsftpd anon chroot)
+
+> **Numbering note:** highest unique §28 heading is §28.19 (the trailing
+> `### 28.7`/`### 28.8` are the known pre-existing collision). This section is
+> **§28.20**; nothing was renumbered.
+
+After §28.19 the tool-service accepted the `flag.txt` request (no more HTTP 400),
+but a live run vs Fawn then failed with `the requested file does not exist or is
+not readable` (`file_not_found`, ×2). Auth/connection were fine (the earlier
+`ftp_access` listed `/`); only the RETR **path form** was wrong.
+`apex_tool_service.executor._ftp_read_sync` issued the validated absolute path
+verbatim — `f"RETR {path}"` → **`RETR /flag.txt`** (leading slash). On a vsftpd
+**anonymous chroot** the flag is served as the bare basename `flag.txt` in the
+login directory; a leading-slash absolute `RETR /flag.txt` does not resolve inside
+the chroot → 550 → `file_not_found`.
+
+**Fix (server-side, keeps the client contract + allowlist):** issue the bounded
+retrieve as **`CWD <dirname>` + `RETR <basename>`** rather than `RETR
+<absolute-path>`. `/flag.txt` → `CWD /`, `RETR flag.txt` (resolves); a candidate
+with a directory that does not exist in the chroot (`/home/anonymous/user.txt` →
+`CWD /home/anonymous` 550s) is a clean `file_not_found`, not a crash. This is the
+FTP idiom that resolves inside a chroot and is **equivalent** to the old absolute
+RETR on a non-chroot server (no regression). The same fix is mirrored in the
+in-process path `apex_host.runtime_registry._read_ftp_file_sync` (local backend /
+tests). Both keep it ONE bounded retrieve (one CWD + one RETR), passive, close.
+
+**Client unchanged.** The client keeps sending **absolute** candidate paths (§28.18
+`is_bounded_candidate_path` still requires a leading `/`; the policy gate and the
+server basename allowlist are unchanged) — the server translates the validated
+absolute path into `CWD dirname` + `RETR basename`. `verify_user_flag` is
+unchanged; the flag value is still never logged/stored raw (SHA-256 only); the
+server-side basename allowlist and the traversal/oversized guards are unchanged;
+`memfabric` is untouched; apex stays off the VPN.
+
+**Tests** (fakes only, real routing): the `/v1/ftp-read` endpoint fakes
+(`tests/apex_tool_service/test_ftp_validate.py::_ReadFakeFTP`,
+`tests/apex_host/test_ftp_flag_read.py::_ServerFakeFTP`,
+`apex_host.eval.release_gate._FlagRetrFtp`) are now **faithful vsftpd anon-chroot
+doubles**: the flag is a bare basename in the root, served ONLY via `CWD /` +
+`RETR <basename>`; an absolute-path `RETR /flag.txt` or a CWD to a non-root
+directory 550s. New endpoint tests: a flag present only as a bare basename is
+read successfully (proving the CWD+basename form — **fails** if the server reverts
+to the absolute RETR), and an allowlisted basename under a non-existent chroot
+directory is a clean `file_not_found`. The release-gate scenario
+`ftp_flag_read_via_tool_service` (§28.19, now §28.20-faithful) drives the REAL
+objective loop through the REAL `/v1/ftp-read` against a fake that serves the flag
+ONLY via `CWD /` + `RETR flag.txt`; it **fails** against the old absolute
+`RETR /path` form (verified by reverting the executor) and passes after.
 
 ### 28.7 Release gate
 

@@ -2048,12 +2048,16 @@ async def scenario_ftp_validation_via_tool_service() -> ScenarioResult:
 
 
 class _FlagRetrFtp:
-    """Server-side ftplib.FTP double for the tool-service: RETRs the synthetic
-    flag for ``/flag.txt`` (an empty miss for any other path). No network I/O."""
+    """Server-side ftplib.FTP double for the tool-service, faithful to a vsftpd
+    anonymous chroot (§28.20): the flag exists as the BARE basename ``flag.txt``
+    in the root landing dir. It is served ONLY via ``CWD /`` + ``RETR flag.txt``
+    — a CWD to any non-root dir 550s (chroot), and an absolute-path
+    ``RETR /flag.txt`` 550s. No network I/O."""
 
     def __init__(self) -> None:
         self.encoding = "utf-8"
         self.sock: _FawnLiveSock | None = _FawnLiveSock()
+        self.cwd_path = "/"
 
     def connect(self, host: str = "", port: int = 0, timeout: float = -1,
                 source_address: object = None) -> str:
@@ -2064,13 +2068,23 @@ class _FlagRetrFtp:
     def login(self, user: str = "", passwd: str = "", acct: str = "") -> str:
         return "230 Login successful."
 
+    def cwd(self, dirname: str) -> str:
+        import ftplib as _ftplib
+        if (dirname or "/").rstrip("/") in ("", "/"):
+            self.cwd_path = "/"
+            return "250 Directory changed to /"
+        raise _ftplib.error_perm("550 Failed to change directory.")
+
     def retrbinary(self, cmd: str, cb: Any, blocksize: int = 8192) -> str:
-        # Exact-path match (not substring) — the flag lives ONLY at the true FTP
-        # root "/flag.txt", never "/home/<user>/flag.txt".
-        path = cmd.split("RETR ", 1)[1].strip() if cmd.startswith("RETR ") else ""
-        if path == "/flag.txt":
+        import ftplib as _ftplib
+        name = cmd.split("RETR ", 1)[1].strip() if cmd.startswith("RETR ") else ""
+        # The flag resolves only as the bare basename "flag.txt" at the root.
+        if name == "flag.txt" and self.cwd_path == "/":
             cb((_FLAG_VALUE + "\n").encode())
-        return "226 Transfer complete."
+            return "226 Transfer complete."
+        if "/" in name or self.cwd_path != "/":
+            raise _ftplib.error_perm("550 Failed to open file.")
+        return "226 Transfer complete."  # allowlisted basename, but a miss (empty)
 
     def quit(self) -> str:
         self.sock.sendall(b"QUIT\r\n")  # type: ignore[union-attr]

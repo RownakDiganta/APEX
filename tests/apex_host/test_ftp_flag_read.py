@@ -167,17 +167,30 @@ class _LiveSock:
 
 
 class _ServerFakeFTP:
+    """Faithful vsftpd anon-chroot double (§28.20): the flag is a bare basename in
+    the root; RETR must be issued as CWD /<dir> + RETR <basename> (an absolute-path
+    RETR, or a CWD to a non-root dir, 550s — like a chroot)."""
+
     def __init__(self) -> None:
         self.encoding = "utf-8"
         self.sock: _LiveSock | None = None
+        self.cwd_path = "/"
     def connect(self, host: str = "", port: int = 0, timeout: float = -1, source_address: object = None) -> str:
         self.sock = _LiveSock()
         return "220"
     def set_pasv(self, v: bool) -> None: ...
     def login(self, user: str = "", passwd: str = "", acct: str = "") -> str:
         return "230"
+    def cwd(self, dirname: str) -> str:
+        if (dirname or "/").rstrip("/") in ("", "/"):
+            self.cwd_path = "/"
+            return "250"
+        raise ftplib.error_perm("550 Failed to change directory.")
     def retrbinary(self, cmd: str, cb: Any, blocksize: int = 8192) -> str:
         assert cmd.startswith("RETR ")
+        name = cmd.split("RETR ", 1)[1].strip()
+        if "/" in name or self.cwd_path != "/":
+            raise ftplib.error_perm("550 Failed to open file.")
         cb((_FLAG + "\n").encode())
         return "226"
     def quit(self) -> str:

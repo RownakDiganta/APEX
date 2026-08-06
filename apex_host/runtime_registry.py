@@ -673,10 +673,19 @@ def _read_ftp_file_sync(
                 return
             chunks.append(block)
 
+        # §28.20 — CWD <dirname> + RETR <basename>, NOT `RETR <absolute-path>`
+        # (a leading-slash absolute path does not resolve inside a vsftpd
+        # anonymous chroot). Mirrors the tool-service fix in
+        # apex_tool_service/executor.py; equivalent to the old absolute RETR on
+        # a non-chroot server. Still ONE bounded retrieve of an allowlisted
+        # basename (the caller validated the path).
+        directory, _, basename = path.rpartition("/")
+        directory = directory or "/"
         try:
-            ftp.retrbinary(f"RETR {path}", _sink, blocksize=min(8192, max_bytes + 1))
+            ftp.cwd(directory)
+            ftp.retrbinary(f"RETR {basename}", _sink, blocksize=min(8192, max_bytes + 1))
         except (ftplib.Error, socket.timeout, EOFError, OSError) as exc:
-            # connected=True: the session reached the server; a bad path is a
+            # connected=True: the session reached the server; a bad path/dir is a
             # read failure, not a connection failure.
             return True, "", f"ftp retr failed: {type(exc).__name__}", False
         if oversized["v"]:
