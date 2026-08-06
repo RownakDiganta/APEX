@@ -418,16 +418,23 @@ class ApexConfig:
     objective_type: str = "user_flag"
     # Small, documented, overrideable list of generic HTB user-flag filename
     # candidates. Never a machine-specific value (CLAUDE.md §13.8/§13.9).
-    user_flag_candidate_filenames: list[str] = field(default_factory=lambda: ["user.txt"])
+    # Generic HTB user-flag filename candidates (never a machine-specific value,
+    # CLAUDE.md §13.8/§13.9). "flag.txt" (§28.18) covers FTP-root / non-home
+    # placements (e.g. an anonymous-FTP root at "/") in addition to "user.txt".
+    user_flag_candidate_filenames: list[str] = field(default_factory=lambda: ["user.txt", "flag.txt"])
     # Bounded candidate root templates. "{username}" is substituted with the
-    # already-authenticated SSH username (validated against a conservative
+    # already-authenticated username (validated against a conservative
     # POSIX-username charset before substitution — see
     # apex_host/planners/objective_planner.py); a root containing
     # "{username}" is skipped defensively if the username fails that check.
-    user_flag_candidate_roots: list[str] = field(default_factory=lambda: ["/home/{username}"])
+    # "/" (§28.18) is the filesystem root — the common location for an
+    # anonymous-FTP flag (Fawn: "/flag.txt") and other non-home placements.
+    user_flag_candidate_roots: list[str] = field(default_factory=lambda: ["/home/{username}", "/"])
     # Hard cap on distinct candidate paths attempted per engagement — bounds
     # the discovery surface; never an unrestricted recursive filesystem search.
-    max_user_flag_attempts: int = 3
+    # 6 (§28.18) admits the {home×{user,flag}, root×{user,flag}} generic set so
+    # a root-level "/flag.txt" is reachable; still tightly bounded per engagement.
+    max_user_flag_attempts: int = 6
     # Per-read output cap in bytes — the verifier also independently rejects
     # oversized/multiline/malformed content regardless of this cap.
     user_flag_max_output_bytes: int = 4096
@@ -734,7 +741,7 @@ class ApexConfig:
             # Phase 18 — user-flag objective configuration. Never a CLI
             # option accepts an expected plaintext flag value.
             "objective_type": _g("objective_type", "user_flag"),
-            "max_user_flag_attempts": _g("max_user_flag_attempts", 3),
+            "max_user_flag_attempts": _g("max_user_flag_attempts", 6),
             "user_flag_max_output_bytes": _g("user_flag_max_output_bytes", 4096),
             "user_flag_verification_regex": _g("user_flag_verification_regex", None),
             "user_flag_read_timeout_seconds": _g("user_flag_read_timeout_seconds", 35.0),

@@ -116,8 +116,8 @@ class _ObjectiveDeterministic:
         self._target = target
         self._registry = registry
         self._objective_type = objective_type
-        self._filenames = list(candidate_filenames or ["user.txt"])
-        self._roots = list(candidate_roots or ["/home/{username}"])
+        self._filenames = list(candidate_filenames or ["user.txt", "flag.txt"])
+        self._roots = list(candidate_roots or ["/home/{username}", "/"])
         self._max_attempts = max(1, max_attempts)
         self._format_regex = format_regex
         self._max_output_bytes = max_output_bytes
@@ -130,11 +130,21 @@ class _ObjectiveDeterministic:
                 # Unsafe/unmatched principal — skip this templated root
                 # defensively rather than building an unvalidated path.
                 continue
-            resolved_root = (root.format(username=safe_principal) if safe_principal else root).rstrip("/")
-            if not resolved_root:
-                continue
+            raw_root = root.format(username=safe_principal) if safe_principal else root
+            # A "/" root is the filesystem root (§28.18) — the common location
+            # of an anonymous-FTP flag ("/flag.txt"). ".rstrip('/')" collapses
+            # it to "" so it must be handled explicitly (an empty non-"/" root
+            # is still skipped as before). A non-root gets its trailing slashes
+            # trimmed and a "/" separator; the root prefixes filenames directly.
+            if raw_root == "/":
+                prefix = "/"
+            else:
+                resolved_root = raw_root.rstrip("/")
+                if not resolved_root:
+                    continue
+                prefix = f"{resolved_root}/"
             for filename in self._filenames:
-                path = f"{resolved_root}/{filename}"
+                path = f"{prefix}{filename}"
                 if path not in candidates:
                     candidates.append(path)
                 if len(candidates) >= self._max_attempts:

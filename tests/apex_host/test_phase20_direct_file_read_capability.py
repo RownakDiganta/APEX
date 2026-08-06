@@ -1039,7 +1039,13 @@ class TestPlanner:
         })
         await _seed_edge(api, h_id, obj_id, edge_type="indicates")
         subgraph = await _subgraph(api, _TARGET)
-        core = _ObjectiveDeterministic(_TARGET, ToolRegistry.from_config(ApexConfig(target=_TARGET)))
+        # Pin one candidate path so the SSH capability is exhausted after its
+        # single attempted pair, isolating the cross-capability retry logic
+        # from the §28.18 default candidate-set size.
+        core = _ObjectiveDeterministic(
+            _TARGET, ToolRegistry.from_config(ApexConfig(target=_TARGET)),
+            candidate_filenames=["user.txt"], candidate_roots=["/home/{username}"], max_attempts=1,
+        )
         result = await core.plan(_goal(_TARGET), subgraph, _empty_evidence())
         assert isinstance(result, list), "DFR retry of the SSH-attempted path must still be offered"
         assert result[0].params["capability_id"] == dfr_cap_id
@@ -1049,7 +1055,13 @@ class TestPlanner:
         api = _make_api()
         dfr_cap_id = await _seed_validated_dfr_capability(api, _TARGET, principal="application")
         subgraph = await _subgraph(api, _TARGET)
-        core = _ObjectiveDeterministic(_TARGET, ToolRegistry.from_config(ApexConfig(target=_TARGET)))
+        # Pin a single candidate path so this test exercises the exhaustion
+        # LOGIC (attempting the whole candidate set == exhausted), independent
+        # of the §28.18 default candidate-set size.
+        core = _ObjectiveDeterministic(
+            _TARGET, ToolRegistry.from_config(ApexConfig(target=_TARGET)),
+            candidate_filenames=["user.txt"], candidate_roots=["/home/{username}"], max_attempts=1,
+        )
         prospective = {(dfr_cap_id, "/home/application/user.txt")}
         assert core._is_globally_exhausted(subgraph, prospective) is True
 

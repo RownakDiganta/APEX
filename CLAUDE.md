@@ -10549,6 +10549,12 @@ in-process) — it **fails** against the old in-process routing (verified).
 reachability gap; routing them through equivalent bounded tool-service
 operations is a documented follow-on (not in this change).
 
+> **Follow-on (§28.18):** the FTP flag-read capability derived/registered/routed
+> correctly but still verified nothing live, because the default candidate paths
+> never reached the FTP-root `/flag.txt` (and distinct candidate reads shared one
+> action fingerprint → duplicate-stall before the root path was tried). Both are
+> fixed in §28.18 below — a PATH + fingerprint fix, no capability-type branching.
+
 ### 28.17 FTP flag-read capability — closing the objective→flag-read loop for FTP
 
 > **Numbering note:** highest unique §28 heading is §28.16 (the trailing
@@ -10612,6 +10618,74 @@ release-gate scenario `ftp_flag_read` drives the **real** derivation → discove
 → objective → verify path (validated FTP access → objective `user_flag_verified`,
 raw flag absent from the graph); it **fails** against the old code (0 FTP
 capabilities derived — verified by reverting the provider/derive).
+
+### 28.18 User-flag candidate paths reach the FTP root; distinct reads are distinct actions
+
+> **Numbering note:** highest unique §28 heading is §28.17 (the trailing
+> `### 28.7`/`### 28.8` are the known pre-existing collision). This section is
+> **§28.18**; nothing was renumbered.
+
+The §28.17 FTP flag-read capability derived, registered, and routed correctly,
+but a live run vs Fawn still verified **nothing**: the objective attempted a read
+and failed with empty output. **Diagnosed to PATH, not routing or threading**
+(§28.17 routing was correct — the empty `backend=` on `user_flag_verify` is a red
+herring: `dispatcher._run_user_flag_verify` never sets a `backend` key at all,
+unlike `_run_command`; FTP transport shows in `read_method`. Threading was correct
+— `UserFlagExecutor` passes a connected read's bytes straight to
+`verify_user_flag`). **Root cause:** the default candidate set was
+`user_flag_candidate_roots (["/home/{username}"]) × user_flag_candidate_filenames
+(["user.txt"])`, so for the `anonymous` principal the ONLY candidate was
+`/home/anonymous/user.txt`. Fawn's flag is `/flag.txt` at the anonymous FTP root
+— the RETR of `/home/anonymous/user.txt` missed → empty → nothing to verify.
+Compounding, `_candidate_paths` could not even *construct* `/flag.txt`: a `/` root
+collapsed to `"".rstrip("/")` and was skipped, and `flag.txt` was not a default
+filename.
+
+**PATH fix (generic HTB names, never a machine-specific hardcode; no
+capability-type branching → §18B contract preserved; `verify_user_flag`
+unchanged):**
+
+- `ApexConfig` defaults broadened: `user_flag_candidate_filenames = ["user.txt",
+  "flag.txt"]`, `user_flag_candidate_roots = ["/home/{username}", "/"]`,
+  `max_user_flag_attempts` 3 → **6** (field default AND the `from_cli_args`
+  fallback — P9-I01). The generated set for a principal is now the
+  `{home, root} × {user.txt, flag.txt}` product (4 absolute candidates; `/flag.txt`
+  reachable), still tightly bounded per engagement.
+- `apex_host/planners/objective_planner.py::_candidate_paths` now handles a `/`
+  (filesystem-root) template so it yields `/flag.txt`, `/user.txt` — previously
+  impossible. Every candidate remains **absolute** and basename-allowlisted, so
+  `is_bounded_candidate_path`/the policy gate are unchanged.
+
+**Fingerprint fix (the second, load-bearing half — without it the PATH fix cannot
+work end-to-end).** A `user_flag_verify` task encodes its action identity in
+`params["candidate_path"]`, NOT in `args` (empty for this param-driven executor
+task). `apex_host.planning.fingerprint.task_fingerprint` hashes `args`, so every
+distinct candidate read produced the SAME fingerprint — the §27 duplicate/stall
+gate treated reading `/flag.txt` as a *repeat* of reading
+`/home/anonymous/user.txt` and terminated the objective with a
+`duplicate_task_stall` after 3 turns, **before candidate #4 (`/flag.txt`) was ever
+tried**. This broke the objective in the real compiled graph even though the
+direct planner loop worked. Fix: `apex_host/execution/dispatcher.py` folds
+`candidate_path` into the fingerprint's args for `user_flag_verify` tasks — a
+distinct candidate path is a distinct action; the SAME path re-read is still
+correctly a duplicate. No other tool's fingerprint changes.
+
+**Tests (fakes only, real routing):**
+`tests/apex_host/test_ftp_flag_read.py::TestCandidatePathsReachFtpRoot` (config
+defaults include `flag.txt`/`/`/cap≥4; `_candidate_paths` produces the absolute
+`/flag.txt`; an unsafe username still yields only the root candidates; the REAL
+default-config `ObjectivePlanner` reaches `/flag.txt` across candidate turns).
+`tests/apex_host/test_phase12a_state_machine.py::…priv_esc_agent_actually_dispatched`
+is the full-compiled-graph guard for the fingerprint fix — with 4 default
+candidates it only reaches `priv_esc` (after the objective exhausts) if distinct
+reads are NOT dedup-suppressed. Three pair-scoped exhaustion / cross-capability
+tests in `test_phase20`/`test_phase21` were pinned to an explicit single-candidate
+set (their real intent — the exhaustion/blocking LOGIC, not the default
+candidate-set size). Release-gate scenario `ftp_root_flag_path` (§28.18) drives
+the REAL `ObjectivePlanner` turn loop against a path-sensitive fake FTP adapter
+that RETRs the flag ONLY for `/flag.txt` (every other path a connected miss),
+proving the default candidate set reaches the FTP root; it **fails** against the
+pre-§28.18 candidate generation (which never produced `/flag.txt`).
 
 ### 28.7 Release gate
 

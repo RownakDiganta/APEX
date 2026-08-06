@@ -930,7 +930,13 @@ class TestPlanner:
         })
         await _seed_edge(api, h_id, obj_id, edge_type="indicates")
         subgraph = await _subgraph(api, _TARGET)
-        core = _ObjectiveDeterministic(_TARGET, ToolRegistry.from_config(ApexConfig(target=_TARGET)))
+        # Pin one candidate path so the SSH capability is exhausted after its
+        # single already-attempted pair — isolating the cross-capability
+        # blocking logic from the §28.18 default candidate-set size.
+        core = _ObjectiveDeterministic(
+            _TARGET, ToolRegistry.from_config(ApexConfig(target=_TARGET)),
+            candidate_filenames=["user.txt"], candidate_roots=["/home/{username}"], max_attempts=1,
+        )
         result = await core.plan(_goal(_TARGET), subgraph, _empty_evidence())
         assert isinstance(result, list), "command-capability retry of the SSH-attempted path must still be offered"
         assert result[0].params["capability_id"] == cmd_cap_id
@@ -961,7 +967,12 @@ class TestPlanner:
         })
         await _seed_edge(api, h_id, obj_id, edge_type="indicates")
         subgraph = await _subgraph(api, _TARGET)
-        core = _ObjectiveDeterministic(_TARGET, ToolRegistry.from_config(ApexConfig(target=_TARGET)))
+        # Pin one candidate path (see the SSH sibling test above) so the DFR
+        # capability exhausts after its single attempted pair.
+        core = _ObjectiveDeterministic(
+            _TARGET, ToolRegistry.from_config(ApexConfig(target=_TARGET)),
+            candidate_filenames=["user.txt"], candidate_roots=["/home/{username}"], max_attempts=1,
+        )
         result = await core.plan(_goal(_TARGET), subgraph, _empty_evidence())
         assert isinstance(result, list)
         assert result[0].params["capability_id"] == cmd_cap_id

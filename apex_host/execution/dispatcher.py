@@ -348,8 +348,22 @@ class TaskDispatcher:
         # apex_host.tools.backend.backend_capability_mode.
         executor_domain = str(task.params.get("executor_domain", phase))
         capability_mode = backend_capability_mode(self._config)
+        # §28.18 — a user_flag_verify task encodes its real action (which
+        # candidate path to read) in params["candidate_path"], NOT in args
+        # (which is empty for this param-driven executor task). Without folding
+        # it into the fingerprint, every distinct candidate read hashes
+        # identically and the duplicate/stall gate treats reading "/flag.txt"
+        # as a repeat of reading "/home/<user>/user.txt" — terminating the
+        # objective before later candidates (e.g. an FTP-root flag) are tried.
+        # A distinct candidate path is a distinct action; the SAME path re-read
+        # is still correctly a duplicate.
+        fp_args = list(args)
+        if tool == "user_flag_verify":
+            candidate = str(task.params.get("candidate_path", ""))
+            if candidate:
+                fp_args.append(candidate)
         fingerprint = task_fingerprint(
-            phase, tool, args, target, parser, executor_domain, capability_mode
+            phase, tool, fp_args, target, parser, executor_domain, capability_mode
         )
 
         ts = now()

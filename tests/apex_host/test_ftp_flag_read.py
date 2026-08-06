@@ -23,7 +23,7 @@ from apex_host.planners.objective_planner import _ObjectiveDeterministic
 from apex_host.runtime_registry import CapabilityRuntimeRegistry, FtpFileReadCapabilityAdapter
 from apex_host.tools.registry import ToolRegistry
 from apex_host.types import AccessCapabilityType
-from apex_host.verification.user_flag import verify_user_flag
+from apex_host.verification.user_flag import is_bounded_candidate_path, verify_user_flag
 from memfabric.api import MemoryAPI
 from memfabric.config import Config
 from memfabric.ids import now
@@ -205,6 +205,83 @@ def _remote_config() -> ApexConfig:
         tool_service_url="http://svc", tool_service_token=_TOKEN,
         user_flag_max_output_bytes=4096,
     )
+
+
+# ---------------------------------------------------------------------------
+# §28.18 — candidate paths reach the FTP root (/flag.txt), not only /home/*.
+# ---------------------------------------------------------------------------
+class TestCandidatePathsReachFtpRoot:
+    def test_config_defaults_include_flag_txt_and_root(self) -> None:
+        cfg = ApexConfig(target=_TARGET)
+        assert "flag.txt" in cfg.user_flag_candidate_filenames
+        assert "/" in cfg.user_flag_candidate_roots
+        assert cfg.max_user_flag_attempts >= 4  # enough to reach the root-level /flag.txt
+
+    def test_candidate_paths_produce_absolute_ftp_root_flag(self) -> None:
+        core = _ObjectiveDeterministic(
+            _TARGET, ToolRegistry.from_config(ApexConfig(target=_TARGET)),
+            candidate_filenames=["user.txt", "flag.txt"], candidate_roots=["/home/{username}", "/"],
+            max_attempts=6,
+        )
+        paths = core._candidate_paths("anonymous")
+        assert "/flag.txt" in paths  # the Fawn layout
+        assert "/user.txt" in paths
+        assert "/home/anonymous/user.txt" in paths
+        # every candidate is absolute and passes the bounded-path validator
+        allowed = frozenset(["user.txt", "flag.txt"])
+        for p in paths:
+            assert p.startswith("/")
+            assert is_bounded_candidate_path(p, allowed_filenames=allowed)
+
+    def test_root_only_candidate_when_username_unsafe(self) -> None:
+        # A principal that fails the POSIX-username check must not build a
+        # templated /home/{username} path, but the filesystem-root "/" candidates
+        # (which have no {username}) must still be produced.
+        core = _ObjectiveDeterministic(
+            _TARGET, ToolRegistry.from_config(ApexConfig(target=_TARGET)),
+            candidate_filenames=["flag.txt"], candidate_roots=["/home/{username}", "/"], max_attempts=6,
+        )
+        paths = core._candidate_paths("../evil")
+        assert paths == ["/flag.txt"]
+
+    async def test_default_config_planner_reaches_ftp_root_flag(self) -> None:
+        # End-to-end through the REAL default-config ObjectivePlanner: with a
+        # validated FTP capability, the planner (over turns) emits a
+        # candidate_path of "/flag.txt". Uses the same default candidate set a
+        # live engagement would.
+        api = _make_api()
+        cap_id = await _seed_validated_ftp_capability(api, _TARGET, principal="anonymous")
+        _ = cap_id
+        reg = CapabilityRuntimeRegistry()
+        config = ApexConfig(target=_TARGET, username_candidates=["anonymous"], password_candidates=["anonymous"])
+        from apex_host.planners.objective_planner import ObjectivePlanner
+        from apex_host.parsers.objective_parser import ObjectiveParser
+        from memfabric.types import AbandonSignal
+        planner = ObjectivePlanner(_TARGET, reg, config=config)
+        parser = ObjectiveParser()
+        goal = Goal(id="g", description="obj", phase="objective", anchor_node=host_id(_TARGET))
+        eb = EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[])
+        seen_paths: list[str] = []
+        for _ in range(8):
+            sub = await api.get_subgraph(host_id(_TARGET), depth=6)
+            plan = await planner.plan(goal, sub, eb)
+            if isinstance(plan, AbandonSignal) or not plan:
+                break
+            path = str(plan[0].params["candidate_path"])
+            seen_paths.append(path)
+            # Simulate a connected miss so the planner advances to the next
+            # candidate (the parser persists the attempted (cap, path) pair).
+            parsed = parser.parse_user_flag_result(
+                target=_TARGET, objective_type="user_flag", candidate_path=path,
+                connected=True, verified=False, value_digest="", redacted_value="",
+                verification_method="", capability_id=str(plan[0].params["capability_id"]),
+                capability_type="ftp_file_read", principal="anonymous",
+                attempted_paths=list(plan[0].params.get("attempted_paths", [])),
+                attempted_capability_paths=list(plan[0].params.get("attempted_capability_paths", [])),
+                is_last_candidate=bool(plan[0].params.get("is_last_candidate", False)),
+            )
+            await api.apply_deltas(nodes=parsed.node_deltas, edges=parsed.edge_deltas)
+        assert "/flag.txt" in seen_paths  # the planner reaches the FTP root
 
 
 class TestFtpAdapterReadsFlag:

@@ -179,11 +179,11 @@ class TestBugACredentialBudgetExhaustion:
         the objective phase itself concludes without success (Phase 18):
         seed a REAL ssh access_state plus operator credentials so
         ObjectivePlanner actually dispatches a bounded verification task
-        (never an AbandonSignal) — in dry-run mode that attempt always
-        fails to verify, and with only one default candidate path
-        (max_user_flag_attempts default x one filename) that single
-        failure immediately marks the objective 'failed', letting the very
-        next turn fall through to priv_esc."""
+        (never an AbandonSignal) — in dry-run mode every attempt always
+        fails to verify. The default candidate set is now the generic
+        {home,root}x{user.txt,flag.txt} product (§28.18, 4 candidates), so the
+        objective takes several turns to exhaust before it is marked 'failed';
+        max_turns is sized to leave a turn for priv_esc to run afterward."""
         api = make_api()
         await _seed_node(api, _ANCHOR, "host", {"ip": _TARGET})
         await _seed_node(
@@ -215,7 +215,7 @@ class TestBugACredentialBudgetExhaustion:
             await _seed_edge(api, _ANCHOR, to_id)
 
         config = ApexConfig(
-            target=_TARGET, dry_run=True, max_turns=6,
+            target=_TARGET, dry_run=True, max_turns=10,
             username_candidates=["testuser"], password_candidates=["testpass"],
         )
         registry = ToolRegistry.from_config(config)

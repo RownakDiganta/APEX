@@ -263,6 +263,100 @@ async def scenario_ftp_flag_read() -> ScenarioResult:
     )
 
 
+async def scenario_ftp_root_flag_path() -> ScenarioResult:
+    """§28.18 — the user flag lives at the FTP root ("/flag.txt"), NOT at
+    "/home/<user>/user.txt" (Fawn's anonymous-FTP layout). Drive the REAL
+    ``ObjectivePlanner`` turn loop against a path-sensitive fake FTP adapter that
+    RETRs the flag ONLY for "/flag.txt" (every other path returns a connected,
+    empty "no such file" read, exactly like a real RETR miss). Proves the default
+    candidate set now reaches the FTP root. FAILS against the pre-§28.18 candidate
+    generation, which only ever produced "/home/<user>/user.txt" and could not
+    even construct "/flag.txt" (a "/" root collapsed to "" and was skipped)."""
+    name = "ftp_root_flag_path"
+    from apex_host.agents.user_flag_executor import UserFlagExecutor
+    from apex_host.planners.objective_planner import ObjectivePlanner
+    from apex_host.tools.registry import ToolRegistry
+    from memfabric.types import AbandonSignal, EvidenceBundle, Goal
+
+    api = _make_api()
+    config = _config(username_candidates=["anonymous"], password_candidates=["anonymous"])
+    await _seed_node(api, _ANCHOR, "host", {"ip": _TARGET})
+    await _seed_node(
+        api, access_state_id(_TARGET, "anonymous", protocol="ftp"), "access_state",
+        {"level": "user", "username": "anonymous", "target": _TARGET, "service": "ftp"},
+    )
+    cap_id = access_capability_id(_TARGET, AccessCapabilityType.ftp_file_read.value, "anonymous")
+    # A real engagement has an already-persisted, runtime-available capability
+    # node by the time ObjectivePlanner selects it (dispatch_node flips
+    # runtime_available True after registration) — seed that end state.
+    await _seed_node(api, cap_id, "access_capability", {
+        "capability_type": "ftp_file_read", "host_id": _ANCHOR, "validated": True,
+        "principal": "anonymous", "confidence": 0.85, "runtime_available": True, "metadata": {},
+    })
+    await _seed_edge(api, _ANCHOR, cap_id)
+
+    class _RootOnlyFtp:
+        """Flag only at the FTP root; every other path is a connected miss."""
+
+        async def read_bounded_file(self, path: str) -> BoundedReadResult:
+            if path == "/flag.txt":
+                return BoundedReadResult(
+                    connected=True, output=_FLAG_VALUE + "\n", error=None, method="ftp_read",
+                )
+            return BoundedReadResult(
+                connected=True, output="", error="ftp retr failed: no such file", method="ftp_read",
+            )
+
+    registry = CapabilityRuntimeRegistry()
+    registry.register(cap_id, _RootOnlyFtp())
+
+    planner = ObjectivePlanner(_TARGET, ToolRegistry.from_config(config), config=config)
+    executor = UserFlagExecutor(config, registry)
+    parser = ObjectiveParser()
+    goal = Goal(id="g", description="user-flag objective", phase="objective", anchor_node=_ANCHOR)
+    eb = EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[])
+
+    verified_path = ""
+    for _ in range(8):  # bounded — one capability yields at most 6 candidates
+        sub = await _subgraph(api)
+        if objective_status_from_subgraph(sub, _TARGET, "user_flag") == "verified":
+            break
+        plan = await planner.plan(goal, sub, eb)
+        if isinstance(plan, AbandonSignal) or not plan:
+            break
+        task = plan[0]
+        res = await executor.run(task, eb)
+        d = res.episode.data
+        parsed = parser.parse_user_flag_result(
+            target=_TARGET, objective_type="user_flag", candidate_path=str(d["candidate_path"]),
+            connected=bool(d["connected"]), verified=bool(d["verified"]),
+            value_digest=str(d["value_digest"]), redacted_value=str(d["redacted_value"]),
+            verification_method=str(d["verification_method"]), capability_id=cap_id,
+            capability_type="ftp_file_read", principal="anonymous",
+            attempted_paths=list(task.params.get("attempted_paths", [])),
+            attempted_capability_paths=list(task.params.get("attempted_capability_paths", [])),
+            is_last_candidate=bool(task.params.get("is_last_candidate", False)),
+        )
+        await api.apply_deltas(nodes=parsed.node_deltas, edges=parsed.edge_deltas)
+        if bool(d["verified"]):
+            verified_path = str(d["candidate_path"])
+            break
+
+    final = await _subgraph(api)
+    status = objective_status_from_subgraph(final, _TARGET, "user_flag")
+    if status != "verified":
+        return ScenarioResult(
+            name, False, f"objective not verified (status={status!r}) — FTP-root /flag.txt not reached",
+        )
+    if verified_path != "/flag.txt":
+        return ScenarioResult(name, False, f"verified via {verified_path!r}, expected the FTP root /flag.txt")
+    if not await _raw_flag_absent(api):
+        return ScenarioResult(name, False, "raw flag value leaked into the graph")
+    return ScenarioResult(
+        name, True, "flag at FTP root /flag.txt reached across candidate turns, read, and verified; raw absent",
+    )
+
+
 async def scenario_remote_bounded_command_success() -> ScenarioResult:
     """3. Remote bounded-command user-flag success."""
     return await _run_ssh_style_success(
@@ -1956,6 +2050,7 @@ async def scenario_ftp_validation_via_tool_service() -> ScenarioResult:
 SCENARIOS: list[Any] = [
     scenario_ssh_success,
     scenario_ftp_flag_read,
+    scenario_ftp_root_flag_path,
     scenario_dfr_success,
     scenario_remote_bounded_command_success,
     scenario_no_capability_failure,

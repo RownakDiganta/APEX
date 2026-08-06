@@ -689,7 +689,10 @@ adapter (SSH command, direct file read, bounded command, and — new in
 §28.17 — **FTP**: a validated FTP access now derives an `ftp_file_read`
 capability whose adapter RETRs the flag on the target-reachable Kali/VPN
 side via the tool-service, closing the objective→flag-read loop for
-FTP-only targets). Full design:
+FTP-only targets). The generic candidate paths reach the FTP root
+(`/flag.txt`, not only `/home/<user>/user.txt`), and each distinct
+candidate read is a distinct action so the objective tries every bounded
+candidate rather than dedup-stalling on the first (§28.18). Full design:
 [`docs/user-flag-objective.md`](docs/user-flag-objective.md).
 
 **Access-capability abstraction (Phase 18B):** the objective's access
