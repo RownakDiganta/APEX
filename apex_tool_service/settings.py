@@ -65,14 +65,20 @@ _DEFAULT_MAX_STDERR_BYTES = 1_048_576
 # and `_DEFAULT_BOUNDED_READ_TIMEOUT_SECONDS` are the service-side HARD
 # ceilings — a caller-requested value is always clamped to
 # min(requested, this ceiling), never the other way around.
-# `_DEFAULT_ALLOWED_FLAG_BASENAMES` intentionally contains only "user.txt" —
-# do not widen this default to arbitrary filenames or system paths.
+# `_DEFAULT_ALLOWED_FLAG_BASENAMES` is a strict BASENAME allowlist (no
+# traversal, basename-only, bounded size — see validate_bounded_path). It MUST
+# stay a SUPERSET of the client's requestable basenames
+# (`ApexConfig.user_flag_candidate_filenames`, default ["user.txt","flag.txt"])
+# or a legitimate bounded flag read is 400-rejected (§28.19 — the two lists must
+# agree). It contains exactly the generic HTB user-flag names the client can
+# request — do NOT widen it to arbitrary filenames, system paths, or root.txt
+# (which the client never requests).
 # `_DEFAULT_AUTHORIZED_CIDRS` mirrors `ApexConfig.htb_route_cidr`'s own
 # established default (the standard HTB lab network range) — not a single
 # hardcoded machine IP, and always operator-overridable.
 _DEFAULT_BOUNDED_READ_MAX_BYTES = 4096
 _DEFAULT_BOUNDED_READ_TIMEOUT_SECONDS = 10.0
-_DEFAULT_ALLOWED_FLAG_BASENAMES: tuple[str, ...] = ("user.txt",)
+_DEFAULT_ALLOWED_FLAG_BASENAMES: tuple[str, ...] = ("user.txt", "flag.txt")
 _DEFAULT_AUTHORIZED_CIDRS: tuple[str, ...] = ("10.129.0.0/16",)
 # §28.16 — FTP-validate bounds.
 ENV_FTP_VALIDATE_TIMEOUT = "APEX_TOOL_SERVICE_FTP_VALIDATE_TIMEOUT"

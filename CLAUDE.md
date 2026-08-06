@@ -10549,11 +10549,15 @@ in-process) — it **fails** against the old in-process routing (verified).
 reachability gap; routing them through equivalent bounded tool-service
 operations is a documented follow-on (not in this change).
 
-> **Follow-on (§28.18):** the FTP flag-read capability derived/registered/routed
-> correctly but still verified nothing live, because the default candidate paths
-> never reached the FTP-root `/flag.txt` (and distinct candidate reads shared one
-> action fingerprint → duplicate-stall before the root path was tried). Both are
-> fixed in §28.18 below — a PATH + fingerprint fix, no capability-type branching.
+> **Follow-on (§28.18, §28.19):** the FTP flag-read capability derived/registered/
+> routed correctly but still verified nothing live — first because the default
+> candidate paths never reached the FTP-root `/flag.txt` (and distinct candidate
+> reads shared one action fingerprint → duplicate-stall before the root path was
+> tried; fixed in §28.18), then because the tool-service's OWN
+> `allowed_flag_basenames` (a second, server-side allowlist) still 400-rejected
+> `flag.txt` (fixed in §28.19 — the client and server basename lists must stay in
+> sync). All are PATH/fingerprint/allowlist-sync fixes; no capability-type
+> branching, `verify_user_flag` unchanged.
 
 ### 28.17 FTP flag-read capability — closing the objective→flag-read loop for FTP
 
@@ -10686,6 +10690,59 @@ the REAL `ObjectivePlanner` turn loop against a path-sensitive fake FTP adapter
 that RETRs the flag ONLY for `/flag.txt` (every other path a connected miss),
 proving the default candidate set reaches the FTP root; it **fails** against the
 pre-§28.18 candidate generation (which never produced `/flag.txt`).
+
+### 28.19 Server-side flag-basename allowlist must stay in sync with the client's candidate basenames
+
+> **Numbering note:** highest unique §28 heading is §28.18 (the trailing
+> `### 28.7`/`### 28.8` are the known pre-existing collision). This section is
+> **§28.19**; nothing was renumbered.
+
+After §28.18 the client (apex) correctly requested `/flag.txt`, but a live run vs
+Fawn still failed with `tool service returned HTTP 400: basename 'flag.txt' is not
+in the server's allowed_flag_basenames`. **There are TWO independent basename
+allowlists** — the client's candidate basenames
+(`ApexConfig.user_flag_candidate_filenames`, §28.18 default `["user.txt",
+"flag.txt"]`) and the tool-service's OWN
+`ServiceSettings.allowed_flag_basenames`, enforced server-side by
+`apex_tool_service.validation.validate_bounded_path` for both `POST /v1/ftp-read`
+(§28.17) and `POST /v1/bounded-file-read` (Phase 22). Only the client was updated
+in §28.18; the server default was still `("user.txt",)`, so it (correctly, by its
+own defense-in-depth bound) 400-rejected the legitimate `flag.txt` read. The two
+lists had drifted.
+
+**This is defense-in-depth working — the server enforces its own independent
+bound — the lists were simply out of sync.** `POST /v1/ftp-validate` (§28.16) has
+NO analogous drift: it is a login check gated by `FTP_VALIDATE_ALLOWED_OPERATIONS`
+(PWD/NOOP), never a file-basename list.
+
+**Fix (keep the server's independent allowlist; just make it a correct superset):**
+- `apex_tool_service.settings._DEFAULT_ALLOWED_FLAG_BASENAMES` is now
+  `("user.txt", "flag.txt")` — a SUPERSET equal to the client's requestable
+  basenames. It remains a strict BASENAME allowlist (no traversal, basename-only,
+  bounded size — `validate_bounded_path` unchanged); it was NOT widened to
+  arbitrary basenames (`root.txt`, which the client never requests, is still
+  400-rejected). The `.env.example` and `compose.yaml` `${...:-user.txt,flag.txt}`
+  interpolation defaults were updated to match.
+- **Binding invariant:** the tool-service `allowed_flag_basenames` MUST stay a
+  superset of (⊇) the client's `user_flag_candidate_filenames`, or a legitimate
+  bounded flag read is 400-rejected. When either list changes, update BOTH
+  (`ApexConfig.user_flag_candidate_filenames`,
+  `apex_tool_service.settings._DEFAULT_ALLOWED_FLAG_BASENAMES`, `.env.example`,
+  `compose.yaml`). The server check is never removed — the client never dictates
+  arbitrary basenames.
+
+`verify_user_flag` / `ObjectivePlanner` / `FtpFileReadCapabilityAdapter` are
+unchanged; the flag value is still never logged/stored raw (SHA-256 only) and
+oversized output is still fully rejected. **Tests** (fakes only, real routing):
+`tests/apex_tool_service/test_ftp_validate.py::TestFtpReadEndpoint` — `flag.txt`
+is now ACCEPTED (was 400) and RETRs the flag; an off-allowlist basename
+(`/etc/passwd`) and `root.txt` are STILL 400-rejected; traversal/oversized still
+rejected. Release-gate scenario `ftp_flag_read_via_tool_service` (§28.19) drives
+the REAL objective loop through the REAL in-process tool-service `/v1/ftp-read`
+(server-side ftplib mocked to RETR the flag only for the exact `/flag.txt`),
+reaching `user_flag_verified`; it **fails** against the pre-§28.19 server allowlist
+(`user.txt` only, which 400-rejects `flag.txt` before the RETR) — verified by
+reverting the server default.
 
 ### 28.7 Release gate
 

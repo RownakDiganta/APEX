@@ -681,7 +681,7 @@ class TestReleaseGateScenarios:
         # + the vhost-redirect web-discovery (--resolve Host-aware) scenario
         # + the web-incomplete-must-not-report-goal_completed scenario
         # + the incomplete-scan-escalates-not-stall scenario.
-        assert len(SCENARIOS) == 25
+        assert len(SCENARIOS) == 26
 
     @pytest.mark.asyncio
     async def test_full_release_gate_passes(self) -> None:

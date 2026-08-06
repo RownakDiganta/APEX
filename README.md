@@ -692,7 +692,11 @@ side via the tool-service, closing the objective→flag-read loop for
 FTP-only targets). The generic candidate paths reach the FTP root
 (`/flag.txt`, not only `/home/<user>/user.txt`), and each distinct
 candidate read is a distinct action so the objective tries every bounded
-candidate rather than dedup-stalling on the first (§28.18). Full design:
+candidate rather than dedup-stalling on the first (§28.18). The
+tool-service enforces its own independent basename allowlist
+(`allowed_flag_basenames`) that must stay a superset of the client's
+requestable basenames — both default to `user.txt,flag.txt` and must be
+kept in sync (§28.19). Full design:
 [`docs/user-flag-objective.md`](docs/user-flag-objective.md).
 
 **Access-capability abstraction (Phase 18B):** the objective's access

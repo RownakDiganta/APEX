@@ -252,11 +252,32 @@ class TestFtpReadEndpoint:
         j = r.json()
         assert j["ok"] is True and "HTB{synthetic-not-a-real-flag}" in j["output"]
 
+    async def test_flag_txt_basename_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # §28.19 — flag.txt is in the default server allowlist (aligned with the
+        # client's requestable basenames); an FTP-root /flag.txt read is accepted.
+        # This request was 400-rejected before §28.19 (server allowlist was
+        # user.txt only, so the 40545b9 client fix could never complete a read).
+        _install_read(monkeypatch)
+        async with client_for(create_app(_settings())) as client:
+            r = await client.post("/v1/ftp-read", headers=auth_headers(), json=_read_body(path="/flag.txt"))
+        assert r.status_code == 200
+        j = r.json()
+        assert j["ok"] is True and "HTB{synthetic-not-a-real-flag}" in j["output"]
+
     async def test_off_basename_path_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install_read(monkeypatch)
         async with client_for(create_app(_settings())) as client:
             r = await client.post("/v1/ftp-read", headers=auth_headers(), json=_read_body(path="/etc/passwd"))
-        assert r.status_code == 400  # not in the basename allowlist (user.txt)
+        assert r.status_code == 400  # not in the basename allowlist (user.txt / flag.txt)
+
+    async def test_root_txt_basename_still_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # §28.19 — the allowlist was aligned to the client set, NOT widened to
+        # arbitrary basenames: root.txt (which the client never requests) is
+        # still 400-rejected. Defense-in-depth stays a strict basename allowlist.
+        _install_read(monkeypatch)
+        async with client_for(create_app(_settings())) as client:
+            r = await client.post("/v1/ftp-read", headers=auth_headers(), json=_read_body(path="/root.txt"))
+        assert r.status_code == 400
 
     async def test_oversized_read_rejected_completely(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _install_read(monkeypatch)

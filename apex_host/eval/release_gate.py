@@ -2047,10 +2047,162 @@ async def scenario_ftp_validation_via_tool_service() -> ScenarioResult:
     )
 
 
+class _FlagRetrFtp:
+    """Server-side ftplib.FTP double for the tool-service: RETRs the synthetic
+    flag for ``/flag.txt`` (an empty miss for any other path). No network I/O."""
+
+    def __init__(self) -> None:
+        self.encoding = "utf-8"
+        self.sock: _FawnLiveSock | None = _FawnLiveSock()
+
+    def connect(self, host: str = "", port: int = 0, timeout: float = -1,
+                source_address: object = None) -> str:
+        self.sock = _FawnLiveSock()
+        return "220 (vsFTPd 3.0.3)"
+
+    def set_pasv(self, value: bool) -> None: ...
+    def login(self, user: str = "", passwd: str = "", acct: str = "") -> str:
+        return "230 Login successful."
+
+    def retrbinary(self, cmd: str, cb: Any, blocksize: int = 8192) -> str:
+        # Exact-path match (not substring) — the flag lives ONLY at the true FTP
+        # root "/flag.txt", never "/home/<user>/flag.txt".
+        path = cmd.split("RETR ", 1)[1].strip() if cmd.startswith("RETR ") else ""
+        if path == "/flag.txt":
+            cb((_FLAG_VALUE + "\n").encode())
+        return "226 Transfer complete."
+
+    def quit(self) -> str:
+        self.sock.sendall(b"QUIT\r\n")  # type: ignore[union-attr]
+        return "221 Goodbye."
+
+    def close(self) -> None:
+        self.sock = None
+
+
+async def scenario_ftp_flag_read_via_tool_service() -> ScenarioResult:
+    """§28.19 — a legitimate FTP-root ``/flag.txt`` read is accepted by the
+    tool-service's OWN basename allowlist and verifies, driving the REAL objective
+    turn loop (ObjectivePlanner → UserFlagExecutor → verify_user_flag →
+    ObjectiveParser) through the REAL in-process tool-service ``/v1/ftp-read``
+    endpoint (server-side ftplib mocked to RETR the flag only for ``/flag.txt``;
+    the client HTTP transport pointed at the ASGI app). The objective node is built
+    entirely by the parser across candidate turns (no pre-seed), reaching
+    ``/flag.txt`` (the FTP-root name §28.18 added).
+
+    FAILS against the pre-§28.19 server allowlist (``user.txt`` only), which
+    400-rejects ``flag.txt`` before the RETR — so the ``/flag.txt`` read never
+    completes and the objective never verifies (exactly the demonstrated live
+    failure)."""
+    name = "ftp_flag_read_via_tool_service"
+    import ftplib as _ftplib
+
+    import httpx
+
+    from apex_host.agents.user_flag_executor import UserFlagExecutor
+    from apex_host.planners.objective_planner import ObjectivePlanner
+    from apex_host.runtime_registry import CapabilityRuntimeRegistry, FtpFileReadCapabilityAdapter
+    from apex_host.tools.registry import ToolRegistry
+    from apex_tool_service.app import create_app
+    from apex_tool_service.settings import ServiceSettings
+    from memfabric.types import AbandonSignal, EvidenceBundle, Goal
+
+    _TOKEN = "rg-ftpread-token"
+    _SECRET = "anon-not-a-real-secret@x"
+    api = _make_api()
+    config = _config(
+        username_candidates=["anonymous"], password_candidates=["anonymous"],
+        dry_run=False, tool_backend="remote", tool_service_url="http://svc", tool_service_token=_TOKEN,
+        ftp_connect_timeout_seconds=1.0, ftp_login_timeout_seconds=1.0, ftp_command_timeout_seconds=1.0,
+    )
+    await _seed_node(api, _ANCHOR, "host", {"ip": _TARGET})
+    await _seed_node(
+        api, access_state_id(_TARGET, "anonymous", protocol="ftp"), "access_state",
+        {"level": "user", "username": "anonymous", "target": _TARGET, "service": "ftp"},
+    )
+    cap_id = access_capability_id(_TARGET, AccessCapabilityType.ftp_file_read.value, "anonymous")
+    await _seed_node(api, cap_id, "access_capability", {
+        "capability_type": "ftp_file_read", "host_id": _ANCHOR, "validated": True,
+        "principal": "anonymous", "confidence": 0.85, "runtime_available": True, "metadata": {},
+    })
+    await _seed_edge(api, _ANCHOR, cap_id)
+
+    # Real tool-service (kali side) with DEFAULT settings (§28.19: flag.txt now in
+    # allowed_flag_basenames), authorized for the synthetic target's /24.
+    registry = CapabilityRuntimeRegistry()
+    registry.register(cap_id, FtpFileReadCapabilityAdapter(
+        target=_TARGET, port="21", username="anonymous", password=_SECRET, config=config,
+    ))
+    app = create_app(ServiceSettings(token=_TOKEN, authorized_cidrs=("10.10.10.0/24",)))
+    transport = httpx.ASGITransport(app=app)
+    _real_client = httpx.AsyncClient
+    orig_ftp = _ftplib.FTP
+    orig_async_client = httpx.AsyncClient
+
+    planner = ObjectivePlanner(_TARGET, ToolRegistry.from_config(config), config=config)
+    executor = UserFlagExecutor(config, registry)
+    parser = ObjectiveParser()
+    goal = Goal(id="g", description="user-flag objective", phase="objective", anchor_node=_ANCHOR)
+    eb = EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[])
+    verified_path = ""
+    last_secret_seen = False
+    try:
+        setattr(_ftplib, "FTP", lambda *a, **k: _FlagRetrFtp())
+        setattr(httpx, "AsyncClient", lambda *a, **k: _real_client(transport=transport))
+        for _ in range(8):  # bounded — at most 4 candidates for one capability
+            sub = await _subgraph(api)
+            if objective_status_from_subgraph(sub, _TARGET, "user_flag") == "verified":
+                break
+            plan = await planner.plan(goal, sub, eb)
+            if isinstance(plan, AbandonSignal) or not plan:
+                break
+            task = plan[0]
+            res = await executor.run(task, eb)
+            d = res.episode.data
+            last_secret_seen = last_secret_seen or (_SECRET in str(d))
+            parsed = parser.parse_user_flag_result(
+                target=_TARGET, objective_type="user_flag", candidate_path=str(d["candidate_path"]),
+                connected=bool(d["connected"]), verified=bool(d["verified"]),
+                value_digest=str(d["value_digest"]), redacted_value=str(d["redacted_value"]),
+                verification_method=str(d["verification_method"]), capability_id=cap_id,
+                capability_type="ftp_file_read", principal="anonymous",
+                attempted_paths=list(task.params.get("attempted_paths", [])),
+                attempted_capability_paths=list(task.params.get("attempted_capability_paths", [])),
+                is_last_candidate=bool(task.params.get("is_last_candidate", False)),
+            )
+            await api.apply_deltas(nodes=parsed.node_deltas, edges=parsed.edge_deltas)
+            if bool(d["verified"]):
+                verified_path = str(d["candidate_path"])
+                break
+    finally:
+        setattr(_ftplib, "FTP", orig_ftp)
+        setattr(httpx, "AsyncClient", orig_async_client)
+
+    final = await _subgraph(api)
+    status = objective_status_from_subgraph(final, _TARGET, "user_flag")
+    if status != "verified":
+        return ScenarioResult(
+            name, False,
+            f"objective not verified (status={status!r}) — /flag.txt rejected by the server allowlist",
+        )
+    if verified_path != "/flag.txt":
+        return ScenarioResult(name, False, f"verified via {verified_path!r}, expected the FTP root /flag.txt")
+    if not await _raw_flag_absent(api):
+        return ScenarioResult(name, False, "raw flag value leaked into the graph")
+    if last_secret_seen:
+        return ScenarioResult(name, False, "the FTP password leaked into an executor result")
+    return ScenarioResult(
+        name, True,
+        "/flag.txt accepted by the tool-service basename allowlist, RETR'd, and verified "
+        "via the real objective loop through /v1/ftp-read; raw flag absent; password never stored",
+    )
+
+
 SCENARIOS: list[Any] = [
     scenario_ssh_success,
     scenario_ftp_flag_read,
     scenario_ftp_root_flag_path,
+    scenario_ftp_flag_read_via_tool_service,
     scenario_dfr_success,
     scenario_remote_bounded_command_success,
     scenario_no_capability_failure,
