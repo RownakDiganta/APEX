@@ -48,6 +48,7 @@ CAPABILITY_TYPE_LABELS: dict[str, str] = {
     AccessCapabilityType.arbitrary_file_read.value: "Direct File Read",
     AccessCapabilityType.api_file_read.value: "API File Read",
     AccessCapabilityType.remote_command.value: "Remote Command",
+    AccessCapabilityType.ftp_file_read.value: "FTP File Read",
 }
 
 #: Directness tie-break table (Phase 20; extended Phase 21) — used ONLY to
@@ -62,6 +63,7 @@ CAPABILITY_TYPE_LABELS: dict[str, str] = {
 _DIRECTNESS_RANK: dict[str, int] = {
     AccessCapabilityType.arbitrary_file_read.value: 0,
     AccessCapabilityType.api_file_read.value: 0,
+    AccessCapabilityType.ftp_file_read.value: 0,  # §28.17 — a direct file read
     AccessCapabilityType.local_shell.value: 1,
     AccessCapabilityType.ssh_command.value: 1,
     AccessCapabilityType.remote_command.value: 1,

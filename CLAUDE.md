@@ -7934,6 +7934,19 @@ generator, or the policy rule — enforced going forward by the static scans
 in `TestObjectiveTransportIndependence`
 (`tests/apex_host/test_access_capability_refactor.py`).
 
+> **Extension-log addendum (§28.17):** the FTP flag-read capability
+> (`ftp_file_read`) was added via exactly this contract, extended through the
+> §23/§24 discovery/registration layers a NEW capability family now goes
+> through: an `FtpFileReadCapabilityAdapter` + `CapabilityParser
+> .derive_ftp_capability` + an `FtpCapabilityProvider` (`DEFAULT_PROVIDERS`) +
+> a `discovery._materialize` branch + `emission.evidence_from_ftp_validation` +
+> `parsing_node.ftp_capability_evidence_for_result` + `ensure_ftp_file_read` +
+> `runtime_resolution._register_ftp_adapter` + a directness-rank/label —
+> **with no change to `ObjectivePlanner`/`UserFlagExecutor`/`ObjectiveParser`/
+> `verify_user_flag`/report.** It also runs the read on the target-reachable
+> Kali/VPN side (a new tool-service `POST /v1/ftp-read`), consistent with
+> §28.16. See §28.17.
+
 **New files:** `apex_host/runtime_registry.py`,
 `apex_host/parsers/capability_parser.py`,
 `apex_host/planners/access_capabilities.py`,
@@ -10535,6 +10548,70 @@ in-process) — it **fails** against the old in-process routing (verified).
 **Follow-on:** SSH/Telnet validation still run in-process and have the same
 reachability gap; routing them through equivalent bounded tool-service
 operations is a documented follow-on (not in this change).
+
+### 28.17 FTP flag-read capability — closing the objective→flag-read loop for FTP
+
+> **Numbering note:** highest unique §28 heading is §28.16 (the trailing
+> `### 28.7`/`### 28.8` are the known collision). This section is **§28.17**;
+> nothing was renumbered.
+
+The final live gap: a validated FTP `access_state` (via §28.16) never became a
+flag-read action — the objective phase made 0 attempts and stalled
+`no_actionable_task`. Root cause: `ssh_capability_evidence_for_result`
+(`parsing_node.py`) emitted `CapabilityEvidence` **only** for `ssh_access`, so a
+validated `ftp_access` produced no `access_capability`; and there was no
+`FlagReadCapability` adapter that could RETR a file over FTP. So
+`ObjectivePlanner` correctly emitted nothing (no validated+runtime-available
+capability) — the fix is a new **FTP flag-read capability**, not a planner change.
+
+This is the §18B/§20/§21 extension contract applied to a **new** capability
+family, extended through the §23/§24 discovery/registration layers — **with no
+change to `ObjectivePlanner`, `UserFlagExecutor`, `ObjectiveParser`,
+`verify_user_flag`, or the report** (verified by the release-gate scenario driving
+the real objective path):
+
+- **`AccessCapabilityType.ftp_file_read`** (a file-read primitive) +
+  `CapabilityEvidenceType.FTP_FILE_READ_VALIDATED` (mapped 1:1).
+- **`FtpFileReadCapabilityAdapter`** (`runtime_registry.py`) — its only method,
+  `read_bounded_file(path)`, RETRs the candidate flag over a bounded ftplib
+  session. When `tool_backend == "remote"` it runs on the Kali/VPN side via the
+  new tool-service `POST /v1/ftp-read` (§28.16-consistent — apex has no VPN
+  route); otherwise in-process (local/tests). Passive, one RETR, close;
+  oversized rejected completely; §28.15 None-sock crash guard applied; password
+  never logged; returns the SAME `BoundedReadResult` as the SSH/DFR adapters, so
+  `UserFlagExecutor`/`verify_user_flag` are unchanged.
+- **Tool-service `POST /v1/ftp-read`** (`apex_tool_service`) — bounded RETR of one
+  approved candidate path (validated against the same basename allowlist as
+  bounded-file-read), bearer-authed, dry-run aware, password never logged,
+  content only in the response `output`. `apex_tool_service` still never imports
+  `apex_host`. `RemoteToolBackend.ftp_read_file` is the client.
+- **Derivation pipeline (§23):** `CapabilityParser.derive_ftp_capability`,
+  `FtpCapabilityProvider` (a live, organic evidence source like SSH — added to
+  `DEFAULT_PROVIDERS`), a `discovery._materialize` branch, the typed emitter
+  `emission.evidence_from_ftp_validation`, and `parsing_node
+  .ftp_capability_evidence_for_result` (wired into
+  `parse_result_and_collect_evidence` right after the SSH bridge).
+- **Registration (§24):** `CapabilityRuntimeRegistry.ensure_ftp_file_read` +
+  `runtime_resolution._register_ftp_adapter` (pairs the capability principal with
+  the operator FTP credentials, same trust model as `_register_ssh_adapter`) +
+  its dispatch-table branch. `access_capabilities.py` gains a directness-rank
+  (0 — a direct file read) and display label ("FTP File Read") — data only.
+
+`verify_user_flag` is unchanged: empty/multiline/oversized rejected; on success
+only a SHA-256 digest + redacted display survive; the raw flag is never
+stored/logged/reported.
+
+**Tests (fakes only, real routing):** `tests/apex_host/test_ftp_flag_read.py`
+(derivation, evidence acceptance, discovery → capability node, `_register_ftp_adapter`,
+`ObjectivePlanner` emits a bounded `user_flag_verify` for a validated FTP
+capability, the adapter RETRs the flag via the in-process tool-service and
+`verify_user_flag` succeeds with a SHA-256 digest and the raw flag absent, remote
+routing never runs in-process, password never in the result).
+`tests/apex_tool_service/test_ftp_validate.py` covers the endpoint family. The
+release-gate scenario `ftp_flag_read` drives the **real** derivation → discovery
+→ objective → verify path (validated FTP access → objective `user_flag_verified`,
+raw flag absent from the graph); it **fails** against the old code (0 FTP
+capabilities derived — verified by reverting the provider/derive).
 
 ### 28.7 Release gate
 

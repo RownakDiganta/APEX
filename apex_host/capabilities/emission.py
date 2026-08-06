@@ -98,6 +98,30 @@ def evidence_from_ssh_validation(
     )
 
 
+def evidence_from_ftp_validation(
+    result: "CredentialValidationResult", *, task_id: str, target: str, is_dry_run: bool = False,
+) -> CapabilityEvidence | None:
+    """§28.17 — build ``FTP_FILE_READ_VALIDATED`` evidence from a validated FTP
+    ``CredentialValidationResult`` (the real FTP executor result type). The
+    second family with a real, live producer (after SSH). Rejects a non-``ftp``
+    protocol, a failed/unauthenticated result, or a missing username. Mirrors
+    :func:`evidence_from_ssh_validation`."""
+    if result.protocol != "ftp" or not result.success or not result.username:
+        return None
+    return CapabilityEvidence(
+        evidence_id=new_id(),
+        evidence_type=CapabilityEvidenceType.FTP_FILE_READ_VALIDATED,
+        capability_family=AccessCapabilityType.ftp_file_read,
+        target_host_id=f"host:{target}",
+        source_task_id=task_id,
+        principal=result.username,
+        validation_method="deterministic_benign_command",
+        confidence=_SSH_CAPABILITY_CONFIDENCE,
+        timestamp=now(),
+        is_dry_run=is_dry_run,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class DirectFileReadValidationResult:
     """Minimal typed result shape for a future direct-file-read validation

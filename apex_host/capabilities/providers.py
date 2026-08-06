@@ -398,10 +398,56 @@ class WebCommandCapabilityProvider:
 #: The complete, ordered set of providers the discovery engine dispatches
 #: to — stable order (never a set/dict-iteration-order dependency), one
 #: instance per family. Adding a new provider means adding one entry here.
+class FtpCapabilityProvider:
+    """§28.17 — accepts only evidence proving an authenticated FTP session that
+    can RETR a bounded file. Mirrors ``SSHCapabilityProvider`` exactly (a live,
+    organic evidence source). Rejects: an open port 21, an FTP banner, a failed
+    login, dry-run evidence (rejected centrally beforehand), or an LLM claim
+    (never an accepted ``validation_method``)."""
+
+    supported_evidence_types = frozenset({CapabilityEvidenceType.FTP_FILE_READ_VALIDATED})
+    accepted_capability_families = frozenset({AccessCapabilityType.ftp_file_read})
+
+    def evaluate(
+        self, evidence: CapabilityEvidence, context: "CapabilityDiscoveryContext",
+    ) -> CapabilityDerivationDecision:
+        name = type(self).__name__
+        if not _evidence_type_accepted(evidence, self.supported_evidence_types):
+            return _base_decision(
+                evidence, provider_name=name, status=CapabilityDerivationStatus.rejected,
+                capability_id="", confidence=0.0, sanitized_reason="unsupported_evidence",
+            )
+        if evidence.capability_family is not AccessCapabilityType.ftp_file_read:
+            return _base_decision(
+                evidence, provider_name=name, status=CapabilityDerivationStatus.rejected,
+                capability_id="", confidence=0.0, sanitized_reason="unsupported_evidence",
+            )
+        if not evidence.principal:
+            return _base_decision(
+                evidence, provider_name=name, status=CapabilityDerivationStatus.rejected,
+                capability_id="", confidence=0.0, sanitized_reason="target_mismatch",
+            )
+        if evidence.confidence < _MIN_SSH_CONFIDENCE:
+            return _base_decision(
+                evidence, provider_name=name, status=CapabilityDerivationStatus.rejected,
+                capability_id="", confidence=0.0, sanitized_reason="confidence_below_threshold",
+            )
+        capability_id = access_capability_id(
+            evidence.target_host_id.removeprefix("host:"),
+            AccessCapabilityType.ftp_file_read.value, evidence.principal,
+        )
+        status, confidence = _classify_against_existing(evidence, context, capability_id=capability_id)
+        return _base_decision(
+            evidence, provider_name=name, status=status, capability_id=capability_id,
+            confidence=confidence, sanitized_reason="authenticated ftp session validated",
+        )
+
+
 DEFAULT_PROVIDERS: tuple[CapabilityProvider, ...] = (
     SSHCapabilityProvider(),
     DirectFileReadCapabilityProvider(),
     LocalCommandCapabilityProvider(),
     RemoteCommandCapabilityProvider(),
     WebCommandCapabilityProvider(),
+    FtpCapabilityProvider(),
 )

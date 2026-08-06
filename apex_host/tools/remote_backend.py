@@ -70,6 +70,7 @@ _EXECUTE_PATH = "/v1/execute"
 # touches apex_tool_service's ALLOWED_TOOLS allowlist at all.
 _READ_BOUNDED_FILE_PATH = "/v1/bounded-file-read"
 _FTP_VALIDATE_PATH = "/v1/ftp-validate"  # §28.16
+_FTP_READ_PATH = "/v1/ftp-read"  # §28.17
 _ENV_TOKEN = "APEX_TOOL_SERVICE_TOKEN"
 
 _REQUIRED_BOUNDED_READ_RESPONSE_FIELDS: dict[str, type | tuple[type, ...]] = {
@@ -427,6 +428,63 @@ class RemoteToolBackend:
             error_category=category, error_detail=str(data.get("sanitized_error") or ""),
             duration_seconds=time.monotonic() - start, timed_out=bool(data.get("timed_out")),
             executor="ftp",
+        )
+
+    async def ftp_read_file(
+        self, *, target: str, port: int, username: str, password: str, path: str,
+        max_output_bytes: int, connect_timeout: float, login_timeout: float, command_timeout: float,
+    ) -> BoundedReadResult:
+        """Call the tool service's dedicated ``POST /v1/ftp-read`` — one bounded
+        ftplib RETR of *path* on the Kali/VPN side (§28.17). Returns a
+        ``BoundedReadResult`` identical in shape to the SSH/direct-file-read
+        adapters, so ``UserFlagExecutor``/``verify_user_flag`` are unchanged. The
+        password rides only in the (bearer-authed) request body; a transport/HTTP
+        failure is a clean ``connected=False`` result, never a raised exception.
+        Dry-run is enforced by the caller before this is reached."""
+        client_timeout = connect_timeout + login_timeout + command_timeout + _CLIENT_TIMEOUT_MARGIN_SECONDS
+        body = {
+            "target": target, "port": int(port), "username": username, "password": password,
+            "path": path, "max_output_bytes": int(max_output_bytes),
+            "connect_timeout_seconds": float(connect_timeout),
+            "login_timeout_seconds": float(login_timeout),
+            "command_timeout_seconds": float(command_timeout),
+        }
+        headers = {"Authorization": f"Bearer {self._token}"}
+        url = f"{self._base_url}{_FTP_READ_PATH}"
+
+        client = self._get_client()
+        try:
+            response = await client.post(url, json=body, headers=headers, timeout=client_timeout)
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.TimeoutException) as exc:
+            return BoundedReadResult(connected=False, output="",
+                                     error=f"tool service request timed out: {_safe_exc_text(exc)}",
+                                     timed_out=True, method="ftp_read")
+        except httpx.RequestError as exc:
+            return BoundedReadResult(connected=False, output="",
+                                     error=f"could not reach tool service: {_safe_exc_text(exc)}",
+                                     method="ftp_read")
+        if response.status_code != 200:
+            detail = self._extract_detail(response)
+            return BoundedReadResult(connected=False, output="",
+                                     error=(f"tool service returned HTTP {response.status_code}"
+                                            + (f": {detail}" if detail else ""))[:500],
+                                     method="ftp_read")
+        try:
+            data = response.json()
+        except ValueError:
+            return BoundedReadResult(connected=False, output="", error="response is not JSON", method="ftp_read")
+        if not isinstance(data, dict):
+            return BoundedReadResult(connected=False, output="", error="response is not a JSON object", method="ftp_read")
+        # A completed RETR (or a classified read failure) is a CONNECTED result —
+        # the FTP session reached the server. Only a transport/HTTP failure above
+        # is connected=False (so a bad path is "connected, empty", never a
+        # spurious connection error).
+        return BoundedReadResult(
+            connected=True, output=str(data.get("output") or ""),
+            error=(None if data.get("ok") else str(data.get("sanitized_error") or data.get("error_code") or "")),
+            return_code=None, bytes_received=int(data.get("bytes_received") or 0),
+            truncated=bool(data.get("oversized")), timed_out=bool(data.get("timed_out")),
+            method="ftp_read",
         )
 
     # ------------------------------------------------------------------

@@ -35,7 +35,11 @@ from typing import TYPE_CHECKING
 from apex_tool_service.models import ExecuteResponse
 
 if TYPE_CHECKING:
-    from apex_tool_service.executor import BoundedFileReadResult, FtpValidateResult
+    from apex_tool_service.executor import (
+        BoundedFileReadResult,
+        FtpReadResult,
+        FtpValidateResult,
+    )
 
 logger = logging.getLogger("apex_tool_service.audit")
 
@@ -142,4 +146,29 @@ def log_ftp_validate_result(
         "error_code=%s timed_out=%s duration_seconds=%.3f",
         correlation_id, target, username, result.ok, result.authenticated,
         result.error_code or "", result.timed_out, result.duration_seconds,
+    )
+
+
+def log_ftp_read_accepted(
+    correlation_id: str, target: str, port: int, username: str, basename: str,
+) -> None:
+    """Log that an FTP-read request passed auth+authorization+validation and is
+    about to execute (§28.17). Only the approved basename is logged, never the
+    full path; the PASSWORD and the file CONTENT are NEVER logged."""
+    logger.info(
+        "ftp_read_accepted id=%s target=%s port=%d username=%s basename=%s",
+        correlation_id, target, port, username, basename,
+    )
+
+
+def log_ftp_read_result(
+    correlation_id: str, target: str, username: str, result: "FtpReadResult",
+) -> None:
+    """Log an FTP-read outcome — ok/error_code/byte-length/timing only, never the
+    password and never ``result.output`` (the file content)."""
+    logger.info(
+        "ftp_read_complete id=%s target=%s username=%s ok=%s error_code=%s "
+        "bytes_received=%d oversized=%s timed_out=%s duration_seconds=%.3f",
+        correlation_id, target, username, result.ok, result.error_code or "",
+        result.bytes_received, result.oversized, result.timed_out, result.duration_seconds,
     )

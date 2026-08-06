@@ -24,7 +24,10 @@ from memfabric.ids import now
 from memfabric.types import ParsedObservation, RawObservation
 
 from apex_host.capabilities.discovery import CapabilityDiscoveryContext, run_capability_discovery
-from apex_host.capabilities.emission import evidence_from_ssh_validation
+from apex_host.capabilities.emission import (
+    evidence_from_ftp_validation,
+    evidence_from_ssh_validation,
+)
 from apex_host.capabilities.evidence import CapabilityEvidence
 from apex_host.parsers.access_parser import AccessParser
 from apex_host.parsers.banner_parser import BannerParser
@@ -312,6 +315,44 @@ def ssh_capability_evidence_for_result(
     )
 
 
+def ftp_capability_evidence_for_result(
+    tool_result: dict[str, Any], *, target: str,
+) -> CapabilityEvidence | None:
+    """§28.17 — build ``FTP_FILE_READ_VALIDATED`` evidence from one successful
+    ``ftp_access`` tool_result, or ``None`` when it does not qualify. The FTP
+    twin of :func:`ssh_capability_evidence_for_result` — a thin dict-to-typed
+    adapter over the same tr-dict shape, delegating all acceptance logic to
+    :func:`apex_host.capabilities.emission.evidence_from_ftp_validation`. This is
+    what turns a validated FTP access into an ``access_capability`` the
+    ObjectivePlanner can act on (previously only SSH had this bridge)."""
+    if tool_result.get("tool") != "ftp_access" or not tool_result.get("success"):
+        return None
+    username = str(tool_result.get("username", ""))
+    if not username:
+        return None
+    result = CredentialValidationResult(
+        protocol="ftp",
+        target=target,
+        port=str(tool_result.get("port", "")),
+        username=username,
+        success=True,
+        authenticated=bool(tool_result.get("authenticated", True)),
+        operation=str(tool_result.get("operation", "")),
+        response_summary="",
+        error_category=str(tool_result.get("error_category", "")),
+        error_detail="",
+        duration_seconds=float(tool_result.get("duration_seconds", 0.0) or 0.0),
+        timed_out=bool(tool_result.get("timed_out", False)),
+        executor="ftp",
+    )
+    return evidence_from_ftp_validation(
+        result,
+        task_id=str(tool_result.get("task_id", "")),
+        target=target,
+        is_dry_run=bool(tool_result.get("dry_run", False)),
+    )
+
+
 def findings_from_parsed(
     parsed: ParsedObservation, *, phase: str, source: str, timestamp: str
 ) -> list[dict[str, Any]]:
@@ -349,6 +390,8 @@ def parse_result_and_collect_evidence(
     Raises whatever ``parse_single_result`` raises.
     """
     evidence = ssh_capability_evidence_for_result(tool_result, target=target)
+    if evidence is None:  # §28.17 — FTP is the second live evidence source
+        evidence = ftp_capability_evidence_for_result(tool_result, target=target)
     parsed, source = parse_single_result(tool_result, state)
     return parsed, source, evidence
 

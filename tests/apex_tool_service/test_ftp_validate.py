@@ -212,3 +212,85 @@ class TestExecuteFtpValidateDirect:
         import inspect
         src = inspect.getsource(mod)
         assert "import apex_host" not in src and "from apex_host" not in src
+
+
+# ---------------------------------------------------------------------------
+# §28.17 — POST /v1/ftp-read (bounded RETR of an approved flag file).
+# ---------------------------------------------------------------------------
+class _ReadFakeFTP(_FakeFTP):
+    retr_content: bytes = b"HTB{synthetic-not-a-real-flag}\n"
+
+    def retrbinary(self, cmd: str, cb: Any, blocksize: int = 8192) -> str:
+        assert cmd.startswith("RETR ")
+        cb(type(self).retr_content)
+        return "226"
+
+
+def _install_read(monkeypatch: pytest.MonkeyPatch, *, connect_raises: Exception | None = None) -> None:
+    _ReadFakeFTP.connect_raises = connect_raises
+    _ReadFakeFTP.login_raises = None
+    _ReadFakeFTP.retr_content = b"HTB{synthetic-not-a-real-flag}\n"
+    monkeypatch.setattr(ftplib, "FTP", _ReadFakeFTP)
+
+
+def _read_body(**overrides: Any) -> dict[str, Any]:
+    b: dict[str, Any] = {
+        "target": _TARGET, "port": 21, "username": "anonymous", "password": _SECRET,
+        "path": "/user.txt", "max_output_bytes": 4096,
+        "connect_timeout_seconds": 1.0, "login_timeout_seconds": 1.0, "command_timeout_seconds": 1.0,
+    }
+    b.update(overrides)
+    return b
+
+
+class TestFtpReadEndpoint:
+    async def test_success_returns_content(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install_read(monkeypatch)
+        async with client_for(create_app(_settings())) as client:
+            r = await client.post("/v1/ftp-read", headers=auth_headers(), json=_read_body())
+        assert r.status_code == 200
+        j = r.json()
+        assert j["ok"] is True and "HTB{synthetic-not-a-real-flag}" in j["output"]
+
+    async def test_off_basename_path_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install_read(monkeypatch)
+        async with client_for(create_app(_settings())) as client:
+            r = await client.post("/v1/ftp-read", headers=auth_headers(), json=_read_body(path="/etc/passwd"))
+        assert r.status_code == 400  # not in the basename allowlist (user.txt)
+
+    async def test_oversized_read_rejected_completely(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install_read(monkeypatch)
+        _ReadFakeFTP.retr_content = b"x" * 10_000
+        async with client_for(create_app(_settings())) as client:
+            r = await client.post("/v1/ftp-read", headers=auth_headers(), json=_read_body(max_output_bytes=16))
+        j = r.json()
+        assert j["ok"] is False and j["error_code"] == "oversized_output"
+        assert j["output"] == ""  # never a truncated prefix
+
+    async def test_connect_failure_no_crash(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install_read(monkeypatch, connect_raises=OSError(113, "No route to host"))
+        async with client_for(create_app(_settings())) as client:
+            r = await client.post("/v1/ftp-read", headers=auth_headers(), json=_read_body())
+        assert r.status_code == 200 and r.json()["error_code"] == "connection_failed"
+
+    async def test_dry_run_no_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install_read(monkeypatch)
+        async with client_for(create_app(_settings())) as client:
+            r = await client.post("/v1/ftp-read", headers=auth_headers(), json=_read_body(dry_run=True))
+        assert r.json()["error_code"] == "dry_run"
+
+    async def test_missing_auth_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install_read(monkeypatch)
+        async with client_for(create_app(_settings())) as client:
+            r = await client.post("/v1/ftp-read", json=_read_body())
+        assert r.status_code == 401
+
+    async def test_password_and_content_never_logged(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _install_read(monkeypatch)
+        with caplog.at_level(logging.DEBUG):
+            async with client_for(create_app(_settings())) as client:
+                await client.post("/v1/ftp-read", headers=auth_headers(), json=_read_body())
+        assert _SECRET not in caplog.text
+        assert "HTB{synthetic-not-a-real-flag}" not in caplog.text

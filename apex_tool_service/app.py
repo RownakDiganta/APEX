@@ -33,6 +33,8 @@ from apex_tool_service.audit import (
     log_bounded_read_accepted,
     log_bounded_read_result,
     log_execution_result,
+    log_ftp_read_accepted,
+    log_ftp_read_result,
     log_ftp_validate_accepted,
     log_ftp_validate_result,
     log_request_accepted,
@@ -42,12 +44,15 @@ from apex_tool_service.audit import (
 from apex_tool_service.auth import AuthStatus, check_bearer_token
 from apex_tool_service.executor import (
     execute_bounded_file_read,
+    execute_ftp_read,
     execute_ftp_validate,
     execute_tool,
 )
 from apex_tool_service.models import (
     ExecuteRequest,
     ExecuteResponse,
+    FtpReadRequest,
+    FtpReadResponse,
     FtpValidateRequest,
     FtpValidateResponse,
     HealthResponse,
@@ -59,6 +64,7 @@ from apex_tool_service.validation import (
     RequestValidationError,
     resolve_and_validate_tool,
     resolve_bounded_read_limits,
+    resolve_ftp_read_max_bytes,
     resolve_ftp_validate_timeout,
     resolve_timeout,
     validate_arguments,
@@ -100,6 +106,8 @@ _FTP_ERROR_CODE_MESSAGES: dict[str, str] = {
     "protocol_error": "an FTP protocol error occurred during login",
     "command_timeout": "the FTP validation operation timed out",
     "command_failed": "the FTP validation operation failed",
+    "file_not_found": "the requested file does not exist or is not readable",
+    "oversized_output": "the file exceeds the maximum bounded read size",
     "dry_run": "dry-run: no login attempted",
     "success": "",
 }
@@ -134,7 +142,7 @@ def create_app(settings: ServiceSettings | None = None) -> FastAPI:
         # path, or exposes allowed paths/basenames.
         return HealthResponse(
             status="ok", service=SERVICE_NAME, tools=tool_availability(),
-            bounded_file_read=True, ftp_validate=True,
+            bounded_file_read=True, ftp_validate=True, ftp_read=True,
         )
 
     @app.post("/v1/execute", response_model=ExecuteResponse)
@@ -343,6 +351,81 @@ def create_app(settings: ServiceSettings | None = None) -> FastAPI:
             error_code=result.error_code,
             sanitized_error=result.sanitized_error
             or (_FTP_ERROR_CODE_MESSAGES.get(result.error_code, result.error_code) if result.error_code else None),
+            timed_out=result.timed_out,
+            duration_ms=result.duration_seconds * 1000.0,
+        )
+
+    @app.post("/v1/ftp-read", response_model=FtpReadResponse)
+    async def ftp_read(
+        raw_request: Request, authorization: str | None = Header(default=None),
+    ) -> FtpReadResponse:
+        """Dedicated, structured bounded FTP file-read (§28.17): connect → login
+        → RETR one approved candidate path (bounded) → close, on the Kali/VPN
+        side. Same order of operations and safety model as ``/v1/ftp-validate``
+        and ``/v1/bounded-file-read``; the path is validated against the same
+        basename allowlist as bounded-file-read. The password is used only for
+        the single login and is never logged; the retrieved content appears only
+        in the response ``output`` (bounded), never in a log.
+        """
+        correlation_id = new_correlation_id()
+
+        auth_result = check_bearer_token(authorization, settings)
+        if auth_result.status is AuthStatus.service_misconfigured:
+            logger.warning("ftp_read rejected: no server token configured id=%s", correlation_id)
+            raise HTTPException(status_code=503, detail="tool service is not configured with an authentication token")
+        if not auth_result.is_authenticated:
+            log_auth_failure(correlation_id, auth_result.status.value)
+            raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+
+        try:
+            raw_body = await raw_request.json()
+        except Exception:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail="request body must be valid JSON") from None
+        try:
+            req = FtpReadRequest.model_validate(raw_body)
+        except pydantic.ValidationError as exc:
+            log_validation_rejected(correlation_id, "schema validation failed")
+            raise HTTPException(
+                status_code=400,
+                detail={"message": "invalid request schema", "errors": _format_schema_errors(exc)},
+            ) from None
+
+        try:
+            validate_target_authorized(req.target, authorized_cidrs=settings.authorized_cidrs)
+            port = validate_ftp_port(req.port)
+            validate_ftp_credentials(
+                req.username, req.password, max_bytes=settings.ftp_validate_max_credential_bytes,
+            )
+            validate_bounded_path(req.path, allowed_basenames=settings.allowed_flag_basenames)
+            max_output_bytes = resolve_ftp_read_max_bytes(req.max_output_bytes, settings)
+            connect_timeout = resolve_ftp_validate_timeout(req.connect_timeout_seconds, settings)
+            login_timeout = resolve_ftp_validate_timeout(req.login_timeout_seconds, settings)
+            command_timeout = resolve_ftp_validate_timeout(req.command_timeout_seconds, settings)
+        except RequestValidationError as exc:
+            log_validation_rejected(correlation_id, exc.detail)
+            raise HTTPException(status_code=400, detail=exc.detail) from None
+
+        basename = req.path.rsplit("/", 1)[-1]
+        if req.dry_run:
+            log_ftp_read_accepted(correlation_id, req.target, port, req.username, basename)
+            return FtpReadResponse(ok=False, error_code="dry_run", sanitized_error="dry-run: no read attempted")
+
+        log_ftp_read_accepted(correlation_id, req.target, port, req.username, basename)
+        result = await execute_ftp_read(
+            target=req.target, port=port, username=req.username, password=req.password,
+            path=req.path, max_output_bytes=max_output_bytes, connect_timeout=connect_timeout,
+            login_timeout=login_timeout, command_timeout=command_timeout,
+        )
+        log_ftp_read_result(correlation_id, req.target, req.username, result)
+
+        return FtpReadResponse(
+            ok=result.ok,
+            output=result.output,
+            error_code=result.error_code,
+            sanitized_error=result.sanitized_error
+            or (_FTP_ERROR_CODE_MESSAGES.get(result.error_code, result.error_code) if result.error_code else None),
+            bytes_received=result.bytes_received,
+            oversized=result.oversized,
             timed_out=result.timed_out,
             duration_ms=result.duration_seconds * 1000.0,
         )

@@ -189,14 +189,14 @@ def _install_fake_ssh(
 # ---------------------------------------------------------------------------
 
 class TestCapabilityCreation:
-    def test_all_seven_capability_types_exist(self) -> None:
-        # Phase 21 added `remote_command` — a generic, non-web, non-SSH
-        # remote command-execution channel — as an additive 7th member.
+    def test_all_eight_capability_types_exist(self) -> None:
+        # Phase 21 added `remote_command`; §28.17 added `ftp_file_read` — a
+        # validated FTP session that can RETR a bounded file (the user-flag).
         names = {t.value for t in AccessCapabilityType}
         assert names == {
             "ssh_command", "telnet_command", "web_command",
             "local_shell", "arbitrary_file_read", "api_file_read",
-            "remote_command",
+            "remote_command", "ftp_file_read",
         }
 
     def test_capability_fields_match_spec(self) -> None:

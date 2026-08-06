@@ -48,6 +48,15 @@ def ssh_port_for_capability(subgraph: "SubgraphView") -> str:
     return sorted(caps, key=lambda c: int(c.port) if c.port.isdigit() else 22)[0].port or "22"
 
 
+def ftp_port_for_capability(subgraph: "SubgraphView") -> str:
+    """Lowest-port ``access_validate_ftp`` capability's port, or the FTP default
+    (§28.17)."""
+    caps = [c for c in capabilities_from_subgraph(subgraph) if c.name == "access_validate_ftp"]
+    if not caps:
+        return "21"
+    return sorted(caps, key=lambda c: int(c.port) if c.port.isdigit() else 21)[0].port or "21"
+
+
 def register_capability_adapter(
     *,
     config: "ApexConfig",
@@ -67,6 +76,8 @@ def register_capability_adapter(
     """
     if cap.capability_type is AccessCapabilityType.ssh_command:
         return _register_ssh_adapter(config, capability_registry, subgraph, target, cap)
+    if cap.capability_type is AccessCapabilityType.ftp_file_read:  # §28.17
+        return _register_ftp_adapter(config, capability_registry, subgraph, target, cap)
     if cap.capability_type in (
         AccessCapabilityType.arbitrary_file_read,
         AccessCapabilityType.api_file_read,
@@ -93,6 +104,31 @@ def _register_ssh_adapter(
         cap.capability_id,
         target=target,
         port=ssh_port_for_capability(subgraph),
+        username=cap.principal,
+        password=passwords[0],
+        config=config,
+    )
+    return True
+
+
+def _register_ftp_adapter(
+    config: "ApexConfig",
+    capability_registry: "CapabilityRuntimeRegistry",
+    subgraph: "SubgraphView",
+    target: str,
+    cap: "AccessCapability",
+) -> bool:
+    """§28.17 — pair the validated FTP capability's principal with the operator
+    credentials (same trust model as ``_register_ssh_adapter``) and register an
+    ``FtpFileReadCapabilityAdapter`` (which reads on the Kali/VPN side)."""
+    usernames = list(getattr(config, "username_candidates", None) or [])
+    passwords = list(getattr(config, "password_candidates", None) or [])
+    if not usernames or not passwords or cap.principal != usernames[0]:
+        return False
+    capability_registry.ensure_ftp_file_read(
+        cap.capability_id,
+        target=target,
+        port=ftp_port_for_capability(subgraph),
         username=cap.principal,
         password=passwords[0],
         config=config,

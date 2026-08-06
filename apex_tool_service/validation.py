@@ -268,6 +268,18 @@ def validate_ftp_port(port: int) -> int:
     return port
 
 
+def resolve_ftp_read_max_bytes(requested: int | None, settings: ServiceSettings) -> int:
+    """Effective max RETR size: ``min(requested, bounded_read_max_bytes)`` — the
+    same hard cap that bounds ``/v1/bounded-file-read`` (§28.17)."""
+    if requested is None:
+        return settings.bounded_read_max_bytes
+    if not isinstance(requested, int) or isinstance(requested, bool):
+        raise RequestValidationError("'max_output_bytes' must be an integer")
+    if requested <= 0:
+        raise RequestValidationError("'max_output_bytes' must be positive")
+    return min(requested, settings.bounded_read_max_bytes)
+
+
 def resolve_ftp_validate_timeout(requested: float | None, settings: ServiceSettings) -> float:
     """Per-phase (connect/login/command) timeout: ``min(requested, cap)``,
     rejecting malformed values rather than silently coercing them."""

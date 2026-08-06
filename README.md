@@ -684,7 +684,13 @@ short redacted display in the EKG (`objective`/`objective_evidence` nodes)
 — the raw flag value is never stored, logged, or reported anywhere. Only
 `EngagementOutcome.user_flag_verified` is ever success
 (`is_success_outcome()`); a validated-access-only run now exits `1`, not
-`0`. Full design: [`docs/user-flag-objective.md`](docs/user-flag-objective.md).
+`0`. The flag is read by a transport-independent `FlagReadCapability`
+adapter (SSH command, direct file read, bounded command, and — new in
+§28.17 — **FTP**: a validated FTP access now derives an `ftp_file_read`
+capability whose adapter RETRs the flag on the target-reachable Kali/VPN
+side via the tool-service, closing the objective→flag-read loop for
+FTP-only targets). Full design:
+[`docs/user-flag-objective.md`](docs/user-flag-objective.md).
 
 **Access-capability abstraction (Phase 18B):** the objective's access
 mechanism is transport-independent. A validated login produces a generic

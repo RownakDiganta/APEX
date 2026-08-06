@@ -166,6 +166,10 @@ async def _run_ssh_style_success(
         await _seed_node(api, access_state_id(_TARGET, "root", protocol="ssh"), "access_state", {
             "level": "user", "username": "root", "target": _TARGET, "service": "ssh",
         })
+    elif capability_family is AccessCapabilityType.ftp_file_read:  # §28.17
+        await _seed_node(api, access_state_id(_TARGET, "root", protocol="ftp"), "access_state", {
+            "level": "user", "username": "root", "target": _TARGET, "service": "ftp",
+        })
     subgraph = await _subgraph(api)
 
     registry = CapabilityRuntimeRegistry()
@@ -173,7 +177,10 @@ async def _run_ssh_style_success(
         evidence_id=new_id(), evidence_type=evidence_type, capability_family=capability_family,
         target_host_id=_ANCHOR, source_task_id="release-gate-task", principal="root",
         validation_method=(
-            "deterministic_benign_command" if evidence_type is CapabilityEvidenceType.SSH_AUTHENTICATED_COMMAND
+            "deterministic_benign_command" if evidence_type in (
+                CapabilityEvidenceType.SSH_AUTHENTICATED_COMMAND,
+                CapabilityEvidenceType.FTP_FILE_READ_VALIDATED,  # §28.17
+            )
             else "backend_confirmed_session"
         ),
         confidence=0.85, timestamp=now(),
@@ -239,6 +246,20 @@ async def scenario_ssh_success() -> ScenarioResult:
         capability_family=AccessCapabilityType.ssh_command,
         evidence_type=CapabilityEvidenceType.SSH_AUTHENTICATED_COMMAND,
         tool_name="ssh_success",
+    )
+
+
+async def scenario_ftp_flag_read() -> ScenarioResult:
+    """§28.17 — a validated FTP access_state derives an ftp_file_read
+    access_capability the ObjectivePlanner acts on, the flag is read, and the
+    objective is user_flag_verified (raw flag never persisted). Drives the REAL
+    derivation → discovery → objective → verify path (with the release gate's own
+    synthetic-transport substitution). Fails against the old code, which had no
+    FTP capability provider/derivation, so `capabilities_derived` would be 0."""
+    return await _run_ssh_style_success(
+        capability_family=AccessCapabilityType.ftp_file_read,
+        evidence_type=CapabilityEvidenceType.FTP_FILE_READ_VALIDATED,
+        tool_name="ftp_flag_read",
     )
 
 
@@ -1934,6 +1955,7 @@ async def scenario_ftp_validation_via_tool_service() -> ScenarioResult:
 
 SCENARIOS: list[Any] = [
     scenario_ssh_success,
+    scenario_ftp_flag_read,
     scenario_dfr_success,
     scenario_remote_bounded_command_success,
     scenario_no_capability_failure,

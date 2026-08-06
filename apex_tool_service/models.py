@@ -149,6 +149,47 @@ class FtpValidateResponse(BaseModel):
     method: str = "ftp_validate"
 
 
+class FtpReadRequest(BaseModel):
+    """One dedicated, structured bounded FTP file-read request (§28.17): connect
+    -> login -> RETR one approved candidate ``path`` (bounded) -> close. No
+    ``tool``/``arguments``/``command`` field and none accepted
+    (``extra="forbid"``). The password is used only for the single login; it is
+    never logged, and neither it nor the retrieved content appears anywhere but
+    the caller's own bounded response ``output``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: str
+    port: int = 21
+    username: str
+    password: str
+    path: str
+    max_output_bytes: int | None = None
+    connect_timeout_seconds: float | None = None
+    login_timeout_seconds: float | None = None
+    command_timeout_seconds: float | None = None
+    dry_run: bool = False
+
+
+class FtpReadResponse(BaseModel):
+    """Structured result of one bounded FTP RETR. ``output`` is populated ONLY on
+    a genuine, in-bound success — never a truncated prefix of an oversized read
+    (mirrors ``ReadBoundedFileResponse``). It is the only field that may carry
+    file content; every other field is bounded status/metadata."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    output: str = ""
+    error_code: str | None = None
+    sanitized_error: str | None = None
+    bytes_received: int = 0
+    oversized: bool = False
+    timed_out: bool = False
+    duration_ms: float = 0.0
+    method: str = "ftp_read"
+
+
 class HealthResponse(BaseModel):
     """``/health`` response — availability only, never secrets or paths."""
 
@@ -164,3 +205,6 @@ class HealthResponse(BaseModel):
     #: §28.16 — static capability flag: the dedicated bounded FTP-validate
     #: route exists. Never exposes a credential, target, or result.
     ftp_validate: bool = True
+    #: §28.17 — static capability flag: the dedicated bounded FTP-read route
+    #: exists. Never exposes a credential, path, target, or content.
+    ftp_read: bool = True

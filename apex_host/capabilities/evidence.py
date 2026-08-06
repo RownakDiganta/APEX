@@ -81,6 +81,11 @@ class CapabilityEvidenceType(str, Enum):
     #: A fixed, validated web-command mechanism available, with a safe
     #: bounded objective adapter registrable.
     WEB_COMMAND_VALIDATED = "web_command_validated"
+    #: §28.17 — a validated FTP session that can RETR a bounded file. A live,
+    #: organic evidence source (unlike the four families above, which today
+    #: only have operator-attested evidence): produced from a real ftp_access
+    #: validation by ``apex_host.orchestration.parsing_node``.
+    FTP_FILE_READ_VALIDATED = "ftp_file_read_validated"
     #: An existing backend confirms an already-validated session handle —
     #: must be paired with an accepted capability family and proof type by
     #: the evidence's own ``capability_family``/``validation_method``.
@@ -99,6 +104,7 @@ _EVIDENCE_TYPE_TO_FAMILY: dict[CapabilityEvidenceType, AccessCapabilityType] = {
     CapabilityEvidenceType.LOCAL_COMMAND_VALIDATED: AccessCapabilityType.local_shell,
     CapabilityEvidenceType.REMOTE_COMMAND_VALIDATED: AccessCapabilityType.remote_command,
     CapabilityEvidenceType.WEB_COMMAND_VALIDATED: AccessCapabilityType.web_command,
+    CapabilityEvidenceType.FTP_FILE_READ_VALIDATED: AccessCapabilityType.ftp_file_read,
     # DIRECT_FILE_READ_VALIDATED maps to either arbitrary_file_read or
     # api_file_read (the operator's own classification) — both accepted,
     # so it is intentionally absent from this 1:1 table and checked

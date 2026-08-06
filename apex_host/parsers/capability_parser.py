@@ -226,6 +226,50 @@ class CapabilityParser:
         ]
         return ParsedObservation(node_deltas=[cap_node], edge_deltas=edges)
 
+    def derive_ftp_capability(
+        self, *, target: str, username: str, source_task_id: str,
+        confidence: float = _SSH_CAPABILITY_CONFIDENCE, metadata: dict[str, Any] | None = None,
+    ) -> ParsedObservation:
+        """§28.17 — build the ``access_capability`` node + edges for a validated
+        FTP login (mirrors ``derive_ssh_capability`` exactly, protocol ``ftp``).
+        Edges: ``host --has_capability--> access_capability`` and
+        ``access_state --enables--> access_capability`` (the FTP access_state).
+        ``runtime_available`` starts ``False``; the orchestration layer flips it
+        once an ``FtpFileReadCapabilityAdapter`` is registered."""
+        if not username:
+            return ParsedObservation()
+
+        timestamp = now()
+        cap_id = access_capability_id(target, AccessCapabilityType.ftp_file_read.value, username)
+        h_id = host_id(target)
+        cap_node = Node(
+            id=cap_id, type="access_capability",
+            props={
+                "capability_type": AccessCapabilityType.ftp_file_read.value,
+                "host_id": h_id, "validated": True, "principal": username,
+                "confidence": confidence, "source_task_id": source_task_id,
+                "metadata": dict(metadata or {}), "runtime_available": False,
+            },
+            confidence=confidence, source="capability_parser",
+            first_seen=timestamp, last_seen=timestamp,
+        )
+        acc_id = access_state_id(target, username, protocol="ftp")
+        edges = [
+            Edge(
+                id=has_capability_edge_id(h_id, cap_id),
+                from_id=h_id, to_id=cap_id, type="has_capability", props={},
+                confidence=confidence, source="capability_parser",
+                first_seen=timestamp, last_seen=timestamp,
+            ),
+            Edge(
+                id=enables_edge_id(acc_id, cap_id),
+                from_id=acc_id, to_id=cap_id, type="enables", props={},
+                confidence=confidence, source="capability_parser",
+                first_seen=timestamp, last_seen=timestamp,
+            ),
+        ]
+        return ParsedObservation(node_deltas=[cap_node], edge_deltas=edges)
+
     def derive_direct_file_read_capability(
         self,
         *,

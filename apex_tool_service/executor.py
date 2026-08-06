@@ -452,3 +452,134 @@ async def execute_ftp_validate(
             ok=False, error_code="connect_timeout", timed_out=True,
             duration_seconds=time.monotonic() - start,
         )
+
+
+@dataclass
+class FtpReadResult:
+    """Service-internal result of one ``execute_ftp_read()`` call — distinct from
+    the Pydantic ``FtpReadResponse``. ``output`` is populated ONLY on ``ok=True``
+    and only up to the byte cap; an oversized RETR is rejected COMPLETELY (never
+    a truncated prefix, mirroring bounded-file-read). Carries no password."""
+
+    ok: bool
+    output: str = ""
+    error_code: str | None = None
+    sanitized_error: str | None = None
+    bytes_received: int = 0
+    oversized: bool = False
+    timed_out: bool = False
+    duration_seconds: float = 0.0
+
+
+def _ftp_read_sync(
+    *, target: str, port: int, username: str, password: str, path: str,
+    max_output_bytes: int, connect_timeout: float, login_timeout: float, command_timeout: float,
+) -> FtpReadResult:
+    """One bounded ftplib session (§28.17): connect -> login -> RETR <path> into a
+    bounded buffer -> close. Passive mode. ONE retrieve, of ONE approved candidate
+    path (the caller validates the path/basename). Never lists, deletes, uploads,
+    or transfers anything else. Never logs the password or the file content. The
+    §28.15 None-sock crash guard is applied (quit only on an established
+    connection). An oversized transfer is rejected completely."""
+    import ftplib
+    import socket
+
+    start = time.monotonic()
+    ftp = ftplib.FTP()  # noqa: S321 — passive mode, one bounded RETR of an approved path
+    ftp.encoding = "utf-8"
+    try:
+        try:
+            ftp.connect(host=target, port=port, timeout=connect_timeout)
+        except socket.timeout:
+            return FtpReadResult(ok=False, error_code="connect_timeout", timed_out=True,
+                                 duration_seconds=time.monotonic() - start)
+        except (OSError, ftplib.Error, EOFError):
+            return FtpReadResult(ok=False, error_code="connection_failed",
+                                 duration_seconds=time.monotonic() - start)
+
+        ftp.set_pasv(True)
+        if ftp.sock is not None:
+            ftp.sock.settimeout(login_timeout)
+        try:
+            ftp.login(user=username, passwd=password)
+        except ftplib.error_perm as exc:
+            return FtpReadResult(ok=False, error_code="auth_rejected",
+                                 sanitized_error=_redact_password(str(exc)[:200], password),
+                                 duration_seconds=time.monotonic() - start)
+        except socket.timeout:
+            return FtpReadResult(ok=False, error_code="auth_timeout", timed_out=True,
+                                 duration_seconds=time.monotonic() - start)
+        except (ftplib.Error, EOFError, OSError):
+            return FtpReadResult(ok=False, error_code="protocol_error",
+                                 duration_seconds=time.monotonic() - start)
+
+        if ftp.sock is not None:
+            ftp.sock.settimeout(command_timeout)
+        chunks: list[bytes] = []
+        received = 0
+        oversized = {"v": False}
+
+        def _sink(block: bytes) -> None:
+            nonlocal received
+            if oversized["v"]:
+                return
+            received += len(block)
+            if received > max_output_bytes:
+                oversized["v"] = True
+                chunks.clear()
+                return
+            chunks.append(block)
+
+        try:
+            ftp.retrbinary(f"RETR {path}", _sink, blocksize=min(8192, max_output_bytes + 1))
+        except ftplib.error_perm:
+            return FtpReadResult(ok=False, error_code="file_not_found",
+                                 duration_seconds=time.monotonic() - start)
+        except socket.timeout:
+            return FtpReadResult(ok=False, error_code="command_timeout", timed_out=True,
+                                 duration_seconds=time.monotonic() - start)
+        except (ftplib.Error, EOFError, OSError):
+            return FtpReadResult(ok=False, error_code="command_failed",
+                                 duration_seconds=time.monotonic() - start)
+
+        if oversized["v"]:
+            return FtpReadResult(ok=False, error_code="oversized_output", oversized=True,
+                                 duration_seconds=time.monotonic() - start)
+        data = b"".join(chunks)
+        return FtpReadResult(
+            ok=True, output=data.decode("utf-8", errors="replace"),
+            error_code="success", bytes_received=len(data),
+            duration_seconds=time.monotonic() - start,
+        )
+    finally:
+        if ftp.sock is not None:
+            try:
+                ftp.quit()
+            except (ftplib.Error, OSError, EOFError):
+                pass
+        try:
+            ftp.close()
+        except OSError:
+            pass
+
+
+async def execute_ftp_read(
+    *, target: str, port: int, username: str, password: str, path: str,
+    max_output_bytes: int, connect_timeout: float, login_timeout: float, command_timeout: float,
+) -> FtpReadResult:
+    """Run the bounded ftplib RETR off the event loop under an overall ceiling."""
+    overall = connect_timeout + login_timeout + command_timeout + 5.0
+    start = time.monotonic()
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _ftp_read_sync,
+                target=target, port=port, username=username, password=password, path=path,
+                max_output_bytes=max_output_bytes, connect_timeout=connect_timeout,
+                login_timeout=login_timeout, command_timeout=command_timeout,
+            ),
+            timeout=overall,
+        )
+    except asyncio.TimeoutError:
+        return FtpReadResult(ok=False, error_code="command_timeout", timed_out=True,
+                             duration_seconds=time.monotonic() - start)

@@ -893,6 +893,12 @@ class AccessCapabilityType(str, Enum):
     #: isn't SSH or Telnet specifically). Distinct from ``ssh_command``,
     #: which already denotes a specific, concrete protocol.
     remote_command = "remote_command"
+    #: §28.17 — a validated FTP session that can RETR a bounded file (the
+    #: user-flag). A file-read primitive (like arbitrary_file_read), NOT a
+    #: command channel: the only operation is a bounded RETR of an approved
+    #: candidate path. Runs on the target-reachable Kali/VPN side via the
+    #: §28.16 tool-service, never in-process apex.
+    ftp_file_read = "ftp_file_read"
 
 
 @dataclass(slots=True)

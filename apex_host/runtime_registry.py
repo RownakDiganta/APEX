@@ -330,6 +330,22 @@ class CapabilityRuntimeRegistry:
         adapter: FlagReadCapability = BoundedCommandCapabilityAdapter(primitive)
         return self._ensure(capability_id, adapter)
 
+    def ensure_ftp_file_read(
+        self, capability_id: str, *, target: str, port: str, username: str,
+        password: str, config: "ApexConfig",
+    ) -> FlagReadCapability:
+        """Idempotently register (and return) an ``FtpFileReadCapabilityAdapter``
+        for *capability_id* (§28.17), built from the validated FTP session's
+        credentials. Mirrors ``ensure_ssh``'s idempotency exactly; constructing
+        the adapter performs no network I/O."""
+        existing = self._adapters.get(capability_id)
+        if existing is not None:
+            return existing
+        adapter: FlagReadCapability = FtpFileReadCapabilityAdapter(
+            target=target, port=port, username=username, password=password, config=config,
+        )
+        return self._ensure(capability_id, adapter)
+
 
 # ---------------------------------------------------------------------------
 # SSH adapter — the original concrete adapter (Phase 18 / access-capability
@@ -549,6 +565,133 @@ def _same_origin(a: str, b: str) -> bool:
         and (pa.hostname or "").lower() == (pb.hostname or "").lower()
         and pa.port == pb.port
     )
+
+
+# ---------------------------------------------------------------------------
+# §28.17 — FTP file-read adapter. Reads the user-flag over a bounded ftplib
+# RETR. When a remote tool backend is configured it runs on the target-reachable
+# Kali/VPN side via the §28.16/§28.17 tool-service (POST /v1/ftp-read); otherwise
+# it runs in-process (local/tests). Either path returns the same BoundedReadResult,
+# so UserFlagExecutor/verify_user_flag are unchanged. The password is held only as
+# a plain constructor argument, never logged/returned.
+# ---------------------------------------------------------------------------
+
+class FtpFileReadCapabilityAdapter:
+    """``FlagReadCapability`` adapter backed by FTP (ftplib RETR). Stateless per
+    read: holds only connection parameters, never a live ``ftplib.FTP`` across
+    calls (memfabric Invariant 6)."""
+
+    def __init__(
+        self, *, target: str, port: str, username: str, password: str, config: "ApexConfig",
+    ) -> None:
+        self._target = target
+        self._port = port
+        self._username = username
+        self._password = password
+        self._config = config
+        self._connect_timeout = float(getattr(config, "ftp_connect_timeout_seconds", 10.0))
+        self._login_timeout = float(getattr(config, "ftp_login_timeout_seconds", 10.0))
+        self._command_timeout = float(getattr(config, "ftp_command_timeout_seconds", 10.0))
+        self._max_bytes = int(getattr(config, "user_flag_max_output_bytes", 4096) or 4096)
+
+    async def read_bounded_file(self, path: str) -> BoundedReadResult:
+        try:
+            port = int(self._port)
+        except ValueError:
+            port = 21
+        if str(getattr(self._config, "tool_backend", "local")).strip().lower() == "remote":
+            return await self._remote_read(port, path)
+        connected, output, error, oversized = await asyncio.to_thread(
+            _read_ftp_file_sync, self._target, port, self._username, self._password, path,
+            self._connect_timeout, self._login_timeout, self._command_timeout, self._max_bytes,
+        )
+        return BoundedReadResult(
+            connected=connected, output=output, error=error, return_code=None,
+            bytes_received=len(output.encode("utf-8", errors="replace")),
+            truncated=oversized, method="ftp_read",
+        )
+
+    async def _remote_read(self, port: int, path: str) -> BoundedReadResult:
+        """RETR the flag on the Kali/VPN side via the tool-service (§28.17)."""
+        try:
+            from apex_host.tools.remote_backend import RemoteToolBackend
+
+            backend = RemoteToolBackend(self._config)
+        except ValueError as exc:
+            return BoundedReadResult(
+                connected=False, output="",
+                error=f"remote tool backend unavailable: {type(exc).__name__}", method="ftp_read",
+            )
+        try:
+            return await backend.ftp_read_file(
+                target=self._target, port=port, username=self._username, password=self._password,
+                path=path, max_output_bytes=self._max_bytes, connect_timeout=self._connect_timeout,
+                login_timeout=self._login_timeout, command_timeout=self._command_timeout,
+            )
+        finally:
+            await backend.aclose()
+
+
+def _read_ftp_file_sync(
+    target: str, port: int, username: str, password: str, path: str,
+    connect_timeout: float, login_timeout: float, command_timeout: float, max_bytes: int,
+) -> tuple[bool, str, str | None, bool]:
+    """In-process bounded ftplib RETR (local/tests). Returns
+    ``(connected, output, error, oversized)``. Passive, one RETR, close; the
+    §28.15 None-sock crash guard applies. Never logs the password or content."""
+    import ftplib
+    import socket
+
+    ftp = ftplib.FTP()  # noqa: S321 — passive, one bounded RETR of an approved path
+    ftp.encoding = "utf-8"
+    try:
+        try:
+            ftp.connect(host=target, port=port, timeout=connect_timeout)
+        except (socket.timeout, OSError, ftplib.Error, EOFError) as exc:
+            return False, "", f"ftp connection failed: {type(exc).__name__}", False
+        ftp.set_pasv(True)
+        if ftp.sock is not None:
+            ftp.sock.settimeout(login_timeout)
+        try:
+            ftp.login(user=username, passwd=password)
+        except (ftplib.Error, socket.timeout, EOFError, OSError) as exc:
+            return False, "", f"ftp login failed: {type(exc).__name__}", False
+        if ftp.sock is not None:
+            ftp.sock.settimeout(command_timeout)
+        chunks: list[bytes] = []
+        received = 0
+        oversized = {"v": False}
+
+        def _sink(block: bytes) -> None:
+            nonlocal received
+            if oversized["v"]:
+                return
+            received += len(block)
+            if received > max_bytes:
+                oversized["v"] = True
+                chunks.clear()
+                return
+            chunks.append(block)
+
+        try:
+            ftp.retrbinary(f"RETR {path}", _sink, blocksize=min(8192, max_bytes + 1))
+        except (ftplib.Error, socket.timeout, EOFError, OSError) as exc:
+            # connected=True: the session reached the server; a bad path is a
+            # read failure, not a connection failure.
+            return True, "", f"ftp retr failed: {type(exc).__name__}", False
+        if oversized["v"]:
+            return True, "", "oversized_output", True
+        return True, b"".join(chunks).decode("utf-8", errors="replace"), None, False
+    finally:
+        if ftp.sock is not None:
+            try:
+                ftp.quit()
+            except (ftplib.Error, OSError, EOFError):
+                pass
+        try:
+            ftp.close()
+        except OSError:
+            pass
 
 
 class DirectFileReadCapabilityAdapter:
