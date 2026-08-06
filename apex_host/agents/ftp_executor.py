@@ -91,23 +91,36 @@ class FTPExecutor:
         overall_timeout = connect_timeout + login_timeout + command_timeout + 5.0
 
         start = time.monotonic()
-        try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    _attempt_ftp_sync,
-                    target, port, username, password, operation,
-                    connect_timeout, login_timeout, command_timeout,
-                ),
-                timeout=overall_timeout,
+        # §28.16 — when a remote tool backend is configured, FTP validation runs on
+        # the Kali/VPN side (where the HTB target is reachable — apex has no VPN
+        # route). Otherwise it runs in-process here (local/tests). Either path
+        # returns the identical CredentialValidationResult, so everything
+        # downstream (AccessParser → access_state) is unchanged. The bounded §12B
+        # model holds either way: one login attempt, passive mode, one PWD/NOOP,
+        # then close; the password is never logged.
+        if str(getattr(self._config, "tool_backend", "local")).strip().lower() == "remote":
+            result = await self._remote_validate(
+                target, port, port_str, username, password, operation,
+                connect_timeout, login_timeout, command_timeout, start,
             )
-        except asyncio.TimeoutError:
-            result = CredentialValidationResult(
-                protocol="ftp", target=target, port=port_str, username=username,
-                success=False, authenticated=False, operation=operation,
-                response_summary="", error_category=CredentialErrorCategory.connect_timeout.value,
-                error_detail="ftp validation exceeded the overall bounded timeout",
-                duration_seconds=time.monotonic() - start, timed_out=True, executor="ftp",
-            )
+        else:
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _attempt_ftp_sync,
+                        target, port, username, password, operation,
+                        connect_timeout, login_timeout, command_timeout,
+                    ),
+                    timeout=overall_timeout,
+                )
+            except asyncio.TimeoutError:
+                result = CredentialValidationResult(
+                    protocol="ftp", target=target, port=port_str, username=username,
+                    success=False, authenticated=False, operation=operation,
+                    response_summary="", error_category=CredentialErrorCategory.connect_timeout.value,
+                    error_detail="ftp validation exceeded the overall bounded timeout",
+                    duration_seconds=time.monotonic() - start, timed_out=True, executor="ftp",
+                )
 
         outcome = Outcome.success if result.success else Outcome.fundamental
         logger.info(
@@ -167,6 +180,37 @@ class FTPExecutor:
             phase=task.phase,
         )
         return ExecutorResult(task_id=task.id, episode=episode)
+
+    async def _remote_validate(
+        self, target: str, port: int, port_str: str, username: str, password: str,
+        operation: str, connect_timeout: float, login_timeout: float,
+        command_timeout: float, start: float,
+    ) -> CredentialValidationResult:
+        """Delegate the bounded FTP validation to the remote tool service (§28.16),
+        which runs it on the target-reachable Kali/VPN side. Constructs its own
+        RemoteToolBackend from config and always closes it (one bounded attempt).
+        A misconfigured backend (e.g. missing service token) is a clean
+        classified error, never a crash."""
+        try:
+            from apex_host.tools.remote_backend import RemoteToolBackend
+
+            backend = RemoteToolBackend(self._config)
+        except ValueError as exc:
+            return CredentialValidationResult(
+                protocol="ftp", target=target, port=port_str, username=username,
+                success=False, authenticated=False, operation=operation, response_summary="",
+                error_category=CredentialErrorCategory.connection_failed.value,
+                error_detail=f"remote tool backend unavailable: {type(exc).__name__}",
+                duration_seconds=time.monotonic() - start, timed_out=False, executor="ftp",
+            )
+        try:
+            return await backend.validate_ftp(
+                target=target, port=port, username=username, password=password,
+                operation=operation, connect_timeout=connect_timeout,
+                login_timeout=login_timeout, command_timeout=command_timeout,
+            )
+        finally:
+            await backend.aclose()
 
 
 def _attempt_ftp_sync(

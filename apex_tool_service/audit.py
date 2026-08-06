@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING
 from apex_tool_service.models import ExecuteResponse
 
 if TYPE_CHECKING:
-    from apex_tool_service.executor import BoundedFileReadResult
+    from apex_tool_service.executor import BoundedFileReadResult, FtpValidateResult
 
 logger = logging.getLogger("apex_tool_service.audit")
 
@@ -117,4 +117,29 @@ def log_bounded_read_result(
         correlation_id, target, basename, result.ok, result.error_code or "",
         result.return_code, result.bytes_received, result.oversized, result.timed_out,
         result.duration_seconds,
+    )
+
+
+def log_ftp_validate_accepted(
+    correlation_id: str, target: str, port: int, username: str, operation: str,
+) -> None:
+    """Log that an FTP-validate request passed auth+authorization+validation and
+    is about to execute (§28.16). The username is logged (bounded, not a secret);
+    the PASSWORD is NEVER logged, here or anywhere in this package."""
+    logger.info(
+        "ftp_validate_accepted id=%s target=%s port=%d username=%s operation=%s",
+        correlation_id, target, port, username, operation,
+    )
+
+
+def log_ftp_validate_result(
+    correlation_id: str, target: str, username: str, result: "FtpValidateResult",
+) -> None:
+    """Log an FTP-validate outcome — ok/authenticated/error_code/timing only,
+    never the password and never the response body content."""
+    logger.info(
+        "ftp_validate_complete id=%s target=%s username=%s ok=%s authenticated=%s "
+        "error_code=%s timed_out=%s duration_seconds=%.3f",
+        correlation_id, target, username, result.ok, result.authenticated,
+        result.error_code or "", result.timed_out, result.duration_seconds,
     )

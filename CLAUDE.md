@@ -6164,6 +6164,19 @@ entirely inside the APEX process via Python libraries, never through the
 Kali Tool API or `RemoteToolBackend`, so no infrastructure change was
 needed or made.
 
+> **Correction (§28.16):** the "SSH/FTP validation runs entirely inside the
+> APEX process … never through the Kali Tool API" statement above was true
+> when Phase 12B completed and is left in place per this file's append-only
+> convention. It is **no longer accurate for FTP**: in the HTB Docker
+> topology only the `kali` container is on the VPN (`network_mode:
+> service:vpn`), so the `apex` container has no route to a VPN-only target —
+> in-process FTP validation always timed out. **FTP** credential validation
+> now runs on the Kali/VPN side via a dedicated bounded tool-service operation
+> (`POST /v1/ftp-validate`) when `tool_backend="remote"`, in-process
+> otherwise. The bounded §12B model is preserved exactly. SSH/Telnet still run
+> in-process and have the same reachability gap — a documented follow-on. See
+> §28.16 below.
+
 **Validation (clean-rebuilt `.venv`, Python 3.11.14):**
 
 | Check | Result |
@@ -10458,6 +10471,70 @@ classified; a successful login still quits+closes. Release-gate scenario
 with a faithful double): a failed connect yields a clean classified error (never
 the crash) and a successful anonymous login is a validated access with the
 password never stored. All fail against the old code (verified by reverting).
+
+### 28.16 FTP credential validation runs on the target-reachable tool-service side
+
+> **Numbering note:** highest unique §28 heading is §28.15 (the trailing
+> `### 28.7`/`### 28.8` are the known collision). This section is **§28.16**;
+> nothing was renumbered.
+
+Fixes the reachability gap the §28.15 crash fix exposed. In the HTB Docker
+topology only `kali` is on the VPN (`network_mode: service:vpn`); `apex` is on
+`apex-internal` and reaches the tool-service at `http://vpn:8080`. nmap/curl
+already run on the Kali side (via `run_command_fn` → `ToolBackend`), but FTP/SSH
+credential validation ran **in-process in apex** (`ftplib`/Paramiko) — which has
+no route to a VPN-only target, so every FTP attempt was a clean `connect_timeout`
+(after §28.15). This routes **FTP** validation to the target-reachable Kali side.
+
+**Approach (a), least surface — a dedicated bounded tool-service operation**
+mirroring the Phase 22 `POST /v1/bounded-file-read` precedent. `POST
+/v1/ftp-validate` (`apex_tool_service`) runs ONE bounded ftplib login (passive
+mode) + one harmless `PWD`/`NOOP` + close, on the Kali side. It is deliberately
+NOT `/v1/execute`: no `tool`/`arguments` field, no binary allowlist consulted
+(adding `python3` to run an ftplib script would be RCE — explicitly forbidden).
+Order of operations mirrors bounded-file-read: authenticate (bearer), parse
+(Pydantic `extra="forbid"`), validate (target CIDR, port, credential byte cap,
+`PWD`/`NOOP`-only operation, per-phase timeout caps), dry-run short-circuit,
+execute, audit, respond. The §28.15 None-sock crash guard is reimplemented
+server-side too. The password rides only in the bearer-authed request body
+(never an argv → no `ps` exposure), is **never logged** (audit logs the username
+only), and **never appears in the response** (an `auth_rejected` server message
+is password-redacted server-side). `apex_tool_service` still does not import
+`apex_host` (the ftplib session + redaction are self-contained).
+
+**Client + routing.** `RemoteToolBackend.validate_ftp(...)`
+(`apex_host/tools/remote_backend.py`) calls the new endpoint and maps the
+response to the SAME `CredentialValidationResult` shape as the in-process path
+(so `AccessParser`→`access_state` is unchanged); a transport/HTTP failure is a
+clean classified result, never a raised exception. `FTPExecutor.run` routes to
+`_remote_validate` (which builds a `RemoteToolBackend` from config and always
+`aclose()`s it) when `config.tool_backend == "remote"`, and stays in-process for
+`local`/tests; dry-run returns the synthetic result before either path. `apex`
+stays OFF the VPN namespace; nmap/curl backend wiring is untouched; `memfabric`
+untouched. New tool-service settings `ftp_validate_timeout_seconds` (10s per
+phase) / `ftp_validate_max_credential_bytes` (256) + their `APEX_TOOL_SERVICE_*`
+env (wired in `compose.yaml`'s `kali` service + `.env.example`).
+
+**Bounded §12B model preserved exactly:** one login attempt per protocol,
+passive mode, one harmless post-login op, then close; no brute force; success →
+`access_state`; failure → clean classified error.
+
+**Tests (fakes only — ftplib mocked server-side; the client reaches the service
+via in-process ASGI).** `tests/apex_tool_service/test_ftp_validate.py` (auth,
+scope, dry-run, success = one login, connect-failure = no crash, `auth_rejected`
+redaction, oversized-credential/bad-operation/extra-field rejection, password
+never in the response or logs, no `apex_host` import). `tests/apex_host/
+test_ftp_remote_routing.py` (remote success → validated access; remote connect
+failure → clean error; `tool_backend="remote"` never runs the in-process path;
+`local` never runs the remote path; dry-run never reaches remote; password never
+in the episode). Release-gate scenario `ftp_validation_via_tool_service` (§28.16)
+drives the **real** FTPExecutor (`tool_backend="remote"`) against the **real**
+in-process tool-service app and asserts validation went to the service (never
+in-process) — it **fails** against the old in-process routing (verified).
+
+**Follow-on:** SSH/Telnet validation still run in-process and have the same
+reachability gap; routing them through equivalent bounded tool-service
+operations is a documented follow-on (not in this change).
 
 ### 28.7 Release gate
 

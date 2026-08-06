@@ -1843,6 +1843,95 @@ async def scenario_ftp_anonymous_access() -> ScenarioResult:
     )
 
 
+async def scenario_ftp_validation_via_tool_service() -> ScenarioResult:
+    """22. FTP credential validation runs on the target-reachable tool-service
+    (Kali/VPN) side, not in-process in apex (§28.16).
+
+    apex has no route to a VPN-only HTB target, so in-process ftplib validation
+    always times out — only kali can reach it. Drives the REAL FTPExecutor with
+    ``tool_backend="remote"`` against the REAL in-process tool-service app (its
+    server-side ftplib mocked for a successful anonymous login). Fails the gate
+    if validation ran in-process (the old routing), if the tool-service path did
+    not produce a validated access, or if the password leaked into the episode.
+    """
+    import ftplib as _ftplib
+
+    import httpx
+
+    import apex_host.agents.ftp_executor as ftp_mod
+    from apex_host.agents.ftp_executor import FTPExecutor
+    from apex_host.config import ApexConfig
+    from apex_host.types import CredentialErrorCategory, CredentialValidationResult
+    from apex_tool_service.app import create_app
+    from apex_tool_service.settings import ServiceSettings
+    from memfabric.types import EvidenceBundle, TaskSpec
+
+    _TOKEN = "rg-ftp-token"
+    _SECRET = "probe-not-a-real-secret@x"
+    task = TaskSpec(
+        id="rg-ftp-remote", goal_id="g", executor_domain="credential",
+        params={"tool": "ftp_access", "target": _TARGET, "port": "21",
+                "username": "anonymous", "password": _SECRET, "parser": "access"},
+        subgraph_anchor=_ANCHOR, phase="credential",
+    )
+    ev = EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[])
+    config = ApexConfig(
+        target=_TARGET, dry_run=False, tool_backend="remote",
+        tool_service_url="http://svc", tool_service_token=_TOKEN,
+        ftp_connect_timeout_seconds=1.0, ftp_login_timeout_seconds=1.0,
+        ftp_command_timeout_seconds=1.0,
+    )
+    # Tool-service (kali side), authorized for the synthetic target's /24, with a
+    # successful server-side ftplib login (reusing the §28.15 faithful double).
+    app = create_app(ServiceSettings(token=_TOKEN, authorized_cidrs=("10.10.10.0/24",)))
+    transport = httpx.ASGITransport(app=app)
+    _real_client = httpx.AsyncClient  # bind before patching to avoid recursion
+
+    in_process_ran = {"v": False}
+
+    def _spy_in_process(*a: object, **k: object) -> CredentialValidationResult:
+        # If FTPExecutor ran the in-process path (the OLD routing), record it and
+        # return a failure — apex has no route to a VPN-only target.
+        in_process_ran["v"] = True
+        return CredentialValidationResult(
+            protocol="ftp", target=_TARGET, port="21", username="anonymous",
+            success=False, authenticated=False, operation="PWD", response_summary="",
+            error_category=CredentialErrorCategory.connect_timeout.value,
+            error_detail="in-process (apex) has no VPN route", duration_seconds=0.0,
+            timed_out=True, executor="ftp",
+        )
+
+    orig_ftp = _ftplib.FTP
+    orig_attempt = ftp_mod._attempt_ftp_sync
+    orig_async_client = httpx.AsyncClient  # RemoteToolBackend uses this same module singleton
+    problems: list[str] = []
+    try:
+        setattr(_ftplib, "FTP", lambda *a, **k: _FawnFtpFake(connect_ok=True))  # server-side success
+        setattr(ftp_mod, "_attempt_ftp_sync", _spy_in_process)
+        setattr(httpx, "AsyncClient", lambda *a, **k: _real_client(transport=transport))
+        result = await FTPExecutor(config).run(task, ev)
+    finally:
+        setattr(_ftplib, "FTP", orig_ftp)
+        setattr(ftp_mod, "_attempt_ftp_sync", orig_attempt)
+        setattr(httpx, "AsyncClient", orig_async_client)
+
+    if in_process_ran["v"]:
+        problems.append("FTP validation ran in-process (apex) instead of the target-reachable tool-service")
+    data = result.episode.data
+    if data.get("success") is not True or data.get("authenticated") is not True:
+        problems.append(f"tool-service FTP validation did not produce a validated access: {data.get('error_category')!r}")
+    if _SECRET in str(data):
+        problems.append("the FTP password leaked into the episode data")
+
+    if problems:
+        return ScenarioResult("ftp_validation_via_tool_service", False, "; ".join(problems))
+    return ScenarioResult(
+        "ftp_validation_via_tool_service", True,
+        "FTPExecutor routed validation to the tool-service (Kali/VPN side) — never in-process; "
+        "successful anonymous login → validated access; password never stored",
+    )
+
+
 SCENARIOS: list[Any] = [
     scenario_ssh_success,
     scenario_dfr_success,
@@ -1866,6 +1955,7 @@ SCENARIOS: list[Any] = [
     scenario_web_endpoint_fetch_loop,
     scenario_recon_service_no_credentials_honest_outcome,
     scenario_ftp_anonymous_access,
+    scenario_ftp_validation_via_tool_service,
 ]
 
 

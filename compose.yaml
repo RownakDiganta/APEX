@@ -101,6 +101,9 @@ services:
       APEX_TOOL_SERVICE_BOUNDED_READ_TIMEOUT: ${APEX_TOOL_SERVICE_BOUNDED_READ_TIMEOUT:-10}
       APEX_TOOL_SERVICE_ALLOWED_FLAG_BASENAMES: ${APEX_TOOL_SERVICE_ALLOWED_FLAG_BASENAMES:-user.txt}
       APEX_TOOL_SERVICE_AUTHORIZED_CIDRS: ${APEX_TOOL_SERVICE_AUTHORIZED_CIDRS:-10.129.0.0/16}
+      # §28.16 — bounded FTP credential validation (POST /v1/ftp-validate).
+      APEX_TOOL_SERVICE_FTP_VALIDATE_TIMEOUT: ${APEX_TOOL_SERVICE_FTP_VALIDATE_TIMEOUT:-10}
+      APEX_TOOL_SERVICE_FTP_VALIDATE_MAX_CREDENTIAL_BYTES: ${APEX_TOOL_SERVICE_FTP_VALIDATE_MAX_CREDENTIAL_BYTES:-256}
     # `expose:` documents intent (reachable on the Compose network at port
     # 8080) but is not strictly required — Compose already makes every
     # service's ports reachable to other services on the same network

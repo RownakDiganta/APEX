@@ -105,6 +105,50 @@ class ReadBoundedFileResponse(BaseModel):
     method: str = "bounded_file_read"
 
 
+class FtpValidateRequest(BaseModel):
+    """One dedicated, structured bounded FTP credential-validation request
+    (§28.16). Deliberately NOT a generalisation of ``ExecuteRequest`` — there
+    is no ``tool``/``arguments``/``command`` field and none is accepted
+    (``extra="forbid"``). The service runs exactly ONE ftplib login attempt
+    (passive mode) followed by exactly one harmless ``PWD``/``NOOP`` and closes
+    — no file transfer, no brute force. The password is used only to attempt the
+    single login; it is never logged, and never appears in the response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: str
+    port: int = 21
+    username: str
+    password: str
+    operation: str = "PWD"
+    connect_timeout_seconds: float | None = None
+    login_timeout_seconds: float | None = None
+    command_timeout_seconds: float | None = None
+    #: Defense-in-depth mirror of ``ApexConfig.dry_run`` — the primary dry-run
+    #: enforcement is apex-side (FTPExecutor returns a synthetic result and never
+    #: reaches this endpoint); this field lets the service refuse too.
+    dry_run: bool = False
+
+
+class FtpValidateResponse(BaseModel):
+    """Structured, sanitized result of one FTP validation. Carries NO password
+    and NO file content — only bounded status/metadata safe to log or report."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    authenticated: bool = False
+    operation: str = "PWD"
+    #: The harmless PWD/NOOP response text (e.g. '"/" is the current directory')
+    #: — bounded and password-redacted server-side; never the password itself.
+    response_summary: str = ""
+    error_code: str | None = None
+    sanitized_error: str | None = None
+    timed_out: bool = False
+    duration_ms: float = 0.0
+    method: str = "ftp_validate"
+
+
 class HealthResponse(BaseModel):
     """``/health`` response — availability only, never secrets or paths."""
 
@@ -117,3 +161,6 @@ class HealthResponse(BaseModel):
     #: a file, validates a path, or exposes allowed paths/basenames —
     #: it simply reports that the dedicated bounded-file-read route exists.
     bounded_file_read: bool = True
+    #: §28.16 — static capability flag: the dedicated bounded FTP-validate
+    #: route exists. Never exposes a credential, target, or result.
+    ftp_validate: bool = True

@@ -654,8 +654,13 @@ with agent forwarding and local key discovery disabled; FTP uses the
 standard library's `ftplib` in passive mode. Both run only a single fixed
 harmless command afterward (`id`/`whoami` for SSH, `PWD`/`NOOP` for FTP)
 and close the connection immediately — no file transfer, no persistent
-session, no privilege escalation. FTP/SSH validation runs **in-process**
-(locally, via `ftplib`/Paramiko), never through the Kali tool service. A
+session, no privilege escalation. In the HTB Docker topology only `kali`
+is on the VPN, so **FTP** validation now runs on the target-reachable
+Kali/VPN side via a dedicated bounded tool-service operation
+(`POST /v1/ftp-validate`) when `tool_backend=remote`, in-process otherwise
+(the bounded one-attempt model is identical; the password rides only in the
+bearer-authed request body, never an argv, and is never logged; §28.16 in
+CLAUDE.md). SSH/Telnet still run in-process (a documented follow-on). A
 failed connect always returns a clean classified error (`connection_failed`)
 — never a crash: an earlier bug where the FTP cleanup called `ftplib.quit()`
 on a never-established (`None`) socket, raising `'NoneType' … 'sendall'` and

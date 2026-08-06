@@ -312,3 +312,143 @@ async def execute_bounded_file_read(
         return BoundedFileReadResult(
             ok=False, error_code="process_failed", duration_seconds=time.monotonic() - start,
         )
+
+
+@dataclass
+class FtpValidateResult:
+    """Service-internal result of one ``execute_ftp_validate()`` call — distinct
+    from the Pydantic ``FtpValidateResponse`` (built from this in ``app.py``).
+    Carries NO password: ``response_summary`` is a redacted, bounded PWD/NOOP
+    reply only."""
+
+    ok: bool
+    authenticated: bool = False
+    operation: str = "PWD"
+    response_summary: str = ""
+    error_code: str | None = None
+    sanitized_error: str | None = None
+    timed_out: bool = False
+    duration_seconds: float = 0.0
+
+
+_FTP_VALIDATE_MAX_SUMMARY_BYTES = 256
+
+
+def _redact_password(text: str, password: str) -> str:
+    """Replace the submitted password anywhere it appears in *text* (defense in
+    depth — no normal FTP server echoes it back, but a hostile/odd one might).
+    Independent of apex_host (this package never imports it)."""
+    if password and len(password) >= 3 and password in text:
+        text = text.replace(password, "[redacted]")
+    return text
+
+
+def _ftp_validate_sync(
+    *, target: str, port: int, username: str, password: str, operation: str,
+    connect_timeout: float, login_timeout: float, command_timeout: float,
+) -> FtpValidateResult:
+    """One bounded ftplib session (§28.16): connect -> login -> one PWD/NOOP ->
+    close. Passive mode. Never brute-forces, never transfers a file, never logs
+    the password. Never raises — every ftplib/socket error is classified. The
+    None-sock crash guard (apex_host §28.15) is applied here too: quit() is only
+    called on an established connection, so a failed connect can never reach
+    self.sock.sendall on a None socket."""
+    import ftplib
+    import socket
+
+    start = time.monotonic()
+    ftp = ftplib.FTP()  # noqa: S321 — passive mode, one bounded op, never transfers a secret
+    ftp.encoding = "utf-8"
+    try:
+        try:
+            ftp.connect(host=target, port=port, timeout=connect_timeout)
+        except socket.timeout:
+            return FtpValidateResult(
+                ok=False, error_code="connect_timeout", timed_out=True,
+                duration_seconds=time.monotonic() - start,
+            )
+        except (OSError, ftplib.Error, EOFError):
+            return FtpValidateResult(
+                ok=False, error_code="connection_failed",
+                duration_seconds=time.monotonic() - start,
+            )
+
+        ftp.set_pasv(True)
+        if ftp.sock is not None:
+            ftp.sock.settimeout(login_timeout)
+        try:
+            ftp.login(user=username, passwd=password)
+        except ftplib.error_perm as exc:
+            return FtpValidateResult(
+                ok=False, authenticated=False, error_code="auth_rejected",
+                sanitized_error=_redact_password(str(exc)[:200], password),
+                duration_seconds=time.monotonic() - start,
+            )
+        except socket.timeout:
+            return FtpValidateResult(
+                ok=False, error_code="auth_timeout", timed_out=True,
+                duration_seconds=time.monotonic() - start,
+            )
+        except (ftplib.error_temp, ftplib.error_proto, ftplib.Error, EOFError, OSError):
+            return FtpValidateResult(
+                ok=False, error_code="protocol_error",
+                duration_seconds=time.monotonic() - start,
+            )
+
+        if ftp.sock is not None:
+            ftp.sock.settimeout(command_timeout)
+        try:
+            response = ftp.voidcmd("NOOP") if operation == "NOOP" else ftp.pwd()
+        except socket.timeout:
+            return FtpValidateResult(
+                ok=False, authenticated=True, operation=operation, error_code="command_timeout",
+                timed_out=True, duration_seconds=time.monotonic() - start,
+            )
+        except (ftplib.Error, EOFError, OSError):
+            return FtpValidateResult(
+                ok=False, authenticated=True, operation=operation, error_code="command_failed",
+                duration_seconds=time.monotonic() - start,
+            )
+
+        return FtpValidateResult(
+            ok=True, authenticated=True, operation=operation,
+            response_summary=_redact_password(str(response), password)[:_FTP_VALIDATE_MAX_SUMMARY_BYTES],
+            error_code="success", duration_seconds=time.monotonic() - start,
+        )
+    finally:
+        # §28.15 crash guard: quit() sends QUIT via self.sock.sendall; only do it
+        # on an established connection. Always close (safe on a None sock).
+        if ftp.sock is not None:
+            try:
+                ftp.quit()
+            except (ftplib.Error, OSError, EOFError):
+                pass
+        try:
+            ftp.close()
+        except OSError:
+            pass
+
+
+async def execute_ftp_validate(
+    *, target: str, port: int, username: str, password: str, operation: str,
+    connect_timeout: float, login_timeout: float, command_timeout: float,
+) -> FtpValidateResult:
+    """Run the bounded ftplib session off the event loop, wrapped in an overall
+    wall-clock ceiling so one attempt can never hang the service."""
+    overall = connect_timeout + login_timeout + command_timeout + 5.0
+    start = time.monotonic()
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _ftp_validate_sync,
+                target=target, port=port, username=username, password=password,
+                operation=operation, connect_timeout=connect_timeout,
+                login_timeout=login_timeout, command_timeout=command_timeout,
+            ),
+            timeout=overall,
+        )
+    except asyncio.TimeoutError:
+        return FtpValidateResult(
+            ok=False, error_code="connect_timeout", timed_out=True,
+            duration_seconds=time.monotonic() - start,
+        )

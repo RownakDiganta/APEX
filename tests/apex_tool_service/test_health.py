@@ -62,10 +62,11 @@ async def test_health_does_not_expose_env_or_internal_paths() -> None:
     async with client_for(app) as client:
         r = await client.get("/health")
     body = r.json()
-    # Phase 22 — "bounded_file_read" is a static capability flag only (the
-    # endpoint exists); it never reads a file, validates a path, or exposes
-    # allowed paths/basenames/executables.
-    assert set(body.keys()) == {"status", "service", "tools", "bounded_file_read"}
+    # Phase 22 — "bounded_file_read" (and §28.16 "ftp_validate") are static
+    # capability flags only (the endpoints exist); neither reads a file,
+    # validates a path/credential, or exposes paths/basenames/executables/targets.
+    assert set(body.keys()) == {"status", "service", "tools", "bounded_file_read", "ftp_validate"}
     assert isinstance(body["bounded_file_read"], bool)
+    assert isinstance(body["ftp_validate"], bool)
     for value in body["tools"].values():
         assert isinstance(value, bool)

@@ -57,6 +57,7 @@ from apex_host.types import ToolCommand, ToolResult
 
 if TYPE_CHECKING:
     from apex_host.config import ApexConfig
+    from apex_host.types import CredentialValidationResult
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ _EXECUTE_PATH = "/v1/execute"
 # apex_tool_service/models.py::ReadBoundedFileRequest/Response) that never
 # touches apex_tool_service's ALLOWED_TOOLS allowlist at all.
 _READ_BOUNDED_FILE_PATH = "/v1/bounded-file-read"
+_FTP_VALIDATE_PATH = "/v1/ftp-validate"  # §28.16
 _ENV_TOKEN = "APEX_TOOL_SERVICE_TOKEN"
 
 _REQUIRED_BOUNDED_READ_RESPONSE_FIELDS: dict[str, type | tuple[type, ...]] = {
@@ -353,6 +355,79 @@ class RemoteToolBackend:
     def _malformed_bounded_read_result(self, message: str) -> BoundedReadResult:
         logger.warning("remote bounded-file-read returned a malformed response: %s", message)
         return BoundedReadResult(connected=False, output="", error=message, method="remote")
+
+    # ------------------------------------------------------------------
+    # §28.16 — bounded FTP credential validation on the target-reachable side
+    # ------------------------------------------------------------------
+
+    async def validate_ftp(
+        self, *, target: str, port: int, username: str, password: str, operation: str,
+        connect_timeout: float, login_timeout: float, command_timeout: float,
+    ) -> "CredentialValidationResult":
+        """Call the tool service's dedicated ``POST /v1/ftp-validate`` — one
+        bounded ftplib login + one harmless PWD/NOOP, run on the Kali/VPN side
+        where the target is reachable. Returns a ``CredentialValidationResult``
+        identical in shape to the in-process path, so FTPExecutor is unchanged
+        downstream. The password is sent only in the (bearer-authed) request body,
+        never on an argv; a transport failure is a clean classified result, never
+        a raised exception. Dry-run is enforced by the caller (FTPExecutor returns
+        a synthetic result before this is ever reached)."""
+        from apex_host.types import CredentialErrorCategory, CredentialValidationResult
+
+        start = time.monotonic()
+        client_timeout = connect_timeout + login_timeout + command_timeout + _CLIENT_TIMEOUT_MARGIN_SECONDS
+        body = {
+            "target": target, "port": int(port), "username": username, "password": password,
+            "operation": operation, "connect_timeout_seconds": float(connect_timeout),
+            "login_timeout_seconds": float(login_timeout), "command_timeout_seconds": float(command_timeout),
+        }
+        headers = {"Authorization": f"Bearer {self._token}"}
+        url = f"{self._base_url}{_FTP_VALIDATE_PATH}"
+
+        def _fail(category: str, detail: str, *, timed_out: bool = False) -> "CredentialValidationResult":
+            logger.warning("remote ftp-validate transport failure: %s", detail)
+            return CredentialValidationResult(
+                protocol="ftp", target=target, port=str(port), username=username,
+                success=False, authenticated=False, operation=operation, response_summary="",
+                error_category=category, error_detail=detail,
+                duration_seconds=time.monotonic() - start, timed_out=timed_out, executor="ftp",
+            )
+
+        client = self._get_client()
+        try:
+            response = await client.post(url, json=body, headers=headers, timeout=client_timeout)
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.TimeoutException) as exc:
+            return _fail(CredentialErrorCategory.connect_timeout.value,
+                         f"tool service request timed out: {_safe_exc_text(exc)}", timed_out=True)
+        except httpx.RequestError as exc:
+            return _fail(CredentialErrorCategory.connection_failed.value,
+                         f"could not reach tool service: {_safe_exc_text(exc)}")
+
+        if response.status_code != 200:
+            detail = self._extract_detail(response)
+            return _fail(CredentialErrorCategory.connection_failed.value,
+                         f"tool service returned HTTP {response.status_code}"
+                         + (f": {detail}" if detail else ""))
+        try:
+            data = response.json()
+        except ValueError:
+            return _fail(CredentialErrorCategory.protocol_error.value, "tool service response is not JSON")
+        if not isinstance(data, dict):
+            return _fail(CredentialErrorCategory.protocol_error.value, "tool service response is not a JSON object")
+
+        category = str(data.get("error_code") or "")
+        known = {c.value for c in CredentialErrorCategory}
+        if category not in known:
+            category = CredentialErrorCategory.protocol_error.value
+        return CredentialValidationResult(
+            protocol="ftp", target=target, port=str(port), username=username,
+            success=bool(data.get("ok")), authenticated=bool(data.get("authenticated")),
+            operation=str(data.get("operation") or operation),
+            response_summary=str(data.get("response_summary") or ""),
+            error_category=category, error_detail=str(data.get("sanitized_error") or ""),
+            duration_seconds=time.monotonic() - start, timed_out=bool(data.get("timed_out")),
+            executor="ftp",
+        )
 
     # ------------------------------------------------------------------
     # Response mapping

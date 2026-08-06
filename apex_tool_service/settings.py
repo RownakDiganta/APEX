@@ -74,6 +74,14 @@ _DEFAULT_BOUNDED_READ_MAX_BYTES = 4096
 _DEFAULT_BOUNDED_READ_TIMEOUT_SECONDS = 10.0
 _DEFAULT_ALLOWED_FLAG_BASENAMES: tuple[str, ...] = ("user.txt",)
 _DEFAULT_AUTHORIZED_CIDRS: tuple[str, ...] = ("10.129.0.0/16",)
+# §28.16 — FTP-validate bounds.
+ENV_FTP_VALIDATE_TIMEOUT = "APEX_TOOL_SERVICE_FTP_VALIDATE_TIMEOUT"
+ENV_FTP_VALIDATE_MAX_CREDENTIAL_BYTES = "APEX_TOOL_SERVICE_FTP_VALIDATE_MAX_CREDENTIAL_BYTES"
+_DEFAULT_FTP_VALIDATE_TIMEOUT_SECONDS = 10.0
+_DEFAULT_FTP_VALIDATE_MAX_CREDENTIAL_BYTES = 256
+#: Fixed set of harmless post-login validation operations — NOT env-configurable
+#: (this is a safety constant, never a knob). Mirrors apex_host §12B.
+FTP_VALIDATE_ALLOWED_OPERATIONS: tuple[str, ...] = ("PWD", "NOOP")
 
 
 def _parse_csv(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -106,6 +114,12 @@ class ServiceSettings:
     bounded_read_timeout_seconds: float = _DEFAULT_BOUNDED_READ_TIMEOUT_SECONDS
     allowed_flag_basenames: tuple[str, ...] = _DEFAULT_ALLOWED_FLAG_BASENAMES
     authorized_cidrs: tuple[str, ...] = _DEFAULT_AUTHORIZED_CIDRS
+    # §28.16 — bounded FTP credential validation (POST /v1/ftp-validate). One
+    # login attempt, passive mode, one harmless PWD/NOOP, then close. The
+    # per-phase timeout cap (connect/login/command each) and the username/
+    # password byte cap bound the operation; the password is never logged.
+    ftp_validate_timeout_seconds: float = _DEFAULT_FTP_VALIDATE_TIMEOUT_SECONDS
+    ftp_validate_max_credential_bytes: int = _DEFAULT_FTP_VALIDATE_MAX_CREDENTIAL_BYTES
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "ServiceSettings":
@@ -144,6 +158,12 @@ class ServiceSettings:
                 e.get(ENV_ALLOWED_FLAG_BASENAMES), _DEFAULT_ALLOWED_FLAG_BASENAMES
             ),
             authorized_cidrs=_parse_csv(e.get(ENV_AUTHORIZED_CIDRS), _DEFAULT_AUTHORIZED_CIDRS),
+            ftp_validate_timeout_seconds=float(
+                e.get(ENV_FTP_VALIDATE_TIMEOUT, _DEFAULT_FTP_VALIDATE_TIMEOUT_SECONDS)
+            ),
+            ftp_validate_max_credential_bytes=int(
+                e.get(ENV_FTP_VALIDATE_MAX_CREDENTIAL_BYTES, _DEFAULT_FTP_VALIDATE_MAX_CREDENTIAL_BYTES)
+            ),
         )
 
     def to_safe_dict(self) -> dict[str, object]:

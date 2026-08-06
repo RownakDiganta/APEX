@@ -33,15 +33,23 @@ from apex_tool_service.audit import (
     log_bounded_read_accepted,
     log_bounded_read_result,
     log_execution_result,
+    log_ftp_validate_accepted,
+    log_ftp_validate_result,
     log_request_accepted,
     log_validation_rejected,
     new_correlation_id,
 )
 from apex_tool_service.auth import AuthStatus, check_bearer_token
-from apex_tool_service.executor import execute_bounded_file_read, execute_tool
+from apex_tool_service.executor import (
+    execute_bounded_file_read,
+    execute_ftp_validate,
+    execute_tool,
+)
 from apex_tool_service.models import (
     ExecuteRequest,
     ExecuteResponse,
+    FtpValidateRequest,
+    FtpValidateResponse,
     HealthResponse,
     ReadBoundedFileRequest,
     ReadBoundedFileResponse,
@@ -51,9 +59,13 @@ from apex_tool_service.validation import (
     RequestValidationError,
     resolve_and_validate_tool,
     resolve_bounded_read_limits,
+    resolve_ftp_validate_timeout,
     resolve_timeout,
     validate_arguments,
     validate_bounded_path,
+    validate_ftp_credentials,
+    validate_ftp_operation,
+    validate_ftp_port,
     validate_stdin,
     validate_target_authorized,
 )
@@ -75,6 +87,21 @@ _ERROR_CODE_MESSAGES: dict[str, str] = {
     "invalid_path": "the requested path is not a readable regular file",
     "process_failed": "the bounded read could not be completed",
     "dry_run": "dry-run: no process launched",
+}
+
+#: §28.16 — fixed, generic, sanitized messages per FTP-validate error category.
+#: Never derived from raw exception text (the one exception is the redacted
+#: auth-rejected server response, which is set as ``sanitized_error`` directly).
+_FTP_ERROR_CODE_MESSAGES: dict[str, str] = {
+    "connect_timeout": "the FTP connection did not complete within the timeout",
+    "connection_failed": "the FTP connection could not be established",
+    "auth_rejected": "the FTP server rejected the credentials",
+    "auth_timeout": "the FTP login did not complete within the timeout",
+    "protocol_error": "an FTP protocol error occurred during login",
+    "command_timeout": "the FTP validation operation timed out",
+    "command_failed": "the FTP validation operation failed",
+    "dry_run": "dry-run: no login attempted",
+    "success": "",
 }
 
 
@@ -106,7 +133,8 @@ def create_app(settings: ServiceSettings | None = None) -> FastAPI:
         # Static capability flag only — never reads a file, validates a
         # path, or exposes allowed paths/basenames.
         return HealthResponse(
-            status="ok", service=SERVICE_NAME, tools=tool_availability(), bounded_file_read=True,
+            status="ok", service=SERVICE_NAME, tools=tool_availability(),
+            bounded_file_read=True, ftp_validate=True,
         )
 
     @app.post("/v1/execute", response_model=ExecuteResponse)
@@ -237,6 +265,84 @@ def create_app(settings: ServiceSettings | None = None) -> FastAPI:
             return_code=result.return_code,
             bytes_received=result.bytes_received,
             oversized=result.oversized,
+            timed_out=result.timed_out,
+            duration_ms=result.duration_seconds * 1000.0,
+        )
+
+    @app.post("/v1/ftp-validate", response_model=FtpValidateResponse)
+    async def ftp_validate(
+        raw_request: Request, authorization: str | None = Header(default=None),
+    ) -> FtpValidateResponse:
+        """Dedicated, structured bounded FTP credential-validation (§28.16).
+
+        Runs on the Kali/VPN side where the target is reachable (apex has no VPN
+        route). Deliberately NOT ``/v1/execute``: no ``tool``/``arguments``, no
+        binary allowlist consulted — the service alone runs ONE ftplib login +
+        one harmless PWD/NOOP + close. Order of operations mirrors
+        ``/v1/bounded-file-read`` exactly: authenticate, parse, validate (target,
+        port, credentials, operation, timeouts), dry-run short-circuit, execute,
+        audit, respond. The password is used only for the single login attempt
+        and is NEVER logged or returned.
+        """
+        correlation_id = new_correlation_id()
+
+        auth_result = check_bearer_token(authorization, settings)
+        if auth_result.status is AuthStatus.service_misconfigured:
+            logger.warning("ftp_validate rejected: no server token configured id=%s", correlation_id)
+            raise HTTPException(status_code=503, detail="tool service is not configured with an authentication token")
+        if not auth_result.is_authenticated:
+            log_auth_failure(correlation_id, auth_result.status.value)
+            raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+
+        try:
+            raw_body = await raw_request.json()
+        except Exception:  # noqa: BLE001 - any body-decoding failure is a 400, not a 500
+            raise HTTPException(status_code=400, detail="request body must be valid JSON") from None
+        try:
+            req = FtpValidateRequest.model_validate(raw_body)
+        except pydantic.ValidationError as exc:
+            log_validation_rejected(correlation_id, "schema validation failed")
+            raise HTTPException(
+                status_code=400,
+                detail={"message": "invalid request schema", "errors": _format_schema_errors(exc)},
+            ) from None
+
+        try:
+            validate_target_authorized(req.target, authorized_cidrs=settings.authorized_cidrs)
+            port = validate_ftp_port(req.port)
+            validate_ftp_credentials(
+                req.username, req.password, max_bytes=settings.ftp_validate_max_credential_bytes,
+            )
+            operation = validate_ftp_operation(req.operation)
+            connect_timeout = resolve_ftp_validate_timeout(req.connect_timeout_seconds, settings)
+            login_timeout = resolve_ftp_validate_timeout(req.login_timeout_seconds, settings)
+            command_timeout = resolve_ftp_validate_timeout(req.command_timeout_seconds, settings)
+        except RequestValidationError as exc:
+            log_validation_rejected(correlation_id, exc.detail)
+            raise HTTPException(status_code=400, detail=exc.detail) from None
+
+        if req.dry_run:
+            log_ftp_validate_accepted(correlation_id, req.target, port, req.username, operation)
+            return FtpValidateResponse(
+                ok=False, error_code="dry_run", sanitized_error="dry-run: no login attempted",
+            )
+
+        log_ftp_validate_accepted(correlation_id, req.target, port, req.username, operation)
+        result = await execute_ftp_validate(
+            target=req.target, port=port, username=req.username, password=req.password,
+            operation=operation, connect_timeout=connect_timeout,
+            login_timeout=login_timeout, command_timeout=command_timeout,
+        )
+        log_ftp_validate_result(correlation_id, req.target, req.username, result)
+
+        return FtpValidateResponse(
+            ok=result.ok,
+            authenticated=result.authenticated,
+            operation=result.operation,
+            response_summary=result.response_summary,
+            error_code=result.error_code,
+            sanitized_error=result.sanitized_error
+            or (_FTP_ERROR_CODE_MESSAGES.get(result.error_code, result.error_code) if result.error_code else None),
             timed_out=result.timed_out,
             duration_ms=result.duration_seconds * 1000.0,
         )

@@ -22,7 +22,7 @@ import math
 import re
 
 from apex_tool_service.allowlist import is_allowed, resolve_binary
-from apex_tool_service.settings import ServiceSettings
+from apex_tool_service.settings import FTP_VALIDATE_ALLOWED_OPERATIONS, ServiceSettings
 
 # Matches apex_host/tools/safety.py::_SHELL_OPERATORS (duplicated on purpose — see module docstring).
 _SHELL_OPERATORS: tuple[str, ...] = (";", "&&", "||", "|", ">>", ">", "<", "$(", "`")
@@ -236,3 +236,46 @@ def resolve_bounded_read_limits(
         max_output_bytes = min(requested_max_output_bytes, settings.bounded_read_max_bytes)
 
     return timeout_seconds, max_output_bytes
+
+
+def validate_ftp_operation(operation: str) -> str:
+    """Return the requested harmless post-login op, restricted to the fixed
+    PWD/NOOP allowlist (§28.16) — never a file transfer, listing, or arbitrary
+    command. An unrecognised value is rejected, never silently coerced."""
+    op = (operation or "").strip().upper()
+    if op not in FTP_VALIDATE_ALLOWED_OPERATIONS:
+        raise RequestValidationError(
+            f"'operation' must be one of {list(FTP_VALIDATE_ALLOWED_OPERATIONS)!r}"
+        )
+    return op
+
+
+def validate_ftp_credentials(username: str, password: str, *, max_bytes: int) -> None:
+    """Bound the credential sizes. The username/password are used only for the
+    single login attempt and are NEVER logged; this only rejects absurdly large
+    values (defense in depth against a hostile/oversized request body)."""
+    if not isinstance(username, str) or not username:
+        raise RequestValidationError("'username' must be a non-empty string")
+    if not isinstance(password, str):
+        raise RequestValidationError("'password' must be a string")
+    if len(username.encode("utf-8")) > max_bytes or len(password.encode("utf-8")) > max_bytes:
+        raise RequestValidationError(f"credential exceeds the {max_bytes}-byte cap")
+
+
+def validate_ftp_port(port: int) -> int:
+    if not isinstance(port, int) or isinstance(port, bool) or not (1 <= port <= 65535):
+        raise RequestValidationError("'port' must be an integer in 1..65535")
+    return port
+
+
+def resolve_ftp_validate_timeout(requested: float | None, settings: ServiceSettings) -> float:
+    """Per-phase (connect/login/command) timeout: ``min(requested, cap)``,
+    rejecting malformed values rather than silently coercing them."""
+    cap = settings.ftp_validate_timeout_seconds
+    if requested is None:
+        return cap
+    if not isinstance(requested, (int, float)) or isinstance(requested, bool):
+        raise RequestValidationError("timeout must be a number")
+    if math.isnan(requested) or math.isinf(requested) or requested <= 0:
+        raise RequestValidationError("timeout must be a positive finite number")
+    return min(float(requested), cap)
