@@ -699,7 +699,11 @@ requestable basenames — both default to `user.txt,flag.txt` and must be
 kept in sync (§28.19). The bounded RETR is issued as `CWD <dir>` +
 `RETR <basename>` (not an absolute `RETR /flag.txt`) so it resolves inside
 a vsftpd anonymous chroot, where the flag is served as a bare basename in
-the login directory (§28.20). Full design:
+the login directory (§28.20). Candidate paths are priority-ordered so the
+two dominant HTB flag locations (`/home/<user>/user.txt` for SSH,
+`/flag.txt` for FTP-anon/simple boxes) are both tried within the first two
+attempts, so a small objective budget still reaches the right one (§28.21).
+Full design:
 [`docs/user-flag-objective.md`](docs/user-flag-objective.md).
 
 **Access-capability abstraction (Phase 18B):** the objective's access

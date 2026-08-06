@@ -10557,8 +10557,14 @@ operations is a documented follow-on (not in this change).
 > `allowed_flag_basenames` (a second, server-side allowlist) still 400-rejected
 > `flag.txt`; (§28.20) the server issued the RETR as an absolute `RETR /flag.txt`,
 > which a vsftpd anonymous chroot rejects — it must be `CWD /` + `RETR flag.txt`.
-> All are PATH/fingerprint/allowlist-sync/RETR-form fixes; no capability-type
-> branching, `verify_user_flag` unchanged, server allowlist + bounds unchanged.
+> (§28.20) the server issued the RETR as an absolute `RETR /flag.txt`, which a
+> vsftpd anonymous chroot rejects — it must be `CWD /` + `RETR flag.txt`; and
+> (§28.21) even then, `/flag.txt` was candidate #4 and the objective's small turn
+> budget was spent on `/home/<user>/*` first, so the candidate ORDER now puts the
+> two dominant HTB flag locations (`/home/<user>/user.txt`, `/flag.txt`) first.
+> All are PATH/fingerprint/allowlist-sync/RETR-form/candidate-order fixes; no
+> capability-type branching, `verify_user_flag` unchanged, server allowlist +
+> bounds unchanged.
 
 ### 28.17 FTP flag-read capability — closing the objective→flag-read loop for FTP
 
@@ -10793,6 +10799,58 @@ directory is a clean `file_not_found`. The release-gate scenario
 objective loop through the REAL `/v1/ftp-read` against a fake that serves the flag
 ONLY via `CWD /` + `RETR flag.txt`; it **fails** against the old absolute
 `RETR /path` form (verified by reverting the executor) and passes after.
+
+### 28.21 User-flag candidate ORDER must reach the FTP-anon root within a small objective budget
+
+> **Numbering note:** highest unique §28 heading is §28.20 (the trailing
+> `### 28.7`/`### 28.8` are the known pre-existing collision). This section is
+> **§28.21**; nothing was renumbered.
+
+After §28.20 the CWD+basename RETR form was correct, but a live run vs Fawn still
+failed: APEX's `user_flag_verify` made only **2 attempts**, both `file_not_found`.
+A faithful repro harness (driving the REAL objective loop through the REAL
+`/v1/ftp-read` against a vsftpd-anon-chroot double, server debug-logging the
+literal `req.path`/`dirname`/`basename`/`CWD`/`RETR`/550-text per call) captured
+the exact divergence:
+
+| # | client `candidate_path` | server `CWD` | server `RETR` | result |
+|---|---|---|---|---|
+| 1 | `/home/anonymous/user.txt` | `/home/anonymous` | `user.txt` | 550 (chroot has no `/home`) |
+| 2 | `/home/anonymous/flag.txt` | `/home/anonymous` | `flag.txt` | 550 |
+| 3 | `/user.txt` | `/` | `user.txt` | 550 |
+| 4 | `/flag.txt` | `/` | `flag.txt` | **would succeed** |
+
+The §28.20 server logic is **correct** — for `/flag.txt` it computes exactly the
+proven manual `CWD /` + `RETR flag.txt`. The bug is **candidate ORDERING**:
+`/flag.txt` was candidate **#4**, but the objective phase only ran 2 turns, both
+`/home/<user>/*` (an SSH-home assumption) which `550` in the FTP anon chroot —
+`/flag.txt` was never sent within budget. HTB reality: the FTP-anon flag is
+`/flag.txt` (root) and the SSH flag is `/home/<user>/user.txt` — **opposite corners
+of the root×filename grid**, so no product order places both in the top two.
+
+**Fix (candidate priority, no capability-type branching, no machine-specific
+name):** `apex_host.planners.objective_planner._candidate_priority` ranks the two
+dominant HTB user-flag locations first — `/home/<user>/user.txt` (SSH, priority 0)
+then `/flag.txt` (FTP-anon / simple-box root, priority 1), then `/user.txt`,
+then `/home/<user>/flag.txt`. `_candidate_paths` stable-sorts the generated
+product by `(priority, insertion_index)` and truncates to `max_user_flag_attempts`
+AFTER ordering. So an FTP-anon chroot box reaches `/flag.txt` at attempt **#2**
+(within the demonstrated 2-attempt budget) and an SSH box reaches its flag at
+**#1** — both within a small budget. The priority is a generic filename/root-SHAPE
+rule (any username, any configured lists; `user.txt`/`flag.txt` are the generic
+§28.18 defaults) — NOT a branch on the capability transport type. §28.20's
+CWD+basename RETR, the server basename allowlist (§28.19), the client absolute-path
+contract (§28.18 `is_bounded_candidate_path`), the per-candidate distinct
+fingerprint (§28.18), and `verify_user_flag` are all unchanged; the flag content is
+never logged (SHA-256 only); memfabric untouched; apex off VPN.
+
+**Tests** (fakes only, faithful vsftpd-anon double): `test_ssh_user_flag_is_first_candidate`,
+`test_flag_txt_is_within_first_two_candidates` (**fails** against the pre-§28.21
+order where `/flag.txt` was #4), and `test_ftp_anon_box_verifies_within_two_attempt_budget`
+(the REAL objective loop capped at 2 turns against an anon-chroot adapter that
+serves the flag ONLY at `/flag.txt` — verifies at #2; **fails** against the old
+order, verified by neutralizing the priority). All in
+`tests/apex_host/test_ftp_flag_read.py::TestCandidateOrderReachesFtpRootEarly`.
 
 ### 28.7 Release gate
 

@@ -20,7 +20,8 @@ from apex_host.graph_ids import access_capability_id, access_state_id, host_id
 from apex_host.orchestration.parsing_node import ftp_capability_evidence_for_result
 from apex_host.parsers.capability_parser import CapabilityParser
 from apex_host.planners.objective_planner import _ObjectiveDeterministic
-from apex_host.runtime_registry import CapabilityRuntimeRegistry, FtpFileReadCapabilityAdapter
+from apex_host.agents.user_flag_executor import UserFlagExecutor
+from apex_host.runtime_registry import BoundedReadResult, CapabilityRuntimeRegistry, FtpFileReadCapabilityAdapter
 from apex_host.tools.registry import ToolRegistry
 from apex_host.types import AccessCapabilityType
 from apex_host.verification.user_flag import is_bounded_candidate_path, verify_user_flag
@@ -295,6 +296,92 @@ class TestCandidatePathsReachFtpRoot:
             )
             await api.apply_deltas(nodes=parsed.node_deltas, edges=parsed.edge_deltas)
         assert "/flag.txt" in seen_paths  # the planner reaches the FTP root
+
+
+# ---------------------------------------------------------------------------
+# §28.21 — candidate ORDER: an FTP-anon chroot box reaches /flag.txt within a
+# small objective budget (both dominant HTB locations are in the top two).
+# ---------------------------------------------------------------------------
+class _AnonChrootAdapter:
+    """In-memory FlagReadCapability faithful to a vsftpd anon chroot: the flag is
+    served ONLY for the exact bare-root path "/flag.txt"; every other path is a
+    connected miss (like a 550 in the chroot)."""
+
+    async def read_bounded_file(self, path: str) -> BoundedReadResult:
+        if path == "/flag.txt":
+            return BoundedReadResult(connected=True, output=_FLAG + "\n", error=None, method="ftp_read")
+        return BoundedReadResult(
+            connected=True, output="", error="ftp retr failed: file_not_found", method="ftp_read",
+        )
+
+
+class TestCandidateOrderReachesFtpRootEarly:
+    def test_ssh_user_flag_is_first_candidate(self) -> None:
+        core = _ObjectiveDeterministic(
+            _TARGET, ToolRegistry.from_config(ApexConfig(target=_TARGET)),
+            candidate_filenames=["user.txt", "flag.txt"], candidate_roots=["/home/{username}", "/"],
+            max_attempts=6,
+        )
+        assert core._candidate_paths("bob")[0] == "/home/bob/user.txt"
+
+    def test_flag_txt_is_within_first_two_candidates(self) -> None:
+        # §28.21 — /flag.txt must be reached within a small (2-attempt) budget.
+        # This FAILS against the pre-§28.21 order, where /flag.txt was candidate
+        # #4 (after both /home/<user>/* candidates).
+        core = _ObjectiveDeterministic(
+            _TARGET, ToolRegistry.from_config(ApexConfig(target=_TARGET)),
+            candidate_filenames=["user.txt", "flag.txt"], candidate_roots=["/home/{username}", "/"],
+            max_attempts=6,
+        )
+        assert "/flag.txt" in core._candidate_paths("anonymous")[:2]
+
+    async def test_ftp_anon_box_verifies_within_two_attempt_budget(self) -> None:
+        # Faithful vsftpd anon chroot (flag only at /flag.txt). With a 2-turn
+        # objective budget (the demonstrated live constraint), the real objective
+        # loop must reach /flag.txt and verify. FAILS against the old order, where
+        # both /home/anonymous/* candidates are tried first and /flag.txt (#4) is
+        # never reached in 2 turns.
+        from apex_host.parsers.objective_parser import ObjectiveParser
+        from apex_host.planners.objective_planner import ObjectivePlanner
+        from memfabric.types import AbandonSignal
+
+        api = _make_api()
+        cap_id = await _seed_validated_ftp_capability(api, _TARGET, principal="anonymous")
+        reg = CapabilityRuntimeRegistry()
+        reg.register(cap_id, _AnonChrootAdapter())
+        config = ApexConfig(
+            target=_TARGET, dry_run=False, tool_backend="local",
+            username_candidates=["anonymous"], password_candidates=["anonymous"],
+        )
+        planner = ObjectivePlanner(_TARGET, ToolRegistry.from_config(config), config=config)
+        executor = UserFlagExecutor(config, reg)
+        parser = ObjectiveParser()
+        goal = Goal(id="g", description="obj", phase="objective", anchor_node=host_id(_TARGET))
+        eb = EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[])
+        verified_path = ""
+        for _ in range(2):  # the demonstrated live objective budget
+            sub = await api.get_subgraph(host_id(_TARGET), depth=6)
+            plan = await planner.plan(goal, sub, eb)
+            if isinstance(plan, AbandonSignal) or not plan:
+                break
+            task = plan[0]
+            res = await executor.run(task, eb)
+            d = res.episode.data
+            parsed = parser.parse_user_flag_result(
+                target=_TARGET, objective_type="user_flag", candidate_path=str(d["candidate_path"]),
+                connected=bool(d["connected"]), verified=bool(d["verified"]),
+                value_digest=str(d["value_digest"]), redacted_value=str(d["redacted_value"]),
+                verification_method=str(d["verification_method"]), capability_id=cap_id,
+                capability_type="ftp_file_read", principal="anonymous",
+                attempted_paths=list(task.params.get("attempted_paths", [])),
+                attempted_capability_paths=list(task.params.get("attempted_capability_paths", [])),
+                is_last_candidate=bool(task.params.get("is_last_candidate", False)),
+            )
+            await api.apply_deltas(nodes=parsed.node_deltas, edges=parsed.edge_deltas)
+            if bool(d["verified"]):
+                verified_path = str(d["candidate_path"])
+                break
+        assert verified_path == "/flag.txt"
 
 
 class TestFtpAdapterReadsFlag:

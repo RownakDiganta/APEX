@@ -98,6 +98,33 @@ _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
 _MAX_TASKS_PER_TURN = 1
 
 
+def _candidate_priority(root_template: str, filename: str) -> int:
+    """Candidate-path priority (lower = tried earlier), so a small objective-phase
+    budget still reaches the correct flag for BOTH dominant HTB access types
+    (§28.21).
+
+    The two locations are opposite corners of the root x filename grid:
+    ``/home/<user>/user.txt`` (an SSH shell landing in the home dir) and
+    ``/flag.txt`` (an FTP-anonymous chroot / simple-box root). A pure
+    root x filename product cannot place both in the top two, so this ranks the
+    single most-probable candidate for each access type first. It is a generic,
+    filename/root-SHAPE-based priority (any username, any configured lists) — NOT
+    a branch on the capability transport type, and never a machine-specific
+    filename (``user.txt``/``flag.txt`` are the generic §28.18 defaults).
+    Unknown combinations fall to the end in their configured order."""
+    is_home = "{username}" in root_template
+    is_fs_root = root_template.strip() == "/"
+    if is_home and filename == "user.txt":
+        return 0  # canonical HTB SSH user flag
+    if is_fs_root and filename == "flag.txt":
+        return 1  # canonical FTP-anon / simple-box root flag
+    if is_fs_root and filename == "user.txt":
+        return 2
+    if is_home and filename == "flag.txt":
+        return 3
+    return 4
+
+
 class _ObjectiveDeterministic:
     """Pure rule-based objective planner."""
 
@@ -124,7 +151,15 @@ class _ObjectiveDeterministic:
 
     def _candidate_paths(self, principal: str) -> list[str]:
         safe_principal = principal if _USERNAME_RE.match(principal) else None
-        candidates: list[str] = []
+        # (priority, insertion_index, path) — priority-ordered so BOTH dominant
+        # HTB user-flag locations are reached within a small objective-phase
+        # budget (§28.21). See _candidate_priority: /home/<user>/user.txt (SSH)
+        # and /flag.txt (FTP-anon / simple-box root) come first, so an FTP-anon
+        # chroot box (whose /home/<user> does not exist) reaches "/flag.txt"
+        # within 2 attempts instead of last.
+        ranked: list[tuple[int, int, str]] = []
+        seen: set[str] = set()
+        index = 0
         for root in self._roots:
             if "{username}" in root and safe_principal is None:
                 # Unsafe/unmatched principal — skip this templated root
@@ -145,11 +180,15 @@ class _ObjectiveDeterministic:
                 prefix = f"{resolved_root}/"
             for filename in self._filenames:
                 path = f"{prefix}{filename}"
-                if path not in candidates:
-                    candidates.append(path)
-                if len(candidates) >= self._max_attempts:
-                    return candidates
-        return candidates
+                if path in seen:
+                    continue
+                seen.add(path)
+                ranked.append((_candidate_priority(root, filename), index, path))
+                index += 1
+        # Stable sort by (priority, insertion order); truncate to max_attempts
+        # AFTER ordering so the highest-priority candidates survive the bound.
+        ranked.sort(key=lambda t: (t[0], t[1]))
+        return [path for _p, _i, path in ranked[: self._max_attempts]]
 
     def _select_capability(
         self, subgraph: SubgraphView, attempted_pairs: set[tuple[str, str]]
