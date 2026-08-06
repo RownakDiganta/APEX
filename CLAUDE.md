@@ -10411,6 +10411,54 @@ termination). Release-gate scenario `recon_service_no_credentials_honest_outcome
 the recon turn, then asserts the honest `no_actionable_task`. Both the tests and
 the scenario **fail** against the old logic (verified by reverting the fix).
 
+### 28.15 FTP credential validation must never crash on a failed connect
+
+> **Numbering note:** highest unique §28 heading is §28.14 (the trailing
+> `### 28.7`/`### 28.8` are the known collision). This section is **§28.15**;
+> nothing was renumbered.
+
+Fixes a crash in `apex_host/agents/ftp_executor.py::_attempt_ftp_sync` that
+blocked FTP credential validation. A live run (Fawn, vsftpd) with `--username
+anonymous --password anonymous` failed every attempt with `category=backend_error`,
+`stderr: 'NoneType' object has no attribute 'sendall'`, and an empty `backend=`.
+
+**Root cause.** The `finally` block called `ftp.quit()` **unconditionally**.
+`ftplib`'s `quit()` sends `QUIT` via `self.sock.sendall(...)`. When `connect()`
+failed (e.g. `OSError`/EHOSTUNREACH), the code correctly returned a classified
+`connection_failed`, but the `finally` still ran on the way out — and
+`ftp.sock is None`, so `ftp.quit()` raised `AttributeError: 'NoneType' object has
+no attribute 'sendall'`. That `AttributeError` was **not** in the cleanup's
+`except (ftplib.Error, OSError, EOFError)`, so it propagated out of the executor
+and was caught by the dispatcher's generic `except Exception`
+(`dispatcher.py`), surfaced as `backend_error` — **masking** the real
+`connection_failed`. The empty `backend=` was NOT the cause: FTP correctly runs
+**locally** via `ftplib` (§12B — SSH/FTP validation is in-process, never through
+the Kali Tool API / `RemoteToolBackend`), so it has no `ToolBackend`; the empty
+field is just the exception-path result dict. No backend rewire was warranted.
+
+**Fix.** (1) The `finally` now calls `ftp.quit()` **only when `ftp.sock is not
+None`** (an established connection), and always calls `ftp.close()` (safe on a
+None sock) — so the NoneType-`sendall` crash is impossible and cleanup can never
+mask the classified result. (2) The `connect()` `except` also catches
+`ftplib.Error`/`EOFError` (a socket that opened but got a bad welcome banner,
+e.g. a `421` → `ftplib.error_temp`) → classified `connection_failed`, never
+proceeding to login on a half-open connection. The bounded Phase 12B model is
+unchanged: one attempt, passive mode, one harmless post-login op, then close;
+the password is still never logged/stored.
+
+**Tests (faithful — fail against the old code).** The pre-existing `_FakeFTP`
+kept `sock` non-None and its `quit()` never touched `sock`, so it could not
+exhibit the crash. `tests/apex_host/test_ftp_executor.py::TestConnectFailureNeverCrashes`
+adds a `_RealisticFakeFTP` faithful to `ftplib` (failed connect → `sock` stays
+None; `quit()` sends via `self.sock.sendall`): a connect EHOSTUNREACH returns a
+clean `connection_failed` (no crash, no `sendall` in the result, `quit()` never
+called on the None sock, `close()` always called); a `421` welcome banner is
+classified; a successful login still quits+closes. Release-gate scenario
+`ftp_anonymous_access` (§28.15) drives the **real** FTPExecutor (ftplib patched
+with a faithful double): a failed connect yields a clean classified error (never
+the crash) and a successful anonymous login is a validated access with the
+password never stored. All fail against the old code (verified by reverting).
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

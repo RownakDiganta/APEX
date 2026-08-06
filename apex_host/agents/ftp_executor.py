@@ -201,7 +201,13 @@ def _attempt_ftp_sync(
                 error_detail="ftp connect timed out",
                 duration_seconds=time.monotonic() - start, timed_out=True, executor="ftp",
             )
-        except OSError as exc:
+        except (OSError, ftplib.Error, EOFError) as exc:
+            # OSError covers a refused/unreachable connect (e.g. EHOSTUNREACH);
+            # ftplib.Error/EOFError cover a connect that opened the socket but
+            # failed reading the welcome banner (e.g. a "421 service not
+            # available" greeting → ftplib.error_temp). Either way the
+            # connection is not usable — return a clean classified error and
+            # NEVER proceed to login/command on a half-open connection.
             return CredentialValidationResult(
                 protocol="ftp", target=target, port=str(port), username=username,
                 success=False, authenticated=False, operation=operation,
@@ -284,10 +290,19 @@ def _attempt_ftp_sync(
             duration_seconds=time.monotonic() - start, timed_out=False, executor="ftp",
         )
     finally:
-        try:
-            ftp.quit()
-        except (ftplib.Error, OSError, EOFError):
+        # Cleanup must NEVER raise or mask the classified result returned above.
+        # ftplib's quit() sends "QUIT" via self.sock.sendall(...); calling it when
+        # connect() failed (ftp.sock is None) raised
+        # ``AttributeError: 'NoneType' object has no attribute 'sendall'`` — the
+        # demonstrated live crash, which the dispatcher then surfaced as an opaque
+        # ``backend_error`` masking the real ``connection_failed``. Only QUIT an
+        # actually-established connection; always close (safe on a None sock).
+        if ftp.sock is not None:
             try:
-                ftp.close()
-            except OSError:
+                ftp.quit()
+            except (ftplib.Error, OSError, EOFError):
                 pass
+        try:
+            ftp.close()
+        except OSError:
+            pass

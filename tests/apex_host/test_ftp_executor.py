@@ -480,3 +480,119 @@ class TestAttemptFtpSyncDirect:
         assert result.success is True
         assert result.protocol == "ftp"
         assert result.executor == "ftp"
+
+
+# ---------------------------------------------------------------------------
+# §28.15 — a FAILED connect must NEVER crash with 'NoneType' has no 'sendall'.
+# The stdlib _FakeFTP above always keeps sock non-None and its quit() never
+# touches sock, so it cannot exhibit the real crash. This double is FAITHFUL to
+# ftplib: after a failed connect sock stays None, and quit() sends QUIT via
+# self.sock.sendall(...) (as ftplib.putline does) — so quit() on a None sock
+# raises the exact live AttributeError. The fix guards quit() on `sock is not
+# None`, so this can no longer reach .sendall.
+# ---------------------------------------------------------------------------
+class _LiveSocket:
+    def settimeout(self, v: float) -> None: ...
+    def sendall(self, data: bytes) -> None: ...  # a live control socket
+
+
+class _RealisticFakeFTP:
+    connect_raises: Exception | None = None
+
+    def __init__(self) -> None:
+        self.encoding = "utf-8"
+        self.sock: _LiveSocket | None = None  # ftplib.FTP() starts with sock=None
+        self.quit_called = False
+        self.close_called = False
+
+    def connect(self, host: str = "", port: int = 0, timeout: float = -999,
+                source_address: object = None) -> str:
+        if type(self).connect_raises is not None:
+            self.sock = None  # ftplib leaves sock None when connect fails
+            raise type(self).connect_raises
+        self.sock = _LiveSocket()
+        return "220 ready"
+
+    def set_pasv(self, value: bool) -> None: ...
+
+    def login(self, user: str = "", passwd: str = "", acct: str = "") -> str:
+        return "230 login successful"
+
+    def pwd(self) -> str:
+        return '"/" is the current directory'
+
+    def voidcmd(self, cmd: str) -> str:
+        return "200 NOOP ok"
+
+    def quit(self) -> str:
+        self.quit_called = True
+        # Faithful to ftplib: quit() -> voidcmd('QUIT') -> putline ->
+        # self.sock.sendall(...). On a None sock this is Attribute: NoneType.
+        self.sock.sendall(b"QUIT\r\n")  # type: ignore[union-attr]
+        return "221 bye"
+
+    def close(self) -> None:
+        self.close_called = True
+        self.sock = None
+
+
+def _install_realistic_ftp(monkeypatch: pytest.MonkeyPatch, connect_raises: Exception | None) -> list[_RealisticFakeFTP]:
+    _RealisticFakeFTP.connect_raises = connect_raises
+    captured: list[_RealisticFakeFTP] = []
+
+    def _factory() -> _RealisticFakeFTP:
+        c = _RealisticFakeFTP()
+        captured.append(c)
+        return c
+
+    import apex_host.agents.ftp_executor as mod
+    monkeypatch.setattr(mod.ftplib, "FTP", _factory)
+    return captured
+
+
+class TestConnectFailureNeverCrashes:
+    def test_connect_ehostunreach_returns_clean_error_not_nonetype_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The live Fawn case: connect fails with EHOSTUNREACH. Against the
+        # pre-fix code the finally's unguarded quit() -> None.sendall raised
+        # AttributeError('NoneType' ... 'sendall'), which propagated (masking
+        # the real connection_failed). This must now return cleanly.
+        captured = _install_realistic_ftp(monkeypatch, OSError(113, "No route to host"))
+        result = _attempt_ftp_sync(_TARGET, 21, "anonymous", "anonymous", "PWD", 1.0, 1.0, 1.0)
+        assert result.success is False
+        assert result.error_category == CredentialErrorCategory.connection_failed.value
+        assert "sendall" not in result.error_detail
+        # quit() must NOT have been called on the None sock; close() always is.
+        assert captured[0].quit_called is False
+        assert captured[0].close_called is True
+
+    async def test_executor_run_connect_failure_no_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _install_realistic_ftp(monkeypatch, OSError(113, "No route to host"))
+        executor = FTPExecutor(_config())
+        result = await executor.run(_task(), _evidence())  # must not raise
+        assert result.episode.data["success"] is False
+        assert result.episode.data["error_category"] == CredentialErrorCategory.connection_failed.value
+        assert "sendall" not in str(result.episode.data)
+
+    def test_welcome_banner_error_temp_is_classified_not_crash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A connect that opens the socket but gets a "421" greeting → ftplib
+        # raises error_temp during connect; it must be classified, not propagate.
+        _install_realistic_ftp(monkeypatch, ftplib.error_temp("421 service not available"))
+        result = _attempt_ftp_sync(_TARGET, 21, "anonymous", "anonymous", "PWD", 1.0, 1.0, 1.0)
+        assert result.success is False
+        assert result.error_category == CredentialErrorCategory.connection_failed.value
+
+    def test_successful_login_still_quits_and_closes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A live socket exists after a good connect → quit() IS called (and works).
+        captured = _install_realistic_ftp(monkeypatch, None)
+        result = _attempt_ftp_sync(_TARGET, 21, "anonymous", "anonymous", "PWD", 1.0, 1.0, 1.0)
+        assert result.success is True
+        assert captured[0].quit_called is True
+        assert captured[0].close_called is True

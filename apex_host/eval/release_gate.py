@@ -1733,6 +1733,116 @@ async def scenario_recon_service_no_credentials_honest_outcome() -> ScenarioResu
     )
 
 
+class _FawnLiveSock:
+    def settimeout(self, value: float) -> None: ...
+    def sendall(self, data: bytes) -> None: ...
+
+
+class _FawnFtpFake:
+    """Faithful ftplib.FTP double: after a FAILED connect ``sock`` stays None and
+    ``quit()`` sends QUIT via ``self.sock.sendall`` (as ftplib.putline does), so
+    the pre-§28.15 unguarded finally quit() would raise the live
+    ``AttributeError: 'NoneType' ... 'sendall'``. No network I/O."""
+
+    def __init__(self, *, connect_ok: bool) -> None:
+        self.encoding = "utf-8"
+        self.sock: _FawnLiveSock | None = None
+        self._connect_ok = connect_ok
+
+    def connect(self, host: str = "", port: int = 0, timeout: float = -1,
+                source_address: object = None) -> str:
+        if not self._connect_ok:
+            self.sock = None
+            raise OSError(113, "No route to host")  # EHOSTUNREACH, the live case
+        self.sock = _FawnLiveSock()
+        return "220 (vsFTPd 3.0.3)"
+
+    def set_pasv(self, value: bool) -> None: ...
+    def login(self, user: str = "", passwd: str = "", acct: str = "") -> str:
+        return "230 Login successful."
+    def pwd(self) -> str:
+        return '"/" is the current directory'
+    def voidcmd(self, cmd: str) -> str:
+        return "200 NOOP ok."
+    def quit(self) -> str:
+        self.sock.sendall(b"QUIT\r\n")  # type: ignore[union-attr]
+        return "221 Goodbye."
+    def close(self) -> None:
+        self.sock = None
+
+
+async def scenario_ftp_anonymous_access() -> ScenarioResult:
+    """21. FTP credential validation: a failed connect yields a clean classified
+    error (never the NoneType 'sendall' crash), and a successful anonymous login
+    is a validated access.
+
+    Reproduces the demonstrated Fawn/vsftpd bug through the REAL FTPExecutor
+    (ftplib patched with a faithful in-process double — no network). Fails the
+    gate if a connect failure crashes/masks as backend_error, if it is not
+    classified connection_failed, if the password leaks into the episode, or if a
+    successful anonymous login is not reported as a validated access.
+    """
+    import ftplib as _ftplib
+
+    from apex_host.agents.ftp_executor import FTPExecutor
+    from apex_host.config import ApexConfig
+    from apex_host.types import CredentialErrorCategory
+    from memfabric.types import EvidenceBundle, TaskSpec
+
+    problems: list[str] = []
+    config = ApexConfig(
+        target=_TARGET, dry_run=False, allowed_tools=["nmap"],
+        ftp_connect_timeout_seconds=1.0, ftp_login_timeout_seconds=1.0,
+        ftp_command_timeout_seconds=1.0,
+    )
+    ev = EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[])
+    _SECRET = "probe-not-a-real-secret@x"  # the anonymous password sent in
+
+    def _task() -> TaskSpec:
+        return TaskSpec(
+            id="rg-ftp", goal_id="g", executor_domain="credential",
+            params={"tool": "ftp_access", "target": _TARGET, "port": "21",
+                    "username": "anonymous", "password": _SECRET, "parser": "access"},
+            subgraph_anchor=_ANCHOR, phase="credential",
+        )
+
+    original = _ftplib.FTP  # ftp_executor calls ftplib.FTP() on this same module
+    try:
+        # 1. Connect FAILURE (EHOSTUNREACH) → clean classified error, NEVER crash.
+        setattr(_ftplib, "FTP", lambda *a, **k: _FawnFtpFake(connect_ok=False))
+        try:
+            r1 = await FTPExecutor(config).run(_task(), ev)
+        except Exception as exc:  # noqa: BLE001 — the whole point is: it must NOT raise
+            return ScenarioResult(
+                "ftp_anonymous_access", False,
+                f"FTP connect failure crashed the executor ({type(exc).__name__}: {exc})",
+            )
+        if r1.episode.data.get("success") is not False:
+            problems.append("connect failure not reported as a failure")
+        if r1.episode.data.get("error_category") != CredentialErrorCategory.connection_failed.value:
+            problems.append(f"connect failure misclassified: {r1.episode.data.get('error_category')!r}")
+        if "sendall" in str(r1.episode.data):
+            problems.append("the NoneType 'sendall' crash leaked into the result")
+
+        # 2. Successful anonymous login → validated access; password never stored.
+        setattr(_ftplib, "FTP", lambda *a, **k: _FawnFtpFake(connect_ok=True))
+        r2 = await FTPExecutor(config).run(_task(), ev)
+        if not (r2.episode.data.get("success") is True and r2.episode.data.get("authenticated") is True):
+            problems.append("successful anonymous FTP login not reported as validated access")
+        if _SECRET in str(r2.episode.data):
+            problems.append("the FTP password leaked into the episode data")
+    finally:
+        setattr(_ftplib, "FTP", original)
+
+    if problems:
+        return ScenarioResult("ftp_anonymous_access", False, "; ".join(problems))
+    return ScenarioResult(
+        "ftp_anonymous_access", True,
+        "FTP connect failure → clean connection_failed (no NoneType 'sendall' crash); "
+        "successful anonymous login → validated access; password never stored",
+    )
+
+
 SCENARIOS: list[Any] = [
     scenario_ssh_success,
     scenario_dfr_success,
@@ -1755,6 +1865,7 @@ SCENARIOS: list[Any] = [
     scenario_web_content_enumeration,
     scenario_web_endpoint_fetch_loop,
     scenario_recon_service_no_credentials_honest_outcome,
+    scenario_ftp_anonymous_access,
 ]
 
 

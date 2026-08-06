@@ -654,7 +654,13 @@ with agent forwarding and local key discovery disabled; FTP uses the
 standard library's `ftplib` in passive mode. Both run only a single fixed
 harmless command afterward (`id`/`whoami` for SSH, `PWD`/`NOOP` for FTP)
 and close the connection immediately — no file transfer, no persistent
-session, no privilege escalation. Full design, safety model, and test
+session, no privilege escalation. FTP/SSH validation runs **in-process**
+(locally, via `ftplib`/Paramiko), never through the Kali tool service. A
+failed connect always returns a clean classified error (`connection_failed`)
+— never a crash: an earlier bug where the FTP cleanup called `ftplib.quit()`
+on a never-established (`None`) socket, raising `'NoneType' … 'sendall'` and
+masking the real error, is fixed (cleanup only quits an established
+connection; §28.15 in CLAUDE.md). Full design, safety model, and test
 strategy: [`docs/credential-validation.md`](docs/credential-validation.md).
 
 **User-flag objective and verification (Phase 18):** for the selected HTB
