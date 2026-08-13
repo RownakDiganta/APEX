@@ -1849,6 +1849,25 @@ be config-driven so tests can override it.
 (the node/edge type convention table). Add parsers that produce them. Add
 tests that verify the correct node type and props are created.
 
+### 13.12 Commit message style
+
+Every commit message must read like a thoughtful engineer explaining the
+change to a teammate — plain language, not a terse mechanical tag. This is a
+required format, not a suggestion.
+
+- **Subject** (under ~72 chars): imperative and specific — what the change
+  *does* and, where it fits, *why*. Never just a section number or a bare
+  noun phrase.
+  - Good: `Fix API probes hitting the bare IP instead of the vhost`
+  - Bad: `api probe fix §28.23`, `§28.23`, `web_planner update`
+- **Body** (blank line, then 2–5 sentences): what was wrong, what the fix
+  does, and any consequence worth knowing. Honest and specific — no vague
+  "improvements", no bare identifiers.
+- Put the CLAUDE.md section reference in **parentheses at the end** (e.g.
+  `(§28.23)`), never as the whole message.
+
+This applies to every commit, including doc-only and test-only changes.
+
 ---
 
 ## 14. LLM Planning Layer (`apex_host/planning/`)
