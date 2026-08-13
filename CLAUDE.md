@@ -970,7 +970,7 @@ it becomes a staged `KnowledgeEntry` at confidence 0.25–0.3.
 | `host` | A reachable IP/hostname | `ip`, `target` |
 | `service` | An open port / protocol binding | `port`, `proto`, `service`, `version` |
 | `tech` | An identified product or library | `name`, `version` |
-| `endpoint` | An HTTP path/URL | `url`, `status`, `server`, `fetched`; (§28.22) `content_kind` (`json`/`graphql`), `api_response`, `json_keys`, `json_array`, `json_item_keys`, `graphql` |
+| `endpoint` | An HTTP path/URL | `url`, `status`, `server`, `fetched`; (§28.22) `content_kind` (`json`/`graphql`), `api_response`, `json_keys`, `json_array`, `json_item_keys`, `graphql`; (§28.24) `js_asset` (a discovered `<script src>` JS file to fetch+parse), `js_analyzed`, `referenced_by` (the JS URL that referenced this API endpoint) |
 | `vhost` (§28.8) | A name-based virtual host DISCOVERED for a host (e.g. from an HTTP redirect `Location`) — never hardcoded | `hostname`, `ip`, `discovered_from`, `source_status` |
 | `api_schema` (§28.22) | A read-only GraphQL schema MAP discovered by introspection — type/field NAMES only, never a value; never an executable action | `endpoint_url`, `query_type`, `mutation_type`, `type_names`, `type_count`, `field_names`, `field_count` |
 | `auth_flow` | A login mechanism or credential boundary | `url`, `hint` |
@@ -11020,6 +11020,92 @@ recorded as JSON/API content. The `web_api_surface_discovery` release-gate scena
 now also asserts the fixed `/api/v1` probe GETs the body via the vhost `--resolve
 -L` path and maps its JSON structure (keys only, no values) — **fails** against the
 pre-§28.23 IP/gated probe.
+
+### 28.24 Linked-JavaScript discovery — fetch JS assets, statically extract API paths
+
+> **Numbering note:** highest unique §28 heading is §28.23 (the trailing
+> `### 28.7`/`### 28.8` are the known pre-existing collision). This section is
+> **§28.24**; nothing was renumbered.
+
+APEX loaded the real app and discovered pages (e.g. TwoMillion's `/invite`,
+`/login`) as `endpoint` nodes, but STOPPED there — it never fetched a discovered
+page's linked JavaScript, so it never found API endpoints referenced ONLY in JS
+(TwoMillion's `/invite` links `/js/inviteapi.min.js`, which references
+`/api/v1/invite/how/to/generate`). The web phase terminated `no_actionable_task`
+with the invite page discovered but its JS unanalyzed. §28.24 closes this
+DISCOVERY gap: fetch linked JS and STATICALLY extract API-endpoint references.
+**Read/map only: GET/HEAD of pages + JS + discovered API endpoints, and static
+string extraction from the JS. The JS is NEVER executed or evaluated, never
+deobfuscated beyond reading literal strings; no POST, no request construction, no
+auth forging.** `tools/safety.py`, the allowlist, dry-run, memfabric, and the
+PolicyAdvisor scope gate are all unchanged; every write is a `MemoryAPI` delta;
+apex stays off the VPN.
+
+**The chain (all via the §28.8/§28.23 Host-aware `--resolve -L` GET path):**
+homepage → discover `/invite` (relative link) → **fetch `/invite`** → its
+`<script src>` → **fetch the JS** → static `/api/...` extraction → **GET the API
+endpoint** → JSON keys-only mapping (§28.22).
+
+**What changed (`apex_host` only):**
+
+1. **`<script src>` extraction** — `CommandParser.parse_curl_body`, alongside the
+   existing relative-`href` extraction, now extracts **same-origin** `<script
+   src>` JS files (cross-origin / protocol-relative / `data:` rejected by
+   `_same_origin_script_path`) as `endpoint` nodes marked `js_asset=True`, bounded
+   at `_MAX_JS_ASSETS`.
+
+2. **JS static-extraction parser** — new `apex_host/parsers/js_parser.py`
+   (`JSParser.parse_js`, parser field `"js"`). Reads LITERAL strings only —
+   `/api…` path literals (a negative lookbehind rejects the path of a cross-origin
+   URL), `fetch(…)`/`axios(…)` URLs, `XMLHttpRequest.open("M","…")` URLs, and
+   `url:`/`endpoint:`/`path:` assignments — keeping only same-origin absolute
+   paths (`/…`). Each becomes an `endpoint` node with `source="js_analysis"`
+   linked `host --exposes--> endpoint` (reachable + fetchable) and `js
+   --contains--> endpoint` (provenance). The JS asset endpoint is marked
+   `fetched`/`js_analyzed` so it is not re-fetched. Bounded at `_MAX_JS_ENDPOINTS`.
+   It NEVER executes the JS — a runtime-concatenated URL (`"/ap"+"i/…"`) is never
+   recovered.
+
+3. **Fetch loop + pending helpers** (`apex_host/planners/web_opportunities.py`,
+   `web_planner.py`) — `pending_enumerated_endpoints` is superseded in the fetch
+   loop by `pending_page_fetches` (a superset: enum sources + relative-link pages
+   `source="curl_body"` + JS-discovered API paths `source="js_analysis"`,
+   excluding JS assets), so a discovered page like `/invite` and a JS-referenced
+   `/api/v1/...` both get GET-fetched (HEAD+body). A new `pending_js_assets` feeds
+   a dedicated JS-fetch step (parser `"js"`, GET body, bounded by
+   `_MAX_JS_FETCHES`). Every fetch uses the Host-aware `--resolve -L` path; the
+   §28.23 per-turn dedup still applies.
+
+4. **Gate** (`phase_gates.web_evidence_status`) — the web phase stays incomplete
+   (`WEB_EVIDENCE_PENDING_ENDPOINTS`) while any page fetch OR JS asset is pending,
+   so it keeps exploring linked pages/JS (e.g. `/invite`'s JS) instead of
+   completing after the homepage. `GlobalPlanner`'s web-budget exhaustion still
+   force-advances, so it can never loop forever.
+
+5. **Route** (`parsing_node.parse_single_result`) — `parser == "js"` →
+   `JSParser.parse_js(stdout, target, host_ip=state["target"])` (§28.8
+   dangling-edge rule). JS-discovered `/api/...` endpoints then feed the existing
+   §28.22/§28.23 fetch+JSON-map path unchanged.
+
+**New EKG props** (documented in §12.8): `endpoint.js_asset` (a discovered JS
+file to fetch+parse), `endpoint.js_analyzed`, `endpoint.referenced_by` (the JS URL
+that referenced this API endpoint). No new node/edge TYPE — JS assets and
+JS-discovered API paths are `endpoint` nodes; provenance is `source` (`curl_body`
+for the `<script src>` asset, `js_analysis` for extracted paths).
+
+**Tests** (`tests/apex_host/test_web_js_discovery.py`, 13; fakes only, driven
+through the REAL `_WebDeterministic.plan` + `parse_single_result` router +
+`safety` + `PolicyAdvisor`): same-origin `<script src>` → JS asset (cross-origin
+rejected); the JS asset is fetched via `--resolve -L` GET with parser `"js"`;
+static extraction of `/api` + `fetch()` + XHR literals (cross-origin `/api` NOT
+extracted; a runtime-concatenated URL NOT recovered — JS never executed);
+discovered API endpoints link to the authorized host and feed the fetch loop; the
+JS fetch passes `safety.py` and PolicyAdvisor scope. Release-gate scenario
+`web_js_api_discovery` (§28.24) drives the full chain end-to-end (homepage →
+`/invite` fetched → JS asset → JS GET+static-parse → `/api/v1/invite/...`
+extracted → `--resolve` GET → JSON keys-only mapping, no values leaked); **fails**
+against pre-§28.24 code (relative-link pages were never fetched, verified by
+reverting).
 
 ### 28.7 Release gate
 

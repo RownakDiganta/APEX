@@ -232,6 +232,64 @@ def pending_enumerated_endpoints(subgraph: "SubgraphView") -> list["Node"]:
     )
 
 
+#: Endpoint provenance the web fetch loop GETs as PAGES (HTML/JSON), §28.24.
+#: Includes content-enum (§28.12/§28.22), relative-link pages discovered from a
+#: fetched HTML body (source curl_body — e.g. /invite), and API paths extracted
+#: from JS (source js_analysis) — all get GET-fetched so their body is mapped.
+_PAGE_FETCH_SOURCES = ("ffuf", "gobuster", "ffuf_api", "gobuster_api", "curl_body", "js_analysis")
+
+
+def pending_page_fetches(subgraph: "SubgraphView") -> list["Node"]:
+    """Discovered-but-unfetched PAGE endpoints the web loop should GET (§28.24).
+
+    A superset of ``pending_enumerated_endpoints``: also includes relative-link
+    pages discovered from a fetched HTML body (so a linked page like ``/invite``
+    gets fetched and its ``<script src>`` seen) and API paths extracted from JS
+    (source ``js_analysis``, so a JS-referenced ``/api/v1/...`` gets GET-fetched
+    and JSON-mapped). Excludes JS-asset endpoints (those are fetched as JS, see
+    ``pending_js_assets``). Unfetched, non-404, path not already fetched, ranked
+    highest-signal first. Stateless/blackboard-only."""
+    fetched_paths = {
+        _url_path(str(n.props.get("url", "")))
+        for n in subgraph.nodes
+        if n.type == "endpoint"
+        and (n.props.get("fetched") is True or n.props.get("browsed") is True)
+        and str(n.props.get("url", ""))
+    }
+    candidates = [
+        n for n in subgraph.nodes
+        if n.type == "endpoint"
+        and n.props.get("js_asset") is not True
+        and n.source in _PAGE_FETCH_SOURCES
+        and str(n.props.get("url", ""))
+        and str(n.props.get("status", "")).strip() != "404"
+        and _url_path(str(n.props.get("url", ""))) not in fetched_paths
+    ]
+    return sorted(
+        candidates,
+        key=lambda n: (
+            _path_interest_rank(str(n.props.get("url", ""))),
+            _path_depth(str(n.props.get("url", ""))),
+            str(n.props.get("url", "")),
+        ),
+    )
+
+
+def pending_js_assets(subgraph: "SubgraphView") -> list["Node"]:
+    """Discovered-but-unfetched JavaScript assets (``js_asset=True``) the web loop
+    should GET and statically parse for API references (§28.24). Unfetched, ranked
+    deterministically. The JS is fetched and READ, never executed."""
+    candidates = [
+        n for n in subgraph.nodes
+        if n.type == "endpoint"
+        and n.props.get("js_asset") is True
+        and n.props.get("fetched") is not True
+        and n.props.get("browsed") is not True
+        and str(n.props.get("url", ""))
+    ]
+    return sorted(candidates, key=lambda n: str(n.props.get("url", "")))
+
+
 def technologies_from_subgraph(subgraph: "SubgraphView") -> list[dict[str, Any]]:
     """Reconstruct detected technologies (``tech`` nodes) for reporting.
 

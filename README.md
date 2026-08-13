@@ -2465,6 +2465,20 @@ routes through `runner.py` → `safety.py` (no shell metacharacters) and the
 PolicyAdvisor scope gate; no arbitrary methods, no attack bodies, no auth-header
 forging, no injection. See CLAUDE.md §28.22–§28.23.
 
+**Linked-JavaScript discovery (§28.24).** APEX also follows a discovered page's
+linked JavaScript to find API endpoints referenced only in JS (e.g. a page's
+`<script src="/js/app.js">` that calls `/api/v1/...`). When a fetched HTML body
+references same-origin `<script src>` files, they are recorded as JS-asset
+`endpoint` nodes, GET-fetched via the same Host-aware `--resolve -L` path, and
+**statically** parsed for referenced API paths — `/api/...` literals,
+`fetch()`/`XMLHttpRequest` URL literals — which become `endpoint` nodes that then
+feed the §28.22/§28.23 GET + JSON keys-only mapping. The discovered relative-link
+pages themselves (e.g. `/invite`) are also GET-fetched so their scripts are seen.
+**The JavaScript is fetched and READ, never executed** — only literal strings are
+extracted; no deobfuscation, no POST, no request construction, cross-origin
+scripts are never fetched, and it is bounded (JS-fetch count, extraction count).
+See CLAUDE.md §28.24.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,

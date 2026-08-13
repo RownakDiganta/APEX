@@ -228,16 +228,18 @@ def web_evidence_status(
     complete — there is nothing to fetch. A terminal, budget-exhausted
     inability to make further web progress is handled by ``GlobalPlanner``
     (not here), since it depends on the turn budget, not the EKG."""
-    from apex_host.planners.web_opportunities import pending_enumerated_endpoints
+    from apex_host.planners.web_opportunities import pending_js_assets, pending_page_fetches
 
     if not has_web_capability:
         return WebEvidence(True, WEB_EVIDENCE_NO_CAPABILITY)
-    # §28.13 — while enumeration discovered endpoints that have NOT been fetched,
-    # the web phase is NOT complete: fetching them is a productive next action,
-    # so the loop must not end (never mark complete with high-signal endpoints
-    # outstanding). GlobalPlanner's web-budget exhaustion still force-advances if
-    # the budget runs out, so this can never loop forever.
-    if pending_enumerated_endpoints(subgraph):
+    # §28.13, §28.24 — while there is a discovered-but-unfetched PAGE (enumeration
+    # hit, relative-link page, or JS-referenced /api path) or an unanalyzed JS
+    # asset, the web phase is NOT complete: fetching/parsing it is a productive
+    # next action, so the loop must not end (never mark complete with a
+    # high-signal discovery outstanding — e.g. /invite's JS still unanalyzed).
+    # GlobalPlanner's web-budget exhaustion still force-advances if the budget
+    # runs out, so this can never loop forever.
+    if pending_page_fetches(subgraph) or pending_js_assets(subgraph):
         return WebEvidence(False, WEB_EVIDENCE_PENDING_ENDPOINTS)
     if _has_web_content(subgraph):
         return WebEvidence(True, WEB_EVIDENCE_CONTENT)

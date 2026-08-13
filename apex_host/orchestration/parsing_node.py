@@ -36,6 +36,7 @@ from apex_host.parsers.command_parser import CommandParser
 from apex_host.parsers.ffuf_parser import FfufParser
 from apex_host.parsers.gobuster_parser import GobusterParser
 from apex_host.parsers.graphql_parser import GraphQLParser
+from apex_host.parsers.js_parser import JSParser
 from apex_host.graph_state import ApexGraphState
 from apex_host.orchestration.outcome import EngagementOutcome
 from apex_host.parsers.nmap_parser import NmapParser
@@ -53,6 +54,7 @@ _NMAP = NmapParser()
 _FFUF = FfufParser()
 _GOBUSTER = GobusterParser()
 _GRAPHQL = GraphQLParser()
+_JS = JSParser()
 _COMMAND = CommandParser()
 _BANNER = BannerParser()
 _BROWSER_PARSER = BrowserParser()
@@ -190,6 +192,11 @@ def parse_single_result(
         return _GRAPHQL.parse_introspection(
             stdout, target=target, host_ip=state["target"]
         ), tool_name
+    if parser_name == "js":
+        # §28.24 — STATIC extraction of API-endpoint path literals from a fetched
+        # JS body (never executed). host_ip = the authorized host so discovered
+        # endpoints link to the existing host node (§28.8 dangling-edge rule).
+        return _JS.parse_js(stdout, target=target, host_ip=state["target"]), tool_name
     if parser_name == "priv_esc":
         # Phase 13 — two producers share this parser field: searchsploit's
         # real tool output and priv_esc_analyze's precomputed analytical

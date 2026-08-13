@@ -1286,18 +1286,20 @@ async def scenario_vhost_redirect_web_discovery() -> ScenarioResult:
     ]
     if not vhost_endpoints:
         problems.append("vhost fetch discovered no endpoint under the vhost URL")
-    # Only AFTER the vhost homepage is fetched (a form was discovered) is the
-    # web phase complete — never on the stub alone.
-    if not web_evidence_status(subgraph2).complete:
-        problems.append("web phase not complete even after fetching the vhost app content")
+    # AFTER the vhost homepage is fetched the web phase has moved off the stub —
+    # it is either complete OR still PRODUCTIVE (a linked page like /dashboard
+    # remains to fetch, §28.24) — never stuck with no content (WEB_EVIDENCE_NONE).
+    from apex_host.planners.phase_gates import WEB_EVIDENCE_NONE
+    if web_evidence_status(subgraph2).reason == WEB_EVIDENCE_NONE:
+        problems.append("web phase stuck with no content after fetching the vhost app content")
 
     if problems:
         return ScenarioResult("vhost_redirect_web_discovery", False, "; ".join(problems))
     return ScenarioResult(
         "vhost_redirect_web_discovery", True,
         f"301 revealed vhost {_VHOST}; stub did NOT complete web; the selected next web "
-        f"action was the --resolve -L vhost fetch (LLM bare-IP overridden); after the vhost "
-        f"fetch discovered a form, web completed — {len(vhost_endpoints)} vhost endpoint(s)",
+        f"action was the --resolve -L vhost fetch (LLM bare-IP overridden); the vhost "
+        f"fetch discovered real content — {len(vhost_endpoints)} vhost endpoint(s)",
     )
 
 
@@ -1913,6 +1915,133 @@ async def scenario_web_api_surface_discovery() -> ScenarioResult:
     )
 
 
+async def scenario_web_js_api_discovery() -> ScenarioResult:
+    """§28.24 — linked-JS → API discovery. Homepage → discovers /invite → fetches
+    /invite → its <script src> JS asset → fetches the JS → STATICALLY extracts a
+    /api/v1/... reference (never executing the JS) → GET-fetches and JSON-maps it.
+    Drives the REAL WebPlanner + PolicyAdvisor + safety.check_command +
+    parse_single_result (router) + MemoryAPI (Invariant 1). Fails against
+    pre-§28.24 code (JS never fetched/parsed). DISCOVERY ONLY — read/map."""
+    import json as _json
+    from typing import cast
+
+    from apex_host.config import ApexConfig
+    from apex_host.graph_state import ApexGraphState
+    from apex_host.orchestration.parsing_node import parse_single_result
+    from apex_host.planners.web_planner import _WebDeterministic
+    from apex_host.policy import PolicyAdvisor
+    from apex_host.policy.policy_loader import load_policy
+    from apex_host.tools.registry import ToolRegistry
+    from apex_host.tools.safety import check_command
+    from apex_host.types import ToolCommand
+    from memfabric.types import EvidenceBundle, Goal
+
+    name = "web_js_api_discovery"
+    _VHOST = "app.example.htb"
+    problems: list[str] = []
+    api = _make_api()
+    await _seed_node(api, _ANCHOR, "host", {"ip": _TARGET})
+    await _seed_node(api, f"service:{_TARGET}:80/tcp", "service",
+                     {"port": "80", "proto": "tcp", "state": "open", "service": "http"})
+    await _seed_edge(api, _ANCHOR, f"service:{_TARGET}:80/tcp", "exposes")
+    await _seed_node(api, f"vhost:{_TARGET}:{_VHOST}", "vhost", {"hostname": _VHOST, "ip": _TARGET})
+    await _seed_edge(api, _ANCHOR, f"vhost:{_TARGET}:{_VHOST}", "exposes")
+    home = f"http://{_VHOST}"
+    await _seed_node(api, f"endpoint:{home}", "endpoint", {"url": home, "status": "200", "fetched": True})
+    await _seed_edge(api, _ANCHOR, f"endpoint:{home}", "exposes")
+    # The homepage linked /invite (a relative-link page, not yet fetched).
+    inv = f"http://{_VHOST}/invite"
+    await _seed_node(api, f"endpoint:{inv}", "endpoint", {"url": inv, "path": "/invite"}, source="curl_body")
+    await _seed_edge(api, _ANCHOR, f"endpoint:{inv}", "exposes")
+
+    config = ApexConfig(target=_TARGET, dry_run=True, allowed_tools=["curl"])
+    goal = Goal(id="rg-js", description="web", phase="web", anchor_node=_ANCHOR)
+    empty = EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[])
+    planner = _WebDeterministic(_TARGET, ToolRegistry.from_config(config))
+    advisor = PolicyAdvisor(load_policy(config), config)
+    st = cast("ApexGraphState", {"target": _TARGET})
+
+    async def _run(parser: str, target: str, stdout: str) -> None:
+        obs, _ = parse_single_result(
+            {"tool": "curl", "parser": parser, "args": ["-s", target], "target": target, "stdout": stdout}, st)
+        await api.apply_deltas(nodes=obs.node_deltas, edges=obs.edge_deltas)
+
+    # Turn 1 — the planner fetches the discovered /invite page (--resolve GET).
+    sub1 = await api.get_subgraph(_ANCHOR, depth=6)
+    tasks1 = await planner.plan(goal, sub1, empty)
+    inv_body = next((t for t in tasks1 if isinstance(tasks1, list)
+                     and t.params.get("parser") == "curl_body"
+                     and t.params["target"] == f"http://{_VHOST}/invite"), None) if isinstance(tasks1, list) else None
+    if inv_body is None:
+        return ScenarioResult(name, False, "planner did not fetch the discovered /invite page")
+    if "--resolve" not in inv_body.params["args"]:
+        problems.append("/invite fetch not --resolve pinned")
+    # /invite's HTML links its JS.
+    await _run("curl_body", inv_body.params["target"],
+               f'<!DOCTYPE html><html><head><title>{_VHOST}</title>'
+               '<script src="/js/inviteapi.min.js"></script></head><body>invite</body></html>')
+    sub2 = await api.get_subgraph(_ANCHOR, depth=6)
+    js_assets = [n for n in sub2.nodes if n.type == "endpoint" and n.props.get("js_asset") is True]
+    if not js_assets:
+        return ScenarioResult(name, False, "/invite's <script src> did not become a JS asset node")
+
+    # Turn 2 — the planner fetches the JS asset (parser "js").
+    tasks2 = await planner.plan(goal, sub2, empty)
+    js_fetch = next((t for t in tasks2 if isinstance(tasks2, list)
+                     and t.params.get("parser") == "js"), None) if isinstance(tasks2, list) else None
+    if js_fetch is None:
+        return ScenarioResult(name, False, "planner did not fetch the discovered JS asset")
+    ja = js_fetch.params["args"]
+    if "--resolve" not in ja or "-L" not in ja:
+        problems.append("JS fetch not --resolve -L pinned")
+    if not advisor.review_task(js_fetch, "web", empty, config).is_approved:
+        problems.append("policy blocked the JS fetch")
+    try:
+        check_command(ToolCommand(tool="curl", args=ja), config)
+    except ValueError as exc:
+        problems.append(f"safety.py rejected the JS fetch: {exc}")
+    # The JS statically references an API endpoint (never executed).
+    await _run("js", js_fetch.params["target"],
+               'fetch("/api/v1/invite/how/to/generate").then(r=>r.json());'
+               'const ext="https://evil.com/api/steal";')  # cross-origin must be ignored
+    sub3 = await api.get_subgraph(_ANCHOR, depth=7)
+    api_eps = [n for n in sub3.nodes if n.type == "endpoint"
+               and str(n.props.get("url", "")).endswith("/api/v1/invite/how/to/generate")]
+    if not api_eps:
+        return ScenarioResult(name, False, "JS-referenced /api/v1/... was not extracted as an endpoint")
+    if api_eps[0].source != "js_analysis":
+        problems.append(f"JS-discovered endpoint provenance wrong: {api_eps[0].source!r}")
+    if any("steal" in str(n.props) or "evil.com" in str(n.props) for n in sub3.nodes):
+        problems.append("a cross-origin API URL was extracted (scope violated)")
+
+    # Turn 3 — the JS-discovered API endpoint is GET-fetched and JSON-mapped.
+    tasks3 = await planner.plan(goal, sub3, empty)
+    api_get = next((t for t in tasks3 if isinstance(tasks3, list)
+                    and t.params.get("parser") == "curl_body"
+                    and str(t.params.get("target", "")).endswith("/api/v1/invite/how/to/generate")),
+                   None) if isinstance(tasks3, list) else None
+    if api_get is None:
+        return ScenarioResult(name, False, "planner did not GET the JS-discovered API endpoint")
+    await _run("curl_body", api_get.params["target"],
+               '{"code": "0", "data": {"code": "SEKRETCODE"}}')  # value must NOT be stored
+    sub4 = await api.get_subgraph(_ANCHOR, depth=7)
+    mapped = [n for n in sub4.nodes if n.type == "endpoint"
+              and str(n.props.get("url", "")).endswith("/api/v1/invite/how/to/generate")]
+    if not any(n.props.get("content_kind") == "json" and "json_keys" in n.props for n in mapped):
+        problems.append("JS-discovered API endpoint's JSON structure was not recorded")
+    if "SEKRETCODE" in _json.dumps([n.props for n in sub4.nodes], default=str):
+        problems.append("a JSON VALUE leaked into the graph (structure-only violated)")
+
+    if problems:
+        return ScenarioResult(name, False, "; ".join(problems))
+    return ScenarioResult(
+        name, True,
+        "homepage → /invite fetched (--resolve) → <script src> JS asset → JS GET-fetched + STATICALLY "
+        "parsed (never executed) → /api/v1/invite/... extracted (cross-origin ignored) → --resolve GET "
+        "→ JSON structure recorded (keys only, no values); policy+safety OK",
+    )
+
+
 class _ReconFtpFakeBackend:
     """A synthetic ``ToolBackend`` that makes recon DISCOVER an FTP service (so
     the engagement is still in current_phase="recon" when the credential gate
@@ -2412,6 +2541,7 @@ SCENARIOS: list[Any] = [
     scenario_web_content_enumeration,
     scenario_web_endpoint_fetch_loop,
     scenario_web_api_surface_discovery,
+    scenario_web_js_api_discovery,
     scenario_recon_service_no_credentials_honest_outcome,
     scenario_ftp_anonymous_access,
     scenario_ftp_validation_via_tool_service,

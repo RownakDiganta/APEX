@@ -58,7 +58,7 @@ from memfabric.types import (
 )
 
 from apex_host.planners.capabilities import capabilities_from_subgraph
-from apex_host.planners.web_opportunities import pending_enumerated_endpoints
+from apex_host.planners.web_opportunities import pending_js_assets, pending_page_fetches
 from apex_host.planning.models import PlanDecision
 from apex_host.tools.registry import ToolRegistry
 from apex_host.types import ApexPhase
@@ -67,6 +67,11 @@ from apex_host.types import ApexPhase
 #: loop-closing fetch step; each endpoint is fetched once (distinct URL →
 #: distinct fingerprint), so the total is bounded by the enumeration result.
 _MAX_ENDPOINT_FETCHES = 3
+
+#: Max JS assets fetched+statically-parsed per web turn (§28.24) — bounds the
+#: JS-fetch step; each JS file is fetched once (distinct URL → distinct
+#: fingerprint), read for literal API-path references, never executed.
+_MAX_JS_FETCHES = 3
 
 #: Fixed, GENERIC API-root path conventions probed for API-surface DISCOVERY
 #: (§28.22) — like browser_planner's /robots.txt, these are generic REST
@@ -385,14 +390,15 @@ class _WebDeterministic:
                  "-d", _GRAPHQL_INTROSPECTION_BODY, *follow_args, *resolve_args, gql_url],
                 web_claim_deps))
 
-        # Fetch discovered-but-unfetched enumeration endpoints (§28.13) — close
-        # the loop: homepage → enumerate → FETCH what enumeration found. Each is
+        # Fetch discovered-but-unfetched PAGE endpoints (§28.13, §28.24) — close
+        # the loop: homepage → discover pages (enumeration hits AND relative
+        # links like /invite AND JS-referenced /api paths) → FETCH them. Each is
         # fetched via the same Host-aware --resolve -L path as the homepage
         # (highest-signal first), HEAD + body, once per endpoint (distinct URL →
         # distinct fingerprint), bounded to _MAX_ENDPOINT_FETCHES per turn.
         # DISCOVERY ONLY — fetch and record; no form submission or request forging.
         if self._registry.get("curl") is not None:
-            for ep in pending_enumerated_endpoints(subgraph)[:_MAX_ENDPOINT_FETCHES]:
+            for ep in pending_page_fetches(subgraph)[:_MAX_ENDPOINT_FETCHES]:
                 path = urlsplit(str(ep.props.get("url", ""))).path or "/"
                 fetch_url = f"{base_url.rstrip('/')}{path}"
                 tasks.append(
@@ -414,6 +420,26 @@ class _WebDeterministic:
                             "tool": "curl",
                             "args": ["-s", *follow_args, *resolve_args, fetch_url],
                             "target": fetch_url, "parser": "curl_body",
+                        },
+                        subgraph_anchor=goal.anchor_node, phase=goal.phase,
+                        claim_dependencies=web_claim_deps,
+                    )
+                )
+
+            # Fetch discovered JS assets (§28.24) — GET the JS body (via the same
+            # Host-aware --resolve -L path) and STATICALLY parse it for referenced
+            # API endpoint paths (parser "js"). Bounded, once per JS file. The JS
+            # is fetched and READ, NEVER executed — no POST, no request forging.
+            for js in pending_js_assets(subgraph)[:_MAX_JS_FETCHES]:
+                js_path = urlsplit(str(js.props.get("url", ""))).path or "/"
+                js_url = f"{base_url.rstrip('/')}{js_path}"
+                tasks.append(
+                    TaskSpec(
+                        id=new_id(), goal_id=goal.id, executor_domain="web",
+                        params={
+                            "tool": "curl",
+                            "args": ["-s", *follow_args, *resolve_args, js_url],
+                            "target": js_url, "parser": "js",
                         },
                         subgraph_anchor=goal.anchor_node, phase=goal.phase,
                         claim_dependencies=web_claim_deps,

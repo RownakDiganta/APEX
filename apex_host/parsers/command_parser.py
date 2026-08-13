@@ -42,6 +42,9 @@ _SCHEME_DEFAULT_PORT = {"http": "80", "https": "443"}
 #: (§28.22) — structure mapping only, keeps the endpoint node bounded.
 _MAX_JSON_KEYS = 40
 
+#: Bound on <script src> JS assets recorded per HTML page (§28.24).
+_MAX_JS_ASSETS = 15
+
 #: A syntactically valid DNS hostname (one or more dot-separated labels, at
 #: least one dot so a bare word is not treated as a vhost). Deliberately strict
 #: so a malformed/dangerous Location value never becomes a vhost that later
@@ -474,7 +477,60 @@ class CommandParser:
                 )
             )
 
+        # §28.24 — extract <script src> JS assets (same-origin only) so the web
+        # planner can FETCH them and statically extract API-endpoint references
+        # (e.g. /invite's inviteapi.min.js → /api/v1/...). Recorded as
+        # discovered-but-unfetched endpoint nodes marked js_asset=True. DISCOVERY
+        # ONLY — the JS is fetched and read, never executed.
+        seen_js: set[str] = set()
+        for m in re.finditer(r"""<script[^>]*\bsrc=["']([^"'#?]+)["']""", text, re.IGNORECASE):
+            src = m.group(1).strip()
+            js_path = self._same_origin_script_path(src, host)
+            if js_path is None or js_path in seen_js:
+                continue
+            seen_js.add(js_path)
+            if len(seen_js) > _MAX_JS_ASSETS:
+                break
+            js_url = f"{url.rstrip('/')}{js_path}"
+            js_ep_id = _endpoint_id(js_url)
+            nodes.append(
+                Node(
+                    id=js_ep_id, type="endpoint",
+                    props={"url": js_url, "path": js_path, "js_asset": True},
+                    confidence=0.5, source=source, first_seen=timestamp, last_seen=timestamp,
+                )
+            )
+            edges.append(
+                Edge(
+                    id=contains_edge_id(ep_id, js_ep_id), from_id=ep_id, to_id=js_ep_id,
+                    type="contains", props={}, confidence=0.5, source=source,
+                    first_seen=timestamp, last_seen=timestamp,
+                )
+            )
+
         return ParsedObservation(node_deltas=nodes, edge_deltas=edges)
+
+    @staticmethod
+    def _same_origin_script_path(src: str, page_host: str) -> str | None:
+        """Return the same-origin absolute path of a ``<script src>`` value, or
+        ``None`` for a cross-origin / protocol-relative / data: script (never
+        fetched — §28.24 scope gate). A relative ``/js/app.js`` is returned as-is;
+        a same-host absolute ``http://<page_host>/js/app.js`` is reduced to its
+        path; a different host is rejected."""
+        s = (src or "").strip()
+        if not s or s.startswith("data:") or s.startswith("//"):
+            return None
+        if s.startswith("http://") or s.startswith("https://"):
+            split = urlsplit(s)
+            if (split.hostname or "").lower() != page_host.lower():
+                return None  # cross-origin — out of scope
+            path = split.path
+        elif s.startswith("/"):
+            path = s
+        else:
+            return None  # relative-to-page (e.g. "app.js") — not an absolute site path
+        path = path.split("?")[0].split("#")[0]
+        return path or None
 
     # ------------------------------------------------------------------
     # JSON API response body — structure mapping only (§28.22)
