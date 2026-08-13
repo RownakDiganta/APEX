@@ -1984,6 +1984,15 @@ async def scenario_web_js_api_discovery() -> ScenarioResult:
     js_assets = [n for n in sub2.nodes if n.type == "endpoint" and n.props.get("js_asset") is True]
     if not js_assets:
         return ScenarioResult(name, False, "/invite's <script src> did not become a JS asset node")
+    # §28.25 — the root-absolute src on /invite must resolve to the HOST ROOT,
+    # not the page directory (the pre-fix bug produced /invite/js/inviteapi.min.js
+    # which 404s and yields no API extraction).
+    js_urls = {str(n.props.get("url", "")) for n in js_assets}
+    if f"http://{_VHOST}/js/inviteapi.min.js" not in js_urls:
+        return ScenarioResult(
+            name, False,
+            f"JS asset URL not resolved to host root (got {sorted(js_urls)}, "
+            f"expected http://{_VHOST}/js/inviteapi.min.js)")
 
     # Turn 2 — the planner fetches the JS asset (parser "js").
     tasks2 = await planner.plan(goal, sub2, empty)

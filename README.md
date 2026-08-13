@@ -2479,6 +2479,15 @@ extracted; no deobfuscation, no POST, no request construction, cross-origin
 scripts are never fetched, and it is bounded (JS-fetch count, extraction count).
 See CLAUDE.md §28.24.
 
+**Correct src/href resolution (§28.25).** Linked `<script src>` and `href` values
+are resolved against the fetched page URL with proper URL joining: a root-absolute
+`/js/app.js` on a sub-path page like `/invite` resolves to the **host root**
+(`http://host/js/app.js`), not the page directory (`/invite/js/app.js`, which
+404s); a bare-relative `sub/x.js` resolves against the page directory; a
+same-origin full URL is used as-is; cross-origin, protocol-relative, `data:`, and
+anchor values are rejected. Before this fix the JS fetch 404'd on any sub-path
+page, so no API endpoints were ever extracted. See CLAUDE.md §28.25.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,

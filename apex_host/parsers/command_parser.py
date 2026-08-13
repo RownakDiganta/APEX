@@ -15,7 +15,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from memfabric.ids import now
 from memfabric.types import Edge, KnowledgeEntry, Node, ParsedObservation, RawObservation
@@ -119,6 +119,42 @@ def _normalize_url(target: str) -> str:
     if target.startswith("http://") or target.startswith("https://"):
         return target
     return f"http://{target}"
+
+
+def _resolve_same_origin_url(page_url: str, value: str, page_host: str) -> str | None:
+    """Resolve a ``src``/``href`` *value* found on the page at *page_url* to an
+    absolute, same-origin URL — or ``None`` if empty, cross-origin,
+    protocol-relative, ``data:``, an anchor, a credential URL, or a non-http(s)
+    scheme.
+
+    A ROOT-ABSOLUTE value (``/js/x``) resolves against the SCHEME+HOST root
+    (``http://h/js/x``); a BARE-RELATIVE value (``sub/x``) against the page's
+    DIRECTORY (``/invite/`` → ``/invite/sub/x``); a same-origin FULL URL is used
+    as-is. Uses :func:`urllib.parse.urljoin` so ``/js/inviteapi.min.js`` on
+    ``http://h/invite`` becomes ``http://h/js/inviteapi.min.js`` (host-root),
+    not ``http://h/invite/js/...`` — the pre-fix directory-relative bug (§28.25).
+    """
+    v = (value or "").strip()
+    if not v or v.startswith("data:") or v.startswith("//") or v.startswith("#"):
+        return None
+    # A trailing slash makes urljoin treat the page path as a DIRECTORY, so a
+    # bare-relative "sub/x" on /invite resolves to /invite/sub/x; a root-absolute
+    # "/js/x" ignores the base path and resolves against the host root regardless.
+    base = page_url if page_url.endswith("/") else page_url + "/"
+    try:
+        split = urlsplit(urljoin(base, v))
+    except ValueError:
+        return None
+    if split.scheme not in ("http", "https"):
+        return None
+    if split.username is not None or split.password is not None:
+        return None  # never follow a credential-bearing URL
+    host = (split.hostname or "").lower()
+    if not host or host != page_host.lower():
+        return None  # cross-origin — out of scope
+    port = f":{split.port}" if split.port else ""
+    path = (split.path or "/").rstrip("/") or "/"
+    return f"{split.scheme}://{split.hostname}{port}{path}"
 
 
 def _http_service_from_url(
@@ -389,6 +425,10 @@ class CommandParser:
         # node (host_ip when a vhost fetch supplies it), while endpoint URLs
         # keep the fetched (vhost) host so relative links resolve correctly.
         host = _host_from_target(host_ip) if host_ip.strip() else _host_from_target(target)
+        # The same-origin check for links/scripts uses the FETCHED page's host
+        # (e.g. the vhost 2million.htb), NOT the authorized EKG host (the IP) —
+        # otherwise every vhost-relative link/script is wrongly rejected.
+        page_host = _host_from_target(target)
         h_id = _host_id_fn(host)
         ep_id = _endpoint_id(url)
 
@@ -436,21 +476,22 @@ class CommandParser:
         nodes.append(svc_node)
         edges.append(svc_edge)
 
-        # Extract relative-path hrefs (skip external URLs and anchors)
-        seen_paths: set[str] = set()
+        # Extract same-origin links (href) as endpoint nodes. §28.25 — resolve
+        # each href against the fetched page URL so a root-absolute "/foo" on
+        # /invite resolves to the HOST ROOT (http://h/foo), not the page dir;
+        # a bare-relative "sub" resolves against the page dir; cross-origin,
+        # anchors, and non-http schemes are rejected by _resolve_same_origin_url.
+        seen_links: set[str] = set()
         for m in re.finditer(r"""href=["']([^"'#?]+)["']""", text, re.IGNORECASE):
-            href = m.group(1).strip()
-            if href.startswith("http://") or href.startswith("https://"):
+            link_url = _resolve_same_origin_url(url, m.group(1), page_host)
+            if link_url is None or link_url == url.rstrip("/"):
                 continue
-            if not href.startswith("/"):
+            path = urlsplit(link_url).path or "/"
+            if path == "/" or link_url in seen_links:
                 continue
-            path = href.split("?")[0].rstrip("/") or "/"
-            if path in seen_paths or path == "/":
-                continue
-            seen_paths.add(path)
-            if len(seen_paths) > 20:
+            seen_links.add(link_url)
+            if len(seen_links) > 20:
                 break
-            link_url = f"{url.rstrip('/')}{path}"
             lnk_id = _endpoint_id(link_url)
             nodes.append(
                 Node(
@@ -484,14 +525,13 @@ class CommandParser:
         # ONLY — the JS is fetched and read, never executed.
         seen_js: set[str] = set()
         for m in re.finditer(r"""<script[^>]*\bsrc=["']([^"'#?]+)["']""", text, re.IGNORECASE):
-            src = m.group(1).strip()
-            js_path = self._same_origin_script_path(src, host)
-            if js_path is None or js_path in seen_js:
+            js_url = _resolve_same_origin_url(url, m.group(1), page_host)
+            if js_url is None or js_url in seen_js:
                 continue
-            seen_js.add(js_path)
+            seen_js.add(js_url)
             if len(seen_js) > _MAX_JS_ASSETS:
                 break
-            js_url = f"{url.rstrip('/')}{js_path}"
+            js_path = urlsplit(js_url).path or "/"
             js_ep_id = _endpoint_id(js_url)
             nodes.append(
                 Node(
@@ -509,28 +549,6 @@ class CommandParser:
             )
 
         return ParsedObservation(node_deltas=nodes, edge_deltas=edges)
-
-    @staticmethod
-    def _same_origin_script_path(src: str, page_host: str) -> str | None:
-        """Return the same-origin absolute path of a ``<script src>`` value, or
-        ``None`` for a cross-origin / protocol-relative / data: script (never
-        fetched — §28.24 scope gate). A relative ``/js/app.js`` is returned as-is;
-        a same-host absolute ``http://<page_host>/js/app.js`` is reduced to its
-        path; a different host is rejected."""
-        s = (src or "").strip()
-        if not s or s.startswith("data:") or s.startswith("//"):
-            return None
-        if s.startswith("http://") or s.startswith("https://"):
-            split = urlsplit(s)
-            if (split.hostname or "").lower() != page_host.lower():
-                return None  # cross-origin — out of scope
-            path = split.path
-        elif s.startswith("/"):
-            path = s
-        else:
-            return None  # relative-to-page (e.g. "app.js") — not an absolute site path
-        path = path.split("?")[0].split("#")[0]
-        return path or None
 
     # ------------------------------------------------------------------
     # JSON API response body — structure mapping only (§28.22)

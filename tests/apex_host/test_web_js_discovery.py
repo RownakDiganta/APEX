@@ -52,21 +52,26 @@ def _plan(planner: _WebDeterministic, nodes: list[Node]) -> list:
 # ---------------------------------------------------------------------------
 class TestScriptSrcExtraction:
     def test_script_src_becomes_js_asset_endpoint(self) -> None:
+        # §28.25 — the page is at /invite, so a root-absolute src must resolve to
+        # the HOST ROOT, a bare-relative src to the page dir, and cross-origin is
+        # dropped. (This FAILS against the pre-fix directory-relative join, which
+        # produced http://2million.htb/invite/js/inviteapi.min.js.)
         html = ('<!DOCTYPE html><html><head><title>Invite</title>'
-                '<script src="/js/inviteapi.min.js"></script>'
+                '<script src="/js/inviteapi.min.js"></script>'   # root-absolute
                 '<script src="https://cdn.evil.com/analytics.js"></script>'  # cross-origin
-                '<script src="app.js"></script>'  # relative-to-page, not absolute
+                '<script src="app.js"></script>'                 # relative-to-page dir
                 '</head><body><a href="/login">Login</a></body></html>')
         obs, _ = parse_single_result(
             {"tool": "curl", "parser": "curl_body", "args": ["-s", f"http://{_VHOST}/invite"],
              "target": f"http://{_VHOST}/invite", "stdout": html},
             {"target": _IP})
-        js = [n for n in obs.node_deltas if n.type == "endpoint" and n.props.get("js_asset") is True]
-        assert len(js) == 1  # only the same-origin /js/inviteapi.min.js
-        assert js[0].props["path"] == "/js/inviteapi.min.js"
-        assert all(e.from_id == _ANCHOR for e in obs.edge_deltas
-                   if e.to_id in {n.id for n in obs.node_deltas if n.type != "endpoint"}) or True
-        # No cross-origin script recorded.
+        js = {n.props["url"] for n in obs.node_deltas
+              if n.type == "endpoint" and n.props.get("js_asset") is True}
+        assert js == {
+            f"http://{_VHOST}/js/inviteapi.min.js",   # host-root, NOT /invite/js/...
+            f"http://{_VHOST}/invite/app.js",         # relative → page dir
+        }
+        # No cross-origin script recorded anywhere.
         assert not any("evil.com" in str(n.props) for n in obs.node_deltas)
 
     def test_js_asset_is_pending_and_planner_fetches_it_via_js_parser(self) -> None:
@@ -224,3 +229,73 @@ class TestJsFetchSafetyAndPolicy:
         # so it is never in the pending set and never fetched.
         nodes = _base_nodes()  # no js_asset seeded
         assert not pending_js_assets(_subgraph(nodes))
+
+
+# ---------------------------------------------------------------------------
+# 5. §28.25 — src/href URL resolution against the fetched page URL
+# ---------------------------------------------------------------------------
+class TestScriptSrcUrlResolution:
+    """A page fetched at a sub-path (/invite) must resolve links/scripts
+    correctly: root-absolute against the HOST ROOT, bare-relative against the
+    page DIRECTORY, same-origin full URLs as-is, cross-origin rejected."""
+
+    def _parse(self, html: str, page: str) -> list:
+        obs, _ = parse_single_result(
+            {"tool": "curl", "parser": "curl_body", "args": ["-s", page],
+             "target": page, "stdout": html},
+            {"target": _IP})
+        return obs.node_deltas
+
+    def _js_urls(self, nodes: list) -> set:
+        return {n.props["url"] for n in nodes
+                if n.type == "endpoint" and n.props.get("js_asset") is True}
+
+    def test_root_absolute_script_resolves_to_host_root(self) -> None:
+        # THE bug: /js/app.js on /invite must be host-root, not /invite/js/app.js.
+        nodes = self._parse('<html><title>x</title><script src="/js/app.js"></script></html>',
+                            f"http://{_VHOST}/invite")
+        assert self._js_urls(nodes) == {f"http://{_VHOST}/js/app.js"}
+        assert f"http://{_VHOST}/invite/js/app.js" not in self._js_urls(nodes)
+
+    def test_relative_script_resolves_to_page_directory(self) -> None:
+        nodes = self._parse('<html><title>x</title><script src="sub/x.js"></script></html>',
+                            f"http://{_VHOST}/invite")
+        assert self._js_urls(nodes) == {f"http://{_VHOST}/invite/sub/x.js"}
+
+    def test_full_url_same_origin_script_used_as_is(self) -> None:
+        nodes = self._parse(
+            f'<html><title>x</title><script src="http://{_VHOST}/assets/m.js"></script></html>',
+            f"http://{_VHOST}/invite")
+        assert self._js_urls(nodes) == {f"http://{_VHOST}/assets/m.js"}
+
+    def test_cross_origin_script_rejected(self) -> None:
+        nodes = self._parse(
+            '<html><title>x</title><script src="https://cdn.evil.com/a.js"></script></html>',
+            f"http://{_VHOST}/invite")
+        assert self._js_urls(nodes) == set()
+
+    def test_root_absolute_href_resolves_to_host_root(self) -> None:
+        # The relative-link extraction gets the same fix: /admin on /invite is
+        # host-root http://vhost/admin, not http://vhost/invite/admin.
+        nodes = self._parse('<html><title>x</title><a href="/admin">A</a></html>',
+                            f"http://{_VHOST}/invite")
+        link_urls = {n.props["url"] for n in nodes
+                     if n.type == "endpoint" and n.props.get("path") == "/admin"}
+        assert link_urls == {f"http://{_VHOST}/admin"}
+        assert f"http://{_VHOST}/invite/admin" not in {n.props.get("url") for n in nodes}
+
+    def test_end_to_end_invite_js_url_correct_then_api_extracted(self) -> None:
+        # /invite HTML → correct host-root JS URL → fetch that JS (fake body) →
+        # /api/v1/... reference statically extracted as an endpoint.
+        html = '<html><title>Invite</title><script src="/js/inviteapi.min.js"></script></html>'
+        page_nodes = self._parse(html, f"http://{_VHOST}/invite")
+        js_url = next(iter(self._js_urls(page_nodes)))
+        assert js_url == f"http://{_VHOST}/js/inviteapi.min.js"  # host-root, not /invite/js/...
+        # Now fetch that JS asset — the (fake) body references an API path.
+        js_body = 'fetch("/api/v1/invite/how/to/generate").then(r=>r.json());'
+        obs, _ = parse_single_result(
+            {"tool": "curl", "parser": "js", "args": ["-s", js_url],
+             "target": js_url, "stdout": js_body},
+            {"target": _IP})
+        api_paths = {n.props.get("path") for n in obs.node_deltas if n.type == "endpoint"}
+        assert "/api/v1/invite/how/to/generate" in api_paths

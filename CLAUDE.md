@@ -11107,6 +11107,65 @@ extracted → `--resolve` GET → JSON keys-only mapping, no values leaked); **f
 against pre-§28.24 code (relative-link pages were never fetched, verified by
 reverting).
 
+### 28.25 Resolve linked src/href URLs against the page root, not its directory
+
+> **Numbering note:** highest unique §28 heading is §28.24 (the trailing
+> `### 28.7`/`### 28.8` are the known pre-existing collision). This section is
+> **§28.25**; nothing was renumbered.
+
+§28.24's linked-JS discovery fired on a live TwoMillion run but built the WRONG
+URLs, so the JS fetch 404'd and NO `/api/v1/...` endpoints were ever extracted.
+The `/invite` page has `<script src="/js/inviteapi.min.js">` (root-absolute), but
+`CommandParser.parse_curl_body` joined it as `url.rstrip('/') + path` where `url`
+is the FULL page URL (`http://2million.htb/invite`), producing
+`http://2million.htb/invite/js/inviteapi.min.js` (does not exist) instead of
+`http://2million.htb/js/inviteapi.min.js`. The same directory-relative join
+affected the relative-`href` link extraction. It only ever worked by accident on
+the homepage (empty page path); any sub-path page (`/invite`) resolved every
+root-absolute reference against the page's directory. Evidence in the live
+`live_graph.json`: endpoint nodes with `path=/js/inviteapi.min.js` but
+`url=.../invite/js/...`. (`js_parser.py` was already correct — it builds `/api`
+URLs from `{scheme}://{netloc}`, the host root, never the JS file's directory.)
+
+**Fix (URL resolution — discovery only, `apex_host/parsers/command_parser.py`):**
+a single `_resolve_same_origin_url(page_url, value, page_host)` helper now
+resolves every `<script src>` and `href` value with `urllib.parse.urljoin`
+against the fetched page URL:
+
+- a **root-absolute** value (`/js/x`) resolves against the SCHEME+HOST root →
+  `http://h/js/x` (the bug fix), never the page directory;
+- a **bare-relative** value (`sub/x`) resolves against the page's DIRECTORY →
+  `/invite/` + `sub/x` = `/invite/sub/x` (urljoin against a trailing-slash base);
+- a **same-origin full URL** (`http://h/x`) is used as-is;
+- **cross-origin**, protocol-relative (`//host`), `data:`, anchors (`#…`),
+  credential URLs (`user:pw@`), and non-http(s) schemes are rejected (`None`).
+
+The helper is applied to BOTH the `<script src>` JS-asset extraction (§28.24) and
+the relative-`href` page-link extraction, so `/invite`'s other links resolve
+correctly too. The same-origin check uses the **fetched page's** host (the vhost
+`2million.htb`, from `target`), NOT the authorized EKG host (the IP, from
+`host_ip`) — otherwise every vhost-relative reference is wrongly rejected; the
+EKG `exposes` edges still attach to the authorized `host:<ip>` node (§28.8
+dangling-edge rule) unchanged. The obsolete `_same_origin_script_path` helper is
+removed. Everything else is unchanged: same-origin/vhost only, GET via
+`--resolve -L`, the JS read-not-executed static extractor (§28.24), no POST,
+bounded (`_MAX_JS_ASSETS` / 20 links), `safety.py`/allowlist/dry-run/policy scope
+gate/memfabric all unchanged; apex stays off the VPN. Once the JS URL is correct,
+the existing §28.24 extractor pulls its `/api/v1/...` references and feeds the
+§28.22 GET + JSON-structure mapping.
+
+**Tests** (`tests/apex_host/test_web_js_discovery.py`, driven through the REAL
+`parse_single_result` router + `_WebDeterministic.plan` + `safety` + policy): a
+`/invite` page's root-absolute `<script src="/js/app.js">` → `http://<vhost>/js/app.js`
+(host-root, NOT `/invite/js/app.js`); a relative `src="sub/x.js"` from `/invite`
+→ `/invite/sub/x.js`; a same-origin full URL used as-is; cross-origin rejected; a
+root-absolute `href="/admin"` from `/invite` → `http://<vhost>/admin`; end-to-end
+`/invite` → correct `/js/inviteapi.min.js` URL → fake JS body with
+`/api/v1/invite/...` → endpoint extracted. The updated
+`test_script_src_becomes_js_asset_endpoint` and the `web_js_api_discovery`
+release-gate scenario both assert the host-root URL, so they **fail** against the
+pre-§28.25 directory-relative join.
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,
