@@ -2456,9 +2456,14 @@ discovered, one fixed introspection query (a schema READ, never a mutation; the
 only request body the web planner ever emits) maps its type/field NAMES into an
 `api_schema` node. JSON API responses are parsed into `endpoint` structure —
 top-level key **names only, never values** — so no secret enters the graph.
-Everything routes through `runner.py` → `safety.py` (no shell metacharacters) and
-the PolicyAdvisor scope gate; no arbitrary methods, no attack bodies, no
-auth-header forging, no injection. See CLAUDE.md §28.22.
+The API root probes go through the **same Host-aware `--resolve -L` GET path as
+the homepage fetch** when a vhost is discovered (§28.23) — so `/api/v1` returns
+its real JSON over the vhost instead of the bare-IP `301` stub; they are deferred
+until the base is settled (a vhost is known, or the homepage confirms none) and
+gated host-aware so a pre-vhost IP probe never blocks the vhost probe. Everything
+routes through `runner.py` → `safety.py` (no shell metacharacters) and the
+PolicyAdvisor scope gate; no arbitrary methods, no attack bodies, no auth-header
+forging, no injection. See CLAUDE.md §28.22–§28.23.
 
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)

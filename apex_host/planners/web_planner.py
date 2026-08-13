@@ -298,14 +298,25 @@ class _WebDeterministic:
                     )
                 )
 
-        # ---- Bounded API-surface DISCOVERY (§28.22) ----------------------
+        # ---- Bounded API-surface DISCOVERY (§28.22, §28.23) --------------
         # The web phase loads the linked app but cannot see an API surface it is
         # not linked to. Probe a FIXED, GENERIC set of API/GraphQL root
         # conventions (like browser_planner probes /robots.txt) — curl HEAD
-        # (status) + GET (JSON structure), via the same Host-aware --resolve
-        # path, ONCE per phase. Responsive roots become endpoint nodes; JSON
-        # bodies are parsed into API structure. DISCOVERY ONLY — read/map.
-        if self._registry.get("curl") is not None and not self._api_probe_done(subgraph):
+        # (status) + GET (JSON structure), through the SAME Host-aware
+        # --resolve -L path as the homepage fetch. Responsive roots become
+        # endpoint nodes; JSON bodies are parsed into API structure.
+        #
+        # §28.23: DEFER until the base is settled — fire only when a vhost node
+        # exists (→ probe the vhost via --resolve -L, so /api/v1 returns its real
+        # JSON, not the bare-IP 301 stub) OR the homepage has been fetched
+        # (confirming no vhost — the IP is the real app). The gate is host-aware
+        # so a pre-vhost IP probe never blocks the vhost probe. DISCOVERY ONLY.
+        base_host = self._url_host(base_url)
+        if (
+            self._registry.get("curl") is not None
+            and (vhost_node is not None or self._homepage_fetched(subgraph))
+            and not self._api_probe_done(subgraph, base_host)
+        ):
             for path in (*_API_ROOT_PATHS, *_GRAPHQL_PATHS):
                 probe_url = f"{base_url.rstrip('/')}{path}"
                 tasks.append(self._curl_task(
@@ -417,7 +428,26 @@ class _WebDeterministic:
                     else "no web-capable tools in allowed_tools and no wordlist-capable tools"
                 )
             )
-        return tasks
+        # §28.23 — a fixed API-root probe and the §28.13 fetch loop can emit an
+        # IDENTICAL fetch for an overlapping path (e.g. a discovered /api and the
+        # fixed /api probe both → the same vhost URL). Drop exact-duplicate curl
+        # actions (same tool+args+target+parser) within this turn, keeping the
+        # first — the dispatcher would dedup them by fingerprint anyway, but the
+        # planner should not emit the same action twice.
+        deduped: list[TaskSpec] = []
+        seen: set[tuple[str, tuple[str, ...], str, str]] = set()
+        for t in tasks:
+            key = (
+                str(t.params.get("tool", "")),
+                tuple(str(a) for a in t.params.get("args", [])),
+                str(t.params.get("target", "")),
+                str(t.params.get("parser", "")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(t)
+        return deduped
 
     @staticmethod
     def _enumeration_done(subgraph: SubgraphView) -> bool:
@@ -471,17 +501,43 @@ class _WebDeterministic:
         except ValueError:
             return "/"
 
+    @staticmethod
+    def _url_host(url: str) -> str:
+        try:
+            return (urlsplit(url).hostname or "").lower()
+        except ValueError:
+            return ""
+
     @classmethod
-    def _api_probe_done(cls, subgraph: SubgraphView) -> bool:
-        """True once the fixed API/GraphQL root set has been probed — any
-        ``endpoint`` node whose URL path is one of the generic API/GraphQL
-        conventions. The HEAD probe creates such a node for ANY HTTP status
-        (even 404), so this reliably gates the fixed probes to once per phase.
-        Stateless/blackboard-only (reads the subgraph)."""
+    def _api_probe_done(cls, subgraph: SubgraphView, base_host: str) -> bool:
+        """True once the fixed API/GraphQL root set has been probed AGAINST
+        *base_host* — an ``endpoint`` node at an API/GraphQL-convention path whose
+        URL host equals *base_host* (§28.23).
+
+        Host-aware on purpose: a pre-vhost bare-IP probe (turn 1, before the vhost
+        is discovered) creates IP-scoped 301 stubs at ``/api`` etc. Those must NOT
+        satisfy the gate for the vhost base — otherwise the API roots are never
+        re-probed through the vhost ``--resolve -L`` GET path once the vhost is
+        known, and the real JSON is never fetched. Stateless/blackboard-only."""
         conventions = set(_API_ROOT_PATHS) | set(_GRAPHQL_PATHS)
         return any(
             n.type == "endpoint"
             and cls._endpoint_path(str(n.props.get("url", ""))) in conventions
+            and cls._url_host(str(n.props.get("url", ""))) == base_host
+            for n in subgraph.nodes
+        )
+
+    @staticmethod
+    def _homepage_fetched(subgraph: SubgraphView) -> bool:
+        """True once the homepage (root-path ``endpoint``) has been fetched — the
+        signal that the base is SETTLED (a vhost has been discovered if one
+        exists, or the redirect-free IP is confirmed to be the real app). Used to
+        DEFER the API-root probes past turn 1 so they never fire prematurely
+        against the bare IP (§28.23)."""
+        return any(
+            n.type == "endpoint"
+            and n.props.get("fetched") is True
+            and (urlsplit(str(n.props.get("url", ""))).path or "/").rstrip("/") in ("", "/")
             for n in subgraph.nodes
         )
 

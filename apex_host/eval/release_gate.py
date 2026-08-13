@@ -1813,6 +1813,32 @@ async def scenario_web_api_surface_discovery() -> ScenarioResult:
     if "/api/v1" not in probe_paths or "/graphql" not in probe_paths:
         problems.append(f"fixed API/GraphQL root probes missing: {sorted(probe_paths)}")
 
+    # §28.23 — the fixed /api/v1 root probe GETs the body through the vhost
+    # --resolve -L path (NOT the bare-IP 301 stub / HEAD). Fails against the
+    # pre-§28.23 code, whose probes hit the IP and were then gated off.
+    api_v1_get = next((t for t in tasks1 if t.params.get("parser") == "curl_body"
+                       and t.params["target"] == f"http://{_VHOST}/api/v1"), None)
+    if api_v1_get is None:
+        problems.append("no vhost /api/v1 GET body probe emitted (§28.23)")
+    else:
+        ga = api_v1_get.params["args"]
+        if "--resolve" not in ga or f"{_VHOST}:80:{_TARGET}" not in ga or "-L" not in ga:
+            problems.append(f"/api/v1 probe not --resolve -L pinned to the vhost: {ga}")
+        else:
+            # A real JSON body over the vhost maps its structure (keys only).
+            jobs, _ = parse_single_result(
+                {"tool": "curl", "parser": "curl_body", "args": ga, "target": api_v1_get.params["target"],
+                 "stdout": '{"routes": ["/api/v1/user", "/api/v1/auth"], "secret": "do-not-store"}'},
+                cast("ApexGraphState", {"target": _TARGET}))
+            await api.apply_deltas(nodes=jobs.node_deltas, edges=jobs.edge_deltas)
+            subj = await api.get_subgraph(_ANCHOR, depth=6)
+            v1 = [n for n in subj.nodes if n.type == "endpoint"
+                  and str(n.props.get("url", "")).rstrip("/").endswith("/api/v1")]
+            if not any(n.props.get("content_kind") == "json" and "json_keys" in n.props for n in v1):
+                problems.append("vhost /api/v1 JSON structure not recorded (§28.23)")
+            if "do-not-store" in _json.dumps([n.props for n in subj.nodes], default=str):
+                problems.append("a JSON VALUE leaked into the graph")
+
     # An API-wordlist hit routes through the REAL router into an endpoint node.
     obs, _ = parse_single_result(
         {"tool": "ffuf", "parser": "ffuf_api", "args": a, "target": api_scan[0].params["target"],

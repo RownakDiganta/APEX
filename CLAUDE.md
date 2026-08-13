@@ -10936,6 +10936,72 @@ endpoint → `--resolve` GET → JSON structure recorded (keys only, no values) 
 GraphQL endpoint → read-only introspection → `api_schema` node; **fails** against
 pre-§28.22 code (no API discovery).
 
+### 28.23 API root probes must go through the vhost --resolve -L GET path (not the bare IP)
+
+> **Numbering note:** highest unique §28 heading is §28.22 (the trailing
+> `### 28.7`/`### 28.8` are the known pre-existing collision). This section is
+> **§28.23**; nothing was renumbered.
+
+The §28.22 API-surface discovery fired on a live run vs TwoMillion (probed `/api`,
+`/api/v1`, created endpoint nodes) but mapped **no** JSON structure. The probes are
+built to use the vhost `--resolve -L` GET path — `probe_url = f"{base_url…}{path}"`
+with `["-s", *follow_args, *resolve_args, probe_url]`, where a discovered `vhost`
+node sets `base_url` to the vhost URL, `resolve_args = ["--resolve", …]` and
+`follow_args = ["-L"]` (§28.8). But two bugs meant they never actually reached the
+vhost API:
+
+1. **Premature bare-IP probing.** The probes fired on turn 1 — after recon
+   produced only host+service, before the homepage 301 had discovered the vhost.
+   With `vhost_node is None`, `base_url = ip_base_url`, so every API probe hit the
+   bare IP → nginx `301` stub (empty body). Those 301s created IP-scoped endpoint
+   nodes at `/api`, `/api/v1`, …
+
+2. **Host-agnostic once-per-phase gate.** `_api_probe_done` counted "any endpoint
+   at an API/GraphQL-convention path" regardless of host, so the turn-1 IP-scoped
+   301 stubs satisfied it. On turn 2 — after the vhost was discovered and the
+   vhost `--resolve -L` path became available — the API probes were **gated off**
+   and never re-fired against the vhost. The real vhost `/api/v1` (JSON) GET never
+   happened, so `parse_curl_body`'s JSON mapping (which is correct — it maps a
+   non-empty JSON body to an `endpoint` node's `json_keys`, keys-only) never
+   received a body.
+
+**Fix (§28.23, `apex_host/planners/web_planner.py`) — vhost-consistent, discovery
+only:**
+
+- **Host-aware gate:** `_api_probe_done(subgraph, base_host)` now counts only
+  endpoints at an API/GraphQL-convention path whose URL host equals the current
+  `base_host`. A pre-vhost IP stub no longer satisfies the gate for the vhost
+  base, so once the vhost is known the API roots ARE re-probed through the vhost
+  `--resolve -L` GET path → `/api/v1` returns its real JSON, not the 301 stub.
+- **Deferred emission:** the probes fire only when the base is SETTLED — a `vhost`
+  node exists (→ probe the vhost via `--resolve -L`), OR the homepage has been
+  fetched (`_homepage_fetched`, a fetched root-path endpoint — confirming no vhost,
+  the IP is the real app). This eliminates the wasted turn-1 bare-IP 301 probes.
+- **Per-turn dedup:** a fixed API-root probe and the §28.13 fetch loop can resolve
+  to the same vhost URL (a discovered `/api` and the fixed `/api` probe); the
+  planner now drops exact-duplicate curl actions (same tool+args+target+parser)
+  within a turn, keeping the first — the dispatcher would dedup by fingerprint
+  anyway, but the planner should not emit the same action twice.
+
+The probes already emit a GET body (not only HEAD) and `parse_curl_body` already
+maps JSON structure (keys only, never values); both were correct and are
+unchanged. No new request shape, method, or body is introduced — still GET/HEAD +
+the single fixed read-only GraphQL introspection query (§28.22). `safety.py`, the
+allowlist, dry-run, memfabric, and the policy scope gate are all untouched.
+
+**Tests** (`tests/apex_host/test_web_api_discovery.py::TestApiProbesVhostConsistent`,
+fakes only, driven through the REAL `_WebDeterministic.plan`): a pre-vhost
+IP-scoped `/api` stub does NOT block the vhost probe (the core regression — fires
+via `--resolve -L`; **fails** against the old host-agnostic gate, verified by
+reverting); every fixed API root emits a `--resolve -L` GET body (not only HEAD);
+probes are deferred until the base is settled; a no-vhost box probes the IP after
+the homepage is fetched; overlapping probe+fetch is emitted once. Parser guards:
+an empty response maps nothing; a raw-IP 301 header is a plain endpoint, NOT
+recorded as JSON/API content. The `web_api_surface_discovery` release-gate scenario
+now also asserts the fixed `/api/v1` probe GETs the body via the vhost `--resolve
+-L` path and maps its JSON structure (keys only, no values) — **fails** against the
+pre-§28.23 IP/gated probe.
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

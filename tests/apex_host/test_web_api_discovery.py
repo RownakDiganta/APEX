@@ -108,6 +108,77 @@ class TestApiRootProbes:
 
 
 # ---------------------------------------------------------------------------
+# 1b. §28.23 — API probes are vhost-consistent (--resolve -L GET), host-aware
+# gate, and deferred until the base is settled.
+# ---------------------------------------------------------------------------
+class TestApiProbesVhostConsistent:
+    def test_ip_scoped_stub_does_not_block_vhost_probe(self) -> None:
+        # §28.23 regression: a pre-vhost bare-IP probe created an IP-scoped /api
+        # 301 stub. With a vhost now discovered, the API roots MUST still be
+        # probed through the vhost --resolve -L path. FAILS against the old
+        # host-agnostic gate (which treated /api as "done" from the IP stub).
+        planner = _WebDeterministic(_IP, ToolRegistry(["curl"]))
+        nodes = _base_nodes(with_vhost=True) + [
+            _node(f"endpoint:http://{_IP}/api", "endpoint",
+                  {"url": f"http://{_IP}/api", "status": "301", "fetched": True}, source="curl"),
+        ]
+        tasks = _plan(planner, nodes)
+        api_body = [t for t in tasks if t.params.get("parser") == "curl_body"
+                    and t.params["target"] == f"http://{_VHOST}/api"]
+        assert api_body, "vhost /api GET not emitted despite an IP-scoped stub"
+        a = api_body[0].params["args"]
+        assert "--resolve" in a and f"{_VHOST}:80:{_IP}" in a and "-L" in a
+
+    def test_api_probes_get_the_body_via_resolve(self) -> None:
+        # Every fixed API-root path emits a GET body probe (not only HEAD),
+        # through the vhost --resolve -L path.
+        planner = _WebDeterministic(_IP, ToolRegistry(["curl"]))
+        tasks = _plan(planner, _base_nodes(with_vhost=True))
+        for p in _API_ROOT_PATHS:
+            body = next((t for t in tasks if t.params.get("parser") == "curl_body"
+                         and urlsplit(t.params["target"]).path == p), None)
+            assert body is not None, f"no GET body probe for {p}"
+            assert "--resolve" in body.params["args"] and "-L" in body.params["args"]
+            assert "-I" not in body.params["args"]  # it is a GET, not HEAD
+
+    def test_probes_deferred_until_base_settled(self) -> None:
+        # No vhost AND no fetched homepage → probes deferred (never premature
+        # bare-IP probing on turn 1).
+        planner = _WebDeterministic(_IP, ToolRegistry(["curl"]))
+        nodes = [_node(_ANCHOR, "host", {"ip": _IP}),
+                 _node(f"service:{_IP}:80/tcp", "service",
+                       {"port": "80", "service": "http", "state": "open"})]
+        tasks = _plan(planner, nodes)
+        assert not any(urlsplit(t.params["target"]).path == "/api" for t in tasks), \
+            "API roots probed before the base was settled"
+
+    def test_no_vhost_probes_after_homepage_fetched(self) -> None:
+        # No vhost, homepage fetched (200, no redirect) → the IP is the app →
+        # probe API roots against the IP.
+        planner = _WebDeterministic(_IP, ToolRegistry(["curl"]))
+        nodes = [_node(_ANCHOR, "host", {"ip": _IP}),
+                 _node(f"service:{_IP}:80/tcp", "service",
+                       {"port": "80", "service": "http", "state": "open"}),
+                 _node(f"endpoint:http://{_IP}/", "endpoint",
+                       {"url": f"http://{_IP}/", "status": "200", "fetched": True}, source="curl")]
+        tasks = _plan(planner, nodes)
+        assert any(urlsplit(t.params["target"]).path == "/api" for t in tasks)
+
+    def test_no_duplicate_curl_action_when_probe_and_fetch_overlap(self) -> None:
+        # A discovered /api endpoint (fetch loop) and the fixed /api probe both
+        # resolve to the same vhost URL — the planner emits it only once.
+        planner = _WebDeterministic(_IP, ToolRegistry(["curl"]))
+        nodes = _base_nodes(with_vhost=True) + [
+            _node(f"endpoint:http://{_IP}/api", "endpoint",
+                  {"url": f"http://{_IP}/api", "status": "200"}, source="ffuf"),
+        ]
+        tasks = _plan(planner, nodes)
+        head_api = [t for t in tasks if t.params.get("parser") == "command"
+                    and t.params["target"] == f"http://{_VHOST}/api"]
+        assert len(head_api) == 1  # deduped, not two identical fetches
+
+
+# ---------------------------------------------------------------------------
 # 2. API wordlist scan (operator-configured, distinct provenance)
 # ---------------------------------------------------------------------------
 class TestApiWordlistScan:
@@ -214,6 +285,26 @@ class TestJsonStructureMapping:
             {"target": _IP})
         ep = next(n for n in obs.node_deltas if n.type == "endpoint")
         assert ep.props.get("title") == "Home"  # existing HTML path intact
+
+    def test_empty_response_maps_nothing(self) -> None:
+        obs, _ = parse_single_result(
+            {"tool": "curl", "parser": "curl_body", "args": ["-s", f"http://{_IP}/api/v1"],
+             "target": f"http://{_IP}/api/v1", "stdout": ""},
+            {"target": _IP})
+        assert not obs.node_deltas and not obs.proposed_knowledge
+
+    def test_raw_ip_301_not_mapped_as_api_content(self) -> None:
+        # A bare-IP /api HEAD 301 stub becomes a plain endpoint (status 301) — it
+        # is NOT recorded as JSON/API content (no content_kind=json/api_response).
+        head = "HTTP/1.1 301 Moved Permanently\r\nLocation: http://2million.htb/api/v1\r\n"
+        obs, _ = parse_single_result(
+            {"tool": "curl", "parser": "command", "args": ["-s", "-I", f"http://{_IP}/api/v1"],
+             "target": f"http://{_IP}/api/v1", "stdout": head},
+            {"target": _IP})
+        eps = [n for n in obs.node_deltas if n.type == "endpoint"]
+        assert eps and eps[0].props.get("status") == "301"
+        assert eps[0].props.get("content_kind") != "json"
+        assert eps[0].props.get("api_response") is not True
 
 
 # ---------------------------------------------------------------------------
