@@ -1738,6 +1738,155 @@ async def scenario_web_endpoint_fetch_loop() -> ScenarioResult:
     )
 
 
+async def scenario_web_api_surface_discovery() -> ScenarioResult:
+    """§28.22 — bounded API-surface DISCOVERY. With the homepage known, the web
+    phase enumerates an API surface it was NOT linked to: an /api/v1 endpoint
+    becomes an EKG node, is GET-fetched via the Host-aware --resolve path, and its
+    JSON structure is recorded (top-level keys only, never values). A discovered
+    GraphQL endpoint is introspected read-only into an api_schema node. Drives the
+    REAL WebPlanner + PolicyAdvisor + safety.check_command + parse_single_result
+    (router) + MemoryAPI (Invariant 1). Fails against pre-§28.22 code (no API
+    discovery). DISCOVERY ONLY — read/map, never forge a request."""
+    import json as _json
+    from typing import cast
+    from urllib.parse import urlsplit
+
+    from apex_host.config import ApexConfig
+    from apex_host.graph_state import ApexGraphState
+    from apex_host.orchestration.parsing_node import parse_single_result
+    from apex_host.planners.web_planner import _GRAPHQL_INTROSPECTION_BODY, _WebDeterministic
+    from apex_host.policy import PolicyAdvisor
+    from apex_host.policy.policy_loader import load_policy
+    from apex_host.tools.registry import ToolRegistry
+    from apex_host.tools.safety import check_command
+    from apex_host.types import ToolCommand
+    from memfabric.types import EvidenceBundle, Goal
+
+    name = "web_api_surface_discovery"
+    _VHOST = "app.example.htb"
+    problems: list[str] = []
+    api = _make_api()
+    await _seed_node(api, _ANCHOR, "host", {"ip": _TARGET})
+    await _seed_node(api, f"service:{_TARGET}:80/tcp", "service",
+                     {"port": "80", "proto": "tcp", "state": "open", "service": "http"})
+    await _seed_edge(api, _ANCHOR, f"service:{_TARGET}:80/tcp", "exposes")
+    await _seed_node(api, f"vhost:{_TARGET}:{_VHOST}", "vhost", {"hostname": _VHOST, "ip": _TARGET})
+    await _seed_edge(api, _ANCHOR, f"vhost:{_TARGET}:{_VHOST}", "exposes")
+    home = f"http://{_VHOST}"
+    await _seed_node(api, f"endpoint:{home}", "endpoint", {"url": home, "status": "200", "fetched": True})
+    await _seed_edge(api, _ANCHOR, f"endpoint:{home}", "exposes")
+
+    config = ApexConfig(
+        target=_TARGET, dry_run=True, allowed_tools=["curl", "ffuf"],
+        web_api_wordlist_path="/seclists/api.txt", allow_password_lists=True,
+        web_enum_threads=10, web_enum_max_seconds=20)
+    goal = Goal(id="rg-api", description="web", phase="web", anchor_node=_ANCHOR)
+    empty = EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[])
+    planner = _WebDeterministic(
+        _TARGET, ToolRegistry.from_config(config),
+        web_api_wordlist_path=config.web_api_wordlist_path,
+        web_enum_threads=config.web_enum_threads, web_enum_max_seconds=config.web_enum_max_seconds)
+    advisor = PolicyAdvisor(load_policy(config), config)
+
+    # Turn 1 — fixed API/GraphQL root probes + the bounded API-wordlist scan.
+    sub1 = await api.get_subgraph(_ANCHOR, depth=5)
+    tasks1 = await planner.plan(goal, sub1, empty)
+    if not isinstance(tasks1, list):
+        return ScenarioResult(name, False, "planner abandoned turn 1")
+    api_scan = [t for t in tasks1 if t.params.get("parser") == "ffuf_api"]
+    if len(api_scan) != 1:
+        return ScenarioResult(name, False, f"expected one bounded API scan, got {len(api_scan)}")
+    a = api_scan[0].params["args"]
+    if "-t" not in a or "-maxtime" not in a or "/seclists/api.txt" not in a:
+        problems.append(f"API scan not bounded/wordlisted: {a}")
+    if "-H" not in a or f"Host: {_VHOST}" not in a:
+        problems.append("API scan missing vhost Host header")
+    if api_scan[0].params["target"] != f"http://{_TARGET}":
+        problems.append(f"API scan target not the authorized IP: {api_scan[0].params['target']}")
+    if not advisor.review_task(api_scan[0], "web", empty, config).is_approved:
+        problems.append("policy blocked the bounded API scan")
+    try:
+        check_command(ToolCommand(tool="ffuf", args=a), config)
+    except ValueError as exc:
+        problems.append(f"safety.py rejected the API scan: {exc}")
+    probe_paths = {urlsplit(t.params["target"]).path for t in tasks1 if t.params.get("parser") == "command"}
+    if "/api/v1" not in probe_paths or "/graphql" not in probe_paths:
+        problems.append(f"fixed API/GraphQL root probes missing: {sorted(probe_paths)}")
+
+    # An API-wordlist hit routes through the REAL router into an endpoint node.
+    obs, _ = parse_single_result(
+        {"tool": "ffuf", "parser": "ffuf_api", "args": a, "target": api_scan[0].params["target"],
+         "stdout": "api/v1/users            [Status: 200, Size: 40]"},
+        cast("ApexGraphState", {"target": _TARGET}))
+    await api.apply_deltas(nodes=obs.node_deltas, edges=obs.edge_deltas)
+    sub2 = await api.get_subgraph(_ANCHOR, depth=6)
+    api_ep = [n for n in sub2.nodes if n.type == "endpoint"
+              and str(n.props.get("url", "")).endswith("/api/v1/users")]
+    if not api_ep:
+        return ScenarioResult(name, False, "discovered /api/v1/users did not become an EKG node")
+    if api_ep[0].source != "ffuf_api":
+        problems.append(f"API endpoint provenance wrong: {api_ep[0].source!r}")
+
+    # Turn 2 — the discovered API endpoint is GET-fetched (--resolve).
+    tasks2 = await planner.plan(goal, sub2, empty)
+    if not isinstance(tasks2, list):
+        return ScenarioResult(name, False, "planner abandoned turn 2")
+    body = next((t for t in tasks2
+                 if t.params.get("target") == f"http://{_VHOST}/api/v1/users"
+                 and t.params.get("parser") == "curl_body"), None)
+    if body is None:
+        return ScenarioResult(name, False, "planner did not GET-fetch the discovered API endpoint")
+    if "--resolve" not in body.params["args"]:
+        problems.append("API endpoint fetch is not --resolve-pinned")
+
+    # The JSON structure is recorded (keys only, never values).
+    obs2, _ = parse_single_result(
+        {"tool": "curl", "parser": "curl_body", "args": body.params["args"],
+         "target": body.params["target"],
+         "stdout": '{"users": [{"id": 1, "username": "supersecret"}], "count": 1}'},
+        cast("ApexGraphState", {"target": _TARGET}))
+    await api.apply_deltas(nodes=obs2.node_deltas, edges=obs2.edge_deltas)
+    sub3 = await api.get_subgraph(_ANCHOR, depth=6)
+    fetched_api = [n for n in sub3.nodes if n.type == "endpoint"
+                   and str(n.props.get("url", "")).endswith("/api/v1/users")]
+    if not any(n.props.get("content_kind") == "json" and "json_keys" in n.props for n in fetched_api):
+        problems.append("API endpoint JSON structure (keys) was not recorded")
+    if "supersecret" in _json.dumps([n.props for n in sub3.nodes], default=str):
+        problems.append("a JSON VALUE leaked into the graph (structure-only violated)")
+
+    # GraphQL — a discovered graphql endpoint is introspected read-only.
+    gql = f"http://{_VHOST}/graphql"
+    await _seed_node(api, f"endpoint:{gql}", "endpoint", {"url": gql, "status": "400", "fetched": True})
+    await _seed_edge(api, _ANCHOR, f"endpoint:{gql}", "exposes")
+    sub4 = await api.get_subgraph(_ANCHOR, depth=6)
+    tasks3 = await planner.plan(goal, sub4, empty)
+    gql_task = [t for t in tasks3 if t.params.get("parser") == "graphql"] if isinstance(tasks3, list) else []
+    if not gql_task:
+        problems.append("no read-only GraphQL introspection emitted for a discovered graphql endpoint")
+    else:
+        if _GRAPHQL_INTROSPECTION_BODY not in gql_task[0].params["args"]:
+            problems.append("introspection did not use the fixed read-only query body")
+        obs3, _ = parse_single_result(
+            {"tool": "curl", "parser": "graphql", "args": gql_task[0].params["args"],
+             "target": gql_task[0].params["target"],
+             "stdout": '{"data":{"__schema":{"queryType":{"name":"Query"},'
+                       '"types":[{"name":"User","fields":[{"name":"id"}]}]}}}'},
+            cast("ApexGraphState", {"target": _TARGET}))
+        await api.apply_deltas(nodes=obs3.node_deltas, edges=obs3.edge_deltas)
+        sub5 = await api.get_subgraph(_ANCHOR, depth=7)
+        if not any(n.type == "api_schema" for n in sub5.nodes):
+            problems.append("GraphQL introspection did not record an api_schema node")
+
+    if problems:
+        return ScenarioResult(name, False, "; ".join(problems))
+    return ScenarioResult(
+        name, True,
+        "bounded API-wordlist scan (-t, --maxtime, -H Host, IP target, policy+safety OK) + fixed "
+        "/api/v1 & /graphql root probes → /api/v1/users endpoint → --resolve GET → JSON structure "
+        "recorded (keys only, no values); GraphQL endpoint → read-only introspection → api_schema node",
+    )
+
+
 class _ReconFtpFakeBackend:
     """A synthetic ``ToolBackend`` that makes recon DISCOVER an FTP service (so
     the engagement is still in current_phase="recon" when the credential gate
@@ -2236,6 +2385,7 @@ SCENARIOS: list[Any] = [
     scenario_incomplete_scan_escalates_not_stall,
     scenario_web_content_enumeration,
     scenario_web_endpoint_fetch_loop,
+    scenario_web_api_surface_discovery,
     scenario_recon_service_no_credentials_honest_outcome,
     scenario_ftp_anonymous_access,
     scenario_ftp_validation_via_tool_service,

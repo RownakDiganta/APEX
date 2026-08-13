@@ -297,9 +297,10 @@ class TestEndpointFetchLoop:
     def test_fetch_bounded_per_turn(self) -> None:
         many = [_discovered(f"p{i}") for i in range(10)]
         tasks = _plan(self._planner(), _nodes_with_vhost_home_and(many))
+        # Fetch-loop HEADs target the discovered /p* endpoints; the §28.22 fixed
+        # API-root probes (/api, /graphql, …) are a separate bounded mechanism.
         head = [t for t in tasks if t.params.get("parser") == "command"
-                and t.params["target"].startswith("http://2million.htb/")
-                and t.params["target"] != "http://2million.htb"]
+                and t.params["target"].startswith("http://2million.htb/p")]
         assert len(head) <= 3  # _MAX_ENDPOINT_FETCHES
 
     def test_already_fetched_endpoint_not_refetched(self) -> None:

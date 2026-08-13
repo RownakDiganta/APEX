@@ -233,6 +233,17 @@ def endpoint_id(url: str) -> str:
     return f"endpoint:{_normalize_endpoint_url(url)}"
 
 
+def api_schema_id(url: str) -> str:
+    """Canonical ID for an ``api_schema`` node (§28.22) — the read-only GraphQL
+    schema map discovered by introspection at *url*. Content-addressed on the
+    normalized endpoint URL so a re-introspection upserts rather than duplicates.
+
+    >>> api_schema_id("http://host/graphql")
+    'api_schema:http://host/graphql'
+    """
+    return f"api_schema:{_normalize_endpoint_url(url)}"
+
+
 def auth_flow_id(url: str) -> str:
     """Canonical ID for an auth_flow node.
 

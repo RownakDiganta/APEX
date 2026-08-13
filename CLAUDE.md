@@ -970,8 +970,9 @@ it becomes a staged `KnowledgeEntry` at confidence 0.25–0.3.
 | `host` | A reachable IP/hostname | `ip`, `target` |
 | `service` | An open port / protocol binding | `port`, `proto`, `service`, `version` |
 | `tech` | An identified product or library | `name`, `version` |
-| `endpoint` | An HTTP path/URL | `url`, `status`, `server`, `fetched` |
+| `endpoint` | An HTTP path/URL | `url`, `status`, `server`, `fetched`; (§28.22) `content_kind` (`json`/`graphql`), `api_response`, `json_keys`, `json_array`, `json_item_keys`, `graphql` |
 | `vhost` (§28.8) | A name-based virtual host DISCOVERED for a host (e.g. from an HTTP redirect `Location`) — never hardcoded | `hostname`, `ip`, `discovered_from`, `source_status` |
+| `api_schema` (§28.22) | A read-only GraphQL schema MAP discovered by introspection — type/field NAMES only, never a value; never an executable action | `endpoint_url`, `query_type`, `mutation_type`, `type_names`, `type_count`, `field_names`, `field_count` |
 | `auth_flow` | A login mechanism or credential boundary | `url`, `hint` |
 | `credential` | A captured credential or token | `username`, `secret_hint` |
 | `access_state` | Current privilege level reached | `level`, `evidence` |
@@ -10851,6 +10852,89 @@ order where `/flag.txt` was #4), and `test_ftp_anon_box_verifies_within_two_atte
 serves the flag ONLY at `/flag.txt` — verifies at #2; **fails** against the old
 order, verified by neutralizing the priority). All in
 `tests/apex_host/test_ftp_flag_read.py::TestCandidateOrderReachesFtpRootEarly`.
+
+### 28.22 Bounded API-surface discovery (API paths + GraphQL introspection + JSON structure)
+
+> **Numbering note:** highest unique §28 heading is §28.21 (the trailing
+> `### 28.7`/`### 28.8` are the known pre-existing collision). This section is
+> **§28.22**; nothing was renumbered.
+
+The web phase (§28.12/§28.13) could load a linked app but could not discover an
+API surface it was not linked to (no API-path enumeration, no GraphQL awareness;
+a JSON API response fell back to a low-confidence `KnowledgeEntry`, never an
+endpoint node). §28.22 adds bounded API-surface **DISCOVERY** — enumerate and
+map, never attack. **Strictly read/map: GET/HEAD probes plus the single
+read-only GraphQL introspection query. No arbitrary methods, no attack bodies,
+no auth-header forging, no injection.** All of `tools/safety.py`, the tool
+allowlist, and dry-run gating are unchanged; `memfabric` is untouched; every
+write is a `MemoryAPI` delta; apex stays off the VPN.
+
+**Three mechanisms, all in `_WebDeterministic.plan` (`apex_host/planners/web_planner.py`):**
+
+1. **Fixed generic API/GraphQL root probes** (no wordlist needed) — a small,
+   FIXED, generic set of REST/GraphQL path conventions (`_API_ROOT_PATHS =
+   ("/api", "/api/v1", "/api/v2")`, `_GRAPHQL_PATHS = ("/graphql",
+   "/api/graphql")`), like `browser_planner` probes `/robots.txt` — generic, NOT
+   machine-specific and NOT payloads. Each is a bounded curl HEAD (status) + GET
+   (JSON structure) via the same Host-aware `--resolve` path, ONCE per phase
+   (`_api_probe_done` — the HEAD always creates an endpoint node for any status,
+   a reliable stateless gate). Responsive roots become `endpoint` nodes.
+
+2. **API-path wordlist enumeration** — extends the §28.12 ffuf/gobuster pattern
+   with a SEPARATE operator-configured wordlist `ApexConfig.web_api_wordlist_path`
+   (never bundled; `None` disables it). ONE bounded scan per phase, capped `-t`
+   threads + `-maxtime`, vhost `-H Host:` header, authorized-IP target. It uses a
+   DISTINCT provenance — parser `ffuf_api`/`gobuster_api` → `endpoint` nodes with
+   `source="ffuf_api"`/`"gobuster_api"` — so it is gated (`_api_enumeration_done`)
+   independently of the content-enum scan (source `ffuf`/`gobuster`); both can run
+   once each per phase. Wordlist fuzzing still requires the §19
+   `allow_password_lists` policy approval (enforced at the policy gate, not the
+   planner). `pending_enumerated_endpoints` (§28.13) now includes the
+   `ffuf_api`/`gobuster_api` sources, so discovered API paths are GET-fetched.
+
+3. **Read-only GraphQL introspection** — IF a live (non-404) GraphQL-convention
+   endpoint is discovered, ONE fixed introspection query is issued (parser
+   `graphql`). `_GRAPHQL_INTROSPECTION_BODY` is a compact, FIXED module constant
+   (type + field NAMES only — a schema READ, never a mutation) and is **the only
+   request body `WebPlanner` ever emits** — never task/LLM-derived, free of shell
+   metacharacters so `safety.py` passes it. `GraphQLParser.parse_introspection`
+   (`apex_host/parsers/graphql_parser.py`) records the schema's STRUCTURE (type
+   names + field names, bounded, `__`-prefixed meta types skipped) into one
+   `api_schema` node linked `endpoint --contains--> api_schema`; a non-GraphQL /
+   invalid response records nothing. Gated once per endpoint
+   (`_graphql_introspected` = an `api_schema` node exists).
+
+**JSON structure mapping** — `CommandParser.parse_curl_body` now maps a JSON API
+response (body starts with `{`/`[`) to an `endpoint` node recording its
+STRUCTURE — top-level key NAMES only (a dict's keys, or a list's first object's
+keys), bounded at `_MAX_JSON_KEYS` — **never a value**, so no secret/data ever
+enters the graph; it also records the live HTTP `service` node (like the HTML
+path). Non-JSON/non-HTML still falls back to a `KnowledgeEntry`.
+
+**New node/edge types + props** (documented in §12.8): `api_schema` node (props
+`endpoint_url`, `query_type`, `mutation_type`, `type_names`, `type_count`,
+`field_names`, `field_count`); reuses the `contains` edge (`endpoint →
+api_schema`). New `endpoint` props: `content_kind` (`"json"`/`"graphql"`),
+`api_response`, `json_keys`, `json_array`, `json_item_keys`, `graphql`.
+`apex_host/graph_ids.py::api_schema_id` is the content-addressed id builder.
+
+**Config/CLI:** `web_api_wordlist_path` (+ `--web-api-wordlist` on `apex_host.main`
+and `apex_host.eval.run_htb_local`), wired through `dependencies.build_planners`.
+
+**Tests** (`tests/apex_host/test_web_api_discovery.py`, 23; fakes only, driven
+through the REAL `_WebDeterministic.plan` + `parse_single_result` router +
+`safety.check_command` + `PolicyAdvisor`): fixed API/GraphQL root probes
+(Host-aware, once-per-phase); the API-wordlist scan (bounded, distinct
+provenance, independent gating, hits → endpoints, fetched); JSON structure
+mapping (keys only, values never recorded, HTML path intact); GraphQL
+introspection (emitted for a live endpoint, gated once, not for 404, response →
+`api_schema` node, invalid records nothing); every emitted command passes
+`safety.py` and a metacharacter-injected scan is blocked; an off-scope target is
+policy-blocked. Release-gate scenario `web_api_surface_discovery` (§28.22) drives
+the full loop end-to-end: homepage known → API-wordlist scan → `/api/v1/users`
+endpoint → `--resolve` GET → JSON structure recorded (keys only, no values) →
+GraphQL endpoint → read-only introspection → `api_schema` node; **fails** against
+pre-§28.22 code (no API discovery).
 
 ### 28.7 Release gate
 

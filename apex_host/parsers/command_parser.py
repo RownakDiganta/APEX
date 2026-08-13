@@ -13,6 +13,7 @@ Dispatch logic inside ``parse()``:
 from __future__ import annotations
 
 import ipaddress
+import json
 import re
 from urllib.parse import urlsplit
 
@@ -36,6 +37,10 @@ _SERVER_PRODUCT_RE = re.compile(r"^(?P<product>[A-Za-z][^\s/(]*)(?:/(?P<version>
 #: Default TCP port per URL scheme, used to record the HTTP service a
 #: successful curl fetch proves is live.
 _SCHEME_DEFAULT_PORT = {"http": "80", "https": "443"}
+
+#: Bound on the number of JSON top-level key NAMES recorded per API response
+#: (§28.22) — structure mapping only, keeps the endpoint node bounded.
+_MAX_JSON_KEYS = 40
 
 #: A syntactically valid DNS hostname (one or more dot-separated labels, at
 #: least one dot so a bare word is not treated as a vhost). Deliberately strict
@@ -363,6 +368,14 @@ class CommandParser:
         target = str(raw.metadata.get("target", ""))
         host_ip = str(raw.metadata.get("host_ip", ""))
 
+        # §28.22 — a JSON API response (body starts with '{' or '[') is mapped to
+        # an ``endpoint`` node recording its STRUCTURE (top-level key names only,
+        # never values), so the planner sees the API surface. DISCOVERY ONLY.
+        if text.lstrip()[:1] in ("{", "["):
+            json_obs = self._try_json_body(text, target=target, host_ip=host_ip, source=source)
+            if json_obs is not None:
+                return json_obs
+
         lower = text.lower()
         if "<html" not in lower and "<!doctype" not in lower and "<title" not in lower:
             return self._fallback_knowledge(text, raw=raw, source=source)
@@ -461,6 +474,67 @@ class CommandParser:
                 )
             )
 
+        return ParsedObservation(node_deltas=nodes, edge_deltas=edges)
+
+    # ------------------------------------------------------------------
+    # JSON API response body — structure mapping only (§28.22)
+    # ------------------------------------------------------------------
+
+    def _try_json_body(
+        self, text: str, *, target: str, host_ip: str, source: str
+    ) -> ParsedObservation | None:
+        """Map a JSON API response to an ``endpoint`` node recording its STRUCTURE.
+
+        Records only the top-level key NAMES (a dict's keys, or the keys of a
+        list's first object element) — never any value, so no secret/data ever
+        enters the graph. Returns ``None`` when the body is not valid JSON (the
+        caller then falls through to the HTML/fallback path). Bounded: at most
+        ``_MAX_JSON_KEYS`` key names are recorded."""
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+        timestamp = now()
+        url = _normalize_url(target)
+        host = _host_from_target(host_ip) if host_ip.strip() else _host_from_target(target)
+        h_id = _host_id_fn(host)
+        ep_id = _endpoint_id(url)
+
+        props: dict[str, object] = {
+            "url": url,
+            "fetched": True,
+            "content_kind": "json",
+            "api_response": True,
+        }
+        if isinstance(data, dict):
+            props["json_keys"] = sorted(str(k) for k in list(data.keys())[:_MAX_JSON_KEYS])
+        elif isinstance(data, list):
+            props["json_array"] = True
+            if data and isinstance(data[0], dict):
+                props["json_item_keys"] = sorted(
+                    str(k) for k in list(data[0].keys())[:_MAX_JSON_KEYS]
+                )
+
+        nodes: list[Node] = [
+            Node(
+                id=ep_id, type="endpoint", props=props, confidence=0.75,
+                source=source, first_seen=timestamp, last_seen=timestamp,
+            )
+        ]
+        edges: list[Edge] = [
+            Edge(
+                id=exposes_edge_id(h_id, ep_id), from_id=h_id, to_id=ep_id,
+                type="exposes", props={}, confidence=0.75, source=source,
+                first_seen=timestamp, last_seen=timestamp,
+            )
+        ]
+        # A JSON API response proves a live HTTP service (same as an HTML body).
+        svc_node, svc_edge = _http_service_from_url(
+            url, host, source=source, timestamp=timestamp, confidence=0.7,
+        )
+        nodes.append(svc_node)
+        edges.append(svc_edge)
         return ParsedObservation(node_deltas=nodes, edge_deltas=edges)
 
     # ------------------------------------------------------------------

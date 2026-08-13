@@ -102,6 +102,14 @@ class ApexConfig:
     # Validated ranges live in apex_host.eval.check_config.validate_combinations.
     web_enum_threads: int = 20
     web_enum_max_seconds: int = 60
+    # Bounded API-surface DISCOVERY (§28.22) — a SEPARATE operator-configured
+    # wordlist of API-oriented paths (e.g. api, api/v1/users, graphql). When set
+    # (and allow_password_lists=True, like §28.12), WebPlanner emits ONE bounded
+    # ffuf/gobuster scan against it, distinct from the content-enum scan. Never
+    # bundled in source; None (default) disables the API wordlist scan. The fixed
+    # generic API/GraphQL root probes (/api, /api/v1, /api/v2, /graphql) run
+    # without a wordlist and need no approval — they are bounded curl GETs.
+    web_api_wordlist_path: str | None = None
     # Bounded access validation — explicit credentials only, no looping.
     # Empty by default: no login attempts are made unless the operator
     # supplies credentials via --username / --password CLI flags.
@@ -684,6 +692,7 @@ class ApexConfig:
             "max_web_paths": _g("max_web_paths", 50),
             "web_enum_threads": _g("web_enum_threads", 20),
             "web_enum_max_seconds": _g("web_enum_max_seconds", 60),
+            "web_api_wordlist_path": _g("web_api_wordlist", None),
             "username_candidates": list(getattr(args, "username", None) or []),
             "password_candidates": list(getattr(args, "password", None) or []),
             "max_access_attempts": _g("max_access_attempts", 1),

@@ -214,7 +214,10 @@ def pending_enumerated_endpoints(subgraph: "SubgraphView") -> list["Node"]:
     candidates = [
         n for n in subgraph.nodes
         if n.type == "endpoint"
-        and n.source in ("ffuf", "gobuster")
+        # §28.22 — API-wordlist scan endpoints (ffuf_api/gobuster_api) are fetched
+        # like content-enum endpoints, so a discovered /api/* path gets GET-fetched
+        # and its JSON structure recorded.
+        and n.source in ("ffuf", "gobuster", "ffuf_api", "gobuster_api")
         and str(n.props.get("url", ""))
         and str(n.props.get("status", "")).strip() != "404"
         and _url_path(str(n.props.get("url", ""))) not in fetched_paths

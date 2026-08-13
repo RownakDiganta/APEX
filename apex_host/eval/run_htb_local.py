@@ -166,6 +166,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Wordlist for ffuf/gobuster directory discovery (omit to use curl-only web probing)",
     )
     parser.add_argument(
+        "--web-api-wordlist", dest="web_api_wordlist", default=None, metavar="PATH",
+        help="Wordlist of API paths for bounded API-surface enumeration (§28.22; "
+             "requires --allow-password-lists; omit to skip)",
+    )
+    parser.add_argument(
         "--max-web-paths", type=int, default=50,
         help="Maximum web paths to discover per turn (default: 50)",
     )

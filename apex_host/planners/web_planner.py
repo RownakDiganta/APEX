@@ -68,6 +68,28 @@ from apex_host.types import ApexPhase
 #: distinct fingerprint), so the total is bounded by the enumeration result.
 _MAX_ENDPOINT_FETCHES = 3
 
+#: Fixed, GENERIC API-root path conventions probed for API-surface DISCOVERY
+#: (§28.22) — like browser_planner's /robots.txt, these are generic REST
+#: conventions, NOT machine-specific and NOT attack payloads. Probed with a
+#: bounded curl HEAD + GET (read-only), once per phase; responsive roots become
+#: endpoint nodes and JSON bodies are parsed into API structure.
+_API_ROOT_PATHS: tuple[str, ...] = ("/api", "/api/v1", "/api/v2")
+
+#: Fixed, generic GraphQL endpoint conventions. Probed like the API roots; if a
+#: live GraphQL endpoint is discovered, ONE read-only introspection query
+#: (schema READ, not an attack) is issued against it.
+_GRAPHQL_PATHS: tuple[str, ...] = ("/graphql", "/api/graphql")
+
+#: The one and only request body WebPlanner ever emits: a compact, FIXED,
+#: read-only GraphQL introspection query (type + field names only — enough to
+#: MAP the schema, never a mutation). A module constant, never task/LLM-derived,
+#: and free of shell metacharacters so tools/safety.py passes it. This is the
+#: sole permitted POST body (§28.22) — discovery only, no request forging.
+_GRAPHQL_INTROSPECTION_BODY: str = (
+    '{"query":"query{__schema{queryType{name} mutationType{name} '
+    'types{name kind fields{name}}}}"}'
+)
+
 if TYPE_CHECKING:
     from apex_host.llm.gateway import LLMGateway
     from apex_host.llm.router import ModelRouter
@@ -102,6 +124,7 @@ class _WebDeterministic:
         max_web_paths: int = 50,
         web_enum_threads: int = 20,
         web_enum_max_seconds: int = 60,
+        web_api_wordlist_path: str | None = None,
     ) -> None:
         self._target = target
         self._registry = registry
@@ -109,6 +132,7 @@ class _WebDeterministic:
         self._max_paths = max_web_paths
         self._enum_threads = web_enum_threads
         self._enum_max_seconds = web_enum_max_seconds
+        self._api_wordlist = web_api_wordlist_path
 
     async def plan(
         self, goal: Goal, subgraph: SubgraphView, evidence: EvidenceBundle
@@ -274,6 +298,82 @@ class _WebDeterministic:
                     )
                 )
 
+        # ---- Bounded API-surface DISCOVERY (§28.22) ----------------------
+        # The web phase loads the linked app but cannot see an API surface it is
+        # not linked to. Probe a FIXED, GENERIC set of API/GraphQL root
+        # conventions (like browser_planner probes /robots.txt) — curl HEAD
+        # (status) + GET (JSON structure), via the same Host-aware --resolve
+        # path, ONCE per phase. Responsive roots become endpoint nodes; JSON
+        # bodies are parsed into API structure. DISCOVERY ONLY — read/map.
+        if self._registry.get("curl") is not None and not self._api_probe_done(subgraph):
+            for path in (*_API_ROOT_PATHS, *_GRAPHQL_PATHS):
+                probe_url = f"{base_url.rstrip('/')}{path}"
+                tasks.append(self._curl_task(
+                    goal, probe_url, "command",
+                    ["-s", "-I", *follow_args, *resolve_args, probe_url], web_claim_deps))
+                tasks.append(self._curl_task(
+                    goal, probe_url, "curl_body",
+                    ["-s", *follow_args, *resolve_args, probe_url], web_claim_deps))
+
+        # Bounded API-path wordlist enumeration (§28.22) — extends the §28.12
+        # ffuf/gobuster pattern with a SEPARATE operator-configured API wordlist
+        # (web_api_wordlist_path). ONE bounded scan per phase, distinct provenance
+        # (parser ffuf_api/gobuster_api) so it neither collides with nor
+        # re-triggers the content-enum scan. Wordlist fuzzing still requires the
+        # §19 allow_password_lists policy approval (enforced at the policy gate,
+        # not here). Discovered API paths become endpoint nodes and are fetched.
+        if self._api_wordlist and not self._api_enumeration_done(subgraph):
+            api_host_header = (
+                ["-H", f"Host: {vhost_node.props.get('hostname', '')}"]
+                if vhost_node is not None else []
+            )
+            api_threads = str(max(1, self._enum_threads))
+            api_maxtime = str(max(1, self._enum_max_seconds))
+            if self._registry.get("ffuf") is not None:
+                tasks.append(TaskSpec(
+                    id=new_id(), goal_id=goal.id, executor_domain="web",
+                    params={
+                        "tool": "ffuf",
+                        "args": ["-u", f"{ip_base_url}/FUZZ", "-w", self._api_wordlist,
+                                 *api_host_header, "-mc", "200,301,302,403",
+                                 "-t", api_threads, "-maxtime", api_maxtime],
+                        "target": ip_base_url, "parser": "ffuf_api",
+                    },
+                    subgraph_anchor=goal.anchor_node, phase=goal.phase,
+                    claim_dependencies=web_claim_deps,
+                ))
+            elif self._registry.get("gobuster") is not None:
+                tasks.append(TaskSpec(
+                    id=new_id(), goal_id=goal.id, executor_domain="web",
+                    params={
+                        "tool": "gobuster",
+                        "args": ["dir", "-u", ip_base_url, "-w", self._api_wordlist,
+                                 *api_host_header, "-t", api_threads, "-q", "--no-progress"],
+                        "target": ip_base_url, "parser": "gobuster_api",
+                    },
+                    subgraph_anchor=goal.anchor_node, phase=goal.phase,
+                    claim_dependencies=web_claim_deps,
+                ))
+
+        # GraphQL introspection (§28.22) — IF a live GraphQL endpoint was
+        # discovered, issue the ONE fixed, read-only introspection query (a schema
+        # READ, never a mutation; the sole POST body WebPlanner ever emits — a
+        # module constant, never task/LLM-derived) and parse the returned
+        # type/field names into schema nodes. Once per discovered endpoint.
+        gql_ep = self._graphql_endpoint(subgraph)
+        if (
+            self._registry.get("curl") is not None
+            and gql_ep is not None
+            and not self._graphql_introspected(subgraph)
+        ):
+            gql_path = urlsplit(str(gql_ep.props.get("url", ""))).path or "/graphql"
+            gql_url = f"{base_url.rstrip('/')}{gql_path}"
+            tasks.append(self._curl_task(
+                goal, gql_url, "graphql",
+                ["-s", "-X", "POST", "-H", "Content-Type: application/json",
+                 "-d", _GRAPHQL_INTROSPECTION_BODY, *follow_args, *resolve_args, gql_url],
+                web_claim_deps))
+
         # Fetch discovered-but-unfetched enumeration endpoints (§28.13) — close
         # the loop: homepage → enumerate → FETCH what enumeration found. Each is
         # fetched via the same Host-aware --resolve -L path as the homepage
@@ -346,6 +446,75 @@ class _WebDeterministic:
             vhosts, key=lambda n: (-float(n.confidence), str(n.props.get("hostname", "")))
         )[0]
 
+    # ------------------------------------------------------------------
+    # API-surface DISCOVERY helpers (§28.22) — pure, blackboard-only
+    # ------------------------------------------------------------------
+
+    def _curl_task(
+        self, goal: Goal, url: str, parser: str, args: list[str],
+        web_claim_deps: "tuple[ClaimDependency, ...]",
+    ) -> TaskSpec:
+        return TaskSpec(
+            id=new_id(),
+            goal_id=goal.id,
+            executor_domain="web",
+            params={"tool": "curl", "args": args, "target": url, "parser": parser},
+            subgraph_anchor=goal.anchor_node,
+            phase=goal.phase,
+            claim_dependencies=web_claim_deps,
+        )
+
+    @staticmethod
+    def _endpoint_path(url: str) -> str:
+        try:
+            return (urlsplit(url).path or "/").rstrip("/") or "/"
+        except ValueError:
+            return "/"
+
+    @classmethod
+    def _api_probe_done(cls, subgraph: SubgraphView) -> bool:
+        """True once the fixed API/GraphQL root set has been probed — any
+        ``endpoint`` node whose URL path is one of the generic API/GraphQL
+        conventions. The HEAD probe creates such a node for ANY HTTP status
+        (even 404), so this reliably gates the fixed probes to once per phase.
+        Stateless/blackboard-only (reads the subgraph)."""
+        conventions = set(_API_ROOT_PATHS) | set(_GRAPHQL_PATHS)
+        return any(
+            n.type == "endpoint"
+            and cls._endpoint_path(str(n.props.get("url", ""))) in conventions
+            for n in subgraph.nodes
+        )
+
+    @staticmethod
+    def _api_enumeration_done(subgraph: SubgraphView) -> bool:
+        """True once the API-wordlist scan has produced endpoints (provenance
+        ffuf_api/gobuster_api) — gates that scan to once per phase, independent
+        of the content-enum scan (source ffuf/gobuster)."""
+        return any(
+            n.type == "endpoint" and n.source in ("ffuf_api", "gobuster_api")
+            for n in subgraph.nodes
+        )
+
+    @classmethod
+    def _graphql_endpoint(cls, subgraph: SubgraphView) -> Node | None:
+        """The highest-confidence LIVE (non-404) ``endpoint`` whose URL path is a
+        GraphQL convention, or None. Deterministic tie-break by URL."""
+        gql = [
+            n for n in subgraph.nodes
+            if n.type == "endpoint"
+            and cls._endpoint_path(str(n.props.get("url", ""))) in set(_GRAPHQL_PATHS)
+            and str(n.props.get("status", "")).strip() != "404"
+        ]
+        if not gql:
+            return None
+        return sorted(gql, key=lambda n: (-float(n.confidence), str(n.props.get("url", ""))))[0]
+
+    @staticmethod
+    def _graphql_introspected(subgraph: SubgraphView) -> bool:
+        """True once a GraphQL schema has been recorded (an ``api_schema`` node) —
+        gates introspection to once per discovered endpoint."""
+        return any(n.type == "api_schema" for n in subgraph.nodes)
+
 
 class WebPlanner:
     """Thin wrapper: routes through PlanningEngine when model_router is provided,
@@ -360,6 +529,7 @@ class WebPlanner:
         max_web_paths: int = 50,
         web_enum_threads: int = 20,
         web_enum_max_seconds: int = 60,
+        web_api_wordlist_path: str | None = None,
         model_router: "ModelRouter | None" = None,
         allowed_tools: list[str] | None = None,
         confidence_threshold: float = 0.4,
@@ -374,6 +544,7 @@ class WebPlanner:
             max_web_paths=max_web_paths,
             web_enum_threads=web_enum_threads,
             web_enum_max_seconds=web_enum_max_seconds,
+            web_api_wordlist_path=web_api_wordlist_path,
         )
         self._engine: PlanningEngine | None = None
         self._last_decision: PlanDecision | None = None

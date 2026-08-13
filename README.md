@@ -2443,6 +2443,23 @@ unfetched, and completes (or honestly terminates via the turn budget) once they
 are exhausted. Discovery only — fetch and record; no form submission or request
 forging. See CLAUDE.md §28.13.
 
+**Bounded API-surface discovery (§28.22).** The web phase can enumerate and map
+an API surface the app is not linked to — **discovery only, read/map, never
+attack**. Three bounded mechanisms: (1) fixed generic **API/GraphQL root probes**
+(`/api`, `/api/v1`, `/api/v2`, `/graphql`, `/api/graphql`) via bounded curl
+HEAD+GET (no wordlist needed), once per phase; (2) an **API-path wordlist scan**
+(`--web-api-wordlist`, requires `--allow-password-lists`) — one bounded
+ffuf/gobuster run with a distinct provenance so it is independent of the
+content-enum scan, whose hits become `endpoint` nodes that get GET-fetched; and
+(3) **read-only GraphQL introspection** — if a live GraphQL endpoint is
+discovered, one fixed introspection query (a schema READ, never a mutation; the
+only request body the web planner ever emits) maps its type/field NAMES into an
+`api_schema` node. JSON API responses are parsed into `endpoint` structure —
+top-level key **names only, never values** — so no secret enters the graph.
+Everything routes through `runner.py` → `safety.py` (no shell metacharacters) and
+the PolicyAdvisor scope gate; no arbitrary methods, no attack bodies, no
+auth-header forging, no injection. See CLAUDE.md §28.22.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,

@@ -35,6 +35,7 @@ from apex_host.parsers.browser_parser import BrowserParser
 from apex_host.parsers.command_parser import CommandParser
 from apex_host.parsers.ffuf_parser import FfufParser
 from apex_host.parsers.gobuster_parser import GobusterParser
+from apex_host.parsers.graphql_parser import GraphQLParser
 from apex_host.graph_state import ApexGraphState
 from apex_host.orchestration.outcome import EngagementOutcome
 from apex_host.parsers.nmap_parser import NmapParser
@@ -51,6 +52,7 @@ logger = logging.getLogger(__name__)
 _NMAP = NmapParser()
 _FFUF = FfufParser()
 _GOBUSTER = GobusterParser()
+_GRAPHQL = GraphQLParser()
 _COMMAND = CommandParser()
 _BANNER = BannerParser()
 _BROWSER_PARSER = BrowserParser()
@@ -121,8 +123,19 @@ def parse_single_result(
         # with a -H Host: <vhost> header, §28.12) link to the existing host node
         # rather than a non-existent host:<url> that would roll back the batch.
         return _FFUF.parse_text(stdout, target=target, host_ip=state["target"]), tool_name
+    if parser_name == "ffuf_api":
+        # §28.22 — API-wordlist scan hits get a DISTINCT provenance (source
+        # "ffuf_api") so the API scan is gated independently of the content-enum
+        # scan; still endpoint nodes linked to the authorized host.
+        return _FFUF.parse_text(
+            stdout, target=target, source="ffuf_api", host_ip=state["target"]
+        ), tool_name
     if parser_name == "gobuster":
         return _GOBUSTER.parse_text(stdout, target=target, host_ip=state["target"]), tool_name
+    if parser_name == "gobuster_api":
+        return _GOBUSTER.parse_text(
+            stdout, target=target, source="gobuster_api", host_ip=state["target"]
+        ), tool_name
     if tool_name in ("nc", "netcat") or parser_name == "banner":
         port = _port_from_nc_args(tool_result.get("args", []))
         return _BANNER.parse_text(stdout, target=target, source=tool_name, port=port), tool_name
@@ -170,6 +183,13 @@ def parse_single_result(
             metadata={"source": "curl_body", "target": target, "host_ip": state["target"]},
         )
         return _COMMAND.parse_curl_body(raw), tool_name
+    if parser_name == "graphql":
+        # §28.22 — a read-only GraphQL introspection response → an api_schema node
+        # (type/field NAMES only). host_ip = the authorized host so the schema's
+        # endpoint links to the existing host node (§28.8 dangling-edge rule).
+        return _GRAPHQL.parse_introspection(
+            stdout, target=target, host_ip=state["target"]
+        ), tool_name
     if parser_name == "priv_esc":
         # Phase 13 — two producers share this parser field: searchsploit's
         # real tool output and priv_esc_analyze's precomputed analytical

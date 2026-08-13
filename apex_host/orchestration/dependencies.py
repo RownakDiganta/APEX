@@ -129,6 +129,7 @@ def build_planners(
             max_web_paths=config.max_web_paths,
             web_enum_threads=config.web_enum_threads,
             web_enum_max_seconds=config.web_enum_max_seconds,
+            web_api_wordlist_path=config.web_api_wordlist_path,
             **_kwargs(),
         ),
         ApexPhase.credential.value: CredentialPlanner(

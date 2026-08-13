@@ -123,20 +123,23 @@ class TestWebPlannerWordlistGuard:
 
 class TestWebPlannerCurlTasks:
     async def test_head_task_always_emitted(self) -> None:
+        # §28.22: bounded API-root probes now also emit HEAD tasks, but the
+        # homepage HEAD is still emitted and is first.
         planner = _planner(tools=["curl"])
         result = await planner.plan(_goal(), _empty_subgraph(), _empty_evidence())
         assert isinstance(result, list)
         head_tasks = [t for t in result if t.params.get("parser") == "command"]
-        assert len(head_tasks) == 1
-        assert "-I" in head_tasks[0].params["args"]
+        assert len(head_tasks) >= 1
+        assert head_tasks[0] is result[0] and "-I" in head_tasks[0].params["args"]
 
     async def test_body_task_always_emitted(self) -> None:
         planner = _planner(tools=["curl"])
         result = await planner.plan(_goal(), _empty_subgraph(), _empty_evidence())
         assert isinstance(result, list)
         body_tasks = [t for t in result if t.params.get("parser") == "curl_body"]
-        assert len(body_tasks) == 1
-        assert "-I" not in body_tasks[0].params["args"]
+        assert len(body_tasks) >= 1
+        # The homepage body (result[1]) has no -I.
+        assert "-I" not in result[1].params["args"]
 
     async def test_head_task_is_first(self) -> None:
         planner = _planner(tools=["curl"])
@@ -151,11 +154,12 @@ class TestWebPlannerCurlTasks:
         assert result[1].params.get("parser") == "curl_body"
 
     async def test_both_curl_tasks_have_same_url(self) -> None:
+        # The homepage HEAD (result[0]) and body (result[1]) point to the same
+        # base URL; §28.22 API-root probes deliberately target distinct paths.
         planner = _planner(tools=["curl"])
         result = await planner.plan(_goal(), _empty_subgraph(), _empty_evidence())
         assert isinstance(result, list)
-        urls = [t.params["target"] for t in result]
-        assert len(set(urls)) == 1  # both point to the same base URL
+        assert result[0].params["target"] == result[1].params["target"]
 
     async def test_curl_executor_domain_is_web(self) -> None:
         planner = _planner(tools=["curl"])
