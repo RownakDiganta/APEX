@@ -37,13 +37,22 @@ def _subgraph(nodes: list[Node]) -> SubgraphView:
     return SubgraphView(nodes=nodes, edges=[], anchor=_ANCHOR, depth=3)
 
 
-def _base_nodes(with_vhost: bool = True) -> list[Node]:
+def _base_nodes(with_vhost: bool = True, homepage_fetched: bool = True) -> list[Node]:
     nodes = [
         _node(_ANCHOR, "host", {"ip": _IP}),
         _node(f"service:{_IP}:80/tcp", "service", {"port": "80", "service": "http", "state": "open"}),
     ]
     if with_vhost:
         nodes.append(_node(f"vhost:{_IP}:{_VHOST}", "vhost", {"hostname": _VHOST, "ip": _IP}))
+    if homepage_fetched:
+        # §28.29 — the fixed API-root probes are a FALLBACK that fires only after
+        # the (base_host) homepage is fetched and no discovered page/JS is pending.
+        # Seed the fetched base homepage (no links → nothing pending) so the tests
+        # that assert the probes fire set up that fallback condition.
+        host = _VHOST if with_vhost else _IP
+        nodes.append(_node(f"endpoint:http://{host}/", "endpoint",
+                           {"url": f"http://{host}/", "status": "200", "fetched": True},
+                           source="curl_body"))
     return nodes
 
 
@@ -176,6 +185,119 @@ class TestApiProbesVhostConsistent:
         head_api = [t for t in tasks if t.params.get("parser") == "command"
                     and t.params["target"] == f"http://{_VHOST}/api"]
         assert len(head_api) == 1  # deduped, not two identical fetches
+
+
+# ---------------------------------------------------------------------------
+# 1c. §28.29 — the fixed API-root probes are a LOW-PRIORITY fallback: a
+# discovered high-signal page (e.g. /invite) and its JS are fetched FIRST.
+# ---------------------------------------------------------------------------
+class TestApiProbesDeferredBehindDiscoveredPages:
+    def _fixed_api_probe_emitted(self, tasks: list) -> bool:
+        return any(urlsplit(t.params["target"]).path in _API_ROOT_PATHS
+                   and t.params.get("parser") in ("command", "curl_body") for t in tasks)
+
+    def test_deferred_while_a_discovered_page_is_pending(self) -> None:
+        # Homepage fetched, but a discovered page (/invite) is not yet fetched:
+        # the fixed /api,/api/v1 probes must NOT fire — /invite wins the budget.
+        planner = _WebDeterministic(_IP, ToolRegistry(["curl"]))
+        nodes = _base_nodes(with_vhost=True, homepage_fetched=True) + [
+            _node(f"endpoint:http://{_VHOST}/invite", "endpoint",
+                  {"url": f"http://{_VHOST}/invite", "path": "/invite"}, source="curl_body"),
+        ]
+        tasks = _plan(planner, nodes)
+        assert not self._fixed_api_probe_emitted(tasks)
+        # /invite's body IS fetched instead.
+        assert any(t.params.get("parser") == "curl_body"
+                   and t.params["target"] == f"http://{_VHOST}/invite" for t in tasks)
+
+    def test_deferred_while_a_js_asset_is_pending(self) -> None:
+        planner = _WebDeterministic(_IP, ToolRegistry(["curl"]))
+        nodes = _base_nodes(with_vhost=True, homepage_fetched=True) + [
+            _node(f"endpoint:http://{_VHOST}/js/inviteapi.min.js", "endpoint",
+                  {"url": f"http://{_VHOST}/js/inviteapi.min.js", "js_asset": True}, source="curl_body"),
+        ]
+        tasks = _plan(planner, nodes)
+        assert not self._fixed_api_probe_emitted(tasks)
+        assert any(t.params.get("parser") == "js" for t in tasks)  # the JS is fetched instead
+
+    def test_fire_once_nothing_is_pending(self) -> None:
+        # Homepage fetched, no discovered page/JS pending → the fallback fires.
+        planner = _WebDeterministic(_IP, ToolRegistry(["curl"]))
+        tasks = _plan(planner, _base_nodes(with_vhost=True, homepage_fetched=True))
+        assert self._fixed_api_probe_emitted(tasks)
+
+    def test_invite_body_fetched_before_any_fixed_probe_end_to_end(self) -> None:
+        # The full live flow: IP→vhost redirect → homepage → /invite BODY → its
+        # JS (inviteapi.min.js) → /api/v1/invite extracted — all BEFORE any fixed
+        # API-root probe. FAILS against the pre-§28.29 ordering (which fired /api,
+        # /api/v1 in the same turn the vhost homepage was fetched, starving /invite).
+        from apex_host.eval.release_gate import _make_api
+
+        async def flow() -> tuple:
+            api = _make_api()
+
+            async def seed(nid: str, typ: str, props: dict) -> None:
+                await api.upsert_node(Node(id=nid, type=typ, props=props, confidence=0.9,
+                                           source="s", first_seen="", last_seen=""))
+            await seed(_ANCHOR, "host", {"ip": _IP})
+            await seed(f"service:{_IP}:80/tcp", "service",
+                       {"port": "80", "service": "http", "state": "open"})
+            planner = _WebDeterministic(_IP, ToolRegistry(["curl"]))
+            goal = Goal(id="g", description="web", phase="web", anchor_node=_ANCHOR)
+            empty = EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[])
+            st = {"target": _IP}
+
+            async def rf(parser: str, target: str, body: str) -> None:
+                obs, _ = parse_single_result(
+                    {"tool": "curl", "parser": parser, "args": ["-s", target],
+                     "target": target, "stdout": body}, st)
+                await api.apply_deltas(nodes=obs.node_deltas, edges=obs.edge_deltas)
+
+            homepage = ('<html><head><script src="/js/home.min.js"></script></head>'
+                        '<body><a href="/invite">i</a></body></html>')
+            invite = '<html><head><script src="/js/inviteapi.min.js"></script></head><body>x</body></html>'
+
+            def resp(t: str, p: str) -> str:
+                if _IP in t:
+                    return ("HTTP/1.1 301 Moved\r\nLocation: http://app.example.htb/\r\n\r\n"
+                            if p == "command" else "<html></html>")
+                if t.endswith("/invite"):
+                    return invite
+                if t.endswith("inviteapi.min.js"):
+                    return '$.post("/api/v1/invite/generate");'
+                if t.endswith("home.min.js"):
+                    return "console.log(1)"
+                if "/api" in t or "/graphql" in t:
+                    return "<html></html>"
+                return homepage
+
+            seen: set = set()
+            invite_body = first_fixed = invite_api = None
+            for turn in range(1, 12):
+                sub = await api.get_subgraph(_ANCHOR, depth=10)
+                res = await planner.plan(goal, sub, empty)
+                for t in (res if isinstance(res, list) else []):
+                    key = (t.params["target"], t.params["parser"])
+                    if t.params.get("parser") in ("command", "curl_body", "js") and key not in seen:
+                        seen.add(key)
+                        await rf(t.params["parser"], t.params["target"],
+                                 resp(t.params["target"], t.params["parser"]))
+                        path = urlsplit(t.params["target"]).path
+                        if path == "/invite" and t.params["parser"] == "curl_body" and invite_body is None:
+                            invite_body = turn
+                        if path in _API_ROOT_PATHS and first_fixed is None:
+                            first_fixed = turn
+                sub2 = await api.get_subgraph(_ANCHOR, depth=10)
+                if any("/api/v1/invite" in str(n.props.get("url", "")) for n in sub2.nodes) and invite_api is None:
+                    invite_api = turn
+            return invite_body, first_fixed, invite_api
+
+        invite_body, first_fixed, invite_api = asyncio.run(flow())
+        assert invite_body is not None, "/invite body never fetched"
+        assert invite_api is not None, "invite API never extracted"
+        # /invite body (and the whole discovered chain) fetched BEFORE any fixed probe.
+        assert first_fixed is None or invite_body < first_fixed
+        assert first_fixed is None or invite_api < first_fixed
 
 
 # ---------------------------------------------------------------------------

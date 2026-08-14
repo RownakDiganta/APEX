@@ -319,7 +319,20 @@ class _WebDeterministic:
         base_host = self._url_host(base_url)
         if (
             self._registry.get("curl") is not None
-            and (vhost_node is not None or self._homepage_fetched(subgraph))
+            # §28.29 — the fixed API-root probes are a LOW-PRIORITY fallback.
+            # Require the homepage to be FETCHED (its links, e.g. /invite, are
+            # now visible) AND every discovered page + its JS to be fetched
+            # (pending empty) before firing. A real linked page like /invite
+            # yields its actual API-referencing JS (inviteapi.min.js); the fixed
+            # /api roots often return only the redirect stub. On a target that
+            # links nothing, pending is empty once the homepage is fetched, so
+            # the probes still fire (their fallback purpose is preserved). This
+            # supersedes §28.23's "vhost exists OR homepage fetched" gate, which
+            # fired the probes in the SAME turn the vhost homepage was fetched —
+            # before /invite was even discovered — starving the high-signal page.
+            and self._homepage_fetched(subgraph, base_host)
+            and not pending_page_fetches(subgraph)
+            and not pending_js_assets(subgraph)
             and not self._api_probe_done(subgraph, base_host)
         ):
             for path in (*_API_ROOT_PATHS, *_GRAPHQL_PATHS):
@@ -553,17 +566,25 @@ class _WebDeterministic:
             for n in subgraph.nodes
         )
 
-    @staticmethod
-    def _homepage_fetched(subgraph: SubgraphView) -> bool:
+    @classmethod
+    def _homepage_fetched(cls, subgraph: SubgraphView, base_host: str = "") -> bool:
         """True once the homepage (root-path ``endpoint``) has been fetched — the
         signal that the base is SETTLED (a vhost has been discovered if one
         exists, or the redirect-free IP is confirmed to be the real app). Used to
         DEFER the API-root probes past turn 1 so they never fire prematurely
-        against the bare IP (§28.23)."""
+        against the bare IP (§28.23).
+
+        §28.29 — host-aware when *base_host* is given: only a fetched root
+        endpoint whose host equals *base_host* counts. This prevents an IP 301
+        REDIRECT-STUB homepage (fetched at turn 1, no links) from satisfying the
+        gate for the VHOST base — the fixed API-root probes must wait for the real
+        vhost homepage (which reveals /invite), not the empty IP stub. Called with
+        no *base_host* (the default) it is host-agnostic, as before."""
         return any(
             n.type == "endpoint"
             and n.props.get("fetched") is True
             and (urlsplit(str(n.props.get("url", ""))).path or "/").rstrip("/") in ("", "/")
+            and (not base_host or cls._url_host(str(n.props.get("url", ""))) == base_host)
             for n in subgraph.nodes
         )
 

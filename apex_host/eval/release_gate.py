@@ -2078,6 +2078,7 @@ async def scenario_web_budget_reaches_invite() -> ScenarioResult:
     the new default budget of 10 — and that the web-evidence gate never marks
     complete before the invite API appears."""
     from typing import cast
+    from urllib.parse import urlsplit
 
     from apex_host.config import ApexConfig
     from apex_host.graph_state import ApexGraphState
@@ -2132,6 +2133,8 @@ async def scenario_web_budget_reaches_invite() -> ScenarioResult:
 
     fetched: set[tuple[str, str]] = set()
     reached_turn = 99
+    first_fixed_probe_turn = None
+    _api_roots = ("/api", "/api/v1", "/api/v2", "/graphql", "/api/graphql")
     for turn in range(1, default_budget + 1):
         sub = await api.get_subgraph(_ANCHOR, depth=12)
         if web_evidence_status(sub).complete:
@@ -2142,12 +2145,25 @@ async def scenario_web_budget_reaches_invite() -> ScenarioResult:
             key = (t.params.get("target", ""), t.params.get("parser", ""))
             if t.params.get("parser") in ("command", "curl_body", "js") and key not in fetched:
                 fetched.add(key)
+                # §28.29 — track the first FIXED API-root probe; it must not fire
+                # before the discovered /invite chain is fetched.
+                if (urlsplit(str(key[0])).path in _api_roots
+                        and first_fixed_probe_turn is None):
+                    first_fixed_probe_turn = turn
                 await rf(t.params["parser"], t.params["target"],
                          resp(t.params["target"], t.params["parser"]))
         sub2 = await api.get_subgraph(_ANCHOR, depth=12)
         if any("/api/v1/invite" in str(n.props.get("url", "")) for n in sub2.nodes):
             reached_turn = turn
             break
+
+    # §28.29 — the fixed API-root probes are a fallback; the discovered /invite
+    # chain (→ its JS → its /api ref) is fetched FIRST, never preempted by the
+    # low-value fixed /api,/api/v1 root probes.
+    if first_fixed_probe_turn is not None and first_fixed_probe_turn <= reached_turn:
+        problems.append(
+            f"fixed API-root probe fired at turn {first_fixed_probe_turn} — before/at the invite "
+            f"API turn {reached_turn} (should be deferred behind the discovered page + its JS)")
 
     if reached_turn == 99:
         return ScenarioResult(name, False,

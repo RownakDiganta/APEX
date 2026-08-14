@@ -11352,6 +11352,60 @@ flow (IP→vhost → homepage → discovered pages → `/invite` → its JS → 
 extracted) and asserts it is reached past turn 5 and within the budget. These
 **fail** against the pre-§28.28 hardcoded/unwired budget.
 
+### 28.29 Fixed API-root probes are a fallback behind discovered high-signal pages
+
+> **Numbering note:** highest unique §28 heading is §28.28 (the trailing
+> `### 28.7`/`### 28.8` are the known pre-existing collision). This section is
+> **§28.29**; nothing was renumbered.
+
+Even with the raised budget (§28.28) a live TwoMillion run still never fetched
+`/invite`'s body: the 5 fetches were IP 301, IP HTML, homepage, then the FIXED
+API-root probes `/api` and `/api/v1` (which return only the redirect stub, zero
+useful content). The `WebPlanner` appends the fixed API-root probes (§28.22 —
+`/api`, `/api/v1`, `/api/v2`, `/graphql`, `/api/graphql`, HEAD+GET each) BEFORE
+the discovered-page fetch loop, and their gate was
+`(vhost_node is not None or homepage_fetched) and not api_probe_done`. The
+`vhost_node is not None` disjunct fired the probes in the **same turn the vhost
+homepage was fetched** — before the homepage's links (`/invite`) were even
+discovered — so the low-value fixed roots consumed the budget ahead of the
+high-signal discovered page. (`js_parser` and the resolver were already correct
+after §28.24–§28.27; this is purely fetch ordering.)
+
+**Fix (discovery only — deprioritize the fixed probes):** the fixed API-root
+probes are now a LOW-PRIORITY FALLBACK. Their gate requires (a) the **base-host**
+homepage to be FETCHED and (b) NO discovered page or JS asset to be pending:
+
+- `_homepage_fetched(subgraph, base_host)` is now **host-aware** — only a fetched
+  root endpoint whose host equals `base_host` counts, so the IP 301
+  **redirect-stub** homepage (fetched at turn 1, no links) no longer satisfies
+  the gate for the VHOST base. The probes wait for the real vhost homepage (which
+  reveals `/invite`), not the empty stub.
+- The gate adds `and not pending_page_fetches(subgraph) and not
+  pending_js_assets(subgraph)`, so the probes fire only after every discovered
+  high-signal page (`/invite` etc.) AND its JS have been fetched. On a target that
+  links nothing, pending is empty once the homepage is fetched, so the probes
+  still fire (their fallback purpose — helping targets that don't link their API
+  — is preserved). The `vhost_node is not None` disjunct is dropped.
+
+Result: homepage → `/invite` body → `inviteapi.min.js` → the JS-discovered
+`/api/v1/invite/...` are all fetched (and the invite API extracted) BEFORE any
+fixed `/api` root probe fires as a fallback. The per-turn caps
+(`_MAX_ENDPOINT_FETCHES`/`_MAX_JS_FETCHES` = 3) and the §28.28 turn budget are
+unchanged — bounded, never unbounded crawling. Everything else unchanged: GET via
+`--resolve -L`, same-origin/vhost only, no POST, `runner`→`safety`, policy scope,
+memfabric/dry-run/allowlist, apex off the VPN, keys-only; the web-evidence gate
+still keeps web incomplete while a high-signal page/JS is unfetched.
+
+**Tests** (`tests/apex_host/test_web_api_discovery.py`, REAL planner/parser): the
+fixed probes are DEFERRED while a discovered page (`/invite`) or a JS asset is
+pending (`/invite`'s body / the JS is fetched instead), and FIRE once nothing is
+pending; an end-to-end IP→vhost→homepage→`/invite`→JS→`/api/v1/invite` flow
+asserts `/invite`'s body (and the invite API) are fetched **before** any fixed
+probe. The `web_budget_reaches_invite` release-gate scenario gains the same
+before-any-fixed-probe assertion. These **fail** against the pre-§28.29 ordering.
+The §28.22/§28.23 tests that assert the probes fire were updated to seed a
+fetched homepage (the fallback condition).
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

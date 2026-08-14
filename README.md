@@ -2518,6 +2518,14 @@ page with an unfetched `<script src>` remains and budget allows. Still bounded (
 finite per-turn fetch cap and a finite turn budget — never unbounded crawling).
 See CLAUDE.md §28.28.
 
+**Discovered pages before fixed API probes (§28.29).** The fixed, generic
+API-root probes (`/api`, `/api/v1`, `/graphql`, …) are now a low-priority
+fallback: a discovered high-signal page like `/invite` — and the JavaScript it
+links, which references the real API — is fetched first, and the fixed probes
+fire only once the homepage is fetched and no discovered page or JS remains
+unfetched. On a target that links nothing, the probes still fire as before. See
+CLAUDE.md §28.29.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,
