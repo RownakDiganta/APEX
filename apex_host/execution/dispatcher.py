@@ -38,6 +38,7 @@ from memfabric.coordination.conflict import check_conflict_dependencies
 from memfabric.ids import now
 from memfabric.types import TaskSpec
 
+from apex_host.execution.approval import ActionClass, ApprovalGate, build_default_gate
 from apex_host.execution.context import DispatchResult, ExecutionContext
 from apex_host.execution.dispositions import ExecutionDisposition, classify_retry
 from apex_host.execution.errors import ErrorCategory, ExecutionError
@@ -195,6 +196,7 @@ class TaskDispatcher:
         priv_esc_analysis_executor: "PrivEscAnalysisExecutor | None" = None,
         priv_esc_enum_executor: "PrivEscEnumExecutor | None" = None,
         user_flag_executor: "UserFlagExecutor | None" = None,
+        approval_gate: "ApprovalGate | None" = None,
     ) -> None:
         self._advisor = advisor
         self._registry = task_registry
@@ -207,6 +209,9 @@ class TaskDispatcher:
         self._priv_esc_analysis_executor = priv_esc_analysis_executor
         self._priv_esc_enum_executor = priv_esc_enum_executor
         self._user_flag_executor = user_flag_executor
+        # §28.30 — the fail-closed human approval gate. When not supplied, build
+        # the fail-closed default (deny send-side in dry-run/non-interactive).
+        self._approval_gate = approval_gate or build_default_gate(config)
 
     @property
     def task_registry(self) -> TaskRegistry:
@@ -242,6 +247,67 @@ class TaskDispatcher:
         # path (policy-blocked, duplicate-skipped, or actually executed)
         # can report a start/end timestamp for diagnostics.
         _dispatch_start_ts = now()
+
+        # Canonical action identity (§27) — computed up front so the approval
+        # gate (§28.30, step 0) and the duplicate gate (step 3) share ONE
+        # fingerprint. capability_mode/executor_domain/candidate_path folding is
+        # identical to the previous step-3 computation.
+        executor_domain = str(task.params.get("executor_domain", phase))
+        capability_mode = backend_capability_mode(self._config)
+        fp_args = list(args)
+        if tool == "user_flag_verify":
+            candidate = str(task.params.get("candidate_path", ""))
+            if candidate:
+                fp_args.append(candidate)
+        fingerprint = task_fingerprint(
+            phase, tool, fp_args, target, parser, executor_domain, capability_mode
+        )
+
+        # ── 0. Human approval gate (§28.30) ───────────────────────────────
+        # A SEND-SIDE action (non-GET/HEAD method, a request body, a custom auth
+        # header, or an unrecognized non-read tool) is BLOCKED until an operator
+        # explicitly approves THIS action; read-side actions pass straight
+        # through. Fail-closed: no approval / non-interactive / any gate error →
+        # DENY. This runs BEFORE policy/conflict/duplicate and the executor, but
+        # an APPROVED action STILL passes through them — approval never bypasses a
+        # guard (safety.py + PolicyAdvisor remain enforced behind the gate).
+        action_class, approval, approval_record = self._approval_gate.review(
+            task, fingerprint=fingerprint, phase=phase,
+            intent=str(task.params.get("intent", "") or task.params.get("rationale", "")),
+            graph_context=f"phase={phase} target={target} run={context.run_id}",
+        )
+        if action_class is ActionClass.SEND_SIDE and (approval is None or not approval.approved):
+            reason = approval.reason if approval is not None else "no approval decision"
+            approval_error = f"approval_denied: {reason}"
+            logger.info(
+                "dispatcher: approval gate [%s] DENIED send-side tool=%r target=%r: %s",
+                phase, tool, target, reason,
+            )
+            err = ExecutionError(
+                category=ErrorCategory.APPROVAL_DENIED,
+                message=approval_error,
+                task_id=task.id,
+            )
+            tr = _make_blocked_result(
+                task, ExecutionDisposition.BLOCKED_APPROVAL, approval_error,
+                phase=phase, dry_run=context.dry_run, tool=tool, args=args,
+                target=target, parser=parser,
+            )
+            tr["returncode"] = 1
+            tr["error"] = approval_error
+            tr["approval_blocked"] = True
+            tr["approval_reason"] = reason
+            tr["approval_record"] = approval_record
+            return DispatchResult(
+                disposition=ExecutionDisposition.BLOCKED_APPROVAL,
+                task_id=task.id,
+                fingerprint="",
+                tool_result_dict=tr,
+                error=err,
+                retryable=False,
+                repairable=False,
+                audit_metadata={"approval_record": approval_record},
+            )
 
         # ── 1. Policy gate ────────────────────────────────────────────────
         pd = self._advisor.review_task(task, phase, context.evidence, self._config)
@@ -341,31 +407,9 @@ class TaskDispatcher:
             )
 
         # ── 3. Duplicate gate (TaskRegistry, atomic check-and-reserve) ───
-        # Phase 2 (post-live-test debugging): capability_mode is part of the
-        # canonical action identity — a task planned identically but under a
-        # different backend capability assumption (e.g. raw-socket-capable
-        # vs TCP-connect-only) is a distinct action. See
-        # apex_host.tools.backend.backend_capability_mode.
-        executor_domain = str(task.params.get("executor_domain", phase))
-        capability_mode = backend_capability_mode(self._config)
-        # §28.18 — a user_flag_verify task encodes its real action (which
-        # candidate path to read) in params["candidate_path"], NOT in args
-        # (which is empty for this param-driven executor task). Without folding
-        # it into the fingerprint, every distinct candidate read hashes
-        # identically and the duplicate/stall gate treats reading "/flag.txt"
-        # as a repeat of reading "/home/<user>/user.txt" — terminating the
-        # objective before later candidates (e.g. an FTP-root flag) are tried.
-        # A distinct candidate path is a distinct action; the SAME path re-read
-        # is still correctly a duplicate.
-        fp_args = list(args)
-        if tool == "user_flag_verify":
-            candidate = str(task.params.get("candidate_path", ""))
-            if candidate:
-                fp_args.append(candidate)
-        fingerprint = task_fingerprint(
-            phase, tool, fp_args, target, parser, executor_domain, capability_mode
-        )
-
+        # The canonical action ``fingerprint`` (incl. capability_mode and, for
+        # user_flag_verify, the candidate_path — §28.18) was computed up front
+        # so the approval gate (step 0) and this gate share ONE identity.
         ts = now()
         reserved, existing = await self._registry.reserve(
             fingerprint=fingerprint,

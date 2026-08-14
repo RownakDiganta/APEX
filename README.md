@@ -2526,6 +2526,20 @@ fire only once the homepage is fetched and no discovered page or JS remains
 unfetched. On a target that links nothing, the probes still fire as before. See
 CLAUDE.md §28.29.
 
+**Supervised approval gate (§28.30).** A fail-closed human-approval gate sits at
+the dispatch chokepoint as a pure safety control (it adds no offensive
+capability). It classifies each action by shape: read-side actions (GET/HEAD,
+bounded file/credential reads, recon/nmap, the existing discovery GETs) run
+autonomously as today, while send-side actions (any non-GET/HEAD method, a
+request body, a custom Authorization header, or an unrecognized non-read tool)
+are BLOCKED and require an explicit, per-action human approval before reaching
+the executor. No approval, or any non-interactive/dry-run context, or any error
+in the gate, results in a deny — never a default-allow. Approval only lets an
+action reach the existing `safety.py` and policy guards; it never bypasses them
+(an approved off-scope or shell-metacharacter action still dies). Every gated
+decision is recorded immutably (episodic event store + an optional durable log
+file), with secrets redacted. See CLAUDE.md §28.30.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,

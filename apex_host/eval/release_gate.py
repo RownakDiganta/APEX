@@ -2182,6 +2182,92 @@ async def scenario_web_budget_reaches_invite() -> ScenarioResult:
     )
 
 
+async def scenario_approval_gate_fail_closed() -> ScenarioResult:
+    """§28.30 — the fail-closed human approval gate at the dispatch chokepoint.
+    A SEND-SIDE action (a curl POST with a body) is BLOCKED without approval and
+    never reaches the executor; a READ-SIDE GET passes through and executes; an
+    APPROVED send-side action reaches the executor. Drives the REAL
+    TaskDispatcher.dispatch()."""
+    from apex_host.execution.approval import (
+        ApprovalDecision,
+        ApprovalGate,
+        bind_approval_token,
+        build_default_gate,
+    )
+    from apex_host.execution.context import ExecutionContext
+    from apex_host.execution.dispatcher import TaskDispatcher
+    from apex_host.execution.dispositions import ExecutionDisposition
+    from apex_host.execution.registry import TaskRegistry
+    from apex_host.policy import PolicyAdvisor
+    from apex_host.policy.policy_loader import load_policy
+    from apex_host.types import ToolResult
+    from memfabric.types import EvidenceBundle, SubgraphView, TaskSpec
+
+    name = "approval_gate_fail_closed"
+    problems: list[str] = []
+    cfg = ApexConfig(target=_TARGET, dry_run=True, allowed_tools=["curl", "nmap"])
+    advisor = PolicyAdvisor(load_policy(cfg), cfg)
+
+    class _Spy:
+        def __init__(self) -> None:
+            self.n = 0
+
+        async def __call__(self, cmd: Any, c: Any) -> ToolResult:
+            self.n += 1
+            return ToolResult(command=cmd, stdout="ok", stderr="", returncode=0,
+                              duration_seconds=0.0, dry_run=True)
+
+    def _ctx() -> ExecutionContext:
+        return ExecutionContext(
+            run_id="rg", phase="web", turn_number=1, evidence_version=None,
+            subgraph=SubgraphView(nodes=[], edges=[], anchor=_ANCHOR, depth=1),
+            evidence=EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[]),
+            dry_run=True)
+
+    def _task(args: list[str], *, tool: str = "curl") -> TaskSpec:
+        return TaskSpec(id=new_id(), goal_id=new_id(), executor_domain="web",
+                        params={"tool": tool, "args": args, "target": _TARGET, "parser": "command"},
+                        subgraph_anchor=_ANCHOR, phase="web")
+
+    class _Approve:
+        def request_approval(self, request: Any) -> ApprovalDecision:
+            return ApprovalDecision(True, "ok", now(), token=bind_approval_token(request.fingerprint))
+
+    # 1. Send-side POST, default fail-closed gate → BLOCKED_APPROVAL, executor untouched.
+    spy1 = _Spy()
+    d1 = TaskDispatcher(advisor=advisor, task_registry=TaskRegistry(), config=cfg,
+                        run_command_fn=spy1, approval_gate=build_default_gate(cfg))
+    r1 = await d1.dispatch(_task(["-s", "-X", "POST", "-d", "q", f"http://{_TARGET}/gql"]), _ctx())
+    if r1.disposition is not ExecutionDisposition.BLOCKED_APPROVAL:
+        problems.append(f"send-side POST not blocked (disposition={r1.disposition.value})")
+    if spy1.n != 0:
+        problems.append("send-side action reached the executor without approval")
+
+    # 2. Read-side GET → passes through and executes.
+    spy2 = _Spy()
+    d2 = TaskDispatcher(advisor=advisor, task_registry=TaskRegistry(), config=cfg,
+                        run_command_fn=spy2, approval_gate=build_default_gate(cfg))
+    r2 = await d2.dispatch(_task(["-s", f"http://{_TARGET}/"]), _ctx())
+    if r2.disposition is not ExecutionDisposition.EXECUTED_SUCCESS or spy2.n != 1:
+        problems.append(f"read-side GET did not pass through (disposition={r2.disposition.value}, n={spy2.n})")
+
+    # 3. Approved send-side → reaches the executor.
+    spy3 = _Spy()
+    d3 = TaskDispatcher(advisor=advisor, task_registry=TaskRegistry(), config=cfg,
+                        run_command_fn=spy3, approval_gate=ApprovalGate(_Approve()))
+    r3 = await d3.dispatch(_task(["-s", "-X", "POST", "-d", "q", f"http://{_TARGET}/gql"]), _ctx())
+    if r3.disposition is not ExecutionDisposition.EXECUTED_SUCCESS or spy3.n != 1:
+        problems.append(f"approved send-side did not reach executor (disposition={r3.disposition.value})")
+
+    if problems:
+        return ScenarioResult(name, False, "; ".join(problems))
+    return ScenarioResult(
+        name, True,
+        "send-side POST fail-closed BLOCKED_APPROVAL (executor untouched); read-side GET passes "
+        "through and executes; an approved send-side action reaches the executor — the gate GATES, "
+        "never bypasses safety/policy")
+
+
 class _ReconFtpFakeBackend:
     """A synthetic ``ToolBackend`` that makes recon DISCOVER an FTP service (so
     the engagement is still in current_phase="recon" when the credential gate
@@ -2683,6 +2769,7 @@ SCENARIOS: list[Any] = [
     scenario_web_api_surface_discovery,
     scenario_web_js_api_discovery,
     scenario_web_budget_reaches_invite,
+    scenario_approval_gate_fail_closed,
     scenario_recon_service_no_credentials_honest_outcome,
     scenario_ftp_anonymous_access,
     scenario_ftp_validation_via_tool_service,

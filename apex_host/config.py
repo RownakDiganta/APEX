@@ -87,6 +87,10 @@ class ApexConfig:
     max_turns: int = 20
     max_concurrency: int = 2
     max_retries: int = 1
+    # §28.30 — durable append-only audit log for the human approval gate (every
+    # send-side gated decision, secrets redacted). None → only the immutable
+    # episodic event-store record is written (via the normal tool_result path).
+    approval_audit_log_path: str | None = None
     # §28.28 — web-phase turn budget (fed to GlobalPlanner's phase_budgets).
     # Principled bound to traverse to depth 2 for a normal app with headroom:
     # IP→vhost redirect + homepage/API-root probes + several high-signal pages
@@ -694,6 +698,7 @@ class ApexConfig:
             "payload_repo_path": _g("payload_repo", "./payloads"),
             "max_turns": _g("max_turns", 20),
             "web_phase_budget": _g("web_phase_budget", 10),
+            "approval_audit_log_path": _g("approval_audit_log", None),
             "dry_run": bool(_g("dry_run", True)),
             "web_wordlist_path": _g("web_wordlist", None),
             "max_web_paths": _g("max_web_paths", 50),

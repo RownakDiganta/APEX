@@ -159,6 +159,23 @@ class _FakeToolResult:
     duration_seconds: float = 0.0
 
 
+class _ApproveAllProvider:
+    """Test provider that approves every send-side action (bound token). Only for
+    tests that exercise a send-side tool through the dispatcher — NOT a production
+    default (production uses the fail-closed TerminalApprovalProvider, §28.30)."""
+
+    def request_approval(self, request: Any) -> Any:
+        from apex_host.execution.approval import ApprovalDecision, bind_approval_token
+        from memfabric.ids import now
+        return ApprovalDecision(True, "test approve", now(),
+                                token=bind_approval_token(request.fingerprint))
+
+
+def _approving_gate() -> Any:
+    from apex_host.execution.approval import ApprovalGate
+    return ApprovalGate(_ApproveAllProvider())
+
+
 def _make_dispatcher(
     advisor: Any | None = None,
     registry: TaskRegistry | None = None,
@@ -166,6 +183,7 @@ def _make_dispatcher(
     run_command_fn: Any | None = None,
     telnet_executor: Any | None = None,
     browser_executor: Any | None = None,
+    approval_gate: Any | None = None,
 ) -> TaskDispatcher:
     if advisor is None:
         advisor = _ApprovedAdvisor()
@@ -184,6 +202,7 @@ def _make_dispatcher(
         run_command_fn=run_command_fn,
         telnet_executor=telnet_executor,
         browser_executor=browser_executor,
+        approval_gate=approval_gate,
     )
 
 
@@ -1443,6 +1462,9 @@ class TestToolBackendSeam:
         disp = _make_dispatcher(
             config=cfg, advisor=_ApprovedAdvisor(),
             run_command_fn=to_run_command_fn(backend),
+            # python3 is a send-side (unrecognized-tool) action under the §28.30
+            # approval gate; approve it so this test exercises the backend seam.
+            approval_gate=_approving_gate(),
         )
         task = _make_task(tool="python3", args=["-c", "print('via-backend-seam')"])
         ctx = _make_exec_context(dry_run=False)

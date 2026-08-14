@@ -32,6 +32,10 @@ class ExecutionDisposition(str, Enum):
     BLOCKED_POLICY = "blocked_policy"
     # An open conflict dependency blocked the task before execution.
     BLOCKED_CONFLICT = "blocked_conflict"
+    # §28.30 — a SEND-SIDE action was denied (or not approved) at the human
+    # approval gate before execution. Fail-closed: never retried, never bypasses
+    # the downstream safety/policy guards (an approved action still passes them).
+    BLOCKED_APPROVAL = "blocked_approval"
     # Task fingerprint matched a recent completed/pending task — skipped.
     SKIPPED_DUPLICATE = "skipped_duplicate"
     # Task schema validation failed (unknown tool, bad args, out-of-scope target).
@@ -80,6 +84,7 @@ class ExecutionDisposition(str, Enum):
         return self in (
             ExecutionDisposition.BLOCKED_POLICY,
             ExecutionDisposition.BLOCKED_CONFLICT,
+            ExecutionDisposition.BLOCKED_APPROVAL,
         )
 
     @property
@@ -108,6 +113,7 @@ class ExecutionDisposition(str, Enum):
         return self in (
             ExecutionDisposition.BLOCKED_POLICY,
             ExecutionDisposition.BLOCKED_CONFLICT,
+            ExecutionDisposition.BLOCKED_APPROVAL,
             ExecutionDisposition.SKIPPED_DUPLICATE,
             ExecutionDisposition.INVALID_TASK,
             ExecutionDisposition.CANCELLED,
@@ -123,6 +129,7 @@ class ExecutionDisposition(str, Enum):
         return self in (
             ExecutionDisposition.BLOCKED_POLICY,
             ExecutionDisposition.BLOCKED_CONFLICT,
+            ExecutionDisposition.BLOCKED_APPROVAL,
             ExecutionDisposition.SKIPPED_DUPLICATE,
             ExecutionDisposition.INVALID_TASK,
             ExecutionDisposition.CANCELLED,

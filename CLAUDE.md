@@ -11406,6 +11406,83 @@ before-any-fixed-probe assertion. These **fail** against the pre-§28.29 orderin
 The §28.22/§28.23 tests that assert the probes fire were updated to seed a
 fetched homepage (the fallback condition).
 
+### 28.30 Supervised approval gate — a fail-closed human control at dispatch
+
+A mechanical, fail-closed **human-approval gate** at the dispatch chokepoint
+(`apex_host/execution/dispatcher.py`, step 0 of `dispatch()`, before the policy/
+conflict/duplicate gates and the executor). It is **pure safety infrastructure —
+it adds NO offensive/request-building capability**; it only CLASSIFIES and GATES
+actions. `safety.py` and `PolicyAdvisor` remain enforced BEHIND the gate.
+
+**Classifier** (`apex_host/execution/approval.py::classify_action`) — on the
+ACTION SHAPE (method/body/headers/command), deterministic, defaults to SEND-SIDE
+when ambiguous:
+
+- **READ-SIDE (no approval, runs autonomously as today):** HTTP GET/HEAD, the
+  bounded-read executors (`ssh_access`, `ftp_access`, `telnet_access`,
+  `user_flag_verify`, `priv_esc_enum`, `priv_esc_analyze`, `browser`), the recon/
+  discovery tools (`nmap`, `nc`/`netcat`, `ping`, `telnet`, `searchsploit`,
+  `ffuf`, `gobuster`), and the existing discovery/`curl --resolve` GETs.
+- **SEND-SIDE (explicit per-action approval required):** any curl method other
+  than GET/HEAD (`-X POST`/PUT/PATCH/DELETE), any request body
+  (`-d`/`--data*`/`-F`/`-T`/`--json`), any custom `Authorization`/auth header or
+  auth flag (`-u`/`--oauth2-bearer`/…), or any unrecognized non-read tool
+  (`python3`, unknown). The GraphQL introspection POST (§28.22) is the one
+  existing send-side-shaped action and is now gated.
+
+**Fail-closed enforcement** — a send-side action MUST NOT reach the executor
+without an explicit approval token bound to THAT action's fingerprint. No token,
+a foreign/blanket token, a non-interactive/dry-run context, an unavailable
+provider, or ANY error in the gate → **DENY** (disposition `BLOCKED_APPROVAL`,
+`ErrorCategory.APPROVAL_DENIED`, never retried/repaired). Read-side actions pass
+straight through unchanged.
+
+**Approval interface** (`ApprovalProvider` Protocol — a clean, swappable
+boundary) — the send-side action is rendered in full (method, full URL, headers,
+the LITERAL body, plus the planner's stated intent and brief graph context) and
+the operator is blocked for a per-action `y`/N decision. Today's implementation
+is `TerminalApprovalProvider` (a terminal prompt); **in dry-run or any
+non-interactive context it DENIES (fail-closed), never auto-approves.** The
+fail-closed default when no provider is wired is `AutoDenyApprovalProvider`.
+Approval is per-action (a token bound to the action's fingerprint via
+`bind_approval_token` — never approve-all), verified by the gate.
+
+**Guards stay behind the gate** — approval only lets an action REACH the existing
+guards; it never bypasses them. After approval the action STILL passes through
+`PolicyAdvisor` (step 1 — an approved but off-scope action dies `BLOCKED_POLICY`)
+and `safety.py` (inside `runner.run_command` — an approved but shell-metacharacter
+action dies at the safety gate). dry-run default and the single-subprocess
+chokepoint (§13.6) are unchanged.
+
+**Immutable audit** — every gated (send-side) decision is recorded in full
+(action shape, classification reason, approve/deny, timestamp) with secrets
+redacted (`apex_host.security.redaction` — Authorization tokens, operator
+passwords, API keys). It is appended to the immutable episodic event store via
+the normal `tool_result → Episode` path (the returned `approval_record` /
+`approval_blocked` fields) AND, when `ApexConfig.approval_audit_log_path` is set,
+to a durable append-only log file. Never mutated, never deleted.
+
+**Scope** — ONLY the gate (classifier + enforcement + interface + audit) was
+added. No send-side/request-building executor, no POST/auth-forging capability,
+nothing that CONSTRUCTS attack requests was added — the gate is a control; there
+is intentionally nothing offensive for it to pass yet. If a send-side action is
+proposed by existing code paths (the GraphQL introspection), the gate handles it.
+`memfabric/` is untouched (the gate lives in `apex_host` execution); apex off VPN;
+existing read-side behavior identical.
+
+**Tests** (`tests/apex_host/test_approval_gate.py`, REAL `TaskDispatcher.dispatch()`):
+the classifier (GET/HEAD/recon/bounded-read → read; POST/body/auth/unknown →
+send; ambiguous/classifier-error → send); fail-closed (a send-side action with no
+approval never reaches the executor; non-interactive → deny; read-side passes
+through); approval flow (approve → reaches executor; deny → dropped + recorded,
+engagement continues; foreign token rejected); guards behind the gate (an
+approved shell-metacharacter action is STILL killed by `safety.py`; an approved
+off-scope action is STILL killed by `PolicyAdvisor`); and the immutable, redacted
+audit record. The `approval_gate_fail_closed` release-gate scenario drives the
+same three paths end-to-end. `_make_dispatcher` in `test_phase6_dispatcher.py`
+gained an optional approving gate for the one pre-existing `python3` backend-seam
+test.
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

@@ -25,6 +25,7 @@ class ErrorCategory(str, Enum):
     # Task rejected before any resource is allocated.
     POLICY_DENIED = "policy_denied"
     CONFLICT_BLOCKED = "conflict_blocked"
+    APPROVAL_DENIED = "approval_denied"  # §28.30 — send-side action denied at the human approval gate
     DUPLICATE_TASK = "duplicate_task"
     INVALID_TASK = "invalid_task"
     TOOL_NOT_FOUND = "tool_not_found"
