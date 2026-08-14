@@ -11483,6 +11483,75 @@ same three paths end-to-end. `_make_dispatcher` in `test_phase6_dispatcher.py`
 gained an optional approving gate for the one pre-existing `python3` backend-seam
 test.
 
+### 28.31 Keep the curl web-discovery node running; don't divert to the browser
+
+A live TwoMillion run stalled `no_actionable_task` with `/invite` discovered but
+never fetched — even though §28.24–§28.29 all work when driven directly. Diagnosis
+against the real `run_reports/live_graph.json` proved the cause was **routing, not
+the fetch pipeline**: `route_after_global_plan` (`routing.py`) sent the web phase
+to `browser_agent` as soon as ANY `phase=="web"` finding existed —
+
+```python
+# pre-§28.31 (WRONG):
+has_web_finding = any(f.get("phase") == "web" for f in state["findings"])
+return "browser_agent" if has_web_finding else "web_agent"
+```
+
+Findings never clear, so after the very first web finding the phase routed to
+`browser_agent` **permanently**. But `browser_agent` (`make_browser_node` →
+`BrowserPlanner` → `tool="browser"` → `BrowserExecutor`, Playwright) does NOT run
+the curl `pending_page_fetches` loop that emits the `/invite` body fetch — that
+loop, and every §28.24–§28.29 fix, lives ONLY in `web_agent`/`_WebDeterministic`.
+So `web_agent` ran only for the first web turn (before `/invite` was even
+discovered) and never again; `browser_agent` additionally crashed every launch
+(the Kali container has no Chromium: "Executable doesn't exist … playwright
+install"). Both paths to `/invite` were dead → stall.
+
+**Fix (routing only — no discovery/capability change):** keep the curl discovery
+node running while web discovery has UNFETCHED work. `global_plan` already writes
+`state["phase_selection"]["web_evidence_complete"]` (from `web_evidence_status`),
+which is False whenever a page still needs fetching or discovered pages/JS/
+endpoints remain unfetched — exactly when the curl node must keep running:
+
+```python
+# §28.31:
+if ps.get("web_evidence_complete") is True:
+    has_web_finding = any(f.get("phase") == "web" for f in state["findings"])
+    return "browser_agent" if has_web_finding else "web_agent"
+return "web_agent"
+```
+
+Because `GlobalPlanner._select_phase` only keeps the engagement in the web phase
+while web discovery is incomplete (`not web_complete`), `phase=="web"` implies
+`web_evidence_complete is False` — so `web_agent` runs across every web turn while
+pending pages/JS remain, fetching `/invite` and its JS and running the full
+§28.24–§28.29 pipeline. `browser_agent` is used only once curl discovery has no
+actionable work left (`web_evidence_complete` True) AND a page was already
+fetched — a rare window in which the engagement advances out of the web phase on
+the next turn regardless, so a Playwright launch failure can no longer starve the
+curl path or stall the phase. Default is `web_agent`; the phase never diverts to
+the (possibly unavailable) browser on the mere existence of a finding.
+
+Everything else unchanged: static extraction only, GET via `--resolve -L`, no
+POST, the §28.30 approval gate, `safety.py`/`PolicyAdvisor`/memfabric/dry-run all
+untouched; apex off the VPN. `BrowserExecutor` and `BrowserPlanner` are unchanged
+— only the routing that reaches them.
+
+**Tests** (`tests/apex_host/test_web_routing.py`): `route_after_global_plan`
+returns `web_agent` for a web phase with a prior web finding while discovery is
+incomplete (across multiple turns), and only returns `browser_agent` once
+`web_evidence_complete` is True — the exact regression, which **fails** against
+the pre-§28.31 rule. An end-to-end test drives the REAL compiled graph + routing
+with a fake backend serving a TwoMillion-like site: homepage → discovers
+`/invite` → `web_agent` curl-fetches `/invite` → its JS → extracts
+`/api/v1/invite/...` (fails against the old browser diversion). The
+`web_routing_keeps_curl_discovery` release-gate scenario asserts the same routing
+decision and drives the same end-to-end. Three pre-existing tests that encoded
+the old "web finding → browser_agent" rule were updated: two browser policy-block
+tests now dispatch a browser task directly through the dispatcher (the browser
+policy-block invariant is unchanged), and the orchestration/browser routing tests
+now assert the §28.31 behavior.
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

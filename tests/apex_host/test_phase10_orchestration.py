@@ -516,12 +516,27 @@ class TestRouting:
         state = self._state(phase="web", findings=[])
         assert route_after_global_plan(state) == "web_agent"
 
-    def test_route08_route_after_global_plan_web_second_visit(self) -> None:
-        """ROUTE-08: web phase with prior web finding → browser_agent."""
+    def test_route08_web_finding_but_incomplete_stays_web_agent(self) -> None:
+        """ROUTE-08 (§28.31): a web finding no longer diverts to browser_agent —
+        while web discovery is incomplete the curl node keeps running."""
         state = self._state(
             phase="web",
             findings=[{"phase": "web", "title": "endpoint found", "id": "x",
                        "confidence": 0.9, "source": "test", "detail": ""}],
+            phase_selection={"web_evidence_complete": False,
+                             "web_reason": "unfetched_discovered_endpoints"},
+        )
+        assert route_after_global_plan(state) == "web_agent"
+
+    def test_route08b_web_complete_with_finding_goes_browser(self) -> None:
+        """ROUTE-08b (§28.31): only once curl discovery is complete does a web
+        finding route to browser_agent for page inspection."""
+        state = self._state(
+            phase="web",
+            findings=[{"phase": "web", "title": "endpoint found", "id": "x",
+                       "confidence": 0.9, "source": "test", "detail": ""}],
+            phase_selection={"web_evidence_complete": True,
+                             "web_reason": "page_content_fetched"},
         )
         assert route_after_global_plan(state) == "browser_agent"
 

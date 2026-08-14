@@ -2268,6 +2268,116 @@ async def scenario_approval_gate_fail_closed() -> ScenarioResult:
         "never bypasses safety/policy")
 
 
+async def scenario_web_routing_keeps_curl_discovery() -> ScenarioResult:
+    """§28.31 — the web phase keeps running the curl discovery node (web_agent)
+    while web discovery has unfetched work, instead of permanently diverting to
+    browser_agent after the first web finding. Asserts the routing decision AND
+    drives the REAL compiled graph (fake backend) end to end: homepage →
+    discovers /invite → web_agent fetches /invite → its JS → extracts /api. FAILS
+    against the pre-§28.31 routing (which starved the curl /invite fetch)."""
+    from typing import cast
+    from urllib.parse import urlsplit
+
+    from apex_host.graph import build_apex_graph
+    from apex_host.graph_state import ApexGraphState
+    from apex_host.orchestration.routing import route_after_global_plan
+    from apex_host.tools.registry import ToolRegistry
+    from apex_host.types import ToolCommand, ToolResult
+    from memfabric.types import Edge as _Edge, Node as _Node
+
+    name = "web_routing_keeps_curl_discovery"
+    _VHOST = "app.example.htb"
+    problems: list[str] = []
+
+    # 1. Routing: a web finding + incomplete discovery → web_agent (not browser).
+    finding = {"phase": "web", "title": "e", "id": "ep1", "confidence": 0.9,
+               "source": "t", "detail": ""}
+    st_incomplete = {"completed": False, "phase": "web", "findings": [finding],
+                     "phase_selection": {"web_evidence_complete": False,
+                                         "web_reason": "unfetched_discovered_endpoints"}}
+    if route_after_global_plan(cast("ApexGraphState", st_incomplete)) != "web_agent":
+        problems.append("a web finding with incomplete discovery diverted away from web_agent")
+    st_complete = {**st_incomplete,
+                   "phase_selection": {"web_evidence_complete": True, "web_reason": "page_content_fetched"}}
+    if route_after_global_plan(cast("ApexGraphState", st_complete)) != "browser_agent":
+        problems.append("web finding + complete discovery did not route to browser_agent")
+
+    # 2. End-to-end through the REAL graph: web_agent fetches /invite → JS → /api.
+    class _FakeWeb:
+        name = "fake-web"
+
+        def __init__(self) -> None:
+            self.fetched: list[str] = []
+
+        async def execute(self, tool: str, arguments: list[str], *,
+                          timeout_seconds: Any = None, stdin: Any = None) -> ToolResult:
+            url = next((a for a in arguments if a.startswith("http")), "")
+            self.fetched.append(url)
+            if "-I" in arguments:
+                body = "HTTP/1.1 200 OK\r\nServer: nginx\r\n\r\n"
+            else:
+                p = urlsplit(url).path or "/"
+                if p in ("", "/"):
+                    body = (f'<html><head><title>{_VHOST}</title>'
+                            '<script src="/js/home.min.js"></script></head>'
+                            '<body><a href="/invite">i</a></body></html>')
+                elif p == "/invite":
+                    body = '<html><head><script src="/js/inviteapi.min.js"></script></head><body>x</body></html>'
+                elif p == "/js/inviteapi.min.js":
+                    body = '$.post("/api/v1/invite/generate");'
+                elif p.startswith("/api/v1/invite"):
+                    body = '{"success": true, "data": {"code": "x"}}'
+                else:
+                    body = "<html></html>"
+            return ToolResult(command=ToolCommand(tool=tool, args=list(arguments)),
+                              stdout=body, stderr="", returncode=0, duration_seconds=0.0,
+                              dry_run=False, backend="fake-web")
+
+    api = _make_api()
+    ts = now()
+    await api.upsert_node(_Node(id=_ANCHOR, type="host", props={"ip": _TARGET},
+                                confidence=0.9, source="t", first_seen=ts, last_seen=ts))
+    await api.upsert_node(_Node(id=f"service:{_TARGET}:80/tcp", type="service",
+                                props={"port": "80", "proto": "tcp", "service": "http", "state": "open"},
+                                confidence=0.9, source="t", first_seen=ts, last_seen=ts))
+    await api.upsert_edge(_Edge(id="e1", from_id=_ANCHOR, to_id=f"service:{_TARGET}:80/tcp",
+                                type="exposes", props={}, confidence=0.9, source="t",
+                                first_seen=ts, last_seen=ts))
+    await api.upsert_node(_Node(id=f"vhost:{_TARGET}:{_VHOST}", type="vhost",
+                                props={"hostname": _VHOST, "ip": _TARGET}, confidence=0.9,
+                                source="t", first_seen=ts, last_seen=ts))
+    await api.upsert_edge(_Edge(id="e2", from_id=_ANCHOR, to_id=f"vhost:{_TARGET}:{_VHOST}",
+                                type="exposes", props={}, confidence=0.9, source="t",
+                                first_seen=ts, last_seen=ts))
+
+    backend = _FakeWeb()
+    config = ApexConfig(target=_TARGET, dry_run=True, allowed_tools=["curl", "nmap"],
+                        max_turns=12, web_phase_budget=10)
+    graph = build_apex_graph(api, ToolRegistry.from_config(config), config, tool_backend=backend)
+    initial: dict[str, Any] = {
+        "run_id": "rg", "target": _TARGET, "phase": "web",
+        "goal": f"enumerate web on {_TARGET}", "current_task": None,
+        "evidence_summary": "", "findings": [], "error_episodes": [],
+        "last_tool_result": None, "last_error": None, "completed": False, "turn_count": 0,
+    }
+    await graph.ainvoke(cast("ApexGraphState", initial),
+                        config={"configurable": {"thread_id": "rg"}, "recursion_limit": 300})
+
+    sub = await api.get_subgraph(_ANCHOR, depth=8)
+    urls = {str(n.props.get("url", "")) for n in sub.nodes if n.type == "endpoint"}
+    if not any(u.endswith("/invite") for u in urls) or not any("/invite" in u for u in backend.fetched):
+        problems.append(f"/invite was never curl-fetched by web_agent (fetched={backend.fetched})")
+    if not any("/api/v1/invite" in u for u in urls):
+        problems.append("the JS-referenced /api/v1/invite endpoint was never extracted")
+
+    if problems:
+        return ScenarioResult(name, False, "; ".join(problems))
+    return ScenarioResult(
+        name, True,
+        "web finding + incomplete discovery → web_agent (never diverted to browser); the compiled "
+        "graph curl-fetched /invite → its JS → extracted /api/v1/invite end to end")
+
+
 class _ReconFtpFakeBackend:
     """A synthetic ``ToolBackend`` that makes recon DISCOVER an FTP service (so
     the engagement is still in current_phase="recon" when the credential gate
@@ -2770,6 +2880,7 @@ SCENARIOS: list[Any] = [
     scenario_web_js_api_discovery,
     scenario_web_budget_reaches_invite,
     scenario_approval_gate_fail_closed,
+    scenario_web_routing_keeps_curl_discovery,
     scenario_recon_service_no_credentials_honest_outcome,
     scenario_ftp_anonymous_access,
     scenario_ftp_validation_via_tool_service,

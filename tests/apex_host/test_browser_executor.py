@@ -27,7 +27,6 @@ from memfabric.stores.lexical_bm25 import BM25LexicalIndex
 from memfabric.stores.vector_faiss import FaissVectorIndex
 from memfabric.types import (
     AbandonSignal,
-    Edge,
     EvidenceBundle,
     Goal,
     Node,
@@ -427,76 +426,26 @@ class TestWebPlannerCapabilities:
 # ---------------------------------------------------------------------------
 
 class TestWebPhaseGraphRouting:
-    async def test_web_phase_routes_to_browser_after_finding(self) -> None:
-        """After a web finding, the second web-phase turn goes to browser_agent.
-
-        We verify by running the full graph with:
-        - an HTTP service pre-seeded in the EKG (so GlobalPlanner picks web phase)
-        - one web finding already in initial state (triggers browser routing)
-        - max_turns=1 so we only run one turn
-        The single turn should invoke browser_agent (not web_agent), which in
-        dry-run mode calls BrowserExecutor._synthetic_observation and writes
-        endpoint/form/auth_flow/token nodes back to the EKG.
-        """
-        api = _make_api()
-        target = _TARGET
-        anchor = f"host:{target}"
-        timestamp = now()
-
-        # Seed: host + HTTP service → GlobalPlanner picks web phase
-        await api.upsert_node(Node(
-            id=anchor,
-            type="host",
-            props={"ip": target},
-            confidence=0.9,
-            source="test",
-            first_seen=timestamp,
-            last_seen=timestamp,
-        ))
-        svc_id = f"service:{target}:80/tcp"
-        await api.upsert_node(Node(
-            id=svc_id,
-            type="service",
-            props={"port": "80", "proto": "tcp", "service": "http", "state": "open", "version": ""},
-            confidence=0.9,
-            source="test",
-            first_seen=timestamp,
-            last_seen=timestamp,
-        ))
-        await api.upsert_edge(Edge(
-            id=f"edge:exposes:{svc_id}",
-            from_id=anchor,
-            to_id=svc_id,
-            type="exposes",
-            props={},
-            confidence=0.9,
-            source="test",
-            first_seen=timestamp,
-            last_seen=timestamp,
-        ))
-
-        config = ApexConfig(target=target, dry_run=True, max_turns=1)
-        registry = ToolRegistry.from_config(config)
-        graph = build_apex_graph(api, registry, config)
-
-        # Pre-populate a web finding so route_after_global_plan picks browser_agent
-        initial = _make_initial_state(target, findings=[{
-            "id": "prior-finding",
-            "phase": "web",
-            "title": "endpoint discovered",
-            "detail": "{}",
-            "confidence": 0.8,
-            "source": "test",
-            "timestamp": timestamp,
-        }])
-
-        final_state = await graph.ainvoke(initial)
-
-        # The browser_agent ran (dry-run) and wrote obs nodes into the EKG.
-        subgraph = await api.get_subgraph(anchor, depth=5)
-        node_types = {n.type for n in subgraph.nodes}
-        # Browser should have written at minimum an endpoint node
-        assert "endpoint" in node_types or final_state["turn_count"] == 1
+    def test_web_finding_but_incomplete_routes_to_web_agent(self) -> None:
+        """§28.31: a prior web finding no longer diverts to browser_agent while
+        web discovery is still incomplete — the curl web_agent (where the
+        pending-page/JS fetch pipeline lives) keeps running so a discovered page
+        like /invite is fetched instead of being starved. Only once curl
+        discovery is complete does a web finding route to browser_agent."""
+        from apex_host.orchestration.routing import route_after_global_plan
+        base = {
+            "completed": False, "phase": "web",
+            "findings": [{"phase": "web", "title": "endpoint discovered", "id": "ep1",
+                          "confidence": 0.9, "source": "test", "detail": ""}],
+        }
+        # Web discovery incomplete (pending endpoints) → curl web_agent, not browser.
+        incomplete = {**base, "phase_selection": {
+            "web_evidence_complete": False, "web_reason": "unfetched_discovered_endpoints"}}
+        assert route_after_global_plan(incomplete) == "web_agent"
+        # Only once curl discovery is complete does a web finding route to browser.
+        complete = {**base, "phase_selection": {
+            "web_evidence_complete": True, "web_reason": "page_content_fetched"}}
+        assert route_after_global_plan(complete) == "browser_agent"
 
     async def test_web_phase_routes_to_web_agent_when_no_prior_finding(self) -> None:
         """Without a prior web finding, the web phase runs web_agent (ffuf/curl)."""

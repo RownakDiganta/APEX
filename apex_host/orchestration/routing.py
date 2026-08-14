@@ -41,8 +41,11 @@ UNKNOWN_PHASE_NODE: str = "unknown_phase_agent"
 def route_after_global_plan(state: "ApexGraphState") -> str:
     """Choose which agent node executes after the global planner decides a phase.
 
-    The web phase routes to ``browser_agent`` on the second+ visit so the
-    engagement does curl/ffuf first, then inspects the page with a browser.
+    The web phase runs the curl discovery node (``web_agent`` /
+    ``_WebDeterministic``) while web discovery still has unfetched work; only
+    once curl discovery is complete does it inspect the page with the browser
+    (§28.31). See below for why the old "any web finding → browser_agent" rule
+    was wrong.
 
     An unrecognized phase (anything not in PHASE_NODE, not `web`, and not
     `done`) never falls through silently to END — it routes to
@@ -60,10 +63,31 @@ def route_after_global_plan(state: "ApexGraphState") -> str:
         return "reflect_or_continue"
     phase = state["phase"]
     if phase == ApexPhase.web.value:
-        has_web_finding = any(
-            f.get("phase") == ApexPhase.web.value for f in state["findings"]
-        )
-        return "browser_agent" if has_web_finding else "web_agent"
+        # §28.31 — keep the curl discovery node (``web_agent``, where the
+        # §28.24-§28.29 pending-page/JS fetch pipeline and the vhost --resolve
+        # loop live) running while web discovery still has UNFETCHED work. The
+        # old rule ("any phase=web finding → browser_agent") permanently diverted
+        # to the browser after the very first web finding — starving the curl
+        # ``/invite`` body fetch (a discovered page like /invite was never
+        # fetched, so its <script src> and the API it referenced were never
+        # seen) and stalling the phase when the Playwright browser was
+        # unavailable. ``web_evidence_complete`` (set by ``global_plan`` from
+        # ``web_evidence_status``) is False whenever a page still needs fetching
+        # or discovered pages/JS/endpoints remain unfetched — the exact
+        # condition under which the curl node must keep running. Only when curl
+        # discovery has NO actionable work left (``web_evidence_complete`` True)
+        # AND a page was already fetched do we inspect with the browser; a
+        # browser launch failure there cannot stall the phase, because the
+        # engagement advances out of the web phase on the next turn once web
+        # evidence is complete. Default to ``web_agent`` — never divert to the
+        # browser on the mere existence of a finding.
+        ps = state.get("phase_selection") or {}
+        if ps.get("web_evidence_complete") is True:
+            has_web_finding = any(
+                f.get("phase") == ApexPhase.web.value for f in state["findings"]
+            )
+            return "browser_agent" if has_web_finding else "web_agent"
+        return "web_agent"
     node = PHASE_NODE.get(phase)
     if node is not None:
         return node

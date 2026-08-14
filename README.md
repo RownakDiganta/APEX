@@ -2540,6 +2540,17 @@ action reach the existing `safety.py` and policy guards; it never bypasses them
 decision is recorded immutably (episodic event store + an optional durable log
 file), with secrets redacted. See CLAUDE.md §28.30.
 
+**Keep the curl discovery node running (§28.31).** The web phase now keeps running
+the curl discovery node (`web_agent`, where the §28.24–§28.29 pending-page/JS
+fetch pipeline lives) while web discovery has unfetched work, instead of
+permanently diverting to the browser after the first web finding. Previously, once
+any web finding existed, routing switched to the browser agent forever — which
+does not run the curl `/invite` fetch and, in an environment without a Playwright
+browser, crashes — so a discovered page like `/invite` was never fetched and the
+phase stalled. Now the browser is used only once curl discovery has no actionable
+work left, so a browser launch failure can never starve the curl path. See
+CLAUDE.md §28.31.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,

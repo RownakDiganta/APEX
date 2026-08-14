@@ -627,79 +627,62 @@ class TestBlockedAppearsInReport:
 # ---------------------------------------------------------------------------
 
 class TestBlockedBrowserNeverReachesExecutor:
-    async def test_blocked_browser_skips_executor(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    """A policy-blocked browser task never reaches BrowserExecutor.run and is
+    recorded as a blocked policy decision — verified by dispatching a browser
+    task directly through the REAL TaskDispatcher. (§28.31 removed the old
+    "web finding → browser_agent" routing that these previously relied on, so
+    the browser policy-block invariant is now tested at the dispatcher.)"""
+
+    async def _dispatch_browser(self, advisor: Any, browser_run: Any) -> Any:
+        from apex_host.agents.browser_executor import BrowserExecutor
+        from apex_host.execution.context import ExecutionContext
+        from apex_host.execution.dispatcher import TaskDispatcher
+        from apex_host.execution.registry import TaskRegistry
+        from memfabric.ids import new_id
+        from memfabric.types import EvidenceBundle, SubgraphView, TaskSpec
+
+        target = "127.0.0.1"
+        config = ApexConfig(target=target, dry_run=True)
+        browser = BrowserExecutor(config)
+        browser.run = browser_run  # type: ignore[method-assign]  # spy: must not be called
+        disp = TaskDispatcher(
+            advisor=advisor, task_registry=TaskRegistry(), config=config,
+            run_command_fn=AsyncMock(return_value=_fake_tool_result()),
+            browser_executor=browser,
+        )
+        task = TaskSpec(
+            id=new_id(), goal_id=new_id(), executor_domain="web",
+            params={"tool": "browser", "url": f"http://{target}", "target": target, "args": []},
+            subgraph_anchor=f"host:{target}", phase="web")
+        ctx = ExecutionContext(
+            run_id="r", phase="web", turn_number=1, evidence_version=None,
+            subgraph=SubgraphView(nodes=[], edges=[], anchor=f"host:{target}", depth=1),
+            evidence=EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[]),
+            dry_run=True)
+        return await disp.dispatch(task, ctx)
+
+    async def test_blocked_browser_skips_executor(self) -> None:
         """With advisor blocking 'browser', BrowserExecutor.run must not be called."""
-        advisor = _FakeAdvisor(block_tool="browser")
+        from apex_host.execution.dispositions import ExecutionDisposition
         browser_calls: list[Any] = []
 
-        async def _forbidden_browser_run(self_ex: Any, task: Any, evidence: Any) -> Any:
+        async def _forbidden(task: Any, evidence: Any) -> Any:
             browser_calls.append(task)
             raise AssertionError("BrowserExecutor.run must not be called for blocked tasks")
 
-        monkeypatch.setattr(
-            "apex_host.agents.browser_executor.BrowserExecutor.run", _forbidden_browser_run
-        )
-        monkeypatch.setattr(
-            "apex_host.tools.runner.run_command",
-            AsyncMock(return_value=_fake_tool_result()),
-        )
+        dr = await self._dispatch_browser(_FakeAdvisor(block_tool="browser"), _forbidden)
+        assert dr.disposition is ExecutionDisposition.BLOCKED_POLICY
+        assert browser_calls == []  # policy blocked it before the executor
 
-        target = "127.0.0.1"
-        api = _make_api()
-        await _seed_host_http(api, target)
+    async def test_blocked_browser_records_policy_decision(self) -> None:
+        """A blocked browser task is recorded as a blocked policy decision (tool='browser')."""
+        async def _forbidden(task: Any, evidence: Any) -> Any:
+            raise AssertionError("BrowserExecutor.run must not be called for blocked tasks")
 
-        config = ApexConfig(target=target, dry_run=True, max_turns=1)
-        registry = ToolRegistry.from_config(config)
-        graph = build_apex_graph(api, registry, config, advisor=advisor)
-
-        # Seed a prior web finding so the planner routes to browser_agent
-        initial = _make_initial_state(target)
-        initial["findings"] = [{"phase": "web", "title": "endpoint discovered",
-                                 "id": "ep1", "confidence": 0.9,
-                                 "source": "test", "detail": ""}]
-
-        await graph.ainvoke(initial)
-
-        assert len(browser_calls) == 0, (
-            "BrowserExecutor.run must not be called for a blocked browser task"
-        )
-
-    async def test_blocked_browser_records_policy_decision(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Blocked browser task produces a policy_decisions entry with tool='browser'."""
-        advisor = _FakeAdvisor(block_tool="browser")
-        monkeypatch.setattr(
-            "apex_host.tools.runner.run_command",
-            AsyncMock(return_value=_fake_tool_result()),
-        )
-
-        target = "127.0.0.1"
-        api = _make_api()
-        await _seed_host_http(api, target)
-
-        config = ApexConfig(target=target, dry_run=True, max_turns=1)
-        registry = ToolRegistry.from_config(config)
-        graph = build_apex_graph(api, registry, config, advisor=advisor)
-
-        initial = _make_initial_state(target)
-        initial["findings"] = [{"phase": "web", "title": "endpoint discovered",
-                                 "id": "ep1", "confidence": 0.9,
-                                 "source": "test", "detail": ""}]
-
-        final_state = await graph.ainvoke(initial)
-
-        pd_list = final_state.get("policy_decisions", [])
-        browser_blocked = [
-            d for d in pd_list
-            if d.get("tool") == "browser" and d.get("status") == "blocked"
-        ]
-        assert len(browser_blocked) > 0, (
-            "policy_decisions must contain a blocked entry for browser; "
-            f"got: {pd_list}"
-        )
+        dr = await self._dispatch_browser(_FakeAdvisor(block_tool="browser"), _forbidden)
+        pd = dr.audit_metadata.get("policy_decision") or {}
+        assert pd.get("tool") == "browser" and pd.get("status") == "blocked"
+        assert dr.tool_result_dict.get("policy_blocked") is True
 
 
 # ---------------------------------------------------------------------------
