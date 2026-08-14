@@ -60,6 +60,10 @@ _CATEGORY_PRIORITY: dict[str, int] = {
 _INTERESTING_PATH_KEYWORDS: tuple[str, ...] = (
     "admin", "login", "administrator", "manage", "dashboard",
     "api", "upload", "backup", "config", "user",
+    # §28.28 — generic account/registration flow pages (NOT machine-specific):
+    # a linked page like /invite, /register, /signup often carries the JS that
+    # references the real API, so fetch it early within the web budget.
+    "invite", "register", "signup", "signin",
 )
 
 

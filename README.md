@@ -2508,6 +2508,16 @@ JavaScript — it extracts nothing and spawns no child fetches, eliminating the
 garbage URLs that arose from resolving links against an already-wrong URL. See
 CLAUDE.md §28.27.
 
+**Configurable web-phase budget (§28.28).** The web phase now has a configurable
+turn budget (`ApexConfig.web_phase_budget`, `--web-phase-budget`, default 10,
+raised from a hardcoded 5) large enough to traverse a normal app to depth 2 —
+homepage → a discovered page like `/invite` → that page's JavaScript → the API it
+references — within budget. Generic account-flow pages (`/invite`, `/register`,
+`/signup`) are prioritized, and the web phase never terminates while a discovered
+page with an unfetched `<script src>` remains and budget allows. Still bounded (a
+finite per-turn fetch cap and a finite turn budget — never unbounded crawling).
+See CLAUDE.md §28.28.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,

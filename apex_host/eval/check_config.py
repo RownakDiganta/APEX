@@ -74,6 +74,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     dry.add_argument("--dry-run", dest="dry_run", action="store_true", default=None)
     dry.add_argument("--no-dry-run", dest="dry_run", action="store_false")
     parser.add_argument("--max-turns", dest="max_turns", type=int, default=None)
+    parser.add_argument("--web-phase-budget", dest="web_phase_budget", type=int, default=None)
     parser.add_argument("--knowledge-root", dest="knowledge_root", default=None, metavar="DIR")
     parser.add_argument("--policy-file", dest="policy_file", default=None, metavar="PATH")
     parser.add_argument(
@@ -180,6 +181,14 @@ def validate_combinations(config: ApexConfig) -> list[str]:
 
     if config.max_turns < 1:
         problems.append(f"max_turns={config.max_turns} must be at least 1")
+
+    # §28.28 — web-phase turn budget. At least 1; a sane ceiling keeps the
+    # bounded web loop from over-crawling (each turn does up to ~a dozen fetches).
+    if config.web_phase_budget < 1:
+        problems.append(f"web_phase_budget={config.web_phase_budget} must be at least 1")
+    elif config.web_phase_budget > 100:
+        problems.append(
+            f"web_phase_budget={config.web_phase_budget} exceeds the sane ceiling of 100")
 
     # LLM planner-call budget ranges (CLAUDE.md §28). Reject zero, negative,
     # and excessively large values — an unbounded/huge budget defeats the

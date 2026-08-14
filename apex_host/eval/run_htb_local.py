@@ -136,6 +136,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-turns", type=int, default=None,
         help="Maximum engagement turns (default: 20, or $APEX_MAX_TURNS)",
     )
+    parser.add_argument(
+        "--web-phase-budget", type=int, default=None,
+        help="Web-phase turn budget — turns to traverse homepage → discovered "
+             "pages → their JS → API (default: 10)",
+    )
     dry = parser.add_mutually_exclusive_group()
     dry.add_argument(
         "--dry-run", dest="dry_run", action="store_true", default=None,

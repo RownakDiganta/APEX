@@ -11295,6 +11295,63 @@ body → `/api/v1/invite/...` extracted. The `web_js_api_discovery` release-gate
 scenario (which fetches the no-trailing-slash `/invite`) gains a compound-garbage
 guard. The HTML-guard tests **fail** against pre-§28.27 code.
 
+### 28.28 Configurable, raised web-phase budget so a discovered page is reached
+
+> **Numbering note:** highest unique §28 heading is §28.27 (the trailing
+> `### 28.7`/`### 28.8` are the known pre-existing collision). This section is
+> **§28.28**; nothing was renumbered.
+
+On a live TwoMillion run the web pipeline (correct after §28.25–§28.27) still
+never fetched the discovered `/invite` page, so its
+`<script src=/js/inviteapi.min.js>` was never seen and the invite API never
+extracted — it stalled at `no_actionable_task`. Root cause: the web-phase turn
+budget was the **hardcoded 5** (`_DEFAULT_PHASE_BUDGETS["web"]`) and was **never
+wired from config** — `builder.py` constructed `GlobalPlanner(max_turns=...)`
+with no `phase_budgets`. Traversing to depth 2 for a real app costs: IP→vhost
+redirect (1 turn) + vhost homepage/API-root probes (1) + several high-signal
+pages at 3/turn + their JS assets at 3/turn + the JS-discovered `/api` fetches.
+A realistic multi-page site reaches the invite API around web-turn 6 — over the
+old ceiling of 5, so the phase force-advanced out of web before `/invite`'s JS
+was fetched. (The `_MAX_ENDPOINT_FETCHES`/`_MAX_JS_FETCHES` per-turn caps of 3
+are unchanged — the fix is the turn budget, not unbounded crawling.)
+
+**Fix (discovery only):**
+
+- New `ApexConfig.web_phase_budget` (default **10**, raised from 5), CLI
+  `--web-phase-budget` on both entry points, validated range `1..100`
+  (`check_config.validate_combinations`). `builder.py` now wires it:
+  `GlobalPlanner(max_turns=..., phase_budgets={"web": config.web_phase_budget})`.
+  The bound is principled — homepage + redirect + a few high-signal pages + their
+  JS + API fetches, with ~2× headroom — not a huge number.
+- `_INTERESTING_PATH_KEYWORDS` gains the generic account-flow terms `invite`,
+  `register`, `signup`, `signin` (universal web patterns, NOT machine-specific)
+  so a linked registration/invite page — which typically carries the
+  API-referencing JS — is fetched early within budget.
+- Guarantee (already enforced, now tested): the web-evidence gate
+  (`web_evidence_status`) returns incomplete while ANY discovered page or JS
+  asset is pending (the pending check precedes the form/content check), so the
+  phase router never leaves web — and the run never terminates
+  `no_actionable_task` — while a discovered page with an unfetched `<script src>`
+  remains and budget allows. css/images are already deprioritized/excluded
+  (§28.26), so they never consume the budget.
+
+Everything else unchanged: GET via `--resolve -L`, same-origin/vhost only, no
+POST, bounded (a finite per-turn cap and a finite, configurable turn budget —
+never unbounded crawling), `runner`→`safety`, policy scope,
+memfabric/dry-run/allowlist untouched, apex off the VPN.
+
+**Tests** (`tests/apex_host/test_web_budget.py`, REAL planner/parser/gate): the
+config default (10) + validation (`0`/`101` rejected) + CLI override + the
+`builder`/`GlobalPlanner` wiring; the new keywords rank as high-signal; a
+single-page flow reaches the invite API within budget; a **9-page** site reaches
+it at web-turn **6** — proving the old budget of 5 would have starved it and the
+new 10 reaches it; and the gate stays incomplete (never premature completion)
+while a discovered page has an unfetched `<script src>`. A new
+`web_budget_reaches_invite` release-gate scenario drives the full multi-turn
+flow (IP→vhost → homepage → discovered pages → `/invite` → its JS → `/api`
+extracted) and asserts it is reached past turn 5 and within the budget. These
+**fail** against the pre-§28.28 hardcoded/unwired budget.
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

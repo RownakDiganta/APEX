@@ -2069,6 +2069,103 @@ async def scenario_web_js_api_discovery() -> ScenarioResult:
     )
 
 
+async def scenario_web_budget_reaches_invite() -> ScenarioResult:
+    """§28.28 — the web-phase budget is large enough to traverse a realistic
+    multi-page site to depth 2 (homepage → a discovered page like /invite → its
+    JS → API) within budget. Drives the REAL web planner turn-by-turn from a bare
+    host+service through the IP→vhost redirect; asserts the invite API is reached
+    at a turn that the OLD hardcoded budget of 5 would have starved, and within
+    the new default budget of 10 — and that the web-evidence gate never marks
+    complete before the invite API appears."""
+    from typing import cast
+
+    from apex_host.config import ApexConfig
+    from apex_host.graph_state import ApexGraphState
+    from apex_host.orchestration.parsing_node import parse_single_result
+    from apex_host.planners.phase_gates import web_evidence_status
+    from apex_host.planners.web_planner import _WebDeterministic
+    from apex_host.tools.registry import ToolRegistry
+    from memfabric.types import EvidenceBundle, Goal
+
+    name = "web_budget_reaches_invite"
+    _VHOST = "app.example.htb"
+    problems: list[str] = []
+    api = _make_api()
+    await _seed_node(api, _ANCHOR, "host", {"ip": _TARGET})
+    await _seed_node(api, f"service:{_TARGET}:80/tcp", "service",
+                     {"port": "80", "proto": "tcp", "state": "open", "service": "http"})
+    await _seed_edge(api, _ANCHOR, f"service:{_TARGET}:80/tcp", "exposes")
+
+    cfg = ApexConfig(target=_TARGET, dry_run=True, allowed_tools=["curl"])
+    default_budget = cfg.web_phase_budget
+    planner = _WebDeterministic(_TARGET, ToolRegistry.from_config(cfg))
+    goal = Goal(id="g", description="web", phase="web", anchor_node=_ANCHOR)
+    empty = EvidenceBundle(query="", entries=[], subgraph=None, tiers_queried=[])
+    st = cast("ApexGraphState", {"target": _TARGET})
+
+    async def rf(parser: str, target: str, body: str) -> None:
+        obs, _ = parse_single_result(
+            {"tool": "curl", "parser": parser, "args": ["-s", target],
+             "target": target, "stdout": body}, st)
+        await api.apply_deltas(nodes=obs.node_deltas, edges=obs.edge_deltas)
+
+    pages = ["/admin", "/login", "/dashboard", "/user", "/manage",
+             "/config", "/backup", "/upload", "/invite"]
+    links = "".join(f'<a href="{p}">x</a>' for p in pages)
+    homepage = (f'<html><head><script src="/js/home.min.js"></script></head>'
+                f'<body>{links}</body></html>')
+    invite = '<html><head><script src="/js/inviteapi.min.js"></script></head><body>x</body></html>'
+
+    def resp(target: str, parser: str) -> str:
+        if _TARGET in target:
+            return (f"HTTP/1.1 301 Moved\r\nLocation: http://{_VHOST}/\r\n\r\n"
+                    if parser == "command" else "<html></html>")
+        if target.endswith("/invite"):
+            return invite
+        if target.endswith("inviteapi.min.js"):
+            return '$.post("/api/v1/invite/generate");'
+        if target.endswith(".min.js"):
+            return "console.log(1)"
+        if any(target.endswith(pg) for pg in pages):
+            return '<html><head><script src="/js/x.min.js"></script></head></html>'
+        return homepage
+
+    fetched: set[tuple[str, str]] = set()
+    reached_turn = 99
+    for turn in range(1, default_budget + 1):
+        sub = await api.get_subgraph(_ANCHOR, depth=12)
+        if web_evidence_status(sub).complete:
+            problems.append(f"web marked complete at turn {turn} before the invite API was reached")
+        res = await planner.plan(goal, sub, empty)
+        tasks = res if isinstance(res, list) else []
+        for t in tasks:
+            key = (t.params.get("target", ""), t.params.get("parser", ""))
+            if t.params.get("parser") in ("command", "curl_body", "js") and key not in fetched:
+                fetched.add(key)
+                await rf(t.params["parser"], t.params["target"],
+                         resp(t.params["target"], t.params["parser"]))
+        sub2 = await api.get_subgraph(_ANCHOR, depth=12)
+        if any("/api/v1/invite" in str(n.props.get("url", "")) for n in sub2.nodes):
+            reached_turn = turn
+            break
+
+    if reached_turn == 99:
+        return ScenarioResult(name, False,
+                              f"invite API never reached within the web budget ({default_budget})")
+    if reached_turn <= 5:
+        problems.append(
+            f"invite API reached at turn {reached_turn} — scenario too easy to prove the budget "
+            "(old budget of 5 must be shown insufficient)")
+    if problems:
+        return ScenarioResult(name, False, "; ".join(problems))
+    return ScenarioResult(
+        name, True,
+        f"multi-page site: IP→vhost redirect → homepage → discovered pages → /invite → its JS → "
+        f"/api/v1/invite extracted at web-turn {reached_turn} (old budget 5 would starve it; "
+        f"new budget {default_budget} reaches it); web-evidence gate stayed incomplete until then",
+    )
+
+
 class _ReconFtpFakeBackend:
     """A synthetic ``ToolBackend`` that makes recon DISCOVER an FTP service (so
     the engagement is still in current_phase="recon" when the credential gate
@@ -2569,6 +2666,7 @@ SCENARIOS: list[Any] = [
     scenario_web_endpoint_fetch_loop,
     scenario_web_api_surface_discovery,
     scenario_web_js_api_discovery,
+    scenario_web_budget_reaches_invite,
     scenario_recon_service_no_credentials_honest_outcome,
     scenario_ftp_anonymous_access,
     scenario_ftp_validation_via_tool_service,

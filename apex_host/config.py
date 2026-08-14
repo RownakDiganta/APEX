@@ -87,6 +87,12 @@ class ApexConfig:
     max_turns: int = 20
     max_concurrency: int = 2
     max_retries: int = 1
+    # §28.28 — web-phase turn budget (fed to GlobalPlanner's phase_budgets).
+    # Principled bound to traverse to depth 2 for a normal app with headroom:
+    # IP→vhost redirect + homepage/API-root probes + several high-signal pages
+    # (3/turn) + their JS assets (3/turn) + JS-discovered /api fetches. Raised
+    # from the old hardcoded 5, which starved a discovered page like /invite.
+    web_phase_budget: int = 10
     # Safe web probing — wordlist-based discovery is opt-in.
     # Set web_wordlist_path to enable ffuf/gobuster directory discovery.
     # Without a wordlist, WebPlanner emits only bounded curl probes (HEAD + body).
@@ -687,6 +693,7 @@ class ApexConfig:
             "target": getattr(args, "target"),
             "payload_repo_path": _g("payload_repo", "./payloads"),
             "max_turns": _g("max_turns", 20),
+            "web_phase_budget": _g("web_phase_budget", 10),
             "dry_run": bool(_g("dry_run", True)),
             "web_wordlist_path": _g("web_wordlist", None),
             "max_web_paths": _g("max_web_paths", 50),

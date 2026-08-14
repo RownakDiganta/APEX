@@ -237,7 +237,12 @@ def build_apex_graph(
 
     deps = OrchestrationDeps(
         api=api, dispatcher=dispatcher,
-        global_planner=GlobalPlanner(max_turns=config.max_turns),
+        global_planner=GlobalPlanner(
+            max_turns=config.max_turns,
+            # §28.28 — feed the configurable web-phase budget so a discovered
+            # high-signal page (e.g. /invite) is reached within budget.
+            phase_budgets={"web": getattr(config, "web_phase_budget", 10)},
+        ),
         phase_planners=phase_planners,
         repair_engine=repair_engine, config=config,
         anchor_id=_host_id(config.target),
