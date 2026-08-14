@@ -2488,6 +2488,16 @@ same-origin full URL is used as-is; cross-origin, protocol-relative, `data:`, an
 anchor values are rejected. Before this fix the JS fetch 404'd on any sub-path
 page, so no API endpoints were ever extracted. See CLAUDE.md §28.25.
 
+**jQuery API refs + fetch prioritization (§28.26).** The static JS extractor also
+reads jQuery-style calls — `$.ajax({… url: "…" …})`, `$.get("…")`, `$.post("…")`,
+`$.getJSON("…")` — and accepts a same-origin full URL (reduced to its path),
+while still rejecting cross-origin and never executing the JS. And the bounded web
+fetch loop now spends its budget on real pages, discovered API paths, and linked
+JavaScript **before** low-signal static assets (css/images/fonts are never fetched
+for discovery), ranking JS on high-signal pages first — so a linked bundle like
+`inviteapi.min.js` is fetched within budget instead of being crowded out by
+homepage assets. See CLAUDE.md §28.26.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,

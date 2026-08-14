@@ -299,3 +299,104 @@ class TestScriptSrcUrlResolution:
             {"target": _IP})
         api_paths = {n.props.get("path") for n in obs.node_deltas if n.type == "endpoint"}
         assert "/api/v1/invite/how/to/generate" in api_paths
+
+
+# ---------------------------------------------------------------------------
+# 6. §28.26 — jQuery-style extraction coverage (BUG1)
+# ---------------------------------------------------------------------------
+class TestJqueryExtraction:
+    """Static extraction of API refs from jQuery calls — never executes the JS."""
+
+    def _paths(self, js: str) -> set:
+        obs, _ = parse_single_result(
+            {"tool": "curl", "parser": "js", "args": ["-s", f"http://{_VHOST}/js/x.js"],
+             "target": f"http://{_VHOST}/js/x.js", "stdout": js},
+            {"target": _IP})
+        return {n.props.get("path") for n in obs.node_deltas
+                if n.type == "endpoint" and n.props.get("path")}
+
+    def test_ajax_options_object_url_extracted(self) -> None:
+        assert "/api/v1/x" in self._paths('$.ajax({type:"POST",dataType:"json",url:"/api/v1/x"});')
+
+    def test_dollar_get_extracted(self) -> None:
+        assert "/api/y" in self._paths('$.get("/api/y");')
+
+    def test_dollar_post_and_getjson_nonapi_extracted(self) -> None:
+        # The real gap: jQuery methods with a non-/api same-origin path were missed.
+        paths = self._paths('$.post("/login/submit", d); $.getJSON("/user/data");')
+        assert "/login/submit" in paths and "/user/data" in paths
+
+    def test_generic_url_key_extracted(self) -> None:
+        assert "/api/z" in self._paths('var o={method:"GET",url:"/api/z"};')
+
+    def test_same_origin_full_url_reduced_to_path(self) -> None:
+        assert "/api/v1/full" in self._paths(f'$.ajax({{url:"http://{_VHOST}/api/v1/full"}});')
+
+    def test_cross_origin_url_rejected(self) -> None:
+        paths = self._paths('$.ajax({url:"https://evil.com/api/steal"}); $.get("https://evil.com/x");')
+        assert not any("evil.com" in str(p) or "steal" in str(p) for p in paths)
+
+    def test_bare_word_url_rejected(self) -> None:
+        assert self._paths('var o={url:"json"};') == set()
+
+    def test_js_still_never_executed(self) -> None:
+        # A runtime-concatenated URL inside a jQuery call is not recovered.
+        assert "/api/v1/dyn" not in self._paths('var p="/ap"+"i/v1/dyn"; $.get(base+p);')
+
+
+# ---------------------------------------------------------------------------
+# 7. §28.26 — fetch-loop prioritization (BUG2)
+# ---------------------------------------------------------------------------
+class TestFetchPrioritization:
+    """High-signal JS/API endpoints are fetched before low-signal static assets,
+    within the bounded per-turn budget."""
+
+    def _nodes_with_assets(self) -> list[Node]:
+        return _base_nodes() + [
+            _node(f"endpoint:http://{_VHOST}/css/style.css", "endpoint",
+                  {"url": f"http://{_VHOST}/css/style.css", "path": "/css/style.css"}, source="curl_body"),
+            _node(f"endpoint:http://{_VHOST}/img/logo.png", "endpoint",
+                  {"url": f"http://{_VHOST}/img/logo.png", "path": "/img/logo.png"}, source="curl_body"),
+            _node(f"endpoint:http://{_VHOST}/fonts/a.woff2", "endpoint",
+                  {"url": f"http://{_VHOST}/fonts/a.woff2", "path": "/fonts/a.woff2"}, source="curl_body"),
+            _node(f"endpoint:http://{_VHOST}/js/inviteapi.min.js", "endpoint",
+                  {"url": f"http://{_VHOST}/js/inviteapi.min.js", "js_asset": True}, source="curl_body"),
+        ]
+
+    def test_static_assets_excluded_from_page_fetches(self) -> None:
+        pend = pending_page_fetches(_subgraph(self._nodes_with_assets()))
+        paths = {n.props.get("path") for n in pend}
+        assert "/css/style.css" not in paths
+        assert "/img/logo.png" not in paths
+        assert "/fonts/a.woff2" not in paths
+
+    def test_invite_js_fetched_and_no_asset_fetch_emitted(self) -> None:
+        planner = _WebDeterministic(_IP, ToolRegistry(["curl"]))
+        tasks = _plan(planner, self._nodes_with_assets())
+        # The /invite JS IS fetched (parser "js", --resolve GET).
+        js_fetch = [t for t in tasks if t.params.get("parser") == "js"]
+        assert any("inviteapi.min.js" in t.params["target"] for t in js_fetch)
+        # No css/image/font is ever fetched (they yield no API references).
+        targets = " ".join(t.params.get("target", "") for t in tasks)
+        assert ".css" not in targets and ".png" not in targets and ".woff2" not in targets
+
+    def test_api_endpoint_ranks_before_plain_page(self) -> None:
+        nodes = _base_nodes() + [
+            _node(f"endpoint:http://{_VHOST}/team", "endpoint",
+                  {"url": f"http://{_VHOST}/team", "path": "/team"}, source="curl_body"),
+            _node(f"endpoint:http://{_VHOST}/api/v1/user", "endpoint",
+                  {"url": f"http://{_VHOST}/api/v1/user", "path": "/api/v1/user"}, source="js_analysis"),
+        ]
+        order = [n.props.get("path") for n in pending_page_fetches(_subgraph(nodes))]
+        assert order.index("/api/v1/user") < order.index("/team")
+
+    def test_high_signal_page_js_ranked_first(self) -> None:
+        # inviteapi.min.js (own path contains "api") beats a homepage bundle.
+        nodes = _base_nodes() + [
+            _node(f"endpoint:http://{_VHOST}/js/htb-frontpage.min.js", "endpoint",
+                  {"url": f"http://{_VHOST}/js/htb-frontpage.min.js", "js_asset": True}, source="curl_body"),
+            _node(f"endpoint:http://{_VHOST}/js/inviteapi.min.js", "endpoint",
+                  {"url": f"http://{_VHOST}/js/inviteapi.min.js", "js_asset": True}, source="curl_body"),
+        ]
+        order = [n.props["url"].rsplit("/", 1)[-1] for n in pending_js_assets(_subgraph(nodes))]
+        assert order.index("inviteapi.min.js") < order.index("htb-frontpage.min.js")

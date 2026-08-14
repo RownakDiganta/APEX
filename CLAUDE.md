@@ -11166,6 +11166,72 @@ root-absolute `href="/admin"` from `/invite` → `http://<vhost>/admin`; end-to-
 release-gate scenario both assert the host-root URL, so they **fail** against the
 pre-§28.25 directory-relative join.
 
+### 28.26 jQuery API-ref extraction + prioritize JS/API fetches over static assets
+
+> **Numbering note:** highest unique §28 heading is §28.25 (the trailing
+> `### 28.7`/`### 28.8` are the known pre-existing collision). This section is
+> **§28.26**; nothing was renumbered.
+
+Two bugs from a live TwoMillion run left API discovery empty even after §28.24/25
+fixed the JS URLs. Both are DISCOVERY ONLY — static extraction, JS never executed.
+
+**BUG 1 (extraction coverage — `apex_host/parsers/js_parser.py`).** The static
+extractor matched `fetch()`/`axios()`, `XMLHttpRequest.open()`, `/api…` literals,
+and `url:"/…"` keys, but MISSED **jQuery-style** API calls: the fetched
+`/js/htb-frontpage.min.js` uses `$.ajax({type:"POST", dataType:"json", url:"…"})`
+(and `$.get`/`$.post`) — real API refs — and nothing was extracted. Two gaps:
+`$.get(…)`/`$.post(…)`/`$.getJSON(…)` were not matched at all (only `fetch`/
+`axios`), and `_URL_ASSIGN_RE` required a **leading `/`**, so a same-origin FULL
+URL in `url:"http://<host>/api/x"` was dropped. Fix:
+
+- new `_JQUERY_RE` matches `$.get("…")` / `$.post("…")` / `$.getJSON("…")` /
+  `$.load("…")` / positional `$.ajax("…")` string literals (the options-object
+  `$.ajax({url:"…"})` is still handled by the `url:` key). Static literal read
+  only — the JS is never executed or evaluated.
+- `_URL_ASSIGN_RE`'s value is broadened, and `_same_origin_path(candidate,
+  page_host)` now accepts a **same-origin full URL** (host equals the fetched JS
+  file's own host, from `target`, NOT the authorized IP — mirrors §28.25) reduced
+  to its path, while cross-origin, protocol-relative, and bare-word values are
+  rejected. So `$.get("/set/session")` (a non-`/api` same-origin path) and
+  `$.ajax({url:"http://<host>/api/x"})` are extracted; `$.get("https://evil/…")`
+  is not. A runtime-concatenated URL (`"/ap"+"i/…"`) is still never recovered.
+
+**BUG 2 (fetch ordering/budget — `apex_host/planners/web_opportunities.py`).** The
+bounded web fetch loop hit its turn limit on the homepage + homepage JS + static
+assets and NEVER fetched `/invite`'s JS. Two causes: `pending_page_fetches`
+included low-signal `<link href>` **static assets** (css/favicon/fonts) that
+compete with a real page like `/invite` for the `_MAX_ENDPOINT_FETCHES` budget
+yet yield no API refs; and `pending_js_assets` was ranked **alphabetically**, so a
+homepage bundle beat `/js/inviteapi.min.js`. Fix:
+
+- `pending_page_fetches` excludes `_STATIC_ASSET_EXTS` (`.css`, images, fonts,
+  `.map`, media, archives — **not** `.js`, which is fetched as JS separately), and
+  ranks confirmed API references first (`_fetch_priority`: `source=js_analysis` or
+  an `/api`-prefixed path → 0). Freeing the budget lets `/invite` (and JS-found
+  `/api/…`) be fetched instead of css/images.
+- `pending_js_assets` ranks by the **referencing page's** interest (via the
+  `contains` edge page→js_asset), then the JS file's own path interest, then URL —
+  so JS on a high-signal page (or a bundle whose own name signals `api`, e.g.
+  `inviteapi.min.js`) is fetched first, within budget.
+
+Everything else is unchanged: GET via `--resolve -L`, same-origin/vhost only,
+cross-origin rejected, no POST, bounded, `runner`→`safety`, policy scope,
+memfabric/dry-run/allowlist untouched, apex off the VPN, keys-only (no secrets).
+No new node/edge type or prop; the `web_evidence_status` gate naturally no longer
+waits on excluded assets.
+
+**Tests** (`tests/apex_host/test_web_js_discovery.py`, REAL router/planner/safety/
+policy): BUG1 — `$.ajax({url:"/api/v1/x"})`, `$.get("/api/y")`, `$.post`/`$.getJSON`
+non-`/api` paths, generic `url:` keys, and a same-origin full URL are all
+extracted; a cross-origin URL and a bare word are rejected; a concatenated URL is
+not (never executed). BUG2 — css/image/font endpoints are excluded from
+`pending_page_fetches`; the `/invite` JS is fetched and no css/image is; a
+`js_analysis`/`api` endpoint ranks before a plain page; `inviteapi.min.js` ranks
+before a homepage bundle. The `web_js_api_discovery` release-gate scenario now
+uses a jQuery same-origin-full-URL API ref and links css/image assets on
+`/invite`, so it **fails** against the pre-§28.26 code (no jQuery extraction /
+asset-first ordering).
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

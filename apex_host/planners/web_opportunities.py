@@ -192,6 +192,37 @@ def _url_path(url: str) -> str:
         return "/"
 
 
+#: Low-signal static-asset extensions that yield NO API references — never worth
+#: a GET for discovery (§28.26). Excluded from the page-fetch loop so the bounded
+#: budget goes to real pages (e.g. /invite) and API paths instead of css/images/
+#: fonts. ``.js`` is NOT here — script assets are fetched+parsed as JS separately.
+_STATIC_ASSET_EXTS: frozenset[str] = frozenset({
+    ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot", ".map", ".mp4", ".webm", ".mp3",
+    ".wav", ".ogg", ".pdf", ".zip", ".gz", ".tar", ".avif",
+})
+
+
+def _is_static_asset(url: str) -> bool:
+    """True if *url*'s path ends in a low-signal static-asset extension."""
+    path = _url_path(url).lower()
+    dot = path.rfind(".")
+    return dot != -1 and path[dot:] in _STATIC_ASSET_EXTS
+
+
+def _fetch_priority(node: "Node") -> int:
+    """Primary page-fetch ordering (§28.26): confirmed API references first.
+
+    A JS-extracted reference (``source=js_analysis``) or an ``/api``-prefixed
+    path is a high-value fetch (JSON-structure mapping) and sorts ahead of a
+    plain discovered link. 0 = highest priority."""
+    if node.source == "js_analysis":
+        return 0
+    if _url_path(str(node.props.get("url", ""))).lower().startswith("/api"):
+        return 0
+    return 1
+
+
 def pending_enumerated_endpoints(subgraph: "SubgraphView") -> list["Node"]:
     """Discovered-but-unfetched enumeration endpoints, ranked highest-signal
     first (§28.13).
@@ -263,11 +294,15 @@ def pending_page_fetches(subgraph: "SubgraphView") -> list["Node"]:
         and n.source in _PAGE_FETCH_SOURCES
         and str(n.props.get("url", ""))
         and str(n.props.get("status", "")).strip() != "404"
+        # §28.26 — never spend the bounded page-fetch budget on css/images/fonts;
+        # they yield no API references. Real pages (e.g. /invite) and API paths win.
+        and not _is_static_asset(str(n.props.get("url", "")))
         and _url_path(str(n.props.get("url", ""))) not in fetched_paths
     ]
     return sorted(
         candidates,
         key=lambda n: (
+            _fetch_priority(n),  # §28.26 — confirmed API references (js_analysis/api) first
             _path_interest_rank(str(n.props.get("url", ""))),
             _path_depth(str(n.props.get("url", ""))),
             str(n.props.get("url", "")),
@@ -277,8 +312,20 @@ def pending_page_fetches(subgraph: "SubgraphView") -> list["Node"]:
 
 def pending_js_assets(subgraph: "SubgraphView") -> list["Node"]:
     """Discovered-but-unfetched JavaScript assets (``js_asset=True``) the web loop
-    should GET and statically parse for API references (§28.24). Unfetched, ranked
-    deterministically. The JS is fetched and READ, never executed."""
+    should GET and statically parse for API references (§28.24). Ranked so the JS
+    on a HIGH-SIGNAL page (e.g. /invite, /login) is fetched BEFORE homepage bundles
+    within the bounded budget (§28.26): by the referencing page's interest, then
+    the JS file's own path interest, then URL. The JS is READ, never executed."""
+    # Map each js_asset endpoint id -> the highest-signal page that referenced it
+    # (via the ``contains`` edge page -> js_asset written by parse_curl_body).
+    ref_page_url: dict[str, str] = {}
+    node_url = {n.id: str(n.props.get("url", "")) for n in subgraph.nodes if n.type == "endpoint"}
+    for e in subgraph.edges:
+        if e.type == "contains" and e.to_id in node_url and e.from_id in node_url:
+            src_url = node_url[e.from_id]
+            cur = ref_page_url.get(e.to_id)
+            if cur is None or _path_interest_rank(src_url) < _path_interest_rank(cur):
+                ref_page_url[e.to_id] = src_url
     candidates = [
         n for n in subgraph.nodes
         if n.type == "endpoint"
@@ -287,7 +334,13 @@ def pending_js_assets(subgraph: "SubgraphView") -> list["Node"]:
         and n.props.get("browsed") is not True
         and str(n.props.get("url", ""))
     ]
-    return sorted(candidates, key=lambda n: str(n.props.get("url", "")))
+
+    def _rank(n: "Node") -> tuple[int, int, str]:
+        own = str(n.props.get("url", ""))
+        page = ref_page_url.get(n.id, own)
+        return (_path_interest_rank(page), _path_interest_rank(own), own)
+
+    return sorted(candidates, key=_rank)
 
 
 def technologies_from_subgraph(subgraph: "SubgraphView") -> list[dict[str, Any]]:

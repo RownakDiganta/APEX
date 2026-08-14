@@ -1976,10 +1976,13 @@ async def scenario_web_js_api_discovery() -> ScenarioResult:
         return ScenarioResult(name, False, "planner did not fetch the discovered /invite page")
     if "--resolve" not in inv_body.params["args"]:
         problems.append("/invite fetch not --resolve pinned")
-    # /invite's HTML links its JS.
+    # /invite's HTML links its JS plus low-signal static assets (css/image) that
+    # must NOT consume the bounded fetch budget (§28.26 BUG2).
     await _run("curl_body", inv_body.params["target"],
                f'<!DOCTYPE html><html><head><title>{_VHOST}</title>'
-               '<script src="/js/inviteapi.min.js"></script></head><body>invite</body></html>')
+               '<link rel="stylesheet" href="/css/app.css">'
+               '<script src="/js/inviteapi.min.js"></script></head>'
+               '<body><a href="/img/logo.png">logo</a>invite</body></html>')
     sub2 = await api.get_subgraph(_ANCHOR, depth=6)
     js_assets = [n for n in sub2.nodes if n.type == "endpoint" and n.props.get("js_asset") is True]
     if not js_assets:
@@ -2000,6 +2003,10 @@ async def scenario_web_js_api_discovery() -> ScenarioResult:
                      and t.params.get("parser") == "js"), None) if isinstance(tasks2, list) else None
     if js_fetch is None:
         return ScenarioResult(name, False, "planner did not fetch the discovered JS asset")
+    # §28.26 BUG2 — the bounded fetch budget goes to the JS, never to css/images.
+    t2_targets = " ".join(t.params.get("target", "") for t in tasks2) if isinstance(tasks2, list) else ""
+    if "/css/app.css" in t2_targets or "/img/logo.png" in t2_targets:
+        problems.append("low-signal static asset (css/image) was fetched instead of the JS")
     ja = js_fetch.params["args"]
     if "--resolve" not in ja or "-L" not in ja:
         problems.append("JS fetch not --resolve -L pinned")
@@ -2009,10 +2016,15 @@ async def scenario_web_js_api_discovery() -> ScenarioResult:
         check_command(ToolCommand(tool="curl", args=ja), config)
     except ValueError as exc:
         problems.append(f"safety.py rejected the JS fetch: {exc}")
-    # The JS statically references an API endpoint (never executed).
+    # §28.26 BUG1 — the JS references its API via a jQuery $.ajax call with a
+    # same-origin FULL URL (the pre-fix parser missed BOTH jQuery calls AND
+    # same-origin full URLs, so no /api endpoint was extracted). A cross-origin
+    # $.get is ignored. Static literal read only — the JS is never executed.
     await _run("js", js_fetch.params["target"],
-               'fetch("/api/v1/invite/how/to/generate").then(r=>r.json());'
-               'const ext="https://evil.com/api/steal";')  # cross-origin must be ignored
+               '$.ajax({type:"POST",dataType:"json",url:"'
+               + f"http://{_VHOST}/api/v1/invite/how/to/generate"
+               + '"});'
+               '$.get("https://evil.com/api/steal");')  # cross-origin must be ignored
     sub3 = await api.get_subgraph(_ANCHOR, depth=7)
     api_eps = [n for n in sub3.nodes if n.type == "endpoint"
                and str(n.props.get("url", "")).endswith("/api/v1/invite/how/to/generate")]
