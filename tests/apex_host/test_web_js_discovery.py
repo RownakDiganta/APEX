@@ -400,3 +400,103 @@ class TestFetchPrioritization:
         ]
         order = [n.props["url"].rsplit("/", 1)[-1] for n in pending_js_assets(_subgraph(nodes))]
         assert order.index("inviteapi.min.js") < order.index("htb-frontpage.min.js")
+
+
+# ---------------------------------------------------------------------------
+# 8. §28.27 — one shared urljoin resolver for src/href on ANY page path
+# ---------------------------------------------------------------------------
+class TestUrlResolutionRootCause:
+    """The exact live failing case (sub-path page, no trailing slash) plus every
+    page-path shape — one urljoin-based resolver, host-root for leading-/."""
+
+    def _js_urls(self, page: str, html: str) -> set:
+        obs, _ = parse_single_result(
+            {"tool": "curl", "parser": "curl_body", "args": ["-s", page],
+             "target": page, "stdout": html}, {"target": _IP})
+        return {n.props["url"] for n in obs.node_deltas
+                if n.type == "endpoint" and n.props.get("js_asset") is True}
+
+    _S = '<html><head><script src="/js/inviteapi.min.js"></script></head></html>'
+    _HOST_ROOT = None  # set in tests
+
+    def test_no_trailing_slash_subpath_resolves_to_host_root(self) -> None:
+        # THE live bug: /invite (no trailing slash) must NOT give /invite/js/...
+        assert self._js_urls(f"http://{_VHOST}/invite", self._S) == {
+            f"http://{_VHOST}/js/inviteapi.min.js"}
+
+    def test_trailing_slash_subpath_resolves_to_host_root(self) -> None:
+        assert self._js_urls(f"http://{_VHOST}/invite/", self._S) == {
+            f"http://{_VHOST}/js/inviteapi.min.js"}
+
+    def test_deep_path_resolves_to_host_root(self) -> None:
+        assert self._js_urls(f"http://{_VHOST}/a/b/c", self._S) == {
+            f"http://{_VHOST}/js/inviteapi.min.js"}
+
+    def test_homepage_resolves_to_host_root(self) -> None:
+        assert self._js_urls(f"http://{_VHOST}", self._S) == {
+            f"http://{_VHOST}/js/inviteapi.min.js"}
+
+    def test_relative_src_resolves_to_page_directory(self) -> None:
+        urls = self._js_urls(f"http://{_VHOST}/invite",
+                             '<html><head><script src="sub/x.js"></script></head></html>')
+        assert urls == {f"http://{_VHOST}/invite/sub/x.js"}
+
+    def test_full_url_same_origin_src_used_as_is(self) -> None:
+        urls = self._js_urls(
+            f"http://{_VHOST}/invite",
+            f'<html><head><script src="http://{_VHOST}/assets/m.js"></script></head></html>')
+        assert urls == {f"http://{_VHOST}/assets/m.js"}
+
+
+# ---------------------------------------------------------------------------
+# 9. §28.27 — a JS-asset URL returning an HTML body must NOT be JS-parsed (BUG3)
+# ---------------------------------------------------------------------------
+class TestJsHtmlBodyGuard:
+    def _js_parse(self, target: str, body: str) -> list:
+        obs, _ = parse_single_result(
+            {"tool": "curl", "parser": "js", "args": ["-s", target],
+             "target": target, "stdout": body}, {"target": _IP})
+        return obs.node_deltas
+
+    def test_html_body_not_extracted_as_js(self) -> None:
+        # nginx served the SPA index (HTML) for a missing .js — an inline /api
+        # literal in that HTML must NOT be extracted (current code WOULD extract it).
+        body = ('<!DOCTYPE html><html><head><script src="/js/htb-frontend.min.js"></script>'
+                '</head><body>fetch("/api/v1/leak")</body></html>')
+        nodes = self._js_parse(f"http://{_VHOST}/js/inviteapi.min.js", body)
+        api = {n.props.get("path") for n in nodes
+               if n.type == "endpoint" and n.props.get("js_asset") is not True}
+        assert api == set()  # nothing extracted from an HTML body
+
+    def test_html_body_produces_no_compound_urls(self) -> None:
+        body = ('<!DOCTYPE html><html><head><a href="images/favicon.png">x</a>'
+                '<script src="/js/htb-frontend.min.js"></script></head></html>')
+        nodes = self._js_parse(f"http://{_VHOST}/invite/js/inviteapi.min.js", body)
+        urls = {str(n.props.get("url", "")) for n in nodes}
+        assert not any("inviteapi.min.js/" in u for u in urls)  # no /…/inviteapi.min.js/images/…
+
+    def test_html_body_marks_asset_fetched_no_refetch_loop(self) -> None:
+        nodes = self._js_parse(f"http://{_VHOST}/js/x.js", "<!DOCTYPE html><html></html>")
+        js = next(n for n in nodes if n.props.get("js_asset") is True)
+        assert js.props.get("fetched") is True  # recorded, so it is not re-fetched
+
+    def test_real_js_body_still_extracted(self) -> None:
+        nodes = self._js_parse(f"http://{_VHOST}/js/x.js",
+                               '$.post("/api/v1/a"); fetch("/api/v1/b");')
+        api = {n.props.get("path") for n in nodes if n.props.get("path")}
+        assert "/api/v1/a" in api and "/api/v1/b" in api
+
+    def test_end_to_end_invite_no_slash_to_js_to_api(self) -> None:
+        # /invite (no trailing slash) → correct host-root JS URL → real JS body
+        # (jQuery + fetch) → API endpoints extracted.
+        page_obs, _ = parse_single_result(
+            {"tool": "curl", "parser": "curl_body", "args": ["-s", f"http://{_VHOST}/invite"],
+             "target": f"http://{_VHOST}/invite",
+             "stdout": '<html><head><script src="/js/inviteapi.min.js"></script></head></html>'},
+            {"target": _IP})
+        js_url = next(n.props["url"] for n in page_obs.node_deltas if n.props.get("js_asset"))
+        assert js_url == f"http://{_VHOST}/js/inviteapi.min.js"
+        js_nodes = self._js_parse(
+            js_url, '$.ajax({type:"POST",url:"/api/v1/invite/how/to/generate"});')
+        api = {n.props.get("path") for n in js_nodes if n.props.get("path")}
+        assert "/api/v1/invite/how/to/generate" in api

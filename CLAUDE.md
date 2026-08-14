@@ -11232,6 +11232,69 @@ uses a jQuery same-origin-full-URL API ref and links css/image assets on
 `/invite`, so it **fails** against the pre-§28.26 code (no jQuery extraction /
 asset-first ordering).
 
+### 28.27 One shared urljoin resolver + guard JS parsing against HTML bodies
+
+> **Numbering note:** highest unique §28 heading is §28.26 (the trailing
+> `### 28.7`/`### 28.8` are the known pre-existing collision). This section is
+> **§28.27**; nothing was renumbered.
+
+Root-cause pass on the recurring URL-resolution bug (3rd time) plus a real
+guard. All DISCOVERY ONLY — the JS is never executed.
+
+**Root cause — duplicated/bespoke resolution.** §28.25 fixed
+`command_parser`'s `<script src>`/`href` join to use `urljoin`, but two other
+code paths still built URLs with **bespoke string joins**: `js_parser` used
+`base = "{scheme}://{netloc}"; api_url = base + path`, and `WebPlanner`'s fetch
+loop rebuilt every fetch URL as `base_url.rstrip('/') + urlsplit(node_url).path`
+(the API-probe, GraphQL, page-fetch, and JS-fetch sites). These happened to be
+correct only because `base_url`/`base` carried no path — a fragile invariant, and
+exactly the class of bug that produced the live compound-garbage URLs
+(`/invite/js/inviteapi.min.js/images/favicon.png` — a link resolved against an
+already-wrong sub-path URL). Fix: **one shared resolver.**
+`command_parser._resolve_same_origin_url(page_url, value, page_host)` (urljoin,
+§28.25) is now the SINGLE source of truth:
+
+- `js_parser` imports and uses it — a leading-`/` reference resolves to the HOST
+  ROOT, a same-origin full URL is used as-is, cross-origin/protocol-relative/bare
+  words are rejected. The bespoke `base + path` is gone; `_same_origin_path` is
+  removed. (A bare-relative literal in a JS body is still not treated as a URL —
+  it is filtered before the resolver so a JS filename is never resolved as a dir.)
+- `WebPlanner`'s four fetch-URL rebuilds use `urljoin(base_url, path)` instead of
+  the `rstrip('/')` string concat, so a leading-`/` node path always resolves to
+  the host root regardless of `base_url`'s shape.
+
+A root-absolute `/js/x` on ANY page (`/`, `/invite`, `/invite/`, `/a/b/c`) now
+yields host-root `http://h/js/x`; a relative `sub/x` resolves against the page
+directory; a same-origin full URL is used as-is.
+
+**Guard — never JS-parse an HTML body (BUG3, real).** When a JS-asset URL 404s to
+the app, nginx serves the SPA `index.html` (HTTP 200). `js_parser.parse_js` ran
+the static extractor on that HTML, marking it `js_analyzed` and mining inline
+literals — extracting nothing useful and (in the pre-§28.25 world) helping spawn
+the compound garbage. Fix: `parse_js` now detects a non-JavaScript body (a
+JavaScript file never begins with `<`; after `lstrip()` an HTML/XML body does)
+and **skips extraction entirely** — no API references, no child resolution. It
+still records the asset endpoint as `fetched` so it is not re-fetched. A real JS
+body is parsed exactly as before.
+
+Everything else unchanged: GET via `--resolve -L`, same-origin/vhost only (the
+resolver uses the fetched page/JS host, not the authorized IP — §28.25),
+cross-origin rejected, no POST, bounded, `runner`→`safety`, policy scope,
+memfabric/dry-run/allowlist untouched, apex off the VPN, keys-only. No new
+node/edge type or prop.
+
+**Tests** (`tests/apex_host/test_web_js_discovery.py`, REAL router/parser): the
+exact live case — a page at `http://h/invite` (NO trailing slash) with
+`<script src="/js/inviteapi.min.js">` → `http://h/js/inviteapi.min.js` (host
+root, NOT `/invite/js/...`); also `/invite/`, a deep `/a/b/c` path, the homepage,
+a relative `src`, and a same-origin full-URL `src` — all correct. HTML-as-JS
+guard — a JS-asset URL returning an HTML body extracts NO API refs, produces NO
+compound URLs, still marks the asset fetched, while a real JS body is still
+extracted; end-to-end `/invite` (no slash) → correct JS URL → jQuery/`fetch`
+body → `/api/v1/invite/...` extracted. The `web_js_api_discovery` release-gate
+scenario (which fetches the no-trailing-slash `/invite`) gains a compound-garbage
+guard. The HTML-guard tests **fail** against pre-§28.27 code.
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

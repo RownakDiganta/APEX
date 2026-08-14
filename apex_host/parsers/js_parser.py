@@ -18,7 +18,11 @@ full URL reduced to its path):
   - ``url:``/``endpoint:``/``path:`` assignment string literals.
 
 Cross-origin (a different host) and non-path literals are ignored. A same-origin
-full URL (``http://<same-host>/api/x``) is reduced to its path. Bounded at
+full URL (``http://<same-host>/api/x``) is reduced to its path. All resolution
+goes through the SINGLE shared ``command_parser._resolve_same_origin_url``
+(urljoin — a leading ``/`` always resolves to the host root), §28.27. A body that
+is NOT JavaScript (an HTML page served for a missing ``.js`` — it begins with
+``<``) is never JS-parsed and spawns no references (§28.27). Bounded at
 ``_MAX_JS_ENDPOINTS`` per file.
 """
 from __future__ import annotations
@@ -35,7 +39,11 @@ from apex_host.graph_ids import (
     exposes_edge_id as _exposes_edge_id,
     host_id as _host_id_fn,
 )
-from apex_host.parsers.command_parser import _host_from_target, _normalize_url
+from apex_host.parsers.command_parser import (
+    _host_from_target,
+    _normalize_url,
+    _resolve_same_origin_url,
+)
 
 #: Bound on API endpoints extracted from one JS file — keeps the graph bounded
 #: on a large/minified bundle. Static string extraction only.
@@ -57,39 +65,10 @@ _XHR_OPEN_RE = re.compile(r"""\.open\s*\(\s*["'`][A-Za-z]+["'`]\s*,\s*["'`]([^"'
 _JQUERY_RE = re.compile(
     r"""\$(?:\.(?:get|post|getJSON|ajax|load))\s*\(\s*["'`]([^"'`\s]+)["'`]""")
 #: ``url: "…"`` / ``endpoint = "…"`` / ``path:"…"`` assignment literals. The value
-#: is validated by _same_origin_path (leading-/ path, or a same-origin full URL
-#: reduced to its path — cross-origin and bare words rejected), §28.26.
+#: is resolved by the SHARED _resolve_same_origin_url (leading-/ path → host root,
+#: or a same-origin full URL as-is — cross-origin and bare words rejected), §28.27.
 _URL_ASSIGN_RE = re.compile(r"""(?:url|uri|endpoint|api|path)\s*[:=]\s*["'`]([^"'`\s]+)["'`]""",
                             re.IGNORECASE)
-
-
-def _same_origin_path(candidate: str, page_host: str = "") -> str:
-    """Return the same-origin absolute path of *candidate*, or ``""`` for a
-    cross-origin / protocol-relative / non-path literal.
-
-    A leading-``/`` value is a same-origin absolute path. A FULL URL is accepted
-    only when its host equals *page_host* (the fetched JS file's own host) and
-    reduced to its path — so ``$.ajax({url:"http://<same-host>/api/x"})`` is
-    extracted while a cross-origin URL is rejected (§28.26). Query/fragment are
-    dropped; the JS is never executed."""
-    c = candidate.strip()
-    if not c:
-        return ""
-    if c.startswith("//"):
-        return ""  # protocol-relative — skip (cross-origin by convention)
-    if "://" in c:
-        split = urlsplit(c)
-        if split.scheme not in ("http", "https"):
-            return ""
-        host = (split.hostname or "").lower()
-        if not page_host or host != page_host.lower():
-            return ""  # cross-origin (or unknown page host) — skip
-        path = split.path or "/"
-    elif c.startswith("/"):
-        path = c
-    else:
-        return ""  # relative fragment / bare word — not an absolute site path
-    return path.split("?")[0].split("#")[0].rstrip("/") or "/"
 
 
 class JSParser:
@@ -102,31 +81,47 @@ class JSParser:
 
         timestamp = now()
         js_url = _normalize_url(target)
-        split = urlsplit(js_url)
-        base = f"{split.scheme or 'http'}://{split.netloc}"
         host = _host_from_target(host_ip) if host_ip.strip() else _host_from_target(target)
         h_id = _host_id_fn(host)
         js_id = _endpoint_id(js_url)
-        # Same-origin comparison for full-URL literals uses the FETCHED JS file's
-        # own host (the vhost, from target), NOT the authorized EKG host (the IP).
+        # Same-origin resolution uses the FETCHED JS file's own url as the base and
+        # its own host (the vhost, from target) — NOT the authorized EKG host (IP).
         page_host = _host_from_target(target)
 
-        # Collect candidate same-origin API paths from all patterns (dedup, order
-        # preserved). Static literals only — the JS is NEVER executed.
-        paths: list[str] = []
+        # §28.27 — a JS-asset URL that returns an HTML body (e.g. nginx served the
+        # SPA index for a missing .js) is NOT JavaScript: do NOT run the static
+        # extractor and do NOT resolve any references from it (that produced the
+        # live compound-garbage URLs). Record only that the asset was fetched so it
+        # is not re-fetched. A JavaScript body never begins with '<'.
+        is_js = not text.lstrip().startswith("<")
+
+        # Collect referenced same-origin API URLs (absolute, dedup, order-preserved)
+        # via the SINGLE shared resolver (§28.27) — a leading-/ path resolves to the
+        # HOST ROOT, a same-origin full URL is used as-is, cross-origin/bare-relative
+        # is rejected. Static literals only — the JS is NEVER executed.
+        urls: list[str] = []
         seen: set[str] = set()
 
         def _add(candidate: str) -> None:
-            p = _same_origin_path(candidate, page_host)
-            if p and p != "/" and p not in seen and len(paths) < _MAX_JS_ENDPOINTS:
-                seen.add(p)
-                paths.append(p)
+            c = candidate.strip()
+            # Only a leading-/ path or a full URL is an unambiguous reference; a
+            # bare-relative word in a JS body is not treated as a URL (avoids
+            # resolving it against the JS-file directory and producing garbage).
+            if not (c.startswith("/") or "://" in c):
+                return
+            resolved = _resolve_same_origin_url(js_url, c, page_host)
+            if resolved is None or urlsplit(resolved).path in ("", "/"):
+                return
+            if resolved not in seen and len(urls) < _MAX_JS_ENDPOINTS:
+                seen.add(resolved)
+                urls.append(resolved)
 
-        for m in _API_PATH_RE.finditer(text):
-            _add(m.group(0))
-        for rx in (_FETCH_RE, _XHR_OPEN_RE, _JQUERY_RE, _URL_ASSIGN_RE):
-            for m in rx.finditer(text):
-                _add(m.group(1))
+        if is_js:
+            for m in _API_PATH_RE.finditer(text):
+                _add(m.group(0))
+            for rx in (_FETCH_RE, _XHR_OPEN_RE, _JQUERY_RE, _URL_ASSIGN_RE):
+                for m in rx.finditer(text):
+                    _add(m.group(1))
 
         # Mark the JS asset endpoint analyzed (fetched) so it is not re-fetched.
         nodes: list[Node] = [
@@ -143,13 +138,13 @@ class JSParser:
                 first_seen=timestamp, last_seen=timestamp,
             )
         ]
-        for path in paths:
-            api_url = f"{base}{path}"
+        for api_url in urls:
+            api_path = urlsplit(api_url).path or "/"
             api_id = _endpoint_id(api_url)
             nodes.append(
                 Node(
                     id=api_id, type="endpoint",
-                    props={"url": api_url, "path": path, "referenced_by": js_url},
+                    props={"url": api_url, "path": api_path, "referenced_by": js_url},
                     confidence=0.6, source="js_analysis",
                     first_seen=timestamp, last_seen=timestamp,
                 )

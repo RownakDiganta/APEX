@@ -2053,6 +2053,12 @@ async def scenario_web_js_api_discovery() -> ScenarioResult:
     if "SEKRETCODE" in _json.dumps([n.props for n in sub4.nodes], default=str):
         problems.append("a JSON VALUE leaked into the graph (structure-only violated)")
 
+    # §28.27 — the /invite sub-path (no trailing slash) must not produce a
+    # compound-garbage URL (a link resolved against an already-wrong sub-path
+    # URL, e.g. /invite/js/inviteapi.min.js/...). One urljoin resolver → host-root.
+    if any("/invite/js/" in str(n.props.get("url", "")) for n in sub4.nodes):
+        problems.append("compound-garbage URL present (src resolved against a wrong sub-path URL)")
+
     if problems:
         return ScenarioResult(name, False, "; ".join(problems))
     return ScenarioResult(

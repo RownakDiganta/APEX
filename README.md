@@ -2498,6 +2498,16 @@ for discovery), ranking JS on high-signal pages first — so a linked bundle lik
 `inviteapi.min.js` is fetched within budget instead of being crowded out by
 homepage assets. See CLAUDE.md §28.26.
 
+**One resolver + HTML guard (§28.27).** All `src`/`href`/JS-reference URL
+resolution now goes through a single `urljoin`-based resolver (shared by the HTML
+and JavaScript parsers and the web planner), so a root-absolute `/js/x` on any
+page path — `/`, `/invite`, `/invite/`, `/a/b/c` — always resolves to the host
+root, never the page directory. And a JavaScript-asset URL that returns an HTML
+body (e.g. an SPA index served for a missing `.js`) is no longer parsed as
+JavaScript — it extracts nothing and spawns no child fetches, eliminating the
+garbage URLs that arose from resolving links against an already-wrong URL. See
+CLAUDE.md §28.27.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,

@@ -44,7 +44,7 @@ Safety rules
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from memfabric.ids import new_id, now
 from memfabric.types import (
@@ -323,7 +323,7 @@ class _WebDeterministic:
             and not self._api_probe_done(subgraph, base_host)
         ):
             for path in (*_API_ROOT_PATHS, *_GRAPHQL_PATHS):
-                probe_url = f"{base_url.rstrip('/')}{path}"
+                probe_url = urljoin(base_url, path)
                 tasks.append(self._curl_task(
                     goal, probe_url, "command",
                     ["-s", "-I", *follow_args, *resolve_args, probe_url], web_claim_deps))
@@ -383,7 +383,7 @@ class _WebDeterministic:
             and not self._graphql_introspected(subgraph)
         ):
             gql_path = urlsplit(str(gql_ep.props.get("url", ""))).path or "/graphql"
-            gql_url = f"{base_url.rstrip('/')}{gql_path}"
+            gql_url = urljoin(base_url, gql_path)
             tasks.append(self._curl_task(
                 goal, gql_url, "graphql",
                 ["-s", "-X", "POST", "-H", "Content-Type: application/json",
@@ -400,7 +400,7 @@ class _WebDeterministic:
         if self._registry.get("curl") is not None:
             for ep in pending_page_fetches(subgraph)[:_MAX_ENDPOINT_FETCHES]:
                 path = urlsplit(str(ep.props.get("url", ""))).path or "/"
-                fetch_url = f"{base_url.rstrip('/')}{path}"
+                fetch_url = urljoin(base_url, path)
                 tasks.append(
                     TaskSpec(
                         id=new_id(), goal_id=goal.id, executor_domain="web",
@@ -432,7 +432,7 @@ class _WebDeterministic:
             # is fetched and READ, NEVER executed — no POST, no request forging.
             for js in pending_js_assets(subgraph)[:_MAX_JS_FETCHES]:
                 js_path = urlsplit(str(js.props.get("url", ""))).path or "/"
-                js_url = f"{base_url.rstrip('/')}{js_path}"
+                js_url = urljoin(base_url, js_path)
                 tasks.append(
                     TaskSpec(
                         id=new_id(), goal_id=goal.id, executor_domain="web",
