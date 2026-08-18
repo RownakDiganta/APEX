@@ -2551,6 +2551,21 @@ phase stalled. Now the browser is used only once curl discovery has no actionabl
 work left, so a browser launch failure can never starve the curl path. See
 CLAUDE.md §28.31.
 
+**Discovered links/JS assets stay reachable to the planner (§28.32).** A live run
+stalled with the phase gate reporting unfetched discovered endpoints while the
+planner kept re-emitting only already-fetched (duplicate) tasks. Root cause was a
+subgraph-depth mismatch: the gate reads a depth-3 host-anchored subgraph but the
+planner reads depth-2, and a discovered `href` link or `<script src>` asset was
+linked to its parent page with a `contains` edge only — so the discovery chain
+deepened (homepage → `/invite` → `inviteapi.min.js` at depth 3), pushing the JS
+asset out of the depth-2 planner's view while the depth-3 gate still saw it. The
+parser now also attaches every discovered link and JS asset to the authorized
+host with a `host--exposes-->` edge (as the JS and ffuf/gobuster parsers already
+do), keeping every discovered endpoint at depth 1 so the planner sees exactly
+what the gate sees and fetches it instead of stalling. Discovery only — no JS is
+executed and no machine-specific URL deobfuscation was added. See CLAUDE.md
+§28.32.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,

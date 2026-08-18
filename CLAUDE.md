@@ -11552,6 +11552,68 @@ tests now dispatch a browser task directly through the dispatcher (the browser
 policy-block invariant is unchanged), and the orchestration/browser routing tests
 now assert the §28.31 behavior.
 
+### 28.32 Discovered links/JS assets stay reachable to the depth-bounded planner
+
+Fixes a demonstrated `duplicate_task_stall` on the web phase surfaced by a live
+TwoMillion run: the homepage was fetched, `/invite` discovered and fetched, and
+`inviteapi.min.js` referenced — but the engagement stalled with the phase gate
+reporting `unfetched_discovered_endpoints` while the planner kept re-emitting
+only already-fetched (duplicate) tasks. Root cause is a **subgraph-depth
+mismatch**, not the prompt-theorized "context caching" or "obfuscation":
+
+- The phase gate (`web_evidence_status`, called from
+  `apex_host/orchestration/planning_node.py`) reads a **depth-3**
+  host-anchored subgraph.
+- The planner receives a **depth-2** subgraph
+  (`apex_host/orchestration/dispatch_node.py::_dispatch_tasks`).
+- `CommandParser.parse_curl_body` linked each discovered `href` link and each
+  `<script src>` JS asset to its parent page with a `contains` edge **only** —
+  so the discovery chain deepened: `host`(d0) → homepage(d1) → `/invite`(d2) →
+  `inviteapi.min.js`(**d3**). The JS asset therefore sat at depth 3 —
+  **visible to the depth-3 gate but invisible to the depth-2 planner**. The gate
+  kept the web phase alive on an endpoint the planner literally could not fetch,
+  so every planner turn re-emitted already-fetched pages → duplicate-suppressed
+  → `StallTracker` fired `duplicate_task_stall`.
+
+**Fix (discovery only, `apex_host/parsers/command_parser.py`):**
+`parse_curl_body` now ALSO attaches every discovered link endpoint and every
+`<script src>` JS-asset endpoint to the AUTHORIZED host with a
+`host --exposes--> child` edge, in addition to the existing `contains` edge
+(which still records which page referenced it, for provenance). This mirrors
+what `js_parser` already does for the JS asset + extracted API endpoints
+(§28.24) and what ffuf/gobuster do (§28.12). Every discovered endpoint is now at
+**depth 1** in the host-anchored subgraph, so the depth-bounded planner sees
+exactly what the (deeper) gate sees regardless of how long the discovery chain
+(homepage → page → link → JS → …) grows. The gate/planner depth values are
+unchanged; the fix makes them agree by construction rather than by matching a
+single depth number that a longer chain could still exceed. `h_id` (the
+authorized `host:<ip>`, already used for the base endpoint's `exposes` edge and
+attached via `host_ip=state["target"]`, §28.8/§28.12) is reused, so the new
+edges never dangle (P8-I05).
+
+**Why the existing web tests missed it:** they hand-build a flat `SubgraphView`
+(`edges=[], depth=3`) containing every node, so they never exercise
+`MemoryAPI.get_subgraph`'s depth-bounded BFS. The new regression test
+(`tests/apex_host/test_web_depth_reachability.py`) drives a real `MemoryAPI` +
+`get_subgraph` through the real `CommandParser`, asserting (1) the link/JS-asset
+endpoints each receive a `host--exposes-->` edge, (2) the JS asset is reachable
+in the depth-2 planner subgraph (would FAIL under the pre-§28.32 contains-only
+edges), and (3) the gate and planner agree at the same depth.
+
+**Explicitly NOT changed:** no JS is executed; no obfuscated-URL "deobfuscation"
+map was added — a hardcoded single-letter → path-token cipher (e.g. mapping a
+specific machine's `/d/e/n` to a specific API path) is machine-specific solver
+logic forbidden by §13.8/§13.9/§11.2 and was declined. The repeated-context LLM
+skip the live-run analysis asked for already exists (`PlanningEngine._context_hash`
+/ `LLMBudgetTracker.is_context_repeated`, §28.3/§28.5) and was not duplicated.
+`pending_page_fetches` already includes `source="js_analysis"`/`"curl_body"`
+(§28.24) — the endpoints simply weren't reachable; this fixes the reachability,
+not the source list. `memfabric/` was not touched; apex stays off the VPN.
+
+**Tests:** `tests/apex_host/test_web_depth_reachability.py` (3 tests, the first
+depth-bounded web reachability coverage in the suite). Full suite: 6294 passed;
+`ruff`/`mypy` clean; release gate 31/31.
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

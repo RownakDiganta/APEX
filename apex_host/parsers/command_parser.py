@@ -517,6 +517,30 @@ class CommandParser:
                     last_seen=timestamp,
                 )
             )
+            # §28.32 — ALSO attach the discovered link to the AUTHORIZED host
+            # (host --exposes--> link), mirroring js_parser (§28.24) and
+            # ffuf/gobuster (§28.12). This keeps the endpoint at DEPTH 1 in the
+            # host-anchored subgraph, so a link found on a deep page (homepage →
+            # /invite → link) stays visible to the depth-bounded planner
+            # subgraph regardless of how deep the discovery chain grows. Without
+            # it the link's depth tracks the chain length and can exceed the
+            # planner's retrieval depth while the (deeper) phase gate still sees
+            # it — the exact mismatch that stalled the web phase on endpoints the
+            # planner could not fetch. The `contains` edge above preserves which
+            # page referenced it (provenance).
+            edges.append(
+                Edge(
+                    id=exposes_edge_id(h_id, lnk_id),
+                    from_id=h_id,
+                    to_id=lnk_id,
+                    type="exposes",
+                    props={},
+                    confidence=0.5,
+                    source=source,
+                    first_seen=timestamp,
+                    last_seen=timestamp,
+                )
+            )
 
         # §28.24 — extract <script src> JS assets (same-origin only) so the web
         # planner can FETCH them and statically extract API-endpoint references
@@ -544,6 +568,20 @@ class CommandParser:
                 Edge(
                     id=contains_edge_id(ep_id, js_ep_id), from_id=ep_id, to_id=js_ep_id,
                     type="contains", props={}, confidence=0.5, source=source,
+                    first_seen=timestamp, last_seen=timestamp,
+                )
+            )
+            # §28.32 — host --exposes--> js_asset (DEPTH 1), same reachability
+            # fix as the discovered-link edge above. A JS asset referenced from a
+            # deep page (e.g. /invite's inviteapi.min.js at depth 3) must stay
+            # visible to the depth-bounded planner so it is fetched + statically
+            # parsed for API endpoints; otherwise the phase gate marks the web
+            # phase incomplete on a JS asset the planner cannot see and the
+            # engagement duplicate-stalls.
+            edges.append(
+                Edge(
+                    id=exposes_edge_id(h_id, js_ep_id), from_id=h_id, to_id=js_ep_id,
+                    type="exposes", props={}, confidence=0.5, source=source,
                     first_seen=timestamp, last_seen=timestamp,
                 )
             )
