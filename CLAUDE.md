@@ -1855,14 +1855,21 @@ Every commit message must read like a thoughtful engineer explaining the
 change to a teammate — plain language, not a terse mechanical tag. This is a
 required format, not a suggestion.
 
-- **Subject** (under ~72 chars): imperative and specific — what the change
-  *does* and, where it fits, *why*. Never just a section number or a bare
-  noun phrase.
+- **Subject** (under ~72 chars, ONE line): imperative and specific — what the
+  change *does* and, where it fits, *why*. Never just a section number or a
+  bare noun phrase. It is a plain git commit subject, **not** a Markdown
+  heading — it must **never** start with `#` (any leading `#` seen in a pasted
+  message is a chat-rendering artifact, not part of the commit), and it must
+  never carry the entire explanation.
   - Good: `Fix API probes hitting the bare IP instead of the vhost`
-  - Bad: `api probe fix §28.23`, `§28.23`, `web_planner update`
-- **Body** (blank line, then 2–5 sentences): what was wrong, what the fix
-  does, and any consequence worth knowing. Honest and specific — no vague
-  "improvements", no bare identifiers.
+  - Bad: `api probe fix §28.23`, `§28.23`, `web_planner update`,
+    `# Fix API probes …` (leading `#`)
+- **Body** (optional; when present, a blank line then 2–5 sentences): what was
+  wrong, what the fix does, and any consequence worth knowing. Honest and
+  specific — no vague "improvements", no bare identifiers. A body is
+  recommended for substantive changes; a subject-only message is acceptable
+  for small or self-evident ones. When there is no body, the section reference
+  may go at the end of the subject only if it still fits the ~72-char limit.
 - Put the CLAUDE.md section reference in **parentheses at the end** (e.g.
   `(§28.23)`), never as the whole message.
 
@@ -11613,6 +11620,59 @@ not the source list. `memfabric/` was not touched; apex stays off the VPN.
 **Tests:** `tests/apex_host/test_web_depth_reachability.py` (3 tests, the first
 depth-bounded web reachability coverage in the suite). Full suite: 6294 passed;
 `ruff`/`mypy` clean; release gate 31/31.
+
+### 28.33 Generic, execution-free unpacking of packed JavaScript
+
+Fixes the web-phase blocker where a discovered JS file was fetched and analyzed
+but its API references stayed hidden: `inviteapi.min.js`-style files wrap their
+code in the Dean Edwards `eval(function(p,a,c,k,e,d){…})` packer, so the API
+path (e.g. `/api/v1/invite/how/to/generate`) is not present as a literal string
+and the static extractor (§28.24) found nothing to follow — the engagement then
+`duplicate_task_stall`ed with no further endpoint to fetch.
+
+**Fix (`apex_host/parsers/js_unpack.py`, wired into `js_parser.parse_js`):** a
+GENERIC, domain-agnostic unpacker that reimplements the packer's OWN base-N
+whole-word substitution as **pure string manipulation** — no `eval`, no JS
+engine, no machine-specific mapping. It parses the packer invocation
+(`'PAYLOAD',BASE,COUNT,'KW1|KW2|…'.split('|')` and the `[…]` array-keyword
+variant), reconstructs each token via the packer's own alphabet (`0-9a-z` then
+`A-Z`, matching `c.toString(a)` / `String.fromCharCode(c+29)`), and substitutes
+`\b<token>\b → keyword[token]` from highest index down (its `while(c--)` order,
+honoring the `if(k[c])` empty-keyword skip). The revealed strings come entirely
+from the packed input's **own keyword array** — the same way the packer would
+substitute them at runtime — so `/api/...` paths become visible to the existing
+static regexes. This is the same class of operation as base64-decoding an
+encoded literal; it upholds the §28.24 invariant that the JS is **read, never
+executed**, and CLAUDE.md §13.8/§13.9/§11.2 (no machine-specific solver logic —
+the `/d/e/n`-style single-letter cipher explicitly declined earlier remains
+declined; this decodes generically instead).
+
+**Flow:** `parse_js` calls `unpack_payloads(text)` only when `is_packed(text)`
+and the body is real JS (`is_js`, §28.27 — an HTML page served for a missing
+`.js` is never unpacked). The unpacked payloads are appended to the extraction
+text so the SAME `_API_PATH_RE`/`_FETCH_RE`/`_XHR_OPEN_RE`/`_JQUERY_RE`/
+`_URL_ASSIGN_RE` extractors read the now-visible paths; extracted endpoints keep
+their `host--exposes-->` reachability (§28.32) and are GET-fetched + JSON-mapped
+(§28.22). The JS-asset node gains `js_deobfuscated=True` when unpacking occurred.
+Bounded and fail-safe: input-size / block-count / keyword-count caps, and any
+malformed block is skipped (never raises), so a non-packer or corrupt file
+degrades to the prior literal-only behavior.
+
+**Explicitly NOT done:** the JS is never executed or run through a JS engine; no
+runtime-computed / string-concatenated URL is recovered (only what the packer
+statically encodes); no hardcoded URL map; `memfabric/` untouched; apex off the
+VPN. This reveals a statically-encoded URL — it does not, and cannot, solve a
+challenge the JS computes at runtime (e.g. an invite step that decodes a value
+in the browser); that remains a documented limitation of static discovery.
+
+**Tests:** `tests/apex_host/test_js_deobfuscation.py` (10 tests) — packer
+detection; round-trip unpacking (split-form, array-form, base-24, empty-keyword
+skip) verified against VALIDLY-packed fixtures built from the packer's real
+format (the earlier prompt's hand-written fixture was internally inconsistent
+and was NOT used); malformed-never-raises; `parse_js` end-to-end extracting the
+deobfuscated endpoint with its host--exposes edge and `js_deobfuscated` flag;
+normal (unpacked) JS unchanged and not flagged; HTML-served-as-JS never
+unpacked. Full suite passes; `ruff`/`mypy` clean; release gate 31/31.
 
 ### 28.7 Release gate
 

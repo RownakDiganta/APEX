@@ -4,9 +4,17 @@
 
 DISCOVERY ONLY. This parser reads literal strings present in a JS file and
 records the API endpoint PATHS they reference as ``endpoint`` nodes — it NEVER
-executes or evaluates the JavaScript, never deobfuscates beyond reading literal
-strings, never calls the endpoints, and never constructs a request. A stateless
-``str`` → ``ParsedObservation`` transform like every other parser.
+executes or evaluates the JavaScript, never calls the endpoints, and never
+constructs a request. A stateless ``str`` → ``ParsedObservation`` transform like
+every other parser.
+
+§28.33 — the Dean Edwards ``eval(function(p,a,c,k,e,d){…})`` packer is first
+un-packed by ``js_unpack.unpack_payloads``, a GENERIC transform that reimplements
+the packer's own base-N word substitution as pure string manipulation (no
+``eval``, no JS engine, no machine-specific map — the revealed strings come from
+the packed input's OWN keyword array). This still never executes the JS; it turns
+an encoded literal back into the literal it encodes (like base64-decoding) so the
+same static extractors below can read the API paths hidden inside.
 
 What it extracts (same-origin paths only — a leading ``/`` path or a same-origin
 full URL reduced to its path):
@@ -44,6 +52,7 @@ from apex_host.parsers.command_parser import (
     _normalize_url,
     _resolve_same_origin_url,
 )
+from apex_host.parsers.js_unpack import is_packed, unpack_payloads
 
 #: Bound on API endpoints extracted from one JS file — keeps the graph bounded
 #: on a large/minified bundle. Static string extraction only.
@@ -116,18 +125,39 @@ class JSParser:
                 seen.add(resolved)
                 urls.append(resolved)
 
+        # §28.33 — reveal strings hidden by the Dean Edwards p,a,c,k,e,d packer
+        # WITHOUT executing the JS. `unpack_payloads` reimplements the packer's
+        # own base-N word-substitution as a pure string transform (no eval, no JS
+        # engine, no machine-specific map — the revealed strings come from the
+        # packed input's OWN keyword array). The unpacked payloads are appended to
+        # the extraction text so the SAME static regexes below read the now-visible
+        # /api/... path literals. HTML-served-as-JS (is_js False, §28.27) is never
+        # unpacked. Still DISCOVERY ONLY — the JS is read, never executed.
+        deobfuscated = False
+        extraction_text = text
+        if is_js and is_packed(text):
+            unpacked = unpack_payloads(text)
+            if unpacked:
+                deobfuscated = True
+                extraction_text = text + "\n" + "\n".join(unpacked)
+
         if is_js:
-            for m in _API_PATH_RE.finditer(text):
+            for m in _API_PATH_RE.finditer(extraction_text):
                 _add(m.group(0))
             for rx in (_FETCH_RE, _XHR_OPEN_RE, _JQUERY_RE, _URL_ASSIGN_RE):
-                for m in rx.finditer(text):
+                for m in rx.finditer(extraction_text):
                     _add(m.group(1))
 
         # Mark the JS asset endpoint analyzed (fetched) so it is not re-fetched.
+        js_props: dict[str, object] = {
+            "url": js_url, "fetched": True, "js_asset": True, "js_analyzed": True,
+        }
+        if deobfuscated:
+            js_props["js_deobfuscated"] = True
         nodes: list[Node] = [
             Node(
                 id=js_id, type="endpoint",
-                props={"url": js_url, "fetched": True, "js_asset": True, "js_analyzed": True},
+                props=js_props,
                 confidence=0.7, source="js_analysis", first_seen=timestamp, last_seen=timestamp,
             )
         ]

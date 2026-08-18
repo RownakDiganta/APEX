@@ -2566,6 +2566,18 @@ what the gate sees and fetches it instead of stalling. Discovery only — no JS 
 executed and no machine-specific URL deobfuscation was added. See CLAUDE.md
 §28.32.
 
+**Generic execution-free JavaScript unpacking (§28.33).** Discovered JavaScript
+files often wrap their code in the Dean Edwards `eval(function(p,a,c,k,e,d){…})`
+packer, hiding API paths (e.g. `/api/v1/invite/how/to/generate`) that the static
+extractor cannot see as literals. APEX now unpacks such files with a generic,
+domain-agnostic transform that reimplements the packer's own base-N word
+substitution as pure string manipulation — no `eval`, no JavaScript engine, and
+no machine-specific URL map (the revealed strings come from the packed file's own
+keyword array, like base64-decoding). The JS is still read, never executed, and
+the recovered paths flow into the same discovery/fetch pipeline. It reveals
+statically-encoded URLs only — it does not solve a challenge the JS computes at
+runtime. See CLAUDE.md §28.33.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,
