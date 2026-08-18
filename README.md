@@ -2578,6 +2578,16 @@ the recovered paths flow into the same discovery/fetch pipeline. It reveals
 statically-encoded URLs only — it does not solve a challenge the JS computes at
 runtime. See CLAUDE.md §28.33.
 
+**Operator follow-up recommendations (§28.34).** Because the curl web path
+(§28.31) produces no browser-derived opportunity nodes, discovered
+auth/registration/API endpoints (e.g. `/invite`, `/register`, `/login`,
+`/api/...`) are now also surfaced generically in an "Operator Follow-Up" report
+section (text + JSON). Each entry is advisory only — it flags a discovered
+endpoint a human operator may need to act on (a login, a registration, an API
+request); APEX discovers it but never sends the request itself (§28.30). The
+classification is keyword-driven and generic (no hardcoded path, no decode
+procedure, no machine-specific step). See CLAUDE.md §28.34.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,

@@ -58,6 +58,7 @@ from apex_host.planners.priv_esc_opportunities import (
     rank_opportunities,
 )
 from apex_host.planners.web_opportunities import (
+    operator_followups_from_subgraph,
     opportunities_from_subgraph as web_opportunities_from_subgraph,
     rank_opportunities as rank_web_opportunities,
     technologies_from_subgraph,
@@ -432,6 +433,12 @@ class RunReport:
     # web opportunities — advisory text for a human operator, never an
     # executable action APEX itself would take.
     web_recommendations: list[str] = field(default_factory=list)
+    # §28.34 — generic, read-only advisory list of discovered endpoints a human
+    # operator may need to act on (auth/registration/API), since the curl web
+    # path (§28.31) produces no browser-derived web_opportunity nodes. Advisory
+    # only; APEX never sends these requests itself (§28.30).
+    operator_followup_count: int = 0
+    operator_followups: list[dict[str, str]] = field(default_factory=list)
 
     # Phase 15 — multi-step exploitation orchestration summary. Every field
     # is derived directly from the final subgraph at report-build time
@@ -1149,6 +1156,7 @@ def build_report(
         1 for d in raw_dup if d.get("tool") == "browser"
     )
     web_recommendations = [web_o.recommended_next_action for web_o in ranked_web_opportunities][:5]
+    operator_followups = operator_followups_from_subgraph(subgraph)
 
     # Phase 15: multi-step exploitation orchestration summary. Uses the
     # REAL final completed/outcome values (unlike the live per-turn sync in
@@ -1349,6 +1357,8 @@ def build_report(
         web_opportunity_categories=web_opportunity_categories,
         web_duplicate_pages_avoided=web_duplicate_pages_avoided,
         web_recommendations=web_recommendations,
+        operator_followup_count=len(operator_followups),
+        operator_followups=operator_followups,
         workflow_count=len(ranked_workflows),
         workflows_completed=workflow_status_counts.get("completed", 0),
         workflows_blocked=workflow_status_counts.get("blocked", 0),
@@ -1646,6 +1656,15 @@ def format_text(report: RunReport) -> str:
             lines.append("  Recommendations:")
             for rec in report.web_recommendations:
                 lines.append(f"    {rec[:160]}")
+
+    # Operator Follow-Up (§28.34 — shown whenever any discovered endpoint matches
+    # a generic auth/registration/API keyword, independent of the browser path).
+    # Advisory ONLY: each entry is a HUMAN send-side action APEX does not perform
+    # itself (§28.30). No decode procedure or machine-specific step is implied.
+    if report.operator_followups:
+        lines.append("\nOperator Follow-Up (human action may be required)")
+        for fu in report.operator_followups[:10]:
+            lines.append(f"  [{fu.get('kind', '')}] {fu.get('path', '')} — {fu.get('note', '')[:150]}")
 
     # Workflow Summary (Phase 15 — shown only when at least one workflow's
     # prerequisites were ever met; a target that never reached any
@@ -2187,6 +2206,10 @@ def to_json_dict(report: RunReport) -> dict[str, Any]:
             "opportunity_categories": report.web_opportunity_categories,
             "duplicate_pages_avoided": report.web_duplicate_pages_avoided,
             "recommendations": report.web_recommendations,
+        },
+        "operator_followups": {
+            "count": report.operator_followup_count,
+            "entries": report.operator_followups,
         },
         "workflow_orchestration": {
             "workflow_count": report.workflow_count,

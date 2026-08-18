@@ -11674,6 +11674,48 @@ deobfuscated endpoint with its host--exposes edge and `js_deobfuscated` flag;
 normal (unpacked) JS unchanged and not flagged; HTML-served-as-JS never
 unpacked. Full suite passes; `ruff`/`mypy` clean; release gate 31/31.
 
+### 28.34 Operator follow-up recommendations from discovered endpoints
+
+Surfaces discovered auth/registration/API endpoints as GENERIC, read-only
+advisory operator follow-ups. Motivation: §28.31 routes web discovery through
+the curl `web_agent`, but `web_opportunity` nodes (and thus the report's
+`web_recommendations`) are derived ONLY from browser observations
+(`browser_parser`). So curl/JS-discovered endpoints like `/invite`, `/register`,
+`/login`, and `/api/...` were present in the EKG but never highlighted as
+operator-actionable. This closes that surfacing gap.
+
+**Fix (`apex_host/planners/web_opportunities.py::operator_followups_from_subgraph`,
+read-only; surfaced by `apex_host/eval/report.py`):** a pure function that scans
+discovered `endpoint` nodes and classifies each whose path matches a GENERIC
+interesting/auth/registration/API keyword (the shared `_INTERESTING_PATH_KEYWORDS`,
+§28.28 — documented as NOT machine-specific) into a follow-up KIND
+(`auth_flow` / `admin` / `api` / `notable`) with a fixed, secret-free advisory
+note. JS assets, `.js` files, and static assets are excluded (they are fetch
+targets, not operator actions). Deduped by path, ranked highest-interest first,
+bounded (default 25). The report gains `operator_followup_count` /
+`operator_followups` fields, an "Operator Follow-Up (human action may be
+required)" text section (shown whenever any match exists), and an
+`"operator_followups"` JSON block.
+
+**Advisory only — DISCOVERY, never action.** Every note describes a HUMAN
+send-side step (login, registration, an API request) that APEX deliberately does
+**not** perform itself — consistent with the §28.30 fail-closed send-side
+approval gate. There is NO machine-specific content: no hardcoded path, no decode
+procedure (no "base64"/"ROT13"), no machine name, no autonomous request. It tells
+the operator *which discovered endpoints likely need their attention*; it does not
+attempt, script, or automate the interaction, and this section alone brings APEX
+no closer to autonomously completing an invite/registration flow (that remains a
+human-approved step, by design). A generic single-letter-cipher "deobfuscation"
+map and an in-process JS-execution sandbox were both considered and declined —
+the former as machine-specific (§13.8/§13.9), the latter blocked by a
+non-functional `py-mini-racer` V8 native library in this environment.
+
+**Tests:** `tests/apex_host/test_operator_followups.py` (10 tests) — auth/admin/
+api/notable classification, uninteresting paths ignored, JS/static-asset
+exclusion, dedup+bound, notes are secret-free (no base64/ROT13/machine path),
+purity (no subgraph mutation), and report text/JSON integration. Full suite
+passes; `ruff`/`mypy` clean; release gate 31/31.
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

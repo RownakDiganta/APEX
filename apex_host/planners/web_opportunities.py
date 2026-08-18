@@ -367,6 +367,92 @@ def technologies_from_subgraph(subgraph: "SubgraphView") -> list[dict[str, Any]]
     return out
 
 
+#: Generic classification of a discovered endpoint into an operator follow-up
+#: KIND, reusing the shared _INTERESTING_PATH_KEYWORDS (§28.28 — documented as
+#: NOT machine-specific). Advisory only: every note describes a HUMAN send-side
+#: action APEX deliberately does not perform itself (§28.30). No decode
+#: procedure, concrete path, or machine name is hardcoded here.
+_FOLLOWUP_AUTH_KEYWORDS: tuple[str, ...] = (
+    "login", "signin", "register", "signup", "invite", "user",
+)
+_FOLLOWUP_ADMIN_KEYWORDS: tuple[str, ...] = (
+    "admin", "administrator", "manage", "dashboard",
+)
+_FOLLOWUP_NOTES: dict[str, str] = {
+    "auth_flow": (
+        "authentication/registration flow endpoint — a login or registration "
+        "step (a send-side request) may be required; APEX discovers it but does "
+        "not submit it autonomously (§28.30)"
+    ),
+    "admin": "administrative interface — operator review recommended",
+    "api": (
+        "API endpoint — the operator may need to invoke it manually; APEX "
+        "discovers it but does not send requests to it autonomously (§28.30)"
+    ),
+    "notable": "path of interest — operator review recommended",
+}
+
+
+def _followup_kind(path: str) -> str | None:
+    """Generic follow-up KIND for *path*, or None if not interesting."""
+    p = path.lower()
+    if any(k in p for k in _FOLLOWUP_AUTH_KEYWORDS):
+        return "auth_flow"
+    if any(k in p for k in _FOLLOWUP_ADMIN_KEYWORDS):
+        return "admin"
+    if "api" in p:
+        return "api"
+    if any(k in p for k in _INTERESTING_PATH_KEYWORDS):
+        return "notable"
+    return None
+
+
+def operator_followups_from_subgraph(
+    subgraph: "SubgraphView", *, limit: int = 25,
+) -> list[dict[str, str]]:
+    """Read-only, GENERIC advisory list of discovered endpoints a human operator
+    may need to act on (§28.34).
+
+    §28.31 routes web discovery through the curl ``web_agent``, so ``web_opportunity``
+    nodes (derived only from browser observations) are absent even when useful
+    auth/registration/API endpoints were discovered by curl/JS analysis. This
+    scans discovered ``endpoint`` nodes and classifies each whose path matches a
+    generic interesting/auth/registration/API keyword (the shared
+    ``_INTERESTING_PATH_KEYWORDS``, §28.28) into a follow-up KIND with a fixed,
+    secret-free advisory note. Pure — no I/O, no writes, no machine-specific
+    decode procedure or hardcoded path. Every note describes a HUMAN send-side
+    action APEX deliberately does not perform itself (§28.30). Deduped by path,
+    ranked highest-interest first, bounded by ``limit``."""
+    seen: set[str] = set()
+    out: list[dict[str, str]] = []
+    endpoints = [n for n in subgraph.nodes if n.type == "endpoint"]
+    for node in sorted(
+        endpoints,
+        key=lambda n: (
+            _path_interest_rank(str(n.props.get("url", ""))),
+            str(n.props.get("url", "")),
+        ),
+    ):
+        url = str(node.props.get("url", ""))
+        path = str(node.props.get("path", "")) or _url_path(url)
+        # A JS asset or a static file is a fetch target, not an operator action.
+        if (
+            not url or path in seen
+            or node.props.get("js_asset") is True
+            or _is_static_asset(url)
+            or path.lower().endswith(".js")
+        ):
+            continue
+        kind = _followup_kind(path)
+        if kind is None:
+            continue
+        seen.add(path)
+        out.append({"path": path, "url": url, "kind": kind, "note": _FOLLOWUP_NOTES[kind]})
+        if len(out) >= limit:
+            break
+    return out
+
+
 def build_web_session_state(target: str, subgraph: "SubgraphView") -> WebSessionState:
     """Build the current ``WebSessionState`` snapshot for *target*.
 
