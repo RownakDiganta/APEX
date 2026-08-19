@@ -186,6 +186,15 @@ def tech_id(host_addr: str, tech_name: str) -> str:
     return f"tech:{host_addr}:{tech_slug(tech_name)}"
 
 
+def invite_attempt_id(target: str) -> str:
+    """Canonical ID for the once-per-engagement invite-flow attempt marker
+    (§28.35). Content-addressed on the target so the marker is a single node
+    that records that the opt-in auto-invite-flow was attempted (success OR
+    failure), preventing it from re-emitting every turn (which caused a
+    ``duplicate_task_stall``)."""
+    return f"invite_attempt:{bare_host(target)}"
+
+
 def credential_id(target: str, username: str, protocol: str = "") -> str:
     """Canonical ID for a credential node.
 

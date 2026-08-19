@@ -11778,8 +11778,15 @@ hex/url], `find_matching_endpoints`, `action_matches_auto_approve`,
 
 **Flow + gates.** `_WebDeterministic.plan()` emits ONE `invite_flow` orchestrator
 task (via `build_invite_flow_task`) when the flow is enabled and all three invite
-URLs (generate/verify/register) resolve (idempotent — skipped once an
-`auto_registration` credential node exists). Each URL resolves via
+URLs (generate/verify/register) resolve. It is emitted AT MOST ONCE per
+engagement: `InviteFlowParser` writes a single host-anchored `invite_attempt`
+marker node (type `invite_attempt`, `host --indicates--> invite_attempt`) on
+EVERY result — success OR failure — and `build_invite_flow_task` returns None
+once that marker (or an `auto_registration` credential) exists. This is why a
+FAILED/misconfigured flow (e.g. a register `405`) no longer re-emits every turn
+and no longer causes a `duplicate_task_stall`; the marker also records the
+bounded, secret-redacted failure `error` for report/diagnosis visibility. Each
+URL resolves via
 `_resolve_invite_url`: it PREFERS a discovered `endpoint` node matching the
 pattern (using that endpoint's real, vhost-hosted URL), and FALLS BACK to
 constructing `<vhost-aware base_url><literal-path-pattern>` from the operator's

@@ -155,7 +155,14 @@ def build_invite_flow_task(
     already exists (the flow succeeded), so it is emitted at most once."""
     if not getattr(config, "auto_invite_flow", False):
         return None
+    # Idempotent: emit at most once per engagement. An ``invite_attempt`` marker
+    # node (written by InviteFlowParser on success OR failure, §28.35) means the
+    # flow was already attempted — do not re-emit (a failed/misconfigured flow
+    # re-emitting every turn caused a duplicate_task_stall). The credential check
+    # is kept as a defensive backstop.
     for n in subgraph.nodes:
+        if n.type == "invite_attempt":
+            return None
         if n.type == "credential" and str(n.props.get("source", "")) == "auto_registration":
             return None
     gen_pats = list(getattr(config, "invite_generate_patterns", []))

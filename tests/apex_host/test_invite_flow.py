@@ -224,14 +224,31 @@ class TestParser:
     def test_credential_node_is_redacted(self) -> None:
         obs = InviteFlowParser().parse_result(
             {"credentials_stored": True, "invite_username": "u"}, target=_IP)
-        assert len(obs.node_deltas) == 1
-        n = obs.node_deltas[0]
-        assert n.type == "credential" and n.props["username"] == "u"
-        assert n.props["secret_hint"] == "[redacted]"
-        assert n.props["source"] == "auto_registration"
+        # success → an invite_attempt marker AND a redacted credential node
+        types = {n.type for n in obs.node_deltas}
+        assert types == {"invite_attempt", "credential"}
+        cred = next(n for n in obs.node_deltas if n.type == "credential")
+        assert cred.props["username"] == "u"
+        assert cred.props["secret_hint"] == "[redacted]"
+        assert cred.props["source"] == "auto_registration"
+        marker = next(n for n in obs.node_deltas if n.type == "invite_attempt")
+        assert marker.props["outcome"] == "success"
 
-    def test_nothing_when_not_stored(self) -> None:
-        assert InviteFlowParser().parse_result({"credentials_stored": False}, target=_IP).node_deltas == []
+    def test_failure_writes_marker_but_no_credential(self) -> None:
+        obs = InviteFlowParser().parse_result(
+            {"credentials_stored": False, "error": "registration was not accepted (HTTP 405)"},
+            target=_IP)
+        types = [n.type for n in obs.node_deltas]
+        assert types == ["invite_attempt"]  # marker only, no credential
+        marker = obs.node_deltas[0]
+        assert marker.props["outcome"] == "failed"
+        assert "405" in marker.props["error"]
+        # host --indicates--> invite_attempt (reachable from the host anchor)
+        assert any(e.type == "indicates" and e.to_id == marker.id for e in obs.edge_deltas)
+
+    def test_dry_run_writes_nothing(self) -> None:
+        assert InviteFlowParser().parse_result(
+            {"dry_run": True, "credentials_stored": False}, target=_IP).node_deltas == []
 
 
 _BASE = "http://2million.htb"
@@ -299,6 +316,17 @@ class TestPlannerEmit:
                     source="auto_registration", first_seen="t", last_seen="t")
         sub = _sub([_ep("/api/v1/invite/generate"), _ep("/api/v1/invite/verify"),
                     _ep("/register"), cred])
+        assert build_invite_flow_task(sub, _cfg(), target=_IP, host_ip=_IP,
+                                      base_url=_BASE, goal_id="g", anchor=_H) is None
+
+    def test_idempotent_after_failed_attempt(self) -> None:
+        # §28.35 — an invite_attempt marker (from a FAILED flow) stops re-emit,
+        # preventing the duplicate_task_stall seen on a misconfigured flow.
+        marker = Node(id="invite_attempt:x", type="invite_attempt",
+                      props={"outcome": "failed"}, confidence=0.9,
+                      source="invite_flow", first_seen="t", last_seen="t")
+        sub = _sub([_ep("/api/v1/invite/generate"), _ep("/api/v1/invite/verify"),
+                    _ep("/register"), marker])
         assert build_invite_flow_task(sub, _cfg(), target=_IP, host_ip=_IP,
                                       base_url=_BASE, goal_id="g", anchor=_H) is None
 
@@ -526,7 +554,7 @@ class TestThrowawayCredentials:
         obs = InviteFlowParser().parse_result(
             {"credentials_stored": True, "invite_username": "apex_abc",
              "credentials_auto_generated": True}, target=_IP)
-        n = obs.node_deltas[0]
+        n = next(x for x in obs.node_deltas if x.type == "credential")
         assert n.props["auto_generated"] is True and n.props["secret_hint"] == "[redacted]"
 
 
