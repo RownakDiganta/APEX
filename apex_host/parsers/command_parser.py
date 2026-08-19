@@ -15,6 +15,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
+from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
 
 from memfabric.ids import now
@@ -41,6 +42,53 @@ _SCHEME_DEFAULT_PORT = {"http": "80", "https": "443"}
 #: Bound on the number of JSON top-level key NAMES recorded per API response
 #: (§28.22) — structure mapping only, keeps the endpoint node bounded.
 _MAX_JSON_KEYS = 40
+#: Bound on HTML forms extracted from one page (§28.34-forms) and input-field
+#: NAMES recorded per form — keeps the graph bounded. Field NAMES only (never
+#: values); a form is discovery, never a submission.
+_MAX_FORMS = 10
+_MAX_FORM_FIELDS = 30
+
+
+class _FormExtractor(HTMLParser):
+    """Stdlib HTML form extractor: collects each ``<form>``'s ``action``/
+    ``method`` and its input/select/textarea field NAMES. Read-only — never
+    executes anything, never submits. NAMES only, never values."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.forms: list[dict[str, object]] = []
+        self._cur: dict[str, object] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        a = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "form":
+            self._cur = {"action": a.get("action", ""),
+                         "method": (a.get("method", "get") or "get").upper(),
+                         "fields": []}
+        elif tag in ("input", "select", "textarea") and self._cur is not None:
+            name = a.get("name", "").strip()
+            fields = self._cur["fields"]
+            if name and isinstance(fields, list) and len(fields) < _MAX_FORM_FIELDS:
+                fields.append(name)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "form" and self._cur is not None:
+            if len(self.forms) < _MAX_FORMS:
+                self.forms.append(self._cur)
+            self._cur = None
+
+
+def _extract_forms(html: str) -> list[dict[str, object]]:
+    """Return each ``<form>``'s action/method/field-names from *html*. Never
+    raises (a malformed document yields whatever was parsed so far)."""
+    ex = _FormExtractor()
+    try:
+        ex.feed(html)
+    except (AssertionError, ValueError):
+        pass
+    if ex._cur is not None and len(ex.forms) < _MAX_FORMS:  # unclosed final form
+        ex.forms.append(ex._cur)
+    return ex.forms
 
 #: Bound on <script src> JS assets recorded per HTML page (§28.24).
 _MAX_JS_ASSETS = 15
@@ -585,6 +633,39 @@ class CommandParser:
                     first_seen=timestamp, last_seen=timestamp,
                 )
             )
+
+        # §28.36 — extract <form action> submission endpoints (same-origin). A
+        # form's action is often the REAL registration/login POST endpoint (the
+        # one an operator would otherwise have to guess), so record it as an
+        # endpoint (source html_form) with its method + input-field NAMES. A
+        # self-submitting form (empty/same-URL action) is skipped — the page
+        # endpoint already covers it. DISCOVERY ONLY — the form is read, never
+        # submitted; NAMES only, never values.
+        seen_forms: set[str] = set()
+        for form in _extract_forms(text):
+            action = str(form.get("action", "")).strip()
+            if not action:
+                continue
+            form_url = _resolve_same_origin_url(url, action, page_host)
+            if not form_url or form_url == url or form_url in seen_forms:
+                continue
+            seen_forms.add(form_url)
+            method = str(form.get("method", "GET")).upper()
+            raw_fields = form.get("form_fields") or form.get("fields") or []
+            fields = [str(f) for f in raw_fields][:_MAX_FORM_FIELDS] if isinstance(raw_fields, list) else []
+            form_ep_id = _endpoint_id(form_url)
+            nodes.append(Node(
+                id=form_ep_id, type="endpoint",
+                props={"url": form_url, "path": urlsplit(form_url).path or "/",
+                       "method": method, "form_action": True, "form_fields": fields},
+                confidence=0.6, source="html_form",
+                first_seen=timestamp, last_seen=timestamp,
+            ))
+            edges.append(Edge(
+                id=exposes_edge_id(h_id, form_ep_id), from_id=h_id, to_id=form_ep_id,
+                type="exposes", props={}, confidence=0.6, source="html_form",
+                first_seen=timestamp, last_seen=timestamp,
+            ))
 
         return ParsedObservation(node_deltas=nodes, edge_deltas=edges)
 

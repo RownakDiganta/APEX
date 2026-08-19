@@ -11879,6 +11879,47 @@ node, the planner emit (enabled/disabled/missing-endpoint/idempotent), and the
 credential handoff (runtime read, no-registry, CLI-wins). Full suite passes;
 `ruff`/`mypy` clean; release gate 31/31.
 
+### 28.36 HTML form-action extraction (discovery-only)
+
+Generic, discovery-only extraction of `<form action>` submission endpoints from a
+fetched HTML body — the endpoint an operator (or the auto-invite-flow's register
+step) would otherwise have to guess. A login/registration form's `action` is the
+real POST target; without this it was invisible to the curl-driven web path.
+
+**Fix (`apex_host/parsers/command_parser.py::parse_curl_body`):** a stdlib
+`html.parser.HTMLParser`-based `_extract_forms` collects each `<form>`'s
+`action`/`method` and its input/select/textarea field NAMES (bounded:
+`_MAX_FORMS`, `_MAX_FORM_FIELDS`; NAMES only, never values). Each same-origin
+form action (resolved by the shared `_resolve_same_origin_url`, §28.25/§28.27 —
+cross-origin rejected) becomes an `endpoint` node with `source="html_form"`,
+`method`, `form_action=True`, and `form_fields`, plus a `host --exposes-->`
+edge (§28.32 — reachable in the depth-bounded planner subgraph). A
+self-submitting form (empty/same-URL action) is skipped (the page endpoint
+already covers it). DISCOVERY ONLY — the form is READ, never submitted; no JS is
+executed (§28.24 unchanged).
+
+**Consumers (no special-casing needed):**
+- **Operator follow-ups (§28.34):** a `form_action` endpoint is surfaced as a
+  `form_action` kind whose note carries the method + input-field NAMES, so the
+  operator sees the REAL registration/login POST endpoint.
+- **Auto-invite-flow register candidates (§28.35):** a discovered form action
+  matching the operator's `--invite-register-patterns` is AUTOMATICALLY included
+  by `_resolve_invite_urls` (it matches endpoint URL/path against the patterns) —
+  so the flow POSTs to the real, discovered registration endpoint rather than
+  only the guessed literal path. Each candidate is still individually
+  auto-approve-gated (§28.30).
+- **Page-fetch loop:** `html_form` is a `_PAGE_FETCH_SOURCES` member, but
+  `pending_page_fetches` now excludes any endpoint whose known `method` is
+  non-GET (a POST-only form action would only `405` on a GET). A GET-method form
+  action (e.g. a search form) IS fetched.
+
+**Tests:** `tests/apex_host/test_form_extraction.py` (14 tests) — the stdlib
+extractor (simple/multiple/default-GET/select+textarea/unclosed/malformed), the
+form endpoint node (relative/absolute-same-origin action, cross-origin rejected,
+self-submit skipped), and the wiring (operator follow-up, register-candidate
+auto-inclusion, POST-form excluded from GET-fetch, GET-form included). Full suite
+passes; `ruff`/`mypy` clean; release gate 31/31.
+
 ### 28.7 Release gate
 
 `apex_host.eval.release_gate` (§Phase 25) gains a 13th scenario,

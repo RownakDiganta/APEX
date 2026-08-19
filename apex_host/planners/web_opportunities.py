@@ -271,7 +271,8 @@ def pending_enumerated_endpoints(subgraph: "SubgraphView") -> list["Node"]:
 #: Includes content-enum (§28.12/§28.22), relative-link pages discovered from a
 #: fetched HTML body (source curl_body — e.g. /invite), and API paths extracted
 #: from JS (source js_analysis) — all get GET-fetched so their body is mapped.
-_PAGE_FETCH_SOURCES = ("ffuf", "gobuster", "ffuf_api", "gobuster_api", "curl_body", "js_analysis")
+_PAGE_FETCH_SOURCES = ("ffuf", "gobuster", "ffuf_api", "gobuster_api", "curl_body",
+                       "js_analysis", "html_form")
 
 
 def pending_page_fetches(subgraph: "SubgraphView") -> list["Node"]:
@@ -298,6 +299,10 @@ def pending_page_fetches(subgraph: "SubgraphView") -> list["Node"]:
         and n.source in _PAGE_FETCH_SOURCES
         and str(n.props.get("url", ""))
         and str(n.props.get("status", "")).strip() != "404"
+        # §28.36 — never GET-fetch an endpoint whose known method is non-GET
+        # (e.g. a POST-only form action) — a GET would just 405. A GET-method
+        # form action is still fetched.
+        and str(n.props.get("method", "GET")).upper() in ("", "GET", "HEAD")
         # §28.26 — never spend the bounded page-fetch budget on css/images/fonts;
         # they yield no API references. Real pages (e.g. /invite) and API paths win.
         and not _is_static_asset(str(n.props.get("url", "")))
@@ -442,6 +447,22 @@ def operator_followups_from_subgraph(
             or _is_static_asset(url)
             or path.lower().endswith(".js")
         ):
+            continue
+        # §28.36 — a discovered <form action> (a submission endpoint) is inherently
+        # operator-actionable regardless of keyword, and its note carries the
+        # method + input-field NAMES (never values) so the operator can see the
+        # REAL registration/login POST endpoint they'd otherwise have to guess.
+        if node.props.get("form_action") is True:
+            method = str(node.props.get("method", "GET")).upper()
+            raw_fields = node.props.get("form_fields") or []
+            fields = ", ".join(str(f) for f in raw_fields) if isinstance(raw_fields, list) else ""
+            note = (f"HTML form submission endpoint ({method}) — a likely "
+                    f"registration/login target; fields: {fields or 'none'}. A "
+                    "send-side action APEX does not perform itself (§28.30).")
+            seen.add(path)
+            out.append({"path": path, "url": url, "kind": "form_action", "note": note})
+            if len(out) >= limit:
+                break
             continue
         kind = _followup_kind(path)
         if kind is None:

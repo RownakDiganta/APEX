@@ -2629,6 +2629,16 @@ python -m apex_host.eval.run_htb_local --target <IP> --no-dry-run --confirm-live
   --auto-approve-send-patterns 'POST /api/v1/invite/verify,POST /register'
 ```
 
+**HTML form-action discovery (§28.36).** When APEX fetches an HTML page it now
+also extracts each `<form>`'s `action` (the real submission endpoint — e.g. a
+registration/login POST target) and its input-field names, recording same-origin
+actions as discovered endpoints (`source="html_form"`). These appear in the
+report's Operator Follow-Up list and are automatically included as auto-invite-flow
+registration candidates when they match `--invite-register-patterns` — so you no
+longer have to guess the registration endpoint hidden in a form's `action`.
+Discovery only: the form is read, never submitted (no JS execution); a POST-only
+form action is never GET-fetched. See CLAUDE.md §28.36.
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,
