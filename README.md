@@ -2612,8 +2612,12 @@ field or its nesting), with the configured `--invite-*-field` tried first. For a
 "choose your own credentials" registration (where the server does not return
 credentials), the register step **auto-generates random, single-use, target-app
 credentials** (`secrets`-based) and treats a 2xx/3xx response as success — these
-are never real or HTB-platform credentials. See CLAUDE.md §28.35 and the amended
-§28.30/§11.2/P8-I03. Example:
+are never real or HTB-platform credentials. You can list several candidate
+register endpoints (comma-separated `--invite-register-patterns`) — the flow tries
+each until one is accepted, but only ever POSTs to endpoints you explicitly listed
+*and* auto-approved — and choose the body encoding with
+`--invite-register-content-type` (form default, or `application/json`). See
+CLAUDE.md §28.35 and the amended §28.30/§11.2/P8-I03. Example:
 
 ```bash
 python -m apex_host.eval.run_htb_local --target <IP> --no-dry-run --confirm-live \

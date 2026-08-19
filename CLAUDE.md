@@ -11839,7 +11839,15 @@ alongside the invite code, and treats a 2xx/3xx HTTP status as success (`-w
 was captured). If instead the server DOES return credentials, those are preferred
 (the other model). SECURITY: these are always random, single-use, target-app-only
 credentials — NEVER a real credential and NEVER an HTB-platform credential; the
-credential node carries `auto_generated=True`.
+credential node carries `auto_generated=True`. The operator may supply SEVERAL
+candidate register endpoints (comma-separated `--invite-register-patterns`); the
+executor tries each in order — EACH still individually fail-closed against
+`--auto-approve-send-patterns` and `safety.py`, so only endpoints the operator
+explicitly listed AND auto-approved are ever POSTed to (never autonomous
+spraying) — stopping at the first accepted (2xx/3xx) response. The register body
+uses `--invite-register-content-type` (`application/x-www-form-urlencoded`
+default, or `application/json`). The `invite_attempt` marker records the bounded
+list of endpoints tried.
 
 **Credential handoff (amended P8-I03).** On success the executor stores the
 plaintext (username, password) ONLY in the process-local

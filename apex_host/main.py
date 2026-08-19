@@ -121,6 +121,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="§28.35 — JSON field in the register response holding the password (default 'password').",
     )
     parser.add_argument(
+        "--invite-register-content-type", dest="invite_register_content_type",
+        default="application/x-www-form-urlencoded",
+        choices=["application/x-www-form-urlencoded", "application/json"],
+        help="§28.35 — Content-Type for the register POST (form default, or application/json).",
+    )
+    parser.add_argument(
         "--max-web-paths", type=int, default=50,
         help="Maximum number of web paths to discover per turn (default: 50)",
     )

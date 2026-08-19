@@ -139,6 +139,8 @@ class ApexConfig:
     invite_verify_response_field: str = "code"
     invite_register_username_field: str = "username"
     invite_register_password_field: str = "password"
+    # Content-Type for the register POST: form (default) or "application/json".
+    invite_register_content_type: str = "application/x-www-form-urlencoded"
     # Bounded access validation — explicit credentials only, no looping.
     # Empty by default: no login attempts are made unless the operator
     # supplies credentials via --username / --password CLI flags.
@@ -745,6 +747,8 @@ class ApexConfig:
             "invite_verify_response_field": str(_g("invite_verify_response_field", "code")),
             "invite_register_username_field": str(_g("invite_register_username_field", "username")),
             "invite_register_password_field": str(_g("invite_register_password_field", "password")),
+            "invite_register_content_type": str(
+                _g("invite_register_content_type", "application/x-www-form-urlencoded")),
             "username_candidates": list(getattr(args, "username", None) or []),
             "password_candidates": list(getattr(args, "password", None) or []),
             "max_access_attempts": _g("max_access_attempts", 1),

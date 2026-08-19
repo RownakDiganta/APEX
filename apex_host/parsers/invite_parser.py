@@ -48,9 +48,11 @@ class InviteFlowParser:
         h_id = host_id(bare_host(target))
         outcome = "success" if succeeded else "failed"
         err = redact_secret_patterns(str(tool_result.get("error", "") or ""))[:200]
+        urls_tried = [str(u) for u in (tool_result.get("register_urls_tried") or [])][:8]
         nodes.append(Node(
             id=marker_id, type="invite_attempt",
             props={"target": target, "outcome": outcome, "error": err,
+                   "register_urls_tried": urls_tried,
                    "auto_generated": bool(tool_result.get("credentials_auto_generated"))},
             confidence=0.9, source="invite_flow", first_seen=ts, last_seen=ts,
         ))

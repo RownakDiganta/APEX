@@ -901,6 +901,7 @@ class TaskDispatcher:
             "invite_username": result.username,
             "credentials_stored": result.credentials_stored,
             "credentials_auto_generated": result.credentials_auto_generated,
+            "register_urls_tried": list(result.register_urls_tried),
             "invite_flow_steps": list(result.steps),
         }
         disposition = (

@@ -589,3 +589,115 @@ class TestVerifyMethodAndDiagnostics:
         ex = InviteFlowExecutor(_cfg(), runner, reg)
         res = await ex.run(_task(), EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
         assert res.success
+
+
+class _MultiRegRunner:
+    """Fake: generate/verify OK; register returns a per-URL status map."""
+
+    def __init__(self, reg_status: dict[str, str]) -> None:
+        self.calls: list[list[str]] = []
+        self._reg_status = reg_status  # url-substring -> body-with-status
+
+    async def __call__(self, cmd: ToolCommand, config: object) -> ToolResult:
+        self.calls.append(list(cmd.args))
+        j = " ".join(cmd.args)
+        if "generate" in j and "-X" not in cmd.args:
+            return _tr(_challenge())
+        if "verify" in j:
+            return _tr('{"code": "INV-1"}')
+        from urllib.parse import urlsplit
+        url = next((a for a in cmd.args if a.startswith("http")), "")
+        path = urlsplit(url).path
+        for frag, resp in self._reg_status.items():
+            if path == frag:  # exact path match (avoids /register ⊂ /api/v1/register)
+                return _tr(resp)
+        return _tr("not found\n404")
+
+
+def _multi_task(register_urls: list[str], content_type: str = "application/x-www-form-urlencoded") -> TaskSpec:
+    t = _task()
+    t.params["register_urls"] = register_urls
+    t.params["register_url"] = register_urls[0]
+    t.params["register_content_type"] = content_type
+    return t
+
+
+class TestMultiRegisterAndContentType:
+    """§28.35 — try multiple operator-listed register endpoints (each gated);
+    configurable content type."""
+
+    @pytest.mark.asyncio
+    async def test_first_405_second_accepted(self) -> None:
+        reg = CapabilityRuntimeRegistry()
+        # first candidate 405, second 200
+        runner = _MultiRegRunner({"/register": "denied\n405",
+                                  "/api/v1/register": "created\n200"})
+        cfg = _cfg(auto_approve_send_patterns=[
+            "POST /api/v1/invite/verify", "POST /register", "POST /api/v1/register"])
+        ex = InviteFlowExecutor(cfg, runner, reg)
+        res = await ex.run(_multi_task(["http://2million.htb/register",
+                                        "http://2million.htb/api/v1/register"]),
+                           EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
+        assert res.success and res.credentials_auto_generated
+        assert res.register_urls_tried == ["http://2million.htb/register",
+                                           "http://2million.htb/api/v1/register"]
+
+    @pytest.mark.asyncio
+    async def test_unlisted_candidate_skipped(self) -> None:
+        reg = CapabilityRuntimeRegistry()
+        runner = _MultiRegRunner({"/api/v1/register": "created\n200"})
+        # only /api/v1/register is auto-approved; /register is NOT tried
+        cfg = _cfg(auto_approve_send_patterns=[
+            "POST /api/v1/invite/verify", "POST /api/v1/register"])
+        ex = InviteFlowExecutor(cfg, runner, reg)
+        res = await ex.run(_multi_task(["http://2million.htb/register",
+                                        "http://2million.htb/api/v1/register"]),
+                           EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
+        assert res.success
+        assert res.register_urls_tried == ["http://2million.htb/api/v1/register"]  # /register skipped
+
+    @pytest.mark.asyncio
+    async def test_all_candidates_fail(self) -> None:
+        reg = CapabilityRuntimeRegistry()
+        runner = _MultiRegRunner({"/register": "denied\n405",
+                                  "/api/v1/register": "denied\n405"})
+        cfg = _cfg(auto_approve_send_patterns=[
+            "POST /api/v1/invite/verify", "POST /register", "POST /api/v1/register"])
+        ex = InviteFlowExecutor(cfg, runner, reg)
+        res = await ex.run(_multi_task(["http://2million.htb/register",
+                                        "http://2million.htb/api/v1/register"]),
+                           EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
+        assert not res.success and "any configured endpoint" in (res.error or "")
+        assert reg.get_manual_credentials() is None
+
+    @pytest.mark.asyncio
+    async def test_json_content_type(self) -> None:
+        reg = CapabilityRuntimeRegistry()
+        runner = _MultiRegRunner({"/register": "created\n200"})
+        ex = InviteFlowExecutor(_cfg(), runner, reg)
+        await ex.run(_multi_task(["http://2million.htb/register"],
+                                 content_type="application/json"),
+                    EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
+        reg_call = next(c for c in runner.calls if "/register" in " ".join(c) and "-X" in c)
+        assert "-H" in reg_call
+        assert any("Content-Type: application/json" in a for a in reg_call)
+        body = reg_call[reg_call.index("-d") + 1]
+        assert body.startswith("{") and '"invite_code"' in body
+
+    def test_resolve_invite_urls_returns_all(self) -> None:
+        from apex_host.invite_flow import _resolve_invite_urls
+        sub = _sub([_ep("/register")])
+        urls = _resolve_invite_urls(sub, ["/register", "/api/v1/register"], "http://2million.htb")
+        # discovered /register (real URL) + constructed /api/v1/register
+        assert "http://2million.htb/register" in urls
+        assert "http://2million.htb/api/v1/register" in urls
+
+    def test_build_task_passes_register_urls_and_content_type(self) -> None:
+        sub = _sub([_ep("/api/v1/invite/generate"), _ep("/api/v1/invite/verify")])
+        cfg = _cfg(invite_register_patterns=["/register", "/api/v1/register"],
+                   invite_register_content_type="application/json")
+        task = build_invite_flow_task(sub, cfg, target=_IP, host_ip=_IP,
+                                      base_url="http://2million.htb", goal_id="g", anchor=_H)
+        assert task is not None
+        assert len(task.params["register_urls"]) == 2
+        assert task.params["register_content_type"] == "application/json"

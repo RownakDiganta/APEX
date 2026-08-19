@@ -138,6 +138,31 @@ def _resolve_invite_url(
     return ""
 
 
+def _resolve_invite_urls(
+    subgraph: "SubgraphView", patterns: list[str], base_url: str,
+) -> list[str]:
+    """All candidate URLs for a set of patterns (§28.35): every discovered
+    endpoint matching a pattern PLUS a constructed ``<base_url><literal-path>``
+    for each literal-path pattern. Deduped, order-preserved. Used for the
+    register step so the operator can list several candidate endpoints."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for ep in find_matching_endpoints(subgraph, patterns):
+        u = str(ep.props.get("url", ""))
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    if base_url:
+        for pattern in patterns:
+            path = _literal_path(pattern)
+            if path is not None:
+                u = base_url.rstrip("/") + path
+                if u not in seen:
+                    seen.add(u)
+                    out.append(u)
+    return out
+
+
 def build_invite_flow_task(
     subgraph: "SubgraphView", config: object, *,
     target: str, host_ip: str, base_url: str, goal_id: str, anchor: str | None,
@@ -172,8 +197,8 @@ def build_invite_flow_task(
         return None
     gen_url = _resolve_invite_url(subgraph, gen_pats, base_url)
     ver_url = _resolve_invite_url(subgraph, ver_pats, base_url)
-    reg_url = _resolve_invite_url(subgraph, reg_pats, base_url)
-    if not (gen_url and ver_url and reg_url):
+    reg_urls = _resolve_invite_urls(subgraph, reg_pats, base_url)
+    if not (gen_url and ver_url and reg_urls):
         return None
     from memfabric.ids import new_id
     from memfabric.types import TaskSpec
@@ -184,7 +209,13 @@ def build_invite_flow_task(
             "tool": "invite_flow", "args": [], "target": target, "parser": "invite_flow",
             "generate_url": gen_url,
             "verify_url": ver_url,
-            "register_url": reg_url,
+            "register_url": reg_urls[0],
+            # §28.35 — all operator-listed candidate register endpoints; the
+            # executor tries each (each gated) until one is accepted.
+            "register_urls": reg_urls,
+            "register_content_type": str(
+                getattr(config, "invite_register_content_type",
+                        "application/x-www-form-urlencoded")),
             "host_ip": host_ip,
             "decode_steps": list(getattr(config, "invite_decode_steps", [])),
             "verify_response_field": str(getattr(config, "invite_verify_response_field", "code")),

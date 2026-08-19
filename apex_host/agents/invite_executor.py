@@ -59,6 +59,7 @@ class InviteFlowResult:
     invite_code_obtained: bool = False
     credentials_stored: bool = False
     credentials_auto_generated: bool = False
+    register_urls_tried: list[str] = field(default_factory=list)
     dry_run: bool = False
     error: str | None = None
     steps: list[str] = field(default_factory=list)
@@ -150,49 +151,45 @@ class InviteFlowExecutor:
                        f"{status_note}"))
         steps.append("verify: obtained invite code")
 
-        # 4. POST register (send-side) — fail-closed unless operator auto-approved it.
-        if not action_matches_auto_approve("POST", reg_url, patterns):
+        # 4. POST register — try each operator-listed candidate endpoint in order,
+        # each individually fail-closed against --auto-approve-send-patterns and
+        # safety.py, stopping at the FIRST accepted (2xx/3xx) response. This lets
+        # the operator supply a few candidate register endpoints without knowing
+        # which one the target uses; APEX only ever POSTs to endpoints the
+        # operator explicitly listed AND auto-approved (never autonomous spraying).
+        reg_urls = [u for u in (p.get("register_urls") or [reg_url]) if u]
+        content_type = str(p.get("register_content_type") or "application/x-www-form-urlencoded")
+        reg_tried: list[str] = []
+        last_reason = ""
+        result: tuple[str, str, bool] | None = None
+        for candidate in reg_urls:
+            if not action_matches_auto_approve("POST", candidate, patterns):
+                last_reason = f"{candidate}: not in --auto-approve-send-patterns"
+                continue
+            reg_tried.append(candidate)
+            attempt = await self._attempt_register(
+                candidate, host_ip, invite_code, content_type,
+                user_field, pass_field, invite_field)
+            if attempt is not None:
+                result = attempt
+                steps.append(f"register: accepted by {candidate}")
+                break
+            last_reason = f"{candidate}: not accepted"
+        if result is None:
             return InviteFlowResult(
-                False, steps=steps + ["register: not auto-approved"],
-                error="register POST not in --auto-approve-send-patterns (fail-closed)")
-        # Generate RANDOM THROWAWAY credentials for the TARGET APP and send them
-        # in the register body alongside the invite code — the common "choose
-        # your own credentials" registration model (the server does NOT return
-        # credentials). These are never a real/HTB-platform credential (§28.35).
-        gen_user, gen_pass = self._generate_credentials()
-        reg_body = f"{user_field}={gen_user}&{pass_field}={gen_pass}&{invite_field}={invite_code}"
-        r = await self._curl("POST", reg_url, host_ip, body=reg_body, capture_status=True)
-        if not self._ok(r):
-            return InviteFlowResult(False, steps=steps + ["register: request failed"],
-                                    error="register POST failed")
-        body, status = self._split_status(r.stdout)  # type: ignore[union-attr]
-        # Prefer server-returned credentials when the flow is the other model
-        # (server generates + returns them); otherwise, on a 2xx/3xx, use the
-        # throwaway credentials we just registered.
-        reg_json = self._parse_json(body)
-        resp_user = self._extract_field(reg_json, user_field, _USERNAME_FIELDS) if reg_json else ""
-        resp_pass = self._extract_field(reg_json, pass_field, _PASSWORD_FIELDS) if reg_json else ""
-        auto_generated = False
-        if resp_user and resp_pass:
-            username, password = resp_user, resp_pass
-            steps.append("register: credentials returned by server")
-        elif self._register_succeeded(status, body):
-            username, password = gen_user, gen_pass
-            auto_generated = True
-            steps.append(
-                f"register: registered auto-generated throwaway credentials"
-                f"{f' (HTTP {status})' if status else ''}")
-        else:
-            return InviteFlowResult(
-                False, steps=steps + ["register: not accepted"],
-                error=f"registration was not accepted (HTTP status: {status or 'unknown'})")
+                False, register_urls_tried=reg_tried,
+                steps=steps + ["register: no endpoint accepted the registration"],
+                error=("registration was not accepted by any configured endpoint "
+                       f"({last_reason or 'none auto-approved'})"))
+        username, password, auto_generated = result
 
         # 5. Store plaintext ONLY in the runtime registry (never the EKG/episode).
         self._registry.set_manual_credentials(username, password)
         steps.append("register: credentials stored in runtime registry (redacted in EKG)")
         return InviteFlowResult(
             True, username=username, invite_code_obtained=True,
-            credentials_stored=True, credentials_auto_generated=auto_generated, steps=steps)
+            credentials_stored=True, credentials_auto_generated=auto_generated,
+            register_urls_tried=reg_tried, steps=steps)
 
     # -- helpers ---------------------------------------------------------
     @staticmethod
@@ -235,13 +232,45 @@ class InviteFlowExecutor:
             return status[:1] in ("2", "3")
         return not cls._is_error_response(body)
 
+    async def _attempt_register(
+        self, url: str, host_ip: str, invite_code: str, content_type: str,
+        user_field: str, pass_field: str, invite_field: str,
+    ) -> tuple[str, str, bool] | None:
+        """One registration POST to *url*. Returns (username, password,
+        auto_generated) on a 2xx/3xx (or server-returned credentials), else None.
+
+        Sends RANDOM THROWAWAY target-app credentials (never a real/HTB
+        credential, §28.35) in the chosen content type; prefers server-returned
+        credentials when the server generates them instead."""
+        gen_user, gen_pass = self._generate_credentials()
+        if content_type == "application/json":
+            body = json.dumps({user_field: gen_user, pass_field: gen_pass,
+                               invite_field: invite_code})
+            headers: list[str] | None = ["Content-Type: application/json"]
+        else:
+            body = f"{user_field}={gen_user}&{pass_field}={gen_pass}&{invite_field}={invite_code}"
+            headers = None
+        r = await self._curl("POST", url, host_ip, body=body,
+                             capture_status=True, headers=headers)
+        if not self._ok(r):
+            return None
+        resp_body, status = self._split_status(r.stdout)  # type: ignore[union-attr]
+        reg_json = self._parse_json(resp_body)
+        resp_user = self._extract_field(reg_json, user_field, _USERNAME_FIELDS) if reg_json else ""
+        resp_pass = self._extract_field(reg_json, pass_field, _PASSWORD_FIELDS) if reg_json else ""
+        if resp_user and resp_pass:
+            return resp_user, resp_pass, False  # server returned credentials
+        if self._register_succeeded(status, resp_body):
+            return gen_user, gen_pass, True  # our throwaway credentials
+        return None
+
     @staticmethod
     def _ok(r: "ToolResult | None") -> bool:
         return r is not None and r.returncode == 0 and not r.error
 
     async def _curl(
         self, method: str, url: str, host_ip: str, *, body: str | None = None,
-        capture_status: bool = False,
+        capture_status: bool = False, headers: list[str] | None = None,
     ) -> "ToolResult | None":
         """Build + run one bounded curl, pinned to the AUTHORIZED IP (§28.8).
 
@@ -265,6 +294,8 @@ class InviteFlowExecutor:
             args += ["-L", "--resolve", f"{host}:{port}:{host_ip}"]
         if capture_status:
             args += ["-w", "\\n%{http_code}"]
+        for h in headers or []:
+            args += ["-H", h]
         if method != "GET":
             args += ["-X", method]
         if body is not None:
