@@ -153,6 +153,65 @@ def _connect_ok(payload: dict[str, object]) -> bool:
     return bool(connect.get("ok"))
 
 
+def _connect_guidance(outcome: str, target: str, port: int, timeout: float) -> str:
+    """Actionable operator guidance for a TCP connect outcome. The connect logic
+    is correct (docker/vpn/connect_check.py) — a timeout/unreachable here is
+    almost always operational (machine down / IP changed / port filtered), so
+    the guidance points the operator at the right thing to check rather than the
+    code."""
+    if outcome == "connected":
+        return (
+            f"Guidance: reachable — {target}:{port} accepted a TCP connection "
+            "through the VPN tunnel. Good to proceed."
+        )
+    if outcome == "refused":
+        return (
+            f"Guidance: {target} IS reachable through the tunnel — it responded "
+            f"(connection refused), so only THIS port ({port}) is closed. Use "
+            "the port the target service actually listens on."
+        )
+    if outcome == "timeout":
+        return (
+            f"Guidance: the route resolves through the tunnel, but nothing came "
+            f"back from {target}:{port} within {timeout}s (port scanners call "
+            "this 'filtered'). This is usually operational, not a VPN fault:\n"
+            "  • Verify on the HTB dashboard that the machine is RUNNING and that "
+            "this is its CURRENT IP — HTB IPs change when a box is reset/respawned.\n"
+            f"  • Port {port} may be filtered — try a port you expect open (e.g. 22).\n"
+            "  • Confirm the tunnel is healthy: `python -m apex_host.container_entrypoint "
+            "smoke` or `docker compose --profile htb up`."
+        )
+    if outcome == "unreachable":
+        return (
+            f"Guidance: an ICMP/kernel 'unreachable' came back for {target}. The "
+            "tunnel may be up but this destination is not reachable — recheck the "
+            "target IP on the HTB dashboard and confirm the VPN profile covers "
+            "this target's subnet."
+        )
+    return (
+        f"Guidance: an unclassified connect error occurred for {target}:{port} "
+        "(see 'detail' above). Recheck the target IP/port and VPN tunnel health."
+    )
+
+
+def _route_guidance(result: dict[str, object]) -> str | None:
+    """Operator guidance for a route-lookup-only result. None when the route is
+    healthy (would use the tunnel)."""
+    if not result.get("ok"):
+        return (
+            "Guidance: the route lookup itself FAILED — the VPN tunnel is likely "
+            "not up. Confirm readiness first (`python -m apex_host.container_entrypoint "
+            "smoke` or `docker compose --profile htb up`) before checking a target."
+        )
+    if not result.get("would_use_route"):
+        return (
+            f"Guidance: traffic to {result.get('target')} would NOT use the VPN "
+            f"tunnel (device={result.get('device')}). Confirm the tunnel is up and "
+            "that this target's subnet is covered by the VPN profile's routes."
+        )
+    return None
+
+
 def _print_diagnose_result(payload: dict[str, object]) -> None:
     route = payload.get("route", {})
     connect = payload.get("connect", {})
@@ -212,6 +271,11 @@ async def _async_main(argv: list[str] | None) -> int:
             "reports as 'filtered'); 'refused' means the host responded "
             "but the port is closed."
         )
+        connect = result.get("connect", {})
+        outcome = str(connect.get("outcome", "")) if isinstance(connect, dict) else ""
+        if outcome:
+            print()
+            print(_connect_guidance(outcome, target, port if port is not None else 0, args.timeout))
         ok = _connect_ok(result)
     else:
         _print_route_result(result)
@@ -221,6 +285,10 @@ async def _async_main(argv: list[str] | None) -> int:
             "the target is currently reachable. No packet was sent. Pass "
             "--port to also attempt a real, bounded TCP connection."
         )
+        guidance = _route_guidance(result)
+        if guidance is not None:
+            print()
+            print(guidance)
         ok = bool(result.get("ok"))
 
     return 0 if ok else 1

@@ -130,3 +130,84 @@ class TestAsyncMain:
         with redirect_stdout(out), redirect_stderr(err):
             await _async_main(["--vpn-service-url", "http://vpn:8090", "--target", "8.8.8.8"])
         assert "does NOT prove" in out.getvalue() or "No packet was sent" in out.getvalue()
+
+
+class TestGuidanceMessages:
+    """§ vpn_route_check diagnostics — actionable operator guidance for timeout
+    and route-failure cases (the code is correct; a timeout is operational)."""
+
+    def test_connect_guidance_timeout_points_at_dashboard_and_port(self) -> None:
+        from apex_host.eval.vpn_route_check import _connect_guidance
+
+        msg = _connect_guidance("timeout", "10.129.5.5", 80, 5.0)
+        assert "HTB dashboard" in msg and "filtered" in msg
+        assert "try a port you expect open" in msg
+
+    def test_connect_guidance_refused_says_reachable(self) -> None:
+        from apex_host.eval.vpn_route_check import _connect_guidance
+
+        assert "IS reachable" in _connect_guidance("refused", "10.129.5.5", 80, 5.0)
+
+    def test_connect_guidance_connected(self) -> None:
+        from apex_host.eval.vpn_route_check import _connect_guidance
+
+        assert "reachable" in _connect_guidance("connected", "10.129.5.5", 22, 5.0)
+
+    def test_connect_guidance_unreachable(self) -> None:
+        from apex_host.eval.vpn_route_check import _connect_guidance
+
+        assert "unreachable" in _connect_guidance("unreachable", "10.129.5.5", 80, 5.0)
+
+    def test_route_guidance_lookup_failed_suggests_vpn(self) -> None:
+        from apex_host.eval.vpn_route_check import _route_guidance
+
+        msg = _route_guidance({"ok": False, "target": "10.129.5.5"})
+        assert msg is not None and "VPN tunnel is likely" in msg
+
+    def test_route_guidance_wrong_device(self) -> None:
+        from apex_host.eval.vpn_route_check import _route_guidance
+
+        msg = _route_guidance({"ok": True, "would_use_route": False, "device": "eth0",
+                               "target": "8.8.8.8"})
+        assert msg is not None and "would NOT use the VPN" in msg
+
+    def test_route_guidance_healthy_is_none(self) -> None:
+        from apex_host.eval.vpn_route_check import _route_guidance
+
+        assert _route_guidance({"ok": True, "would_use_route": True, "device": "tun0"}) is None
+
+    @pytest.mark.asyncio
+    async def test_diagnose_timeout_prints_guidance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import apex_host.eval.vpn_route_check as module
+
+        async def _fake_diag(url: str, target: str, port: int, timeout: float) -> dict[str, object]:
+            return {
+                "route": {"target": target, "ok": True, "would_use_route": True,
+                          "device": "tun0", "gateway": None},
+                "connect": {"outcome": "timeout", "ok": False, "errno": None,
+                            "errno_name": None, "elapsed_seconds": 5.0, "detail": "no response"},
+            }
+
+        monkeypatch.setattr(module, "_query_diagnose", _fake_diag)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = await _async_main([
+                "--vpn-service-url", "http://vpn:8090", "--target", "10.129.5.5", "--port", "80",
+            ])
+        assert code == 1
+        assert "Guidance:" in out.getvalue() and "HTB dashboard" in out.getvalue()
+
+    @pytest.mark.asyncio
+    async def test_route_lookup_failed_prints_vpn_guidance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import apex_host.eval.vpn_route_check as module
+
+        async def _fake_query(url: str, target: str, timeout: float) -> dict[str, object]:
+            return {"target": target, "ok": False, "would_use_route": False,
+                    "device": None, "gateway": None, "error": "no route"}
+
+        monkeypatch.setattr(module, "_query_route_check", _fake_query)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = await _async_main(["--vpn-service-url", "http://vpn:8090", "--target", "10.129.5.5"])
+        assert code == 1
+        assert "VPN tunnel is likely" in out.getvalue()
