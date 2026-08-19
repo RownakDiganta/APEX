@@ -130,6 +130,7 @@ class _WebDeterministic:
         web_enum_threads: int = 20,
         web_enum_max_seconds: int = 60,
         web_api_wordlist_path: str | None = None,
+        invite_config: object | None = None,
     ) -> None:
         self._target = target
         self._registry = registry
@@ -138,6 +139,9 @@ class _WebDeterministic:
         self._enum_threads = web_enum_threads
         self._enum_max_seconds = web_enum_max_seconds
         self._api_wordlist = web_api_wordlist_path
+        # §28.35 — the ApexConfig (or None). None → auto-invite-flow off (every
+        # pre-existing caller/test), byte-for-byte unchanged behaviour.
+        self._invite_config = invite_config
 
     async def plan(
         self, goal: Goal, subgraph: SubgraphView, evidence: EvidenceBundle
@@ -459,6 +463,19 @@ class _WebDeterministic:
                     )
                 )
 
+        # §28.35 — opt-in auto-invite-flow. When enabled AND generate/verify/
+        # register endpoints have all been discovered, emit ONE bounded
+        # invite_flow orchestrator task. Default off (invite_config is None for
+        # every pre-existing caller), so nothing changes otherwise.
+        if self._invite_config is not None:
+            from apex_host.invite_flow import build_invite_flow_task
+            invite_task = build_invite_flow_task(
+                subgraph, self._invite_config,
+                target=self._target, host_ip=self._target,
+                goal_id=goal.id, anchor=goal.anchor_node)
+            if invite_task is not None:
+                tasks.append(invite_task)
+
         if not tasks:
             return AbandonSignal(
                 reason=(
@@ -633,6 +650,7 @@ class WebPlanner:
         web_enum_threads: int = 20,
         web_enum_max_seconds: int = 60,
         web_api_wordlist_path: str | None = None,
+        invite_config: object | None = None,
         model_router: "ModelRouter | None" = None,
         allowed_tools: list[str] | None = None,
         confidence_threshold: float = 0.4,
@@ -648,6 +666,7 @@ class WebPlanner:
             web_enum_threads=web_enum_threads,
             web_enum_max_seconds=web_enum_max_seconds,
             web_api_wordlist_path=web_api_wordlist_path,
+            invite_config=invite_config,
         )
         self._engine: PlanningEngine | None = None
         self._last_decision: PlanDecision | None = None

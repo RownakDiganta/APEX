@@ -2588,6 +2588,30 @@ request); APEX discovers it but never sends the request itself (§28.30). The
 classification is keyword-driven and generic (no hardcoded path, no decode
 procedure, no machine-specific step). See CLAUDE.md §28.34.
 
+**Opt-in auto-invite/registration flow (§28.35).** For an authorized engagement,
+APEX can optionally automate a bounded web onboarding flow — GET a challenge →
+decode it (operator-chosen `base64`/`rot13`/`hex`/`url`, pure Python, no JS
+execution) → POST verify → POST register → capture credentials → hand them to the
+credential phase. It is **default OFF** and fully generic: every endpoint pattern,
+decode step, and JSON field name is operator-supplied (no hardcoded path or
+machine). Enabling it requires `--auto-invite-flow` plus explicit
+`--auto-approve-send-patterns` for the exact POSTs to auto-approve; every other
+send-side action stays fail-closed (§28.30), `safety.py` and policy scope still
+apply, and requests only ever reach the authorized target IP. Captured
+credentials live only in the process-local runtime registry (never the EKG/
+episode); the EKG credential node is redacted. See CLAUDE.md §28.35 and the
+amended §28.30/§11.2/P8-I03. Example:
+
+```bash
+python -m apex_host.eval.run_htb_local --target <IP> --no-dry-run --confirm-live \
+  --auto-invite-flow \
+  --invite-generate-patterns '/api/v1/invite/generate' \
+  --invite-verify-patterns '/api/v1/invite/verify' \
+  --invite-register-patterns '/register' \
+  --invite-decode-steps 'base64,rot13' \
+  --auto-approve-send-patterns 'POST /api/v1/invite/verify,POST /register'
+```
+
 **Report fields** — every `duplicate_actions` entry (`RunReport
 .duplicate_action_entries`, `to_json_dict()["duplicate_actions"]["entries"]`)
 now carries `fingerprint`, `previous_status`, `previous_disposition`,

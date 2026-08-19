@@ -138,6 +138,7 @@ class _CredentialDeterministic:
         username_candidates: list[str] | None = None,
         password_candidates: list[str] | None = None,
         max_access_attempts: int = 1,
+        capability_registry: object | None = None,
     ) -> None:
         self._target = target
         self._registry = registry
@@ -146,6 +147,21 @@ class _CredentialDeterministic:
         # max_access_attempts is bounded at 1 in this iteration; stored for
         # future multi-credential support behind an explicit gate.
         self._max_attempts = max(1, max_access_attempts)
+        # §28.35 — runtime registry holding auto-invite-flow credentials (or
+        # None). When no CLI credentials were supplied, plan() loads the
+        # runtime-only pair from here (never from the EKG).
+        self._cap_registry = capability_registry
+
+    def _maybe_load_manual_credentials(self) -> None:
+        """§28.35 — if no operator credentials were configured, adopt the
+        runtime-only pair captured by the auto-invite-flow (if any)."""
+        if (self._usernames and self._passwords) or self._cap_registry is None:
+            return
+        getter = getattr(self._cap_registry, "get_manual_credentials", None)
+        mc = getter() if callable(getter) else None
+        if mc:
+            self._usernames = [mc[0]]
+            self._passwords = [mc[1]]
 
     def has_credentials(self) -> bool:
         """True when at least one username and one password are configured."""
@@ -185,6 +201,7 @@ class _CredentialDeterministic:
     async def plan(
         self, goal: Goal, subgraph: SubgraphView, evidence: EvidenceBundle
     ) -> list[TaskSpec] | AbandonSignal:
+        self._maybe_load_manual_credentials()
         caps = capabilities_from_subgraph(subgraph)
         caps_by_protocol: dict[str, list[Capability]] = {p: [] for p in _PROTOCOL_ORDER}
         for c in caps:
@@ -300,6 +317,7 @@ class CredentialPlanner:
         password_candidates: list[str] | None = None,
         max_access_attempts: int = 1,
         *,
+        capability_registry: object | None = None,
         model_router: "ModelRouter | None" = None,
         allowed_tools: list[str] | None = None,
         confidence_threshold: float = 0.4,
@@ -313,6 +331,7 @@ class CredentialPlanner:
             username_candidates=username_candidates,
             password_candidates=password_candidates,
             max_access_attempts=max_access_attempts,
+            capability_registry=capability_registry,
         )
         self._engine: PlanningEngine | None = None
         self._last_decision: PlanDecision | None = None

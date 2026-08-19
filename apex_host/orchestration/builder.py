@@ -176,10 +176,17 @@ def build_apex_graph(
         run_command_fn = to_run_command_fn(select_runtime_backend(config))
 
     llm_guard, llm_gateway = _build_llm_components(model_router, config, budget_tracker)
+    # §28.35 — construct the runtime registry BEFORE the planners so the
+    # credential planner can read auto-invite-flow credentials from it. (The
+    # user_flag_executor / dispatcher below reuse this same instance; the later
+    # ``if capability_registry is None`` guard is now a no-op.)
+    if capability_registry is None:
+        capability_registry = CapabilityRuntimeRegistry()
     phase_planners = build_planners(
         config, registry,
         model_router=model_router, budget_tracker=budget_tracker,
         llm_guard=llm_guard, llm_gateway=llm_gateway,
+        capability_registry=capability_registry,
     )
     telnet_executor = TelnetExecutor(config)
     browser_executor = BrowserExecutor(config)
@@ -218,6 +225,11 @@ def build_apex_graph(
     # runtime adapter via capability_registry rather than speaking any
     # transport (e.g. SSH) directly.
     user_flag_executor = UserFlagExecutor(config, capability_registry)
+    # §28.35 — opt-in auto-invite-flow orchestrator. Uses the SAME run_command_fn
+    # (so its curl calls go through the selected backend + safety.py) and stores
+    # captured credentials ONLY in capability_registry (never the EKG/episode).
+    from apex_host.agents.invite_executor import InviteFlowExecutor
+    invite_executor = InviteFlowExecutor(config, run_command_fn, capability_registry)
     repair_engine = RepairEngine(
         model_router=model_router, allowed_tools=config.allowed_tools,
         target=config.target, dry_run=config.dry_run,
@@ -232,6 +244,7 @@ def build_apex_graph(
         priv_esc_analysis_executor=priv_esc_analysis_executor,
         priv_esc_enum_executor=priv_esc_enum_executor,
         user_flag_executor=user_flag_executor,
+        invite_executor=invite_executor,
     )
     _max_repair = getattr(config, "max_repair_attempts", 1)
 

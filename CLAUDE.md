@@ -764,6 +764,16 @@ These are stricter than, and additive to, the memfabric invariants:
   and do not make autonomous high-risk exploit decisions. `ExecuteExecutor`
   performs bounded command execution only — no destructive commands, ever
   (enforced by `safety.py`, not by planner discipline alone).
+  - **Exception for bounded registration flows (§28.35, amended).** Autonomous
+    execution of a **bounded, operator-configured registration flow** (GET a
+    challenge → decode it in pure Python → POST verify → POST register) is
+    permitted ONLY when the operator explicitly enables `--auto-invite-flow` and
+    supplies the exact endpoint patterns, decode steps, and per-action
+    `--auto-approve-send-patterns`. This is bounded onboarding on an operator-
+    named flow, not open-ended exploitation: it is default OFF, generic (no
+    hardcoded path/decode/machine), still passes every send through `safety.py`
+    + policy scope, and only ever connects to the authorized target IP. No
+    destructive commands, no JS execution, no free-form request construction.
 - **`BrowserExecutor` only drives Playwright when `dry_run=False`.** In
   dry-run mode it returns a synthetic `BrowserObservation`. It holds no
   browser state across tasks — each `run()` call is stateless, consistent
@@ -3924,6 +3934,17 @@ alongside for debugging without leaking credential material.
 Every `credential` node written to the EKG must have
 `props["secret_hint"] = REDACTED_PLACEHOLDER`.  The plaintext credential must
 never appear in graph state, episodic log, or any proposal.
+
+**Exception for runtime-only credentials (§28.35, amended).** Credentials
+captured by the opt-in `--auto-invite-flow` are held **only** in the process-
+local `CapabilityRuntimeRegistry` (never persisted to the EKG, episodic log, or
+checkpoint — consistent with how that registry already holds live-session
+credentials, Phase 18B/24) and consumed by the credential-validation phase. The
+EKG `credential` node still receives `secret_hint="[redacted]"`; the plaintext
+password lives solely in the runtime registry and is wiped by
+`runtime.aclose()`. The invite-flow result dict and episodic log never contain
+the password (the `InviteFlowExecutor` writes it straight to the registry and
+returns only the non-secret username).
 
 **P8-I04 — `apex_host.graph_ids` is the sole source of EKG ID construction.**  
 All parsers and graph-writing components call the builder functions in
@@ -11444,6 +11465,19 @@ provider, or ANY error in the gate → **DENY** (disposition `BLOCKED_APPROVAL`,
 `ErrorCategory.APPROVAL_DENIED`, never retried/repaired). Read-side actions pass
 straight through unchanged.
 
+**Exception for operator-configured auto-approval (§28.35, amended).** When the
+operator explicitly enables `--auto-invite-flow` and supplies a list of
+send-side action patterns via `--auto-approve-send-patterns`, actions matching
+those patterns (and the opt-in `invite_flow` orchestrator task itself) are
+**auto-approved** for the duration of the engagement — via an `AutoApproveProvider`
+that wraps the fail-closed provider inside the gate, not a bypass of it. This is
+a deliberate, operator-configured override, default OFF: with `auto_invite_flow`
+disabled nothing is ever auto-approved and the gate is byte-for-byte unchanged.
+All auto-approved decisions are recorded with `auto_approved=True` in the audit
+log. The gate remains fail-closed for every other send action, and auto-approval
+never relaxes the guards behind the gate — `safety.py` (destructive/metachar
+blocking) and `PolicyAdvisor` scope still run on every matched action.
+
 **Approval interface** (`ApprovalProvider` Protocol — a clean, swappable
 boundary) — the send-side action is rendered in full (method, full URL, headers,
 the LITERAL body, plus the planner's stated intent and brief graph context) and
@@ -11715,6 +11749,75 @@ api/notable classification, uninteresting paths ignored, JS/static-asset
 exclusion, dedup+bound, notes are secret-free (no base64/ROT13/machine path),
 purity (no subgraph mutation), and report text/JSON integration. Full suite
 passes; `ruff`/`mypy` clean; release gate 31/31.
+
+### 28.35 Generic, opt-in auto-invite/registration flow
+
+An OPT-IN (`--auto-invite-flow`, default OFF), GENERIC automation of a bounded
+web onboarding flow: GET a challenge endpoint → decode it in pure Python → POST
+the decoded value to a verify endpoint → POST the resulting code to a register
+endpoint → capture the returned credentials → hand them to the credential
+phase. Every value (endpoint patterns, decode steps, JSON field names,
+auto-approved send patterns) is OPERATOR-configured — no hardcoded path, no
+hardcoded decode order (e.g. no baked-in "base64+ROT13"), no machine name
+(§13.8/§13.9). This is the feature behind the amended §28.30 (operator-configured
+auto-approval), §11.2 (bounded registration exception), and P8-I03 (runtime-only
+credentials); read those amendments first.
+
+**Default-off guarantee.** With `auto_invite_flow=False` (the default) nothing is
+emitted, no send-side action is ever auto-approved, no new node/executor path
+runs, and behaviour is byte-for-byte unchanged. Under `dry_run` (the default) the
+`InviteFlowExecutor` performs NO network I/O and stores no credentials.
+
+**Modules.** `apex_host/invite_flow.py` (pure: `decode_response` [base64/rot13/
+hex/url], `find_matching_endpoints`, `action_matches_auto_approve`,
+`build_invite_flow_task`); `apex_host/agents/invite_executor.py`
+(`InviteFlowExecutor` orchestrator); `apex_host/parsers/invite_parser.py`
+(`InviteFlowParser` → redacted credential node); the `AutoApproveProvider` in
+`apex_host/execution/approval.py`; and wiring in `web_planner`/`dispatcher`/
+`credential_planner`/`runtime_registry`/`builder`/`runtime`.
+
+**Flow + gates.** `_WebDeterministic.plan()` emits ONE `invite_flow` orchestrator
+task (via `build_invite_flow_task`) when the flow is enabled and generate/verify/
+register endpoints have all been discovered (idempotent — skipped once an
+`auto_registration` credential node exists). The dispatch approval gate (§28.30)
+classifies the orchestrator send-side and the `AutoApproveProvider` auto-approves
+it (operator opted in). INSIDE the executor, EACH send-side sub-request (the two
+POSTs) is INDIVIDUALLY re-checked against the operator's
+`--auto-approve-send-patterns` and **fail-closes** (aborts, stores nothing) if a
+POST is not listed; every curl still passes through `safety.py` (inside
+`run_command`) and is `--resolve`-pinned so it only ever connects to the
+AUTHORIZED target IP (§28.8). The challenge decode is pure Python — the JS is
+never executed (§28.24 unchanged).
+
+**Credential handoff (amended P8-I03).** On success the executor stores the
+plaintext (username, password) ONLY in the process-local
+`CapabilityRuntimeRegistry` (`set_manual_credentials`), never in the result dict,
+episode, or EKG. `InviteFlowParser` writes a `credential` node with
+`secret_hint="[redacted]"`, `source="auto_registration"`. When no CLI credentials
+were supplied, `_CredentialDeterministic._maybe_load_manual_credentials()` adopts
+the runtime pair (CLI credentials always win). `runtime.aclose()` wipes them.
+
+**Config/CLI.** `ApexConfig`: `auto_invite_flow` (bool), `invite_generate_patterns`,
+`invite_verify_patterns`, `invite_register_patterns` (default `["/register"]`),
+`invite_decode_steps`, `auto_approve_send_patterns`, `invite_verify_response_field`
+(`"code"`), `invite_register_username_field` (`"username"`),
+`invite_register_password_field` (`"password"`). CLI flags of the same names on
+both `apex_host.main` and `apex_host.eval.run_htb_local` (list flags are CSV).
+
+**Explicitly bounded.** One orchestrator task per engagement; two POSTs, each
+operator-approved by pattern; no free-form request construction (the executor
+has no "make an arbitrary request" surface — only this fixed 3-step shape); no
+destructive commands; no JS execution; connects only to the authorized IP.
+
+**Tests:** `tests/apex_host/test_invite_flow.py` (24 tests) — decode chain +
+errors, endpoint/auto-approve matching, `AutoApproveProvider` (orchestrator +
+pattern approve, unlisted send delegates→deny), `build_default_gate` off-by-
+default vs wrapped-when-enabled, the executor (dry-run no-op, full success
+storing runtime-only creds with the password absent from the result, fail-closed
+when a POST is not auto-approved, decode-failure abort), the redacted parser
+node, the planner emit (enabled/disabled/missing-endpoint/idempotent), and the
+credential handoff (runtime read, no-registry, CLI-wins). Full suite passes;
+`ruff`/`mypy` clean; release gate 31/31.
 
 ### 28.7 Release gate
 

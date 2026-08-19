@@ -107,6 +107,10 @@ class ApexRuntime:
         if self._runtime_reference_store is not None:
             revoked = self._runtime_reference_store.invalidate_all(reason="shutdown")
             logger.debug("aclose: invalidated %d runtime reference(s)", revoked)
+        # §28.35 (amended P8-I03) — wipe any runtime-only auto-invite-flow
+        # credentials at shutdown; they are never persisted anywhere else.
+        if self._capability_registry is not None:
+            self._capability_registry.clear_manual_credentials()
         # Cancel any background tasks that were started but not awaited.
         # Currently ApexRuntime does not start background tasks directly; this
         # hook is provided for future use and ensures the pattern is in place.

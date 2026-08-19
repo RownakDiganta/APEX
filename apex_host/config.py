@@ -120,6 +120,25 @@ class ApexConfig:
     # generic API/GraphQL root probes (/api, /api/v1, /api/v2, /graphql) run
     # without a wordlist and need no approval — they are bounded curl GETs.
     web_api_wordlist_path: str | None = None
+    # §28.35 — generic, opt-in auto-invite-flow (registration onboarding). ALL
+    # values are operator-configured (no hardcoded path/decode/machine). Default
+    # OFF: with auto_invite_flow=False nothing is ever emitted, no send-side
+    # action is ever auto-approved, and behaviour is byte-for-byte unchanged.
+    # See the amended §28.30 (operator-configured auto-approval), §11.2 (bounded
+    # registration exception), and P8-I03 (runtime-only credentials).
+    auto_invite_flow: bool = False
+    invite_generate_patterns: list[str] = field(default_factory=list)
+    invite_verify_patterns: list[str] = field(default_factory=list)
+    invite_register_patterns: list[str] = field(default_factory=lambda: ["/register"])
+    invite_decode_steps: list[str] = field(default_factory=list)
+    # Send-side action patterns the operator explicitly opts to auto-approve for
+    # the invite flow (e.g. "POST /api/v1/invite/verify"). Empty → nothing is
+    # auto-approved (the gate stays fail-closed). safety.py + policy scope still
+    # apply to every matched action.
+    auto_approve_send_patterns: list[str] = field(default_factory=list)
+    invite_verify_response_field: str = "code"
+    invite_register_username_field: str = "username"
+    invite_register_password_field: str = "password"
     # Bounded access validation — explicit credentials only, no looping.
     # Empty by default: no login attempts are made unless the operator
     # supplies credentials via --username / --password CLI flags.
@@ -675,6 +694,11 @@ class ApexConfig:
             d["htb_ovpn_path"] = _basename(self.htb_ovpn_path)
         if self.direct_file_read_headers:
             d["direct_file_read_headers"] = {k: _REDACTED for k in self.direct_file_read_headers}
+        # §28.35 — `invite_register_password_field` (and `..._username_field`)
+        # hold a JSON FIELD NAME (e.g. the literal "password"), NOT a secret
+        # value, so they are returned verbatim. The auto-invite-flow password
+        # itself is never stored in ApexConfig — it lives only in the runtime
+        # registry (amended P8-I03), never in a serialised config.
         return d
 
     @classmethod
@@ -693,6 +717,12 @@ class ApexConfig:
             v = getattr(args, attr, None)
             return default if v is None else v
 
+        def _csv(value: object) -> list[str]:
+            """Parse a comma-separated CLI string into a trimmed, non-empty list."""
+            if isinstance(value, list):
+                return [str(x).strip() for x in value if str(x).strip()]
+            return [p.strip() for p in str(value or "").split(",") if p.strip()]
+
         kwargs: dict[str, object] = {
             "target": getattr(args, "target"),
             "payload_repo_path": _g("payload_repo", "./payloads"),
@@ -705,6 +735,16 @@ class ApexConfig:
             "web_enum_threads": _g("web_enum_threads", 20),
             "web_enum_max_seconds": _g("web_enum_max_seconds", 60),
             "web_api_wordlist_path": _g("web_api_wordlist", None),
+            # §28.35 — auto-invite-flow (default off; list flags are CSV).
+            "auto_invite_flow": bool(_g("auto_invite_flow", False)),
+            "invite_generate_patterns": _csv(_g("invite_generate_patterns", "")),
+            "invite_verify_patterns": _csv(_g("invite_verify_patterns", "")),
+            "invite_register_patterns": _csv(_g("invite_register_patterns", "/register")) or ["/register"],
+            "invite_decode_steps": _csv(_g("invite_decode_steps", "")),
+            "auto_approve_send_patterns": _csv(_g("auto_approve_send_patterns", "")),
+            "invite_verify_response_field": str(_g("invite_verify_response_field", "code")),
+            "invite_register_username_field": str(_g("invite_register_username_field", "username")),
+            "invite_register_password_field": str(_g("invite_register_password_field", "password")),
             "username_candidates": list(getattr(args, "username", None) or []),
             "password_candidates": list(getattr(args, "password", None) or []),
             "max_access_attempts": _g("max_access_attempts", 1),

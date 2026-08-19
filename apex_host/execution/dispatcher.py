@@ -49,6 +49,7 @@ from apex_host.tools.backend import backend_capability_mode
 if TYPE_CHECKING:
     from apex_host.agents.browser_executor import BrowserExecutor
     from apex_host.agents.ftp_executor import FTPExecutor
+    from apex_host.agents.invite_executor import InviteFlowExecutor
     from apex_host.agents.priv_esc_analysis_executor import PrivEscAnalysisExecutor
     from apex_host.agents.priv_esc_enum_executor import PrivEscEnumExecutor
     from apex_host.agents.ssh_executor import SSHExecutor
@@ -196,6 +197,7 @@ class TaskDispatcher:
         priv_esc_analysis_executor: "PrivEscAnalysisExecutor | None" = None,
         priv_esc_enum_executor: "PrivEscEnumExecutor | None" = None,
         user_flag_executor: "UserFlagExecutor | None" = None,
+        invite_executor: "InviteFlowExecutor | None" = None,
         approval_gate: "ApprovalGate | None" = None,
     ) -> None:
         self._advisor = advisor
@@ -209,6 +211,7 @@ class TaskDispatcher:
         self._priv_esc_analysis_executor = priv_esc_analysis_executor
         self._priv_esc_enum_executor = priv_esc_enum_executor
         self._user_flag_executor = user_flag_executor
+        self._invite_executor = invite_executor
         # §28.30 — the fail-closed human approval gate. When not supplied, build
         # the fail-closed default (deny send-side in dry-run/non-interactive).
         self._approval_gate = approval_gate or build_default_gate(config)
@@ -493,6 +496,8 @@ class TaskDispatcher:
                 tr_dict, disposition = await self._run_priv_esc_enum(task, context, args, target, parser, phase)
             elif tool == "user_flag_verify":
                 tr_dict, disposition = await self._run_user_flag_verify(task, context, args, target, parser, phase)
+            elif tool == "invite_flow":
+                tr_dict, disposition = await self._run_invite_flow(task, context, args, target, parser, phase)
             else:
                 tr_dict, disposition = await self._run_command(task, context, args, target, parser, phase)
         except asyncio.CancelledError:
@@ -862,6 +867,45 @@ class TaskDispatcher:
 
         result = await self._ftp_executor.run(task, context.evidence)
         return _credential_result_to_tr(task, result, "ftp_access", target, parser, phase)
+
+    async def _run_invite_flow(
+        self,
+        task: TaskSpec,
+        context: ExecutionContext,
+        args: list[str],
+        target: str,
+        parser: str,
+        phase: str,
+    ) -> tuple[dict[str, Any], ExecutionDisposition]:
+        """Run the opt-in auto-invite-flow (§28.35) via InviteFlowExecutor.
+
+        The result dict carries the username (for the redacted EKG credential
+        node) and a secret-free step audit — NEVER the password (that lives only
+        in the runtime registry, amended P8-I03)."""
+        if self._invite_executor is None:
+            tr: dict[str, Any] = {
+                "task_id": task.id, "tool": "invite_flow", "args": [],
+                "target": target, "parser": parser, "stdout": "", "stderr": "",
+                "returncode": 1, "dry_run": context.dry_run,
+                "error": "invite executor not configured", "phase": phase,
+            }
+            return tr, ExecutionDisposition.TOOL_UNAVAILABLE
+
+        result = await self._invite_executor.run(task, context.evidence)
+        tr = {
+            "task_id": task.id, "tool": "invite_flow", "args": [],
+            "target": target, "parser": parser, "stdout": "", "stderr": "",
+            "returncode": 0 if result.success else 1, "dry_run": result.dry_run,
+            "error": result.error, "phase": phase,
+            # Non-secret fields only. The password is NEVER placed here.
+            "invite_username": result.username,
+            "credentials_stored": result.credentials_stored,
+            "invite_flow_steps": list(result.steps),
+        }
+        disposition = (
+            ExecutionDisposition.EXECUTED_SUCCESS if result.success
+            else ExecutionDisposition.EXECUTED_VALID_NEGATIVE)
+        return tr, disposition
 
     async def _run_priv_esc_analysis(
         self,

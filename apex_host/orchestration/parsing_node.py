@@ -30,6 +30,7 @@ from apex_host.capabilities.emission import (
 )
 from apex_host.capabilities.evidence import CapabilityEvidence
 from apex_host.parsers.access_parser import AccessParser
+from apex_host.parsers.invite_parser import InviteFlowParser
 from apex_host.parsers.banner_parser import BannerParser
 from apex_host.parsers.browser_parser import BrowserParser
 from apex_host.parsers.command_parser import CommandParser
@@ -59,6 +60,7 @@ _COMMAND = CommandParser()
 _BANNER = BannerParser()
 _BROWSER_PARSER = BrowserParser()
 _ACCESS = AccessParser()
+_INVITE = InviteFlowParser()
 _PRIV_ESC = PrivEscParser()
 _OBJECTIVE = ObjectiveParser()
 
@@ -176,6 +178,10 @@ def parse_single_result(
             proto=str(tool_result.get("proto", "tcp")),
         )
         return parsed, tool_name
+    if parser_name == "invite_flow":
+        # §28.35 — opt-in auto-invite-flow result → redacted credential node.
+        # The plaintext password is NOT in tool_result (runtime registry only).
+        return _INVITE.parse_result(tool_result, target=target), "invite_flow"
     if parser_name == "curl_body":
         # host_ip = the authorized engagement host, so a Host-aware vhost fetch
         # (target = the vhost URL) links its endpoints/service to the existing

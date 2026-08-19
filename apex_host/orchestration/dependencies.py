@@ -78,6 +78,7 @@ def build_planners(
     budget_tracker: "LLMBudgetTracker | None" = None,
     llm_guard: "LLMPolicyGuard | None" = None,
     llm_gateway: "LLMGateway | None" = None,
+    capability_registry: Any | None = None,
 ) -> dict[str, "Planner"]:
     """Construct the phase-planner instances for an engagement.
 
@@ -130,6 +131,9 @@ def build_planners(
             web_enum_threads=config.web_enum_threads,
             web_enum_max_seconds=config.web_enum_max_seconds,
             web_api_wordlist_path=config.web_api_wordlist_path,
+            # §28.35 — the ApexConfig drives the opt-in auto-invite-flow emit
+            # (default off; None keeps behaviour unchanged).
+            invite_config=config if getattr(config, "auto_invite_flow", False) else None,
             **_kwargs(),
         ),
         ApexPhase.credential.value: CredentialPlanner(
@@ -138,6 +142,7 @@ def build_planners(
             username_candidates=config.username_candidates,
             password_candidates=config.password_candidates,
             max_access_attempts=config.max_access_attempts,
+            capability_registry=capability_registry,
             **_kwargs(),
         ),
         ApexPhase.priv_esc.value: PrivEscPlanner(

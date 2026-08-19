@@ -176,6 +176,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "requires --allow-password-lists; omit to skip)",
     )
     parser.add_argument(
+        "--auto-invite-flow", dest="auto_invite_flow", action="store_true", default=False,
+        help="§28.35 — enable the generic, opt-in auto-invite/registration flow "
+             "(default OFF; all endpoints/decode steps are operator-supplied).",
+    )
+    parser.add_argument(
+        "--invite-generate-patterns", dest="invite_generate_patterns", default="", metavar="RE,RE",
+        help="§28.35 — comma-separated regex patterns matching the challenge-GENERATE endpoint.",
+    )
+    parser.add_argument(
+        "--invite-verify-patterns", dest="invite_verify_patterns", default="", metavar="RE,RE",
+        help="§28.35 — comma-separated regex patterns matching the invite-VERIFY endpoint.",
+    )
+    parser.add_argument(
+        "--invite-register-patterns", dest="invite_register_patterns", default="/register", metavar="RE,RE",
+        help="§28.35 — comma-separated regex patterns matching the REGISTER endpoint (default /register).",
+    )
+    parser.add_argument(
+        "--invite-decode-steps", dest="invite_decode_steps", default="", metavar="STEP,STEP",
+        help="§28.35 — ordered pure-Python decode steps for the challenge: base64,rot13,hex,url.",
+    )
+    parser.add_argument(
+        "--auto-approve-send-patterns", dest="auto_approve_send_patterns", default="", metavar="PAT,PAT",
+        help="§28.35/§28.30 — comma-separated send-side action patterns to auto-approve "
+             "(e.g. 'POST /api/v1/invite/verify'). Empty → nothing auto-approved (fail-closed).",
+    )
+    parser.add_argument(
+        "--invite-verify-response-field", dest="invite_verify_response_field", default="code",
+        help="§28.35 — JSON field in the verify response holding the invite code (default 'code').",
+    )
+    parser.add_argument(
+        "--invite-register-username-field", dest="invite_register_username_field", default="username",
+        help="§28.35 — JSON field in the register response holding the username (default 'username').",
+    )
+    parser.add_argument(
+        "--invite-register-password-field", dest="invite_register_password_field", default="password",
+        help="§28.35 — JSON field in the register response holding the password (default 'password').",
+    )
+    parser.add_argument(
         "--max-web-paths", type=int, default=50,
         help="Maximum web paths to discover per turn (default: 50)",
     )

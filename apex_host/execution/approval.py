@@ -242,6 +242,37 @@ class TerminalApprovalProvider:
         return ApprovalDecision(False, "operator denied", ts)
 
 
+class AutoApproveProvider:
+    """§28.30 amended — operator-configured auto-approval for the opt-in
+    auto-invite-flow (§28.35).
+
+    Auto-approves ONLY: (1) the ``invite_flow`` orchestrator task itself (the
+    operator explicitly enabled ``--auto-invite-flow``), and (2) any send-side
+    action whose ``METHOD url`` matches an operator ``--auto-approve-send-patterns``
+    entry. EVERYTHING ELSE delegates to the wrapped fail-closed provider, so a
+    send-side action the operator did NOT list still requires normal approval /
+    is denied. This never relaxes ``safety.py`` or ``PolicyAdvisor`` scope — those
+    run behind the gate regardless. Auto-approval is a deliberate operator
+    override, recorded with ``auto_approved=True`` in the audit log."""
+
+    def __init__(self, patterns: list[str], fallback: ApprovalProvider) -> None:
+        self._patterns = [p for p in (patterns or []) if p.strip()]
+        self._fallback = fallback
+
+    def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
+        from apex_host.invite_flow import action_matches_auto_approve
+
+        matched = request.tool == "invite_flow"
+        if not matched and self._patterns:
+            matched = action_matches_auto_approve(
+                request.method, request.url or request.target, self._patterns)
+        if matched:
+            return ApprovalDecision(
+                True, "auto_approved: operator-configured (§28.35)", now(),
+                token=bind_approval_token(request.fingerprint))
+        return self._fallback.request_approval(request)
+
+
 class ApprovalGate:
     """Classifies each action and, for send-side actions, obtains an explicit
     per-action approval before it may proceed. Fail-closed on ANY error. Appends
@@ -339,6 +370,8 @@ class ApprovalGate:
             "intent": (request.intent or "")[:500],
             "graph_context": (request.graph_context or "")[:500],
             "approved": decision.approved,
+            # §28.35 — operator-configured auto-approval is recorded distinctly.
+            "auto_approved": decision.reason.startswith("auto_approved"),
             "decision_reason": decision.reason,
             "timestamp": decision.timestamp,
         }
@@ -357,8 +390,14 @@ def build_default_gate(config: Any) -> ApprovalGate:
     audit log. Send-side actions in the current pipeline (e.g. a GraphQL
     introspection POST) are therefore denied unless an operator approves them at
     a real terminal."""
+    provider: ApprovalProvider = TerminalApprovalProvider(
+        dry_run=bool(getattr(config, "dry_run", True)))
+    # §28.30 amended / §28.35 — only when the operator explicitly opted in.
+    if getattr(config, "auto_invite_flow", False):
+        provider = AutoApproveProvider(
+            list(getattr(config, "auto_approve_send_patterns", []) or []), provider)
     return ApprovalGate(
-        TerminalApprovalProvider(dry_run=bool(getattr(config, "dry_run", True))),
+        provider,
         audit_log_path=getattr(config, "approval_audit_log_path", None),
         passwords=list(getattr(config, "password_candidates", []) or []),
     )

@@ -178,6 +178,29 @@ class CapabilityRuntimeRegistry:
         #: ``apex_host.capabilities.runtime_references`` module docstring
         #: "runtime_generation semantics".
         self._generations: dict[str, int] = {}
+        #: §28.35 / amended P8-I03 — credentials obtained by the opt-in
+        #: auto-invite-flow are held ONLY here (a process-local, never-persisted
+        #: registry — never written to the EKG, episodic log, or checkpoint) and
+        #: consumed by the credential-validation phase. Cleared on aclose().
+        self._manual_credentials: tuple[str, str] | None = None
+
+    def set_manual_credentials(self, username: str, password: str) -> None:
+        """Store runtime-only credentials from the auto-invite-flow (§28.35).
+
+        Held in memory only — never persisted. The corresponding EKG credential
+        node still receives ``secret_hint="[redacted]"`` (P8-I03); the plaintext
+        password lives solely here."""
+        self._manual_credentials = (username, password)
+
+    def get_manual_credentials(self) -> tuple[str, str] | None:
+        """The runtime-only (username, password) from the auto-invite-flow, or
+        None. Consumed by the credential planner when no operator credentials
+        were supplied on the CLI."""
+        return self._manual_credentials
+
+    def clear_manual_credentials(self) -> None:
+        """Wipe the runtime-only credentials (called on engagement shutdown)."""
+        self._manual_credentials = None
 
     def register(self, capability_id: str, adapter: FlagReadCapability) -> None:
         """Unconditional set. First call for a given ``capability_id``
