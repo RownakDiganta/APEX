@@ -11801,6 +11801,17 @@ POST is not listed; every curl still passes through `safety.py` (inside
 AUTHORIZED target IP (§28.8). The challenge decode is pure Python — the JS is
 never executed (§28.24 unchanged).
 
+**Response field auto-detection.** The executor does not force the operator to
+guess a response's exact JSON field name. The invite code is read from the
+configured `invite_verify_response_field` first, then common names
+(`code`/`invite_code`/`token`/`invite`/`data`/`result`), then — for the OPAQUE
+code only — the first non-status string value as a last resort. The register
+username/password are read from the configured field then common names
+(`username`/`user`/`login`/`name`, `password`/`pass`/`secret`/`pwd`) but NEVER an
+any-string fallback (a wrong string as a credential would be misleading). A
+non-JSON verify/register response, or a missing code, aborts the flow with a
+clear error (the code-not-found message lists the field names tried).
+
 **Credential handoff (amended P8-I03).** On success the executor stores the
 plaintext (username, password) ONLY in the process-local
 `CapabilityRuntimeRegistry` (`set_manual_credentials`), never in the result dict,

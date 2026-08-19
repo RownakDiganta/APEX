@@ -9,6 +9,10 @@ import codecs
 import pytest
 
 from apex_host.agents.invite_executor import InviteFlowExecutor
+from apex_host.agents.invite_executor import (  # noqa: E501
+    _CODE_FIELDS as _CODE,
+    _USERNAME_FIELDS as _USER,
+)
 from apex_host.config import ApexConfig
 from apex_host.execution.approval import (
     AutoApproveProvider,
@@ -342,3 +346,70 @@ class TestRuntimeRegistry:
         assert reg.get_manual_credentials() == ("u", "p")
         reg.clear_manual_credentials()
         assert reg.get_manual_credentials() is None
+
+
+class TestFieldExtraction:
+    """§28.35 — auto-detect the invite-code / credential field names."""
+
+    def test_extract_field_preferred_wins(self) -> None:
+        assert InviteFlowExecutor._extract_field(
+            {"code": "A", "invite_code": "B"}, "invite_code", _CODE) == "B"
+
+    def test_extract_field_code(self) -> None:
+        assert InviteFlowExecutor._extract_field({"code": "X"}, "code", _CODE) == "X"
+
+    def test_extract_field_invite_code(self) -> None:
+        assert InviteFlowExecutor._extract_field({"invite_code": "X"}, "code", _CODE) == "X"
+
+    def test_extract_field_token(self) -> None:
+        assert InviteFlowExecutor._extract_field({"token": "X"}, "code", _CODE) == "X"
+
+    def test_extract_field_data_and_result(self) -> None:
+        assert InviteFlowExecutor._extract_field({"data": "DVAL"}, "code", _CODE) == "DVAL"
+        assert InviteFlowExecutor._extract_field({"result": "RVAL"}, "code", _CODE) == "RVAL"
+
+    def test_extract_any_string_fallback_for_code(self) -> None:
+        # no common field, but a plausible string value is found (code only)
+        assert InviteFlowExecutor._extract_field(
+            {"mystery": "abc123xyz"}, "code", _CODE, allow_any_string=True) == "abc123xyz"
+
+    def test_any_string_fallback_skips_status_words(self) -> None:
+        assert InviteFlowExecutor._extract_field(
+            {"status": "success"}, "code", _CODE, allow_any_string=True) == ""
+
+    def test_no_any_string_fallback_for_credentials(self) -> None:
+        # username/password never use the any-string fallback
+        assert InviteFlowExecutor._extract_field({"mystery": "somename"}, "username", _USER) == ""
+
+    def test_extract_empty_response(self) -> None:
+        assert InviteFlowExecutor._extract_field({}, "code", _CODE, allow_any_string=True) == ""
+
+    def test_parse_json_non_object(self) -> None:
+        assert InviteFlowExecutor._parse_json("not json") is None
+        assert InviteFlowExecutor._parse_json("[1,2,3]") is None
+        assert InviteFlowExecutor._parse_json('{"a": 1}') == {"a": 1}
+
+    @pytest.mark.asyncio
+    async def test_executor_finds_alternate_code_field(self) -> None:
+        # verify response uses 'invite_code', not the configured 'code' — succeeds.
+        reg = CapabilityRuntimeRegistry()
+        runner = _FakeRunner(challenge=_challenge(), verify_json='{"invite_code": "INV-9"}')
+        ex = InviteFlowExecutor(_cfg(), runner, reg)
+        res = await ex.run(_task(), EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
+        assert res.success and reg.get_manual_credentials() == ("u", "s3cret")
+
+    @pytest.mark.asyncio
+    async def test_executor_non_json_verify_reports_clearly(self) -> None:
+        reg = CapabilityRuntimeRegistry()
+        runner = _FakeRunner(challenge=_challenge(), verify_json="<html>nope</html>")
+        ex = InviteFlowExecutor(_cfg(), runner, reg)
+        res = await ex.run(_task(), EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
+        assert not res.success and "not a JSON object" in (res.error or "")
+
+    @pytest.mark.asyncio
+    async def test_executor_missing_code_lists_tried_fields(self) -> None:
+        reg = CapabilityRuntimeRegistry()
+        runner = _FakeRunner(challenge=_challenge(), verify_json='{"status": "ok"}')
+        ex = InviteFlowExecutor(_cfg(), runner, reg)
+        res = await ex.run(_task(), EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
+        assert not res.success and "tried fields:" in (res.error or "")

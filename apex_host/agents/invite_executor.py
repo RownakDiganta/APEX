@@ -35,6 +35,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+#: §28.35 — common field names for the invite code in a verify response, tried
+#: (after the operator-supplied field) so the operator need not guess the exact
+#: name. The code alone permits an any-string fallback (a code is opaque); a
+#: credential NEVER does (a wrong string as a password would be misleading).
+_CODE_FIELDS: tuple[str, ...] = ("code", "invite_code", "token", "invite", "data", "result")
+_USERNAME_FIELDS: tuple[str, ...] = ("username", "user", "login", "name")
+_PASSWORD_FIELDS: tuple[str, ...] = ("password", "pass", "secret", "pwd")
+#: Strings that are status/flags, never an invite code — excluded from the
+#: any-string fallback.
+_NON_CODE_STRINGS: frozenset[str] = frozenset(
+    {"success", "true", "false", "ok", "error", "failed", "none", "1", "0"})
+
 
 @dataclass(slots=True)
 class InviteFlowResult:
@@ -106,11 +118,18 @@ class InviteFlowExecutor:
         if not self._ok(r):
             return InviteFlowResult(False, steps=steps + ["verify: request failed"],
                                     error="verify POST failed")
-        invite_code = self._json_field(r.stdout, verify_field)  # type: ignore[union-attr]
+        verify_json = self._parse_json(r.stdout)  # type: ignore[union-attr]
+        if verify_json is None:
+            return InviteFlowResult(
+                False, steps=steps + ["verify: non-JSON response"],
+                error="verify response was not a JSON object")
+        invite_code = self._extract_field(
+            verify_json, verify_field, _CODE_FIELDS, allow_any_string=True)
         if not invite_code:
+            tried = ", ".join(dict.fromkeys((verify_field, *_CODE_FIELDS)))
             return InviteFlowResult(
                 False, steps=steps + ["verify: no invite code in response"],
-                error="invite code not found in verify response")
+                error=f"invite code not found in verify response (tried fields: {tried})")
         steps.append("verify: obtained invite code")
 
         # 4. POST register (send-side) — fail-closed unless operator auto-approved it.
@@ -122,8 +141,15 @@ class InviteFlowExecutor:
         if not self._ok(r):
             return InviteFlowResult(False, steps=steps + ["register: request failed"],
                                     error="register POST failed")
-        username = self._json_field(r.stdout, user_field)  # type: ignore[union-attr]
-        password = self._json_field(r.stdout, pass_field)  # type: ignore[union-attr]
+        register_json = self._parse_json(r.stdout)  # type: ignore[union-attr]
+        if register_json is None:
+            return InviteFlowResult(
+                False, steps=steps + ["register: non-JSON response"],
+                error="register response was not a JSON object")
+        # Credentials try common field names too, but NEVER an any-string
+        # fallback — a wrong string as a username/password would be misleading.
+        username = self._extract_field(register_json, user_field, _USERNAME_FIELDS)
+        password = self._extract_field(register_json, pass_field, _PASSWORD_FIELDS)
         if not username or not password:
             return InviteFlowResult(
                 False, steps=steps + ["register: credentials not in response"],
@@ -176,12 +202,34 @@ class InviteFlowExecutor:
             return None
 
     @staticmethod
-    def _json_field(text: str, field_name: str) -> str:
+    def _parse_json(text: str) -> dict[str, object] | None:
+        """Parse a JSON object response, or None when the body is not a JSON
+        object (e.g. an HTML page or a JSON array)."""
         try:
             data = json.loads(text.strip())
         except (json.JSONDecodeError, ValueError):
-            return ""
-        if isinstance(data, dict):
-            v = data.get(field_name)
-            return str(v) if v not in (None, "") else ""
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _extract_field(
+        data: dict[str, object], preferred: str, candidates: tuple[str, ...],
+        *, allow_any_string: bool = False,
+    ) -> str:
+        """Return the first non-empty STRING value found for *preferred* then each
+        of *candidates* (§28.35 — so the operator need not guess the exact JSON
+        field name). When *allow_any_string* and none matched, fall back to the
+        first non-status string value (used ONLY for the opaque invite code,
+        never for a credential)."""
+        for name in (preferred, *candidates):
+            if not name:
+                continue
+            v = data.get(name)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        if allow_any_string:
+            for v in data.values():
+                if isinstance(v, str) and len(v.strip()) > 5 \
+                        and v.strip().lower() not in _NON_CODE_STRINGS:
+                    return v.strip()
         return ""

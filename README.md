@@ -2605,8 +2605,10 @@ every other
 send-side action stays fail-closed (§28.30), `safety.py` and policy scope still
 apply, and requests only ever reach the authorized target IP. Captured
 credentials live only in the process-local runtime registry (never the EKG/
-episode); the EKG credential node is redacted. See CLAUDE.md §28.35 and the
-amended §28.30/§11.2/P8-I03. Example:
+episode); the EKG credential node is redacted. The invite-code and credential
+JSON field names are auto-detected from common names (so you need not match the
+target's exact field), with the configured `--invite-*-field` tried first. See
+CLAUDE.md §28.35 and the amended §28.30/§11.2/P8-I03. Example:
 
 ```bash
 python -m apex_host.eval.run_htb_local --target <IP> --no-dry-run --confirm-live \
