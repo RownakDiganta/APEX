@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
+import string
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -56,6 +58,7 @@ class InviteFlowResult:
     username: str = ""
     invite_code_obtained: bool = False
     credentials_stored: bool = False
+    credentials_auto_generated: bool = False
     dry_run: bool = False
     error: str | None = None
     steps: list[str] = field(default_factory=list)
@@ -138,43 +141,101 @@ class InviteFlowExecutor:
             return InviteFlowResult(
                 False, steps=steps + ["register: not auto-approved"],
                 error="register POST not in --auto-approve-send-patterns (fail-closed)")
-        r = await self._curl("POST", reg_url, host_ip, body=f"{invite_field}={invite_code}")
+        # Generate RANDOM THROWAWAY credentials for the TARGET APP and send them
+        # in the register body alongside the invite code — the common "choose
+        # your own credentials" registration model (the server does NOT return
+        # credentials). These are never a real/HTB-platform credential (§28.35).
+        gen_user, gen_pass = self._generate_credentials()
+        reg_body = f"{user_field}={gen_user}&{pass_field}={gen_pass}&{invite_field}={invite_code}"
+        r = await self._curl("POST", reg_url, host_ip, body=reg_body, capture_status=True)
         if not self._ok(r):
             return InviteFlowResult(False, steps=steps + ["register: request failed"],
                                     error="register POST failed")
-        register_json = self._parse_json(r.stdout)  # type: ignore[union-attr]
-        if register_json is None:
+        body, status = self._split_status(r.stdout)  # type: ignore[union-attr]
+        # Prefer server-returned credentials when the flow is the other model
+        # (server generates + returns them); otherwise, on a 2xx/3xx, use the
+        # throwaway credentials we just registered.
+        reg_json = self._parse_json(body)
+        resp_user = self._extract_field(reg_json, user_field, _USERNAME_FIELDS) if reg_json else ""
+        resp_pass = self._extract_field(reg_json, pass_field, _PASSWORD_FIELDS) if reg_json else ""
+        auto_generated = False
+        if resp_user and resp_pass:
+            username, password = resp_user, resp_pass
+            steps.append("register: credentials returned by server")
+        elif self._register_succeeded(status, body):
+            username, password = gen_user, gen_pass
+            auto_generated = True
+            steps.append(
+                f"register: registered auto-generated throwaway credentials"
+                f"{f' (HTTP {status})' if status else ''}")
+        else:
             return InviteFlowResult(
-                False, steps=steps + ["register: non-JSON response"],
-                error="register response was not a JSON object")
-        # Credentials try common field names too, but NEVER an any-string
-        # fallback — a wrong string as a username/password would be misleading.
-        username = self._extract_field(register_json, user_field, _USERNAME_FIELDS)
-        password = self._extract_field(register_json, pass_field, _PASSWORD_FIELDS)
-        if not username or not password:
-            return InviteFlowResult(
-                False, steps=steps + ["register: credentials not in response"],
-                error="credentials not found in register response")
+                False, steps=steps + ["register: not accepted"],
+                error=f"registration was not accepted (HTTP status: {status or 'unknown'})")
 
         # 5. Store plaintext ONLY in the runtime registry (never the EKG/episode).
         self._registry.set_manual_credentials(username, password)
         steps.append("register: credentials stored in runtime registry (redacted in EKG)")
         return InviteFlowResult(
             True, username=username, invite_code_obtained=True,
-            credentials_stored=True, steps=steps)
+            credentials_stored=True, credentials_auto_generated=auto_generated, steps=steps)
 
     # -- helpers ---------------------------------------------------------
+    @staticmethod
+    def _generate_credentials() -> tuple[str, str]:
+        """Generate RANDOM, THROWAWAY credentials for the TARGET APPLICATION
+        registration (§28.35). These are for the simulated app on the target
+        only — never a real/HTB-platform credential, never reused. Uses
+        ``secrets`` (CSPRNG), not ``random``.
+
+        Username: ``apex_`` + 8 lowercase alphanumerics. Password: 16 chars from
+        letters/digits/a small symbol set."""
+        u_alpha = string.ascii_lowercase + string.digits
+        username = "apex_" + "".join(secrets.choice(u_alpha) for _ in range(8))
+        p_alpha = string.ascii_letters + string.digits + "!@#$%^&*"
+        password = "".join(secrets.choice(p_alpha) for _ in range(16))
+        return username, password
+
+    @staticmethod
+    def _split_status(stdout: str) -> tuple[str, str]:
+        """Split a curl body+``\\n%{http_code}`` capture into (body, status)."""
+        if "\n" in stdout:
+            body, _, status = stdout.rpartition("\n")
+            status = status.strip()
+            if status.isdigit():
+                return body, status
+        return stdout, ""
+
+    @staticmethod
+    def _is_error_response(body: str) -> bool:
+        low = body.lower()
+        return any(k in low for k in (
+            "error", "failed", "invalid", "already exists", "already taken",
+            "is taken", "bad request", "unauthorized", "forbidden"))
+
+    @classmethod
+    def _register_succeeded(cls, status: str, body: str) -> bool:
+        """A registration is successful on a 2xx/3xx HTTP status; when no status
+        was captured, fall back to a conservative body keyword check."""
+        if status:
+            return status[:1] in ("2", "3")
+        return not cls._is_error_response(body)
+
     @staticmethod
     def _ok(r: "ToolResult | None") -> bool:
         return r is not None and r.returncode == 0 and not r.error
 
     async def _curl(
         self, method: str, url: str, host_ip: str, *, body: str | None = None,
+        capture_status: bool = False,
     ) -> "ToolResult | None":
         """Build + run one bounded curl, pinned to the AUTHORIZED IP (§28.8).
 
         safety.py runs inside run_command; a rejected command (metachar/
-        destructive) returns None (the flow aborts fail-safe)."""
+        destructive) returns None (the flow aborts fail-safe). When
+        *capture_status* is set, the HTTP status code is appended to stdout as a
+        final line (``-w '\\n%{http_code}'``) so the caller can determine success
+        by status rather than by parsing the body."""
         try:
             sp = urlsplit(url)
         except ValueError:
@@ -188,6 +249,8 @@ class InviteFlowExecutor:
         # to host_ip; a bare-IP URL is fetched directly (host must equal host_ip).
         if host != host_ip:
             args += ["-L", "--resolve", f"{host}:{port}:{host_ip}"]
+        if capture_status:
+            args += ["-w", "\\n%{http_code}"]
         if method != "GET":
             args += ["-X", method]
         if body is not None:

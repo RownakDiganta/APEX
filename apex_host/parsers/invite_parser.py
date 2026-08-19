@@ -39,6 +39,7 @@ class InviteFlowParser:
                 "target": target,
                 "protocol": "",
                 "source": "auto_registration",
+                "auto_generated": bool(tool_result.get("credentials_auto_generated")),
                 "validated": False,
             },
             confidence=0.9,

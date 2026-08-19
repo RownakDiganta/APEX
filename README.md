@@ -2608,8 +2608,12 @@ credentials live only in the process-local runtime registry (never the EKG/
 episode); the EKG credential node is redacted. The invite-code and credential
 JSON field names are auto-detected from common names — searched at the top level
 and in nested objects up to depth 3 (so you need not match the target's exact
-field or its nesting), with the configured `--invite-*-field` tried first. See
-CLAUDE.md §28.35 and the amended §28.30/§11.2/P8-I03. Example:
+field or its nesting), with the configured `--invite-*-field` tried first. For a
+"choose your own credentials" registration (where the server does not return
+credentials), the register step **auto-generates random, single-use, target-app
+credentials** (`secrets`-based) and treats a 2xx/3xx response as success — these
+are never real or HTB-platform credentials. See CLAUDE.md §28.35 and the amended
+§28.30/§11.2/P8-I03. Example:
 
 ```bash
 python -m apex_host.eval.run_htb_local --target <IP> --no-dry-run --confirm-live \

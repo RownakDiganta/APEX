@@ -11815,6 +11815,17 @@ any-string fallback (a wrong string as a credential would be misleading). A
 non-JSON verify/register response, or a missing code, aborts the flow with a
 clear error (the code-not-found message lists the field names tried).
 
+**Registration credentials (choose-your-own model).** Many registration flows
+(e.g. HTB TwoMillion) do NOT return credentials — the client CHOOSES them. So the
+register step GENERATES random, throwaway TARGET-APP credentials with `secrets`
+(username `apex_`+8 alnum, a 16-char password), sends them in the register body
+alongside the invite code, and treats a 2xx/3xx HTTP status as success (`-w
+"%{http_code}"`; a conservative body keyword check is the fallback when no status
+was captured). If instead the server DOES return credentials, those are preferred
+(the other model). SECURITY: these are always random, single-use, target-app-only
+credentials — NEVER a real credential and NEVER an HTB-platform credential; the
+credential node carries `auto_generated=True`.
+
 **Credential handoff (amended P8-I03).** On success the executor stores the
 plaintext (username, password) ONLY in the process-local
 `CapabilityRuntimeRegistry` (`set_manual_credentials`), never in the result dict,

@@ -900,6 +900,7 @@ class TaskDispatcher:
             # Non-secret fields only. The password is NEVER placed here.
             "invite_username": result.username,
             "credentials_stored": result.credentials_stored,
+            "credentials_auto_generated": result.credentials_auto_generated,
             "invite_flow_steps": list(result.steps),
         }
         disposition = (

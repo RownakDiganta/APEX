@@ -463,3 +463,68 @@ class TestNestedExtraction:
         ex = InviteFlowExecutor(_cfg(), runner, reg)
         res = await ex.run(_task(), EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
         assert res.success and reg.get_manual_credentials() == ("u", "s3cret")
+
+
+class TestThrowawayCredentials:
+    """§28.35 — auto-generate throwaway TARGET-APP credentials for a
+    choose-your-own-credentials registration (never a real/HTB credential)."""
+
+    def test_generate_format(self) -> None:
+        u, p = InviteFlowExecutor._generate_credentials()
+        assert u.startswith("apex_") and len(u) == len("apex_") + 8
+        assert all(c.isalnum() for c in u[5:])
+        assert len(p) == 16
+        u2, p2 = InviteFlowExecutor._generate_credentials()
+        assert (u, p) != (u2, p2)  # random each call
+
+    def test_register_succeeded_by_status(self) -> None:
+        assert InviteFlowExecutor._register_succeeded("200", "anything")
+        assert InviteFlowExecutor._register_succeeded("302", "")
+        assert not InviteFlowExecutor._register_succeeded("400", "ok")
+        assert not InviteFlowExecutor._register_succeeded("500", "")
+
+    def test_register_succeeded_body_fallback(self) -> None:
+        assert InviteFlowExecutor._register_succeeded("", "Welcome to the app")
+        assert not InviteFlowExecutor._register_succeeded("", "there was an error")
+
+    def test_split_status(self) -> None:
+        assert InviteFlowExecutor._split_status("body here\n200") == ("body here", "200")
+        assert InviteFlowExecutor._split_status("no status") == ("no status", "")
+
+    @pytest.mark.asyncio
+    async def test_register_generates_creds_on_2xx(self) -> None:
+        reg = CapabilityRuntimeRegistry()
+        runner = _FakeRunner(challenge=_challenge(),
+                             register_json="<html>Account created</html>\n200")
+        ex = InviteFlowExecutor(_cfg(), runner, reg)
+        res = await ex.run(_task(), EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
+        assert res.success and res.credentials_auto_generated
+        mc = reg.get_manual_credentials()
+        assert mc is not None and mc[0].startswith("apex_")
+        assert mc[1] not in str(res)  # generated secret never in the result
+
+    @pytest.mark.asyncio
+    async def test_register_fails_on_4xx(self) -> None:
+        reg = CapabilityRuntimeRegistry()
+        runner = _FakeRunner(challenge=_challenge(), register_json="rejected\n400")
+        ex = InviteFlowExecutor(_cfg(), runner, reg)
+        res = await ex.run(_task(), EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
+        assert not res.success and "not accepted" in (res.error or "")
+        assert reg.get_manual_credentials() is None
+
+    @pytest.mark.asyncio
+    async def test_server_returned_creds_preferred(self) -> None:
+        reg = CapabilityRuntimeRegistry()
+        runner = _FakeRunner(challenge=_challenge(),
+                             register_json='{"username": "srv_u", "password": "srv_p"}')
+        ex = InviteFlowExecutor(_cfg(), runner, reg)
+        res = await ex.run(_task(), EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
+        assert res.success and not res.credentials_auto_generated
+        assert reg.get_manual_credentials() == ("srv_u", "srv_p")
+
+    def test_parser_marks_auto_generated(self) -> None:
+        obs = InviteFlowParser().parse_result(
+            {"credentials_stored": True, "invite_username": "apex_abc",
+             "credentials_auto_generated": True}, target=_IP)
+        n = obs.node_deltas[0]
+        assert n.props["auto_generated"] is True and n.props["secret_hint"] == "[redacted]"
