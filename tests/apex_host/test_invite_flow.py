@@ -413,3 +413,53 @@ class TestFieldExtraction:
         ex = InviteFlowExecutor(_cfg(), runner, reg)
         res = await ex.run(_task(), EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
         assert not res.success and "tried fields:" in (res.error or "")
+
+
+class TestNestedExtraction:
+    """§28.35 — recursive search for the invite code in nested JSON."""
+
+    def test_nested_data_code(self) -> None:
+        assert InviteFlowExecutor._extract_field(
+            {"data": {"code": "X"}}, "code", _CODE) == "X"
+
+    def test_nested_result_invite_code(self) -> None:
+        assert InviteFlowExecutor._extract_field(
+            {"result": {"invite_code": "Y"}}, "code", _CODE) == "Y"
+
+    def test_nested_under_non_candidate_container(self) -> None:
+        # "response" is not a candidate name, but recursion still descends into it.
+        assert InviteFlowExecutor._extract_field(
+            {"status": "success", "response": {"invite_code": "Z"}}, "code", _CODE) == "Z"
+
+    def test_deeply_nested_within_depth(self) -> None:
+        payload = {"a": {"b": {"code": "DEEP"}}}
+        assert InviteFlowExecutor._extract_field(payload, "code", _CODE, max_depth=3) == "DEEP"
+
+    def test_too_deep_beyond_max_depth(self) -> None:
+        payload = {"a": {"b": {"c": {"code": "TOODEEP"}}}}
+        assert InviteFlowExecutor._extract_field(payload, "code", _CODE, max_depth=2) == ""
+
+    def test_array_of_objects(self) -> None:
+        assert InviteFlowExecutor._extract_field(
+            {"items": [{"nope": 1}, {"code": "ARR"}]}, "code", _CODE) == "ARR"
+
+    def test_shallower_wins_over_nested(self) -> None:
+        # a top-level code beats a nested invite_code
+        assert InviteFlowExecutor._extract_field(
+            {"code": "TOP", "data": {"invite_code": "NESTED"}}, "code", _CODE) == "TOP"
+
+    def test_toplevel_still_works(self) -> None:
+        assert InviteFlowExecutor._extract_field({"code": "FLAT"}, "code", _CODE) == "FLAT"
+
+    def test_nested_credentials(self) -> None:
+        # register response nested — username/password found (no any-string).
+        data = {"data": {"username": "u2", "password": "p2"}}
+        assert InviteFlowExecutor._extract_field(data, "username", _USER) == "u2"
+
+    @pytest.mark.asyncio
+    async def test_executor_finds_nested_code(self) -> None:
+        reg = CapabilityRuntimeRegistry()
+        runner = _FakeRunner(challenge=_challenge(), verify_json='{"data": {"code": "INV-N"}}')
+        ex = InviteFlowExecutor(_cfg(), runner, reg)
+        res = await ex.run(_task(), EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
+        assert res.success and reg.get_manual_credentials() == ("u", "s3cret")

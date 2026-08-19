@@ -11802,10 +11802,13 @@ AUTHORIZED target IP (§28.8). The challenge decode is pure Python — the JS is
 never executed (§28.24 unchanged).
 
 **Response field auto-detection.** The executor does not force the operator to
-guess a response's exact JSON field name. The invite code is read from the
-configured `invite_verify_response_field` first, then common names
-(`code`/`invite_code`/`token`/`invite`/`data`/`result`), then — for the OPAQUE
-code only — the first non-status string value as a last resort. The register
+guess a response's exact JSON field name OR its nesting. Named fields (the
+configured field first, then common names) are searched at the top level AND
+recursively in nested objects/arrays up to depth 3 — so a code nested under e.g.
+`{"data": {"code": "..."}}` is found, with a shallower match preferred. The
+invite code uses common names (`code`/`invite_code`/`token`/`invite`/`data`/
+`result`) and then — for the OPAQUE code only — the first TOP-LEVEL non-status
+string value as a last resort (never nested, never for a credential). The register
 username/password are read from the configured field then common names
 (`username`/`user`/`login`/`name`, `password`/`pass`/`secret`/`pwd`) but NEVER an
 any-string fallback (a wrong string as a credential would be misleading). A

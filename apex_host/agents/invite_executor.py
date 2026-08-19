@@ -129,7 +129,8 @@ class InviteFlowExecutor:
             tried = ", ".join(dict.fromkeys((verify_field, *_CODE_FIELDS)))
             return InviteFlowResult(
                 False, steps=steps + ["verify: no invite code in response"],
-                error=f"invite code not found in verify response (tried fields: {tried})")
+                error=("invite code not found in verify response (tried fields: "
+                       f"{tried}; also searched nested objects up to depth 3)"))
         steps.append("verify: obtained invite code")
 
         # 4. POST register (send-side) — fail-closed unless operator auto-approved it.
@@ -212,22 +213,49 @@ class InviteFlowExecutor:
         return data if isinstance(data, dict) else None
 
     @staticmethod
+    def _search_named(data: object, names: tuple[str, ...], depth: int) -> str:
+        """Recursively find the first STRING value under any of *names* (§28.35).
+
+        Checks the named fields at THIS level first (a shallower match wins),
+        then recurses into nested dicts and lists-of-objects up to *depth* — so a
+        code nested under e.g. ``{"data": {"code": "..."}}`` is found. Bounded by
+        *depth* and stdlib-only; never raises."""
+        if isinstance(data, dict):
+            for name in names:
+                v = data.get(name)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            if depth > 0:
+                for v in data.values():
+                    if isinstance(v, (dict, list)):
+                        found = InviteFlowExecutor._search_named(v, names, depth - 1)
+                        if found:
+                            return found
+        elif isinstance(data, list) and depth > 0:
+            for item in data:
+                if isinstance(item, (dict, list)):
+                    found = InviteFlowExecutor._search_named(item, names, depth - 1)
+                    if found:
+                        return found
+        return ""
+
+    @staticmethod
     def _extract_field(
         data: dict[str, object], preferred: str, candidates: tuple[str, ...],
-        *, allow_any_string: bool = False,
+        *, allow_any_string: bool = False, max_depth: int = 3,
     ) -> str:
-        """Return the first non-empty STRING value found for *preferred* then each
-        of *candidates* (§28.35 — so the operator need not guess the exact JSON
-        field name). When *allow_any_string* and none matched, fall back to the
-        first non-status string value (used ONLY for the opaque invite code,
-        never for a credential)."""
-        for name in (preferred, *candidates):
-            if not name:
-                continue
-            v = data.get(name)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-        if allow_any_string:
+        """Return the first non-empty STRING value for *preferred* then each of
+        *candidates*, searched at the top level AND in nested objects up to
+        *max_depth* (§28.35 — so the operator need not guess the exact field name
+        OR its nesting). When *allow_any_string* and none matched, fall back to
+        the first TOP-LEVEL non-status string value (used ONLY for the opaque
+        invite code, never for a credential, and never nested — a nested random
+        string would be too loose a guess)."""
+        names = tuple(n for n in (preferred, *candidates) if n)
+        found = InviteFlowExecutor._search_named(data, names, max_depth)
+        if found:
+            return found
+        if allow_any_string and isinstance(data, dict):
             for v in data.values():
                 if isinstance(v, str) and len(v.strip()) > 5 \
                         and v.strip().lower() not in _NON_CODE_STRINGS:
