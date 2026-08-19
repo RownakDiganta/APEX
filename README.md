@@ -2594,8 +2594,14 @@ decode it (operator-chosen `base64`/`rot13`/`hex`/`url`, pure Python, no JS
 execution) → POST verify → POST register → capture credentials → hand them to the
 credential phase. It is **default OFF** and fully generic: every endpoint pattern,
 decode step, and JSON field name is operator-supplied (no hardcoded path or
-machine). Enabling it requires `--auto-invite-flow` plus explicit
-`--auto-approve-send-patterns` for the exact POSTs to auto-approve; every other
+machine). The flow triggers on the operator-supplied paths **directly**: it uses
+a discovered endpoint's real URL when one matches a pattern, and otherwise
+constructs the URL from the discovered vhost-aware base plus the literal path
+pattern — so it does not require the specific invite endpoints (e.g. a generate
+endpoint hidden behind obfuscated JS) to be re-discovered first, while still
+hitting the real vhost (not the bare IP). Enabling it requires `--auto-invite-flow`
+plus explicit `--auto-approve-send-patterns` for the exact POSTs to auto-approve;
+every other
 send-side action stays fail-closed (§28.30), `safety.py` and policy scope still
 apply, and requests only ever reach the authorized target IP. Captured
 credentials live only in the process-local runtime registry (never the EKG/

@@ -472,6 +472,10 @@ class _WebDeterministic:
             invite_task = build_invite_flow_task(
                 subgraph, self._invite_config,
                 target=self._target, host_ip=self._target,
+                # §28.35 — the vhost-aware base URL derived above, so an invite
+                # URL constructed from an operator path pattern hits the real
+                # (vhost) host via the executor's --resolve pin, not the bare IP.
+                base_url=base_url,
                 goal_id=goal.id, anchor=goal.anchor_node)
             if invite_task is not None:
                 tasks.append(invite_task)

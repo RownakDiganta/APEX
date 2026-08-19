@@ -11777,9 +11777,21 @@ hex/url], `find_matching_endpoints`, `action_matches_auto_approve`,
 `credential_planner`/`runtime_registry`/`builder`/`runtime`.
 
 **Flow + gates.** `_WebDeterministic.plan()` emits ONE `invite_flow` orchestrator
-task (via `build_invite_flow_task`) when the flow is enabled and generate/verify/
-register endpoints have all been discovered (idempotent — skipped once an
-`auto_registration` credential node exists). The dispatch approval gate (§28.30)
+task (via `build_invite_flow_task`) when the flow is enabled and all three invite
+URLs (generate/verify/register) resolve (idempotent — skipped once an
+`auto_registration` credential node exists). Each URL resolves via
+`_resolve_invite_url`: it PREFERS a discovered `endpoint` node matching the
+pattern (using that endpoint's real, vhost-hosted URL), and FALLS BACK to
+constructing `<vhost-aware base_url><literal-path-pattern>` from the operator's
+own `--invite-*-patterns`. So the flow triggers on the operator-supplied paths
+DIRECTLY and does not depend on the specific invite endpoints being
+(re-)discovered first — important because a generate endpoint hidden behind
+obfuscated JS may never surface as an EKG node. The `base_url` is the SAME
+vhost-aware base the web planner already computed (scheme + discovered vhost host
++ port, else the bare IP), so a constructed URL hits the real vhost via the
+executor's `--resolve` pin — never the bare IP (which for a name-based vhost
+target would only return the redirect stub). A non-literal (regex) pattern that
+matches no discovered endpoint cannot be constructed and yields no task. The dispatch approval gate (§28.30)
 classifies the orchestrator send-side and the `AutoApproveProvider` auto-approves
 it (operator opted in). INSIDE the executor, EACH send-side sub-request (the two
 POSTs) is INDIVIDUALLY re-checked against the operator's

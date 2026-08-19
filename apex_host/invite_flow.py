@@ -102,13 +102,54 @@ def find_matching_endpoints(
     return out
 
 
+_REGEX_METACHARS = set(".^$*+?{}[]()|\\")
+
+
+def _literal_path(pattern: str) -> str | None:
+    """Return *pattern* as a literal URL path when it is one (starts with ``/``
+    and contains no regex metacharacters), else None. Used to construct an
+    invite URL directly from an operator-supplied path when the endpoint was not
+    (yet) discovered as an EKG node."""
+    p = pattern.strip()
+    if p.startswith("/") and not (set(p) & _REGEX_METACHARS):
+        return p
+    return None
+
+
+def _resolve_invite_url(
+    subgraph: "SubgraphView", patterns: list[str], base_url: str,
+) -> str:
+    """Resolve one invite endpoint URL (§28.35).
+
+    PREFERS a discovered ``endpoint`` node whose URL/path matches a pattern (so
+    the real, correctly-hosted — e.g. vhost — URL is used). FALLS BACK to
+    constructing ``<base_url><literal-path>`` from the first pattern that is a
+    literal path, so the operator's own `--invite-*-patterns` are used directly
+    without requiring the endpoint to have been (re-)discovered — e.g. a generate
+    endpoint hidden behind obfuscated JS. Returns "" when neither is possible."""
+    eps = find_matching_endpoints(subgraph, patterns)
+    if eps:
+        return str(eps[0].props.get("url", ""))
+    if base_url:
+        for pattern in patterns:
+            path = _literal_path(pattern)
+            if path is not None:
+                return base_url.rstrip("/") + path
+    return ""
+
+
 def build_invite_flow_task(
     subgraph: "SubgraphView", config: object, *,
-    target: str, host_ip: str, goal_id: str, anchor: str | None,
+    target: str, host_ip: str, base_url: str, goal_id: str, anchor: str | None,
 ) -> "TaskSpec | None":
     """Emit ONE ``invite_flow`` orchestrator TaskSpec when the opt-in flow is
-    enabled and all three endpoint types (generate/verify/register) have been
-    discovered — else None (§28.35).
+    enabled and all three endpoint URLs (generate/verify/register) resolve — each
+    either from a DISCOVERED endpoint node or, failing that, constructed from the
+    vhost-aware *base_url* plus the operator's literal path pattern (§28.35). This
+    means the flow triggers on the operator-supplied paths directly and does not
+    depend on the specific invite endpoints being (re-)discovered first — while
+    still using the correct discovered vhost base so the executor's ``--resolve``
+    pin reaches the right host.
 
     Idempotent: returns None once a credential node from ``auto_registration``
     already exists (the flow succeeded), so it is emitted at most once."""
@@ -117,10 +158,15 @@ def build_invite_flow_task(
     for n in subgraph.nodes:
         if n.type == "credential" and str(n.props.get("source", "")) == "auto_registration":
             return None
-    gen = find_matching_endpoints(subgraph, list(getattr(config, "invite_generate_patterns", [])))
-    ver = find_matching_endpoints(subgraph, list(getattr(config, "invite_verify_patterns", [])))
-    reg = find_matching_endpoints(subgraph, list(getattr(config, "invite_register_patterns", [])))
-    if not (gen and ver and reg):
+    gen_pats = list(getattr(config, "invite_generate_patterns", []))
+    ver_pats = list(getattr(config, "invite_verify_patterns", []))
+    reg_pats = list(getattr(config, "invite_register_patterns", []))
+    if not (gen_pats and ver_pats and reg_pats):
+        return None
+    gen_url = _resolve_invite_url(subgraph, gen_pats, base_url)
+    ver_url = _resolve_invite_url(subgraph, ver_pats, base_url)
+    reg_url = _resolve_invite_url(subgraph, reg_pats, base_url)
+    if not (gen_url and ver_url and reg_url):
         return None
     from memfabric.ids import new_id
     from memfabric.types import TaskSpec
@@ -129,9 +175,9 @@ def build_invite_flow_task(
         id=new_id(), goal_id=goal_id, executor_domain="web",
         params={
             "tool": "invite_flow", "args": [], "target": target, "parser": "invite_flow",
-            "generate_url": str(gen[0].props.get("url", "")),
-            "verify_url": str(ver[0].props.get("url", "")),
-            "register_url": str(reg[0].props.get("url", "")),
+            "generate_url": gen_url,
+            "verify_url": ver_url,
+            "register_url": reg_url,
             "host_ip": host_ip,
             "decode_steps": list(getattr(config, "invite_decode_steps", [])),
             "verify_response_field": str(getattr(config, "invite_verify_response_field", "code")),

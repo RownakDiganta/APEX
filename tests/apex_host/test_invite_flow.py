@@ -230,24 +230,64 @@ class TestParser:
         assert InviteFlowParser().parse_result({"credentials_stored": False}, target=_IP).node_deltas == []
 
 
+_BASE = "http://2million.htb"
+
+
 class TestPlannerEmit:
     def _goal(self) -> Goal:
         return Goal(id="g", description="web", phase="web", anchor_node=_H)
 
     def test_emits_when_enabled_and_endpoints_present(self) -> None:
         sub = _sub([_ep("/api/v1/invite/generate"), _ep("/api/v1/invite/verify"), _ep("/register")])
-        task = build_invite_flow_task(sub, _cfg(), target=_IP, host_ip=_IP, goal_id="g", anchor=_H)
+        task = build_invite_flow_task(sub, _cfg(), target=_IP, host_ip=_IP,
+                                      base_url=_BASE, goal_id="g", anchor=_H)
         assert task is not None and task.params["tool"] == "invite_flow"
+        # discovered endpoint URL is preferred (its real, vhost-hosted URL)
         assert task.params["verify_url"] == "http://2million.htb/api/v1/invite/verify"
 
     def test_none_when_disabled(self) -> None:
         sub = _sub([_ep("/api/v1/invite/generate"), _ep("/api/v1/invite/verify"), _ep("/register")])
         assert build_invite_flow_task(sub, ApexConfig(target=_IP), target=_IP, host_ip=_IP,
-                                      goal_id="g", anchor=_H) is None
+                                      base_url=_BASE, goal_id="g", anchor=_H) is None
 
-    def test_none_when_endpoint_missing(self) -> None:
-        sub = _sub([_ep("/api/v1/invite/generate")])  # verify + register missing
-        assert build_invite_flow_task(sub, _cfg(), target=_IP, host_ip=_IP, goal_id="g", anchor=_H) is None
+    def test_constructs_from_pattern_when_not_discovered(self) -> None:
+        # §28.35 — the generate endpoint (behind obfuscated JS) is NOT discovered,
+        # but the operator supplied its literal path: construct it from base_url.
+        sub = _sub([])  # nothing discovered
+        task = build_invite_flow_task(sub, _cfg(), target=_IP, host_ip=_IP,
+                                      base_url=_BASE, goal_id="g", anchor=_H)
+        assert task is not None
+        assert task.params["generate_url"] == "http://2million.htb/api/v1/invite/generate"
+        assert task.params["verify_url"] == "http://2million.htb/api/v1/invite/verify"
+        assert task.params["register_url"] == "http://2million.htb/register"
+
+    def test_prefers_discovered_over_constructed(self) -> None:
+        # a discovered verify endpoint's actual URL wins over base+path construction
+        ep = Node(id="endpoint:http://2million.htb/api/v1/invite/verify?x=1", type="endpoint",
+                  props={"url": "http://2million.htb/api/v1/invite/verify?x=1",
+                         "path": "/api/v1/invite/verify"}, confidence=0.6,
+                  source="js_analysis", first_seen="t", last_seen="t")
+        sub = _sub([ep])
+        task = build_invite_flow_task(sub, _cfg(), target=_IP, host_ip=_IP,
+                                      base_url=_BASE, goal_id="g", anchor=_H)
+        assert task is not None
+        assert task.params["verify_url"] == "http://2million.htb/api/v1/invite/verify?x=1"
+
+    def test_none_when_no_base_and_not_discovered(self) -> None:
+        # No base_url and nothing discovered → cannot construct → None (no blind emit).
+        assert build_invite_flow_task(_sub([]), _cfg(), target=_IP, host_ip=_IP,
+                                      base_url="", goal_id="g", anchor=_H) is None
+
+    def test_regex_pattern_not_constructable(self) -> None:
+        # A regex (non-literal) pattern that matches nothing cannot be constructed.
+        cfg = _cfg(invite_verify_patterns=["/api/.*/verify"])
+        assert build_invite_flow_task(_sub([]), cfg, target=_IP, host_ip=_IP,
+                                      base_url=_BASE, goal_id="g", anchor=_H) is None
+
+    def test_none_when_patterns_missing(self) -> None:
+        cfg = _cfg(invite_verify_patterns=[])  # no verify pattern
+        assert build_invite_flow_task(_sub([]), cfg, target=_IP, host_ip=_IP,
+                                      base_url=_BASE, goal_id="g", anchor=_H) is None
 
     def test_idempotent_once_registered(self) -> None:
         cred = Node(id="credential:x", type="credential",
@@ -255,7 +295,8 @@ class TestPlannerEmit:
                     source="auto_registration", first_seen="t", last_seen="t")
         sub = _sub([_ep("/api/v1/invite/generate"), _ep("/api/v1/invite/verify"),
                     _ep("/register"), cred])
-        assert build_invite_flow_task(sub, _cfg(), target=_IP, host_ip=_IP, goal_id="g", anchor=_H) is None
+        assert build_invite_flow_task(sub, _cfg(), target=_IP, host_ip=_IP,
+                                      base_url=_BASE, goal_id="g", anchor=_H) is None
 
 
 class TestCredentialHandoff:
