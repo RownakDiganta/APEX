@@ -11808,7 +11808,15 @@ recursively in nested objects/arrays up to depth 3 — so a code nested under e.
 `{"data": {"code": "..."}}` is found, with a shallower match preferred. The
 invite code uses common names (`code`/`invite_code`/`token`/`invite`/`data`/
 `result`) and then — for the OPAQUE code only — the first TOP-LEVEL non-status
-string value as a last resort (never nested, never for a credential). The register
+string value as a last resort (never nested, never for a credential). The verify
+POST captures the HTTP status (`-w "%{http_code}"`); a 4xx/5xx (e.g. a `405
+Method Not Allowed` from a wrong endpoint) fails with a clear message stating the
+configured `--invite-verify-patterns` endpoint may not match the target's flow,
+and the status is appended to a non-JSON / code-not-found error too — so a flow
+mismatch is diagnosable rather than opaque. (The verify step is, and always was,
+a POST with the decoded value in the body — a `405` on the verify endpoint in the
+EKG comes from the web-discovery GET-fetch of that endpoint, not the invite
+flow.) The register
 username/password are read from the configured field then common names
 (`username`/`user`/`login`/`name`, `password`/`pass`/`secret`/`pwd`) but NEVER an
 any-string fallback (a wrong string as a credential would be misleading). A

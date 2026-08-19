@@ -117,15 +117,28 @@ class InviteFlowExecutor:
             return InviteFlowResult(
                 False, steps=steps + ["verify: not auto-approved"],
                 error="verify POST not in --auto-approve-send-patterns (fail-closed)")
-        r = await self._curl("POST", ver_url, host_ip, body=f"{verify_field}={decoded}")
+        r = await self._curl("POST", ver_url, host_ip,
+                             body=f"{verify_field}={decoded}", capture_status=True)
         if not self._ok(r):
             return InviteFlowResult(False, steps=steps + ["verify: request failed"],
                                     error="verify POST failed")
-        verify_json = self._parse_json(r.stdout)  # type: ignore[union-attr]
+        # Capture the HTTP status so a wrong endpoint/method (e.g. a 405 Method
+        # Not Allowed, or a 404) is surfaced clearly instead of an opaque
+        # "code not found" — the configured verify endpoint may not match the
+        # target's actual invite flow (which APEX cannot hardcode).
+        v_body, v_status = self._split_status(r.stdout)  # type: ignore[union-attr]
+        status_note = f" (verify returned HTTP {v_status})" if v_status else ""
+        if v_status and v_status[:1] in ("4", "5"):
+            return InviteFlowResult(
+                False, steps=steps + [f"verify: HTTP {v_status}"],
+                error=(f"verify POST to {ver_url} returned HTTP {v_status} — the "
+                       "configured --invite-verify-patterns endpoint/method may not "
+                       "match the target's actual invite flow"))
+        verify_json = self._parse_json(v_body)
         if verify_json is None:
             return InviteFlowResult(
                 False, steps=steps + ["verify: non-JSON response"],
-                error="verify response was not a JSON object")
+                error=f"verify response was not a JSON object{status_note}")
         invite_code = self._extract_field(
             verify_json, verify_field, _CODE_FIELDS, allow_any_string=True)
         if not invite_code:
@@ -133,7 +146,8 @@ class InviteFlowExecutor:
             return InviteFlowResult(
                 False, steps=steps + ["verify: no invite code in response"],
                 error=("invite code not found in verify response (tried fields: "
-                       f"{tried}; also searched nested objects up to depth 3)"))
+                       f"{tried}; also searched nested objects up to depth 3)"
+                       f"{status_note}"))
         steps.append("verify: obtained invite code")
 
         # 4. POST register (send-side) — fail-closed unless operator auto-approved it.

@@ -528,3 +528,36 @@ class TestThrowawayCredentials:
              "credentials_auto_generated": True}, target=_IP)
         n = obs.node_deltas[0]
         assert n.props["auto_generated"] is True and n.props["secret_hint"] == "[redacted]"
+
+
+class TestVerifyMethodAndDiagnostics:
+    """§28.35 — verify is a POST (never a GET), and a 4xx/5xx status is surfaced."""
+
+    @pytest.mark.asyncio
+    async def test_verify_uses_post_with_decoded_code(self) -> None:
+        reg = CapabilityRuntimeRegistry()
+        runner = _FakeRunner(challenge=_challenge())
+        ex = InviteFlowExecutor(_cfg(), runner, reg)
+        await ex.run(_task(), EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
+        verify_call = next(c for c in runner.calls if "/api/v1/invite/verify" in " ".join(c))
+        assert "-X" in verify_call and verify_call[verify_call.index("-X") + 1] == "POST"
+        assert "-d" in verify_call  # the decoded value is sent in the body
+
+    @pytest.mark.asyncio
+    async def test_verify_405_surfaced_clearly(self) -> None:
+        reg = CapabilityRuntimeRegistry()
+        # verify POST returns a 405 (wrong endpoint/method for this flow)
+        runner = _FakeRunner(challenge=_challenge(),
+                             verify_json='{"message": "Method Not Allowed"}\n405')
+        ex = InviteFlowExecutor(_cfg(), runner, reg)
+        res = await ex.run(_task(), EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
+        assert not res.success
+        assert "HTTP 405" in (res.error or "") and "may not match" in (res.error or "")
+
+    @pytest.mark.asyncio
+    async def test_verify_200_with_status_still_extracts(self) -> None:
+        reg = CapabilityRuntimeRegistry()
+        runner = _FakeRunner(challenge=_challenge(), verify_json='{"code": "OK-1"}\n200')
+        ex = InviteFlowExecutor(_cfg(), runner, reg)
+        res = await ex.run(_task(), EvidenceBundle(entries=[], subgraph=None, query="", tiers_queried=[]))
+        assert res.success
