@@ -128,6 +128,14 @@ caching:
    the project itself. This is the slow layer (faiss-cpu, numpy, playwright,
    langgraph, ... — about two minutes on a cold cache in this phase's build);
    it is only invalidated when `pyproject.toml`/`uv.lock` actually change.
+   The builder sets `ENV UV_HTTP_TIMEOUT=300` (5 min, up from uv's 30s
+   default) so the large scientific-Python wheel downloads in this layer —
+   the ~30 MB `faiss-cpu` wheel in particular — cannot abort the build on a
+   slow or contended Docker-build network. This only lengthens a single
+   request's allowed time; it changes no dependency and adds no third-party
+   index/mirror (default PyPI remains the sole source). The same
+   `UV_HTTP_TIMEOUT=300` is set in `docker/kali/Dockerfile`, which runs the
+   identical `uv sync`.
 2. `COPY memfabric apex_host apex_tool_service` then `uv sync --frozen
    --no-dev --no-editable` — builds and installs the three first-party
    packages as real, self-contained site-packages entries (not an editable

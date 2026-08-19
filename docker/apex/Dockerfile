@@ -42,10 +42,19 @@ COPY --from=uv /uv /usr/local/bin/uv
 #   use the base image's interpreter (which already matches requires-python).
 # UV_LINK_MODE=copy: avoid uv's default hardlink/reflink behavior, which can
 #   warn or misbehave across the Docker layer/cache-mount boundary.
+# UV_HTTP_TIMEOUT=300: raise uv's per-request HTTP timeout from its 30s default
+#   to 5 minutes. The dependency layer downloads several large scientific-Python
+#   wheels (faiss-cpu, numpy) plus playwright/langgraph; on a slow or contended
+#   Docker-build network the faiss-cpu wheel (~30 MB) can exceed the 30s default
+#   and abort the build. This ONLY extends how long a single download may take —
+#   it changes no dependency, adds no third-party index/mirror, and keeps the
+#   default PyPI as the sole source (a geo-specific mirror would be a
+#   supply-chain/availability risk and is deliberately not used).
 # UV_PROJECT_ENVIRONMENT: explicit, predictable venv path to copy forward
 #   into the runtime stage.
 ENV UV_PYTHON_DOWNLOADS=never \
     UV_LINK_MODE=copy \
+    UV_HTTP_TIMEOUT=300 \
     UV_PROJECT_ENVIRONMENT=/app/.venv
 
 WORKDIR /app

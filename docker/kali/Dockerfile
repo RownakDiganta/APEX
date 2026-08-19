@@ -103,7 +103,16 @@ COPY --from=uv /uv /usr/local/bin/uv
 # ---------------------------------------------------------------------------
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python \
     UV_LINK_MODE=copy \
+    UV_HTTP_TIMEOUT=300 \
     UV_PROJECT_ENVIRONMENT=/app/.venv
+
+# UV_HTTP_TIMEOUT=300 (5 min, up from uv's 30s default): the `uv sync` steps
+# below pull the same large scientific-Python wheels as the apex image
+# (faiss-cpu ~30 MB, numpy, playwright, langgraph). On a slow/contended
+# Docker-build network the faiss-cpu download can exceed the 30s default and
+# abort the build. This only lengthens a single request's allowed time — no
+# dependency change, no third-party index/mirror (default PyPI stays the sole
+# source). Mirrors the same fix in docker/apex/Dockerfile.
 
 WORKDIR /app
 
